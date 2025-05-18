@@ -21,9 +21,9 @@ python main.py \
   --annotations_file_path ./data/annotations/tibetan_chinese_no.txt \
 
 ## List of altered scripts
-main.py
-dataset_generator.py => altered to dataset_generator_tib_chi_no.py
-text_renderer.py =>altered to 
+- main.py
+- dataset_generator.py => altered to dataset_generator_tib_chi_no.py
+- text_renderer.py =>altered to text_renderer_img_size.py
 
 ## Script Details
 The script loads the Corpus path inputs from main.py to their corresponding bounding boxes of their ann_class_id (YOLO CLASS ID) in order to produce different texts with generate_dataset_tib_chi_no.py. 
