@@ -50,6 +50,7 @@ Here is the table of the label mapping:
 | Tibetan Number Words  | `corpora_tibetan_numbers_path`  | 000-009                 | 0                            |
 | Tibetan Text Body     | `corpora_tibetan_text_path`     | 101-110                 | 1                            |
 | Chinese Number Words  | `corpora_chinese_numbers_path`  | 201-210                 | 2                            |
+
 \* see Limitations
 
 The different text inputs are given by:
