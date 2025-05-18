@@ -60,4 +60,7 @@ See our [Corpora Folder](https://github.com/CodexAITeam/TibetanOCR/tree/syntheti
 
 ## Limitations and Outline for future development
 - Label_dict is still not producing correct results of Planned Label ID Ranges because it only uses tibetan number file labels so far. 
-- Augmentations are still very limited and will be expanded. 
+- Augmentations are still very limited and will be expanded.
+
+## License
+This project is licensed under the MIT License - see the [LICENSE](https://github.com/CodexAITeam/TibetanOCR/blob/synthetic_generation_tib_chi_no/LICENSE) file for details.
