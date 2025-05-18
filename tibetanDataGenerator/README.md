@@ -21,7 +21,7 @@ python main.py \
   --annotations_file_path ./data/annotations/tibetan_chinese_no.txt \
 
 ## List of altered scripts
-- main.py
+- main.py (for correct use shift the script into 
 - dataset_generator.py => altered to dataset_generator_tib_chi_no.py
 - text_renderer.py =>altered to text_renderer_img_size.py
 
@@ -43,7 +43,7 @@ The different text inputs are given by:
 -Tibetan Numbers: tib_no_0001.txt to tib_no_0010.txt: Randomly selected
 -Tibetan Text: uvrip*.txt: Randomly selected
 -Chinese Numbers: chi_no_0001.txt to chi_no_0010.txt: Simultaneosly selected (for instance chi_no_001.txt is selected when tib_no_0001.txt is selected)  
-See our [Tibetan Numbers Dataset Folder](https://github.com/CodexAITeam/TibetanOCR/tree/synthetic_generation_tib_chi_no/data/corpora) for sample files.
+See our [Corpora Folder](https://github.com/CodexAITeam/TibetanOCR/tree/synthetic_generation_tib_chi_no/data/corpora) for sample files.
 
 ## Limitations and Outline for future development
 - Label_dict is still not producing correct results of Planned Label ID Ranges because it only uses tibetan number file labels so far. 
