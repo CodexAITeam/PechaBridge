@@ -20,7 +20,7 @@ python main.py \
   --image_height 361 \
   --annotations_file_path ./data/annotations/tibetan_chinese_no.txt \
 
-## Sample Command
+## Example Usage
 python path/to/main.py \
   --corpora_tibetan_numbers_path "path/to/data/corpora/Tibetan Number Words" \
   --corpora_tibetan_text_path "path/to/data/corpora/UVA Tibetan Spoken Corpus" \
