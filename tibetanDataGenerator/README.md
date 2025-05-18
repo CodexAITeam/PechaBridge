@@ -20,6 +20,19 @@ python main.py \
   --image_height 361 \
   --annotations_file_path ./data/annotations/tibetan_chinese_no.txt \
 
+## Sample Command
+python path/to/main.py \
+  --corpora_tibetan_numbers_path "path/to/data/corpora/Tibetan Number Words" \
+  --corpora_tibetan_text_path "path/to/data/corpora/UVA Tibetan Spoken Corpus" \
+  --corpora_chinese_numbers_path "path/to/data/corpora/Chinese Number Words" \
+  --background_train "path/to/data/background_images_train" \
+  --background_val "path/to/data/background_images_val" \
+  --annotations_file_path "path/to/data/annotations/tibetan_chinese_no/bg_example_0001.txt" \
+  --font_path_tibetan "path/to/fonts/Microsoft Himalaya.ttf" \
+  --font_path_chinese "path/to/fonts/simkai.ttf" \
+  --train_samples 2 \
+  --val_samples 2
+  
 ## List of altered scripts
 - main.py (for correct use shift the script to the [initial project directory](https://github.com/CodexAITeam/TibetanOCR/tree/synthetic_generation_tib_chi_no)
 - dataset_generator.py => altered to dataset_generator_tib_chi_no.py
@@ -28,7 +41,7 @@ python main.py \
 ## Script Details
 The script loads the Corpus path inputs from main.py to their corresponding bounding boxes of their ann_class_id (YOLO CLASS ID) in order to produce different texts with generate_dataset_tib_chi_no.py. 
 The ann_class_id are parsed from a preconfigured annotation template named bg_PPN337138764X_00000005.txt which is located in the Tibetan Layout Analyser project. See our [Tibetan Numbers Dataset Folder](https://github.com/CodexAITeam/TibetanLayoutAnalyzer/tree/main/data/tibetan%20numbers) for sample files. Furthermore, the scipt uses different background image from that project in the format 1024x361 
-because it reflects the original historical data format. 
+because it reflects the original historical data format. The argparse input font_path_tibetan is used to display generated tibetan text, while is font_path_chinese used for chinese text.
 
 Here is the table of the label mapping: 
 
