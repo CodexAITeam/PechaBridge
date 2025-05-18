@@ -58,6 +58,9 @@ The different text inputs are given by:
 -Chinese Numbers: chi_no_0001.txt to chi_no_0010.txt: Simultaneosly selected (for instance chi_no_001.txt is selected when tib_no_0001.txt is selected)  
 See our [Corpora Folder](https://github.com/CodexAITeam/TibetanOCR/tree/synthetic_generation_tib_chi_no/data/corpora) for sample files.
 
+## Generated synthetic image sample
+- generated_sample.png
+
 ## Limitations and Outline for future development
 - Label_dict is still not producing correct results of Planned Label ID Ranges because it only uses tibetan number file labels so far. 
 - Augmentations are still very limited and will be expanded.
