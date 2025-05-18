@@ -54,10 +54,9 @@ Here is the table of the label mapping:
 \* see Limitations
 
 The different text inputs are given by:
-
--Tibetan Numbers: tib_no_0001.txt to tib_no_0010.txt: Randomly selected
--Tibetan Text: uvrip*.txt: Randomly selected
--Chinese Numbers: chi_no_0001.txt to chi_no_0010.txt: Simultaneosly selected (for instance chi_no_001.txt is selected when tib_no_0001.txt is selected)  
+- Tibetan Numbers: tib_no_0001.txt to tib_no_0010.txt: Randomly selected
+- Tibetan Text: uvrip*.txt: Randomly selected
+- Chinese Numbers: chi_no_0001.txt to chi_no_0010.txt: Simultaneosly selected (for instance chi_no_001.txt is selected when tib_no_0001.txt is selected)  
 See our [Corpora Folder](https://github.com/CodexAITeam/TibetanOCR/tree/synthetic_generation_tib_chi_no/data/corpora) for sample files.
 
 ## Generated synthetic image sample
