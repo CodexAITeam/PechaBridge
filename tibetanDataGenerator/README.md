@@ -21,20 +21,25 @@ python main.py \
   --annotations_file_path ./data/annotations/tibetan_chinese_no.txt \
 
 ## Script Details
-The script loads the Corpus path inputs from main.py to their corresponding bounding boxes of their ann_class_id (YOLO CLASS ID) in order to produce different texts in generate_dataset_tib_chi_no.py. 
+The script loads the Corpus path inputs from main.py to their corresponding bounding boxes of their ann_class_id (YOLO CLASS ID) in order to produce different texts with generate_dataset_tib_chi_no.py. 
+The ann_class_id are parsed from a preconfigured annotation template named bg_PPN337138764X_00000005.txt which is located in the Tibetan Layout Analyser project. See our [Tibetan Numbers Dataset Folder](https://github.com/CodexAITeam/TibetanLayoutAnalyzer/tree/main/data/tibetan%20numbers) for sample files. Furthermore, the scipt uses different background image from that project in the format 1024x361 
+because it reflects the original historical data format. 
+
 Here is the table of the label mapping: 
 
-| Corpus Path                     | ID Range | YOLO Class ID |
-|---------------------------------|----------|---------------|
-| `corpora_tibetan_numbers_path`  | 000-009  | 0             |
-| `corpora_tibetan_text_path`     | 101-110  | 1             |
-| `corpora_chinese_numbers_path`  | 201-210  | 2             |
+| Class Name            | Corpus Path                     | Planned Label ID Range* | ann_class_id / YOLO Class ID |
+|-----------------------|---------------------------------|-------------------------|------------------------------|
+| Tibetan Number Words  | `corpora_tibetan_numbers_path`  | 000-009                 | 0                            |
+| Tibetan Text Body     | `corpora_tibetan_text_path`     | 101-110                 | 1                            |
+| Chinese Number Words  | `corpora_chinese_numbers_path`  | 201-210                 | 2                            |
+* see Limitations
 
--Tibetan Numbers: tib_no_0001.txt to tib_no_0010.txt
--Chinese Numbers: chi_no_0001.txt to chi_no_0010.txt
--Tibetan Text: Randomly selected from corpus files
-
+The different text inputs are given by:
+-Tibetan Numbers: tib_no_0001.txt to tib_no_0010.txt: Randomly selected
+-Tibetan Text: uvrip*.txt: Randomly selected
+-Chinese Numbers: chi_no_0001.txt to chi_no_0010.txt: Simultaneosly selected (for instance chi_no_001.txt is selected when tib_no_0001.txt is selected)  
+See our [Tibetan Numbers Dataset Folder](https://github.com/CodexAITeam/TibetanOCR/tree/synthetic_generation_tib_chi_no/data/corpora) for sample files.
 
 ## Limitations and Outline for future development
-- Label_dict is still not producing correct results because it only uses tibetan number file labels so far. 
-- Augmentations are still very limited.
+- Label_dict is still not producing correct results of Planned Label ID Ranges because it only uses tibetan number file labels so far. 
+- Augmentations are still very limited and will be expanded. 
