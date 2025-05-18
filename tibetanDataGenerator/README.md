@@ -13,7 +13,7 @@ A tool for generating synthetic YOLO-formatted datasets for detecting Tibetan te
 python main.py \
   --corpora_tibetan_numbers_path ./data/corpora/Tibetan\ Number\ Words/ \
   --corpora_tibetan_text_path ./data/corpora/UVA\ Tibetan\ Spoken\ Corpus/ \
-  --corpora_chinese_numbers_path ./data/corpora/Chinese\ Number\ Words/ 
+  --corpora_chinese_numbers_path ./data/corpora/Chinese\ Number\ Words/ \ 
   --font_path_tibetan ./fonts/Microsoft\ Himalaya.ttf \
   --font_path_chinese ./fonts/simkai.ttf \
   --image_width 1024 \
