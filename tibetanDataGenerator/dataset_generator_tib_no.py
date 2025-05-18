@@ -10,7 +10,7 @@ from pathlib import Path
 from collections import OrderedDict
 from ultralytics.data.utils import DATASETS_DIR
 from tibetanDataGenerator.utils.data_loader import TextFactory
-from tibetanDataGenerator.data.text_renderer import ImageBuilder
+from tibetanDataGenerator.data.text_renderer_img_size import ImageBuilder
 from tibetanDataGenerator.data.augmentation import RotateAugmentation, NoiseAugmentation, \
      AugmentationStrategy
 from tibetanDataGenerator.utils.bounding_box import BoundingBoxCalculator
