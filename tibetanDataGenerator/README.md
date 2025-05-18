@@ -21,7 +21,7 @@ python main.py \
   --annotations_file_path ./data/annotations/tibetan_chinese_no.txt \
 
 ## List of altered scripts
-- main.py (for correct use shift the script into 
+- main.py (for correct use shift the script to the [initial project directory](https://github.com/CodexAITeam/TibetanOCR/tree/synthetic_generation_tib_chi_no)
 - dataset_generator.py => altered to dataset_generator_tib_chi_no.py
 - text_renderer.py =>altered to text_renderer_img_size.py
 
