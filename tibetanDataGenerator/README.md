@@ -20,6 +20,11 @@ python main.py \
   --image_height 361 \
   --annotations_file_path ./data/annotations/tibetan_chinese_no.txt \
 
+## List of altered scripts
+main.py
+dataset_generator.py => altered to dataset_generator_tib_chi_no.py
+text_renderer.py =>altered to 
+
 ## Script Details
 The script loads the Corpus path inputs from main.py to their corresponding bounding boxes of their ann_class_id (YOLO CLASS ID) in order to produce different texts with generate_dataset_tib_chi_no.py. 
 The ann_class_id are parsed from a preconfigured annotation template named bg_PPN337138764X_00000005.txt which is located in the Tibetan Layout Analyser project. See our [Tibetan Numbers Dataset Folder](https://github.com/CodexAITeam/TibetanLayoutAnalyzer/tree/main/data/tibetan%20numbers) for sample files. Furthermore, the scipt uses different background image from that project in the format 1024x361 
