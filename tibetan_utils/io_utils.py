@@ -6,6 +6,8 @@ import os
 import re
 import json
 import yaml
+import hashlib
+import time
 from pathlib import Path
 from typing import Dict, List, Union, Any
 
@@ -155,3 +157,28 @@ def get_output_path(base_dir: str, name: str, filename: str, create_dir: bool = 
         ensure_dir(output_dir)
     
     return os.path.join(output_dir, filename)
+
+
+def hash_current_time() -> str:
+    """
+    Generate a hash based on current time for unique identifiers.
+    
+    Returns:
+        str: SHA256 hash of current time in nanoseconds
+    """
+    # Get the current time
+    current_time = time.time_ns()
+
+    # Convert the current time to a string
+    time_str = str(current_time)
+
+    # Create a hash object (using SHA256)
+    hash_object = hashlib.sha256()
+
+    # Update the hash object with the time string
+    hash_object.update(time_str.encode())
+
+    # Get the hexadecimal digest of the hash
+    time_hash = hash_object.hexdigest()
+
+    return time_hash

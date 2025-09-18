@@ -31,9 +31,15 @@ class ImageBuilder:
             print("Warning: Default font used.")
         return self
 
-    def add_text(self, text, position, box_size):
+    def add_text(self, text, position, box_size, rotation=0):
         """
         Fügt Text auf dem Bild an einer bestimmten Position mit automatischer Begrenzung hinzu.
+        
+        Args:
+            text: Text to render
+            position: (x, y) position
+            box_size: (width, height) of text box
+            rotation: Rotation angle in degrees (0, 90, 180, 270)
         """
         if not self.font:
             raise ValueError("Font not set. Use set_font() before adding text.")
@@ -42,26 +48,64 @@ class ImageBuilder:
         box_w, box_h = box_size
         max_y = box_y + box_h
 
-        wrapped_text = []
-        for line in text.split('\n'):
-            while line:
-                for i in range(1, len(line) + 1):
-                    if self.draw.textlength(line[:i], font=self.font) > box_w:
-                        break
-                else:
-                    i = len(line)
+        if rotation == 0:
+            # Standard horizontal text rendering
+            wrapped_text = []
+            for line in text.split('\n'):
+                while line:
+                    for i in range(1, len(line) + 1):
+                        if self.draw.textlength(line[:i], font=self.font) > box_w:
+                            break
+                    else:
+                        i = len(line)
 
-                wrapped_text.append(line[:i])
-                line = line[i:]
+                    wrapped_text.append(line[:i])
+                    line = line[i:]
 
-        y_offset = 0
-        for line in wrapped_text:
-            left, top, right, bottom = self.font.getbbox(line)
-            line_height = bottom - top
-            if box_y + y_offset + line_height > max_y:
-                break
-            self.draw.text((box_x, box_y + y_offset), line, font=self.font, fill=(0, 0, 0))
-            y_offset += line_height
+            y_offset = 0
+            for line in wrapped_text:
+                left, top, right, bottom = self.font.getbbox(line)
+                line_height = bottom - top
+                if box_y + y_offset + line_height > max_y:
+                    break
+                self.draw.text((box_x, box_y + y_offset), line, font=self.font, fill=(0, 0, 0))
+                y_offset += line_height
+        
+        elif rotation == 90:
+            # Vertical text rendering (90 degrees clockwise)
+            # Create a temporary image for the rotated text
+            temp_img = Image.new('RGBA', (box_h, box_w), (255, 255, 255, 0))
+            temp_draw = ImageDraw.Draw(temp_img)
+            
+            # Render text on temporary image
+            wrapped_text = []
+            for line in text.split('\n'):
+                while line:
+                    for i in range(1, len(line) + 1):
+                        if temp_draw.textlength(line[:i], font=self.font) > box_h:
+                            break
+                    else:
+                        i = len(line)
+                    wrapped_text.append(line[:i])
+                    line = line[i:]
+            
+            y_offset = 0
+            for line in wrapped_text:
+                left, top, right, bottom = self.font.getbbox(line)
+                line_height = bottom - top
+                if y_offset + line_height > box_w:
+                    break
+                temp_draw.text((0, y_offset), line, font=self.font, fill=(0, 0, 0))
+                y_offset += line_height
+            
+            # Rotate the temporary image and paste it
+            rotated = temp_img.rotate(-90, expand=True)
+            self.image.paste(rotated, (box_x, box_y), rotated)
+        
+        else:
+            # For other rotations, fall back to standard rendering
+            print(f"Warning: Rotation {rotation}° not fully supported, using 0°")
+            return self.add_text(text, position, box_size, rotation=0)
 
         return self
 

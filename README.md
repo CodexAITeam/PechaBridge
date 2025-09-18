@@ -9,7 +9,8 @@ This Python project focuses on detecting and recognizing Tibetan text in images.
 3. **Inference**: Detect Tibetan text blocks in new images, including support for Staatsbibliothek zu Berlin digital collections
 4. **OCR**: Apply Tesseract OCR to the detected text blocks to extract the actual text content
 
-![Validation results](res/results_val_1.png)
+## Example of synthetic data
+![generated synthetic data](res/results_val_1.jpg)
 
 ## Quick Start Guide
 
@@ -17,8 +18,8 @@ This Python project focuses on detecting and recognizing Tibetan text in images.
 
 ```bash
 # Clone the repository
-git clone https://github.com/nih23/Tibetan-NLP.git
-cd Tibetan-NLP
+git clone https://github.com/CodexAITeam/PechaBridge
+cd PechaBridge
 
 # Install dependencies
 pip install -r requirements.txt
@@ -33,7 +34,37 @@ pip install -r requirements.txt
 
 ```bash
 # 1. Generate dataset
-python generate_training_data.py --train_samples 1000 --val_samples 200 --image_size 1024
+python generate_training_data.py --train_samples 10 --val_samples 10 --font_path_tibetan ext/Microsoft\ Himalaya.ttf --font_path_chinese ext/simkai.ttf --dataset_name tibetan-yolo
+
+# 1.5 Inspect and validate dataset with Label Studio (optional)
+# Install Label Studio if not already installed:
+# pip install label-studio label-studio-converter
+
+# Set up environment variables for local file serving
+export LABEL_STUDIO_LOCAL_FILES_SERVING_ENABLED=true
+export LABEL_STUDIO_LOCAL_FILES_DOCUMENT_ROOT=$(pwd)/datasets/tibetan-yolo
+
+# Create classes.txt for Label studio compatibility
+echo "tibetan_no\ntext_body\nchinese_no" > datasets/tibetan-yolo/train/classes.txt
+echo "tibetan_no\ntext_body\nchinese_no" > datasets/tibetan-yolo/val/classes.txt
+
+# Convert YOLO annotations to Label Studio format
+label-studio-converter import yolo -i datasets/tibetan-yolo/train -o ls-tasks.json --image-ext ".png" --image-root-url "/data/local-files/?d=train/images"
+
+# Start Label Studio web interface (opens at http://localhost:8080)
+label-studio
+
+# In Label Studio:
+# 1. Create a new project:
+# 1.1 Go to the project settings and select Cloud Storage.
+# 1.2 Click Add Source Storage and select Local files from the Storage Type options.
+# 1.3 Set the Absolute local path to `$(pwd)/datasets/tibetan-yolo` (You need to resolv `$(pwd)`)
+# 1.4 Click Add storage.
+# 2. Import the generated ls-tasks.json file
+# 3. Review and validate the generated annotations
+# 4. Export corrections if needed
+
+# [1] https://github.com/HumanSignal/label-studio-sdk/tree/master/src/label_studio_sdk/converter#tutorial-importing-yolo-pre-annotated-images-to-label-studio-using-local-storage
 
 # 2. Train model
 python train_model.py --epochs 100 --export

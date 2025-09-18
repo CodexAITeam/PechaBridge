@@ -1,251 +1,207 @@
 """
-Command-line argument utilities for the TibetanOCR project.
+Argument parsing utilities for the TibetanOCR project.
+Multi-class support with Tibetan numbers, Tibetan text, and Chinese numbers.
 """
 
 import argparse
+from pathlib import Path
+try:
+    from ultralytics.data.utils import DATASETS_DIR
+except ImportError:
+    DATASETS_DIR = "./datasets"  # Fallback if ultralytics not installed
+
 from .config import (
-    DEFAULT_MODEL_PATH, DEFAULT_IMAGE_SIZE, DEFAULT_CONFIDENCE,
-    DEFAULT_OUTPUT_DIR, DEFAULT_DATASET_DIR, DEFAULT_OCR_LANG,
-    DEFAULT_TRAIN_SAMPLES, DEFAULT_VAL_SAMPLES, DEFAULT_AUGMENTATION,
-    DEFAULT_FONT_PATH, DEFAULT_SBB_OUTPUT, DEFAULT_OCR_OUTPUT
+    DEFAULT_BACKGROUND_TRAIN_PATH,
+    DEFAULT_BACKGROUND_VAL_PATH,
+    DEFAULT_CORPORA_PATH,
+    DEFAULT_FONT_PATH,
+    DEFAULT_IMAGE_SIZE,
+    DEFAULT_BATCH_SIZE,
+    DEFAULT_EPOCHS,
+    DEFAULT_WORKERS,
+    DEFAULT_TRAIN_SAMPLES,
+    DEFAULT_VAL_SAMPLES,
+    DEFAULT_AUGMENTATION,
+    DEFAULT_ANNOTATION_FILE_PATH
 )
 
 
 def add_model_arguments(parser):
-    """
-    Add model-related arguments to an ArgumentParser.
-    
-    Args:
-        parser: ArgumentParser instance
-        
-    Returns:
-        ArgumentParser: Updated parser
-    """
-    group = parser.add_argument_group('Model Options')
-    group.add_argument('--model', type=str, default=DEFAULT_MODEL_PATH,
-                      help='Path to the model (e.g., yolov8n.pt, best.pt)')
-    group.add_argument('--imgsz', type=int, default=DEFAULT_IMAGE_SIZE,
-                      help='Image size for inference/training')
-    group.add_argument('--conf', type=float, default=DEFAULT_CONFIDENCE,
-                      help='Confidence threshold for detections')
-    group.add_argument('--device', type=str, default='',
-                      help='Device for inference/training (e.g., cpu, 0, 0,1,2,3)')
-    return parser
+    """Add model-related arguments."""
+    parser.add_argument('--model', type=str, default='yolov8n.pt',
+                       help='Path to the model file')
+    parser.add_argument('--imgsz', type=int, default=DEFAULT_IMAGE_SIZE,
+                       help='Image size for inference')
+    parser.add_argument('--conf', type=float, default=0.25,
+                       help='Confidence threshold for detections')
 
 
 def add_output_arguments(parser):
-    """
-    Add output-related arguments to an ArgumentParser.
-    
-    Args:
-        parser: ArgumentParser instance
-        
-    Returns:
-        ArgumentParser: Updated parser
-    """
-    group = parser.add_argument_group('Output Options')
-    group.add_argument('--project', '--output', type=str, default=DEFAULT_OUTPUT_DIR,
-                      help='Directory for output')
-    group.add_argument('--name', type=str, default='exp',
-                      help='Experiment name')
-    group.add_argument('--save', action='store_true', default=True,
-                      help='Save results')
-    group.add_argument('--save-txt', action='store_true',
-                      help='Save results as .txt files')
-    group.add_argument('--save-conf', action='store_true',
-                      help='Save confidence values in .txt files')
-    return parser
+    """Add output-related arguments."""
+    parser.add_argument('--output', type=str, default='output',
+                       help='Output directory')
+    parser.add_argument('--save-crops', action='store_true',
+                       help='Save cropped text regions')
+    parser.add_argument('--debug', action='store_true',
+                       help='Enable debug mode with verbose output')
 
 
 def add_dataset_generation_arguments(parser):
-    """
-    Add dataset generation arguments to an ArgumentParser.
+    """Add dataset generation arguments for multi-class support."""
+    parser.add_argument('--background_train', type=str, default=DEFAULT_BACKGROUND_TRAIN_PATH,
+                       help='Folder with background images for training')
+    parser.add_argument('--background_val', type=str, default=DEFAULT_BACKGROUND_VAL_PATH,
+                       help='Folder with background images for validation')
+    parser.add_argument('--output_dir', type=str, default=str(Path(DATASETS_DIR)),
+                       help='Base directory to save the generated dataset. (Default: Ultralytics DATASETS_DIR)')
+    parser.add_argument('--dataset_name', type=str, default='yolo_tibetan_dataset',
+                       help='Name for the generated dataset folder.')
     
-    Args:
-        parser: ArgumentParser instance
-        
-    Returns:
-        ArgumentParser: Updated parser
-    """
-    group = parser.add_argument_group('Dataset Generation Options')
-    group.add_argument('--background_train', type=str, default='./data/background_images_train/',
-                      help='Folder with background images for training')
-    group.add_argument('--background_val', type=str, default='./data/background_images_val/',
-                      help='Folder with background images for validation')
-    group.add_argument('--dataset_name', type=str, default=DEFAULT_DATASET_DIR,
-                      help='Folder for the generated YOLO dataset')
-    group.add_argument('--corpora_folder', type=str, default='./data/corpora/Tibetan Number Words/',
-                      help='Folder with Tibetan corpora')
-    group.add_argument('--train_samples', type=int, default=DEFAULT_TRAIN_SAMPLES,
-                      help='Number of training samples to generate')
-    group.add_argument('--val_samples', type=int, default=DEFAULT_VAL_SAMPLES,
-                      help='Number of validation samples to generate')
-    group.add_argument('--no_cols', type=int, default=1,
-                      help='Number of text columns to generate [1-5]')
-    group.add_argument('--font_path', type=str, default=DEFAULT_FONT_PATH,
-                      help='Path to a Tibetan font file')
-    group.add_argument('--single_label', action='store_true',
-                      help='Use a single label "tibetan" for all files')
-    group.add_argument('--debug', action='store_true',
-                      help='Enable debug mode for verbose output')
-    group.add_argument('--image_size', type=int, default=DEFAULT_IMAGE_SIZE,
-                      help='Size of generated images in pixels')
-    group.add_argument('--augmentation', choices=['rotate', 'noise'], default=DEFAULT_AUGMENTATION,
-                      help='Type of augmentation to apply')
-    return parser
+    # Multi-class corpora paths
+    parser.add_argument('--corpora_tibetan_numbers_path', type=str, 
+                       default='./data/corpora/Tibetan Number Words/',
+                       help='Folder with Tibetan number words (maps to class_id 0: "tibetan_number_word").')
+    parser.add_argument('--corpora_tibetan_text_path', type=str, 
+                       default='./data/corpora/UVA Tibetan Spoken Corpus/',
+                       help='Folder with general Tibetan text (maps to class_id 1: "tibetan_text").')
+    parser.add_argument('--corpora_chinese_numbers_path', type=str, 
+                       default='./data/corpora/Chinese Number Words/',
+                       help='Folder with Chinese number words (maps to class_id 2: "chinese_number_word").')
+    
+    # Sample counts
+    parser.add_argument('--train_samples', type=int, default=DEFAULT_TRAIN_SAMPLES,
+                       help='Number of training samples to generate')
+    parser.add_argument('--val_samples', type=int, default=DEFAULT_VAL_SAMPLES,
+                       help='Number of validation samples to generate')
+    
+    # Multi-font support
+    parser.add_argument('--font_path_tibetan', type=str, required=True, 
+                       default='ext/Microsoft Himalaya.ttf',
+                       help='Path to a font file that supports Tibetan characters')
+    parser.add_argument('--font_path_chinese', type=str, required=True, 
+                       default='ext/simkai.ttf',
+                       help='Path to a font file that supports Chinese characters')
+    
+    # Image dimensions
+    parser.add_argument('--image_width', type=int, default=1024,
+                       help='Width (pixels) of each generated image.')
+    parser.add_argument('--image_height', type=int, default=361,
+                       help='Height (pixels) of each generated image.')
+    
+    # Labels and augmentation
+    parser.add_argument('--single_label', action='store_true',
+                       help='Use a single label "tibetan" for all files instead of using filenames as labels')
+    parser.add_argument("--augmentation", choices=['rotate', 'noise', 'none'], default=DEFAULT_AUGMENTATION,
+                       help="Type of augmentation to apply")
+    
+    # YOLO annotations support
+    parser.add_argument('--annotations_file_path', type=str,
+                       default=DEFAULT_ANNOTATION_FILE_PATH,
+                       help='Path to a YOLO annotation file to load and draw bounding boxes from.')
 
 
 def add_training_arguments(parser):
-    """
-    Add training-related arguments to an ArgumentParser.
-    
-    Args:
-        parser: ArgumentParser instance
-        
-    Returns:
-        ArgumentParser: Updated parser
-    """
-    group = parser.add_argument_group('Training Options')
-    group.add_argument('--dataset', type=str, default=DEFAULT_DATASET_DIR,
-                      help='Name of the dataset folder')
-    group.add_argument('--epochs', type=int, default=100,
-                      help='Number of training epochs')
-    group.add_argument('--batch', type=int, default=16,
-                      help='Batch size for training')
-    group.add_argument('--workers', type=int, default=8,
-                      help='Number of workers for data loading')
-    group.add_argument('--patience', type=int, default=50,
-                      help='EarlyStopping patience in epochs')
-    group.add_argument('--export', action='store_true',
-                      help='Export the model after training as TorchScript')
-    return parser
+    """Add training-related arguments."""
+    parser.add_argument('--dataset', type=str, default='yolo_tibetan/',
+                       help='Path to dataset YAML file')
+    parser.add_argument('--epochs', type=int, default=DEFAULT_EPOCHS,
+                       help='Number of training epochs')
+    parser.add_argument('--batch', type=int, default=DEFAULT_BATCH_SIZE,
+                       help='Batch size')
+    parser.add_argument('--workers', type=int, default=DEFAULT_WORKERS,
+                       help='Number of worker threads')
+    parser.add_argument('--device', type=str, default='',
+                       help='Device to use for training')
+    parser.add_argument('--project', type=str, default='runs/detect',
+                       help='Project directory')
+    parser.add_argument('--name', type=str, default='train',
+                       help='Experiment name')
+    parser.add_argument('--export', action='store_true',
+                       help='Export model after training')
+    parser.add_argument('--patience', type=int, default=50,
+                       help='EarlyStopping patience')
 
 
 def add_wandb_arguments(parser):
-    """
-    Add Weights & Biases related arguments to an ArgumentParser.
-    
-    Args:
-        parser: ArgumentParser instance
-        
-    Returns:
-        ArgumentParser: Updated parser
-    """
-    group = parser.add_argument_group('Weights & Biases Options')
-    group.add_argument('--wandb', action='store_true',
-                      help='Enable Weights & Biases logging')
-    group.add_argument('--wandb-project', type=str, default='TibetanOCR',
-                      help='Weights & Biases project name')
-    group.add_argument('--wandb-entity', type=str, default=None,
-                      help='Weights & Biases entity (team or username)')
-    group.add_argument('--wandb-tags', type=str, default=None,
-                      help='Comma-separated tags for the experiment (e.g., "yolov8,tibetan")')
-    group.add_argument('--wandb-name', type=str, default=None,
-                      help='Name of the experiment in wandb (default: same as --name)')
-    return parser
+    """Add Weights & Biases arguments."""
+    parser.add_argument('--wandb', action='store_true',
+                       help='Enable Weights & Biases logging')
+    parser.add_argument('--wandb-project', type=str, default='PechaBridge',
+                       help='W&B project name')
+    parser.add_argument('--wandb-entity', type=str,
+                       help='W&B entity (team or username)')
+    parser.add_argument('--wandb-tags', type=str,
+                       help='Comma-separated tags for the experiment')
+    parser.add_argument('--wandb-name', type=str,
+                       help='Name of the experiment in wandb')
 
 
 def add_sbb_arguments(parser):
-    """
-    Add Staatsbibliothek zu Berlin related arguments to an ArgumentParser.
-    
-    Args:
-        parser: ArgumentParser instance
-        
-    Returns:
-        ArgumentParser: Updated parser
-    """
-    group = parser.add_argument_group('SBB Options')
-    group.add_argument('--ppn', type=str,
-                      help='PPN (Pica Production Number) of the document in the Staatsbibliothek zu Berlin')
-    group.add_argument('--download', action='store_true',
-                      help='Download images instead of processing them directly')
-    group.add_argument('--no-ssl-verify', action='store_true',
-                      help='Disable SSL certificate verification (not recommended for production environments)')
-    group.add_argument('--max-images', type=int, default=0,
-                      help='Maximum number of images for inference (0 = all)')
-    group.add_argument('--output', type=str, default=DEFAULT_SBB_OUTPUT,
-                      help='Directory for saving downloaded images')
-    return parser
+    """Add Staatsbibliothek zu Berlin arguments."""
+    parser.add_argument('--ppn', type=str, required=True,
+                       help='PPN (Pica Production Number) of the document')
+    parser.add_argument('--download', action='store_true',
+                       help='Download images instead of processing them directly')
+    parser.add_argument('--max-images', type=int, default=0,
+                       help='Maximum number of images to process (0 = all)')
+    parser.add_argument('--no-ssl-verify', action='store_true',
+                       help='Disable SSL certificate verification')
 
 
 def add_ocr_arguments(parser):
-    """
-    Add OCR-related arguments to an ArgumentParser.
-    
-    Args:
-        parser: ArgumentParser instance
-        
-    Returns:
-        ArgumentParser: Updated parser
-    """
-    group = parser.add_argument_group('OCR Options')
-    group.add_argument('--lang', type=str, default=DEFAULT_OCR_LANG,
-                      help='Language for Tesseract OCR (e.g., eng, deu, eng+deu, bod for Tibetan)')
-    group.add_argument('--tesseract-config', type=str, default='',
-                      help='Additional Tesseract configuration')
-    group.add_argument('--save-crops', action='store_true',
-                      help='Save cropped text blocks as images')
-    group.add_argument('--output', type=str, default=DEFAULT_OCR_OUTPUT,
-                      help='Directory for saving OCR results')
-    return parser
+    """Add OCR-related arguments."""
+    parser.add_argument('--lang', type=str, default='eng+deu',
+                       help='Language for Tesseract OCR')
+    parser.add_argument('--tesseract-config', type=str, default='',
+                       help='Additional Tesseract configuration')
 
 
 def add_source_argument(parser):
-    """
-    Add source argument to an ArgumentParser.
-    
-    Args:
-        parser: ArgumentParser instance
-        
-    Returns:
-        ArgumentParser: Updated parser
-    """
+    """Add source argument for input files."""
     parser.add_argument('--source', type=str,
-                      help='Path to image or directory for inference')
-    return parser
+                       help='Path to image file or directory')
 
 
 def create_generate_dataset_parser():
-    """Create an ArgumentParser for dataset generation."""
+    """Create parser for multi-class dataset generation."""
     parser = argparse.ArgumentParser(description="Generate YOLO dataset for Tibetan text detection")
-    parser = add_dataset_generation_arguments(parser)
+    add_dataset_generation_arguments(parser)
+    add_output_arguments(parser)
     return parser
 
 
 def create_train_parser():
-    """Create an ArgumentParser for model training."""
-    parser = argparse.ArgumentParser(description="Train a YOLO model with Tibetan OCR data")
-    parser = add_model_arguments(parser)
-    parser = add_training_arguments(parser)
-    parser = add_output_arguments(parser)
-    parser = add_wandb_arguments(parser)
+    """Create parser for model training."""
+    parser = argparse.ArgumentParser(description="Train YOLO model for Tibetan text detection")
+    add_training_arguments(parser)
+    add_wandb_arguments(parser)
     return parser
 
 
 def create_inference_parser():
-    """Create an ArgumentParser for inference."""
-    parser = argparse.ArgumentParser(description="Run inference with a trained YOLO model")
-    parser = add_model_arguments(parser)
-    parser = add_output_arguments(parser)
-    parser = add_source_argument(parser)
+    """Create parser for inference."""
+    parser = argparse.ArgumentParser(description="Run inference on images")
+    add_model_arguments(parser)
+    add_source_argument(parser)
+    add_output_arguments(parser)
     return parser
 
 
 def create_sbb_inference_parser():
-    """Create an ArgumentParser for SBB inference."""
-    parser = argparse.ArgumentParser(description="Run inference on Staatsbibliothek zu Berlin data")
-    parser = add_model_arguments(parser)
-    parser = add_output_arguments(parser)
-    parser = add_sbb_arguments(parser)
+    """Create parser for SBB inference."""
+    parser = argparse.ArgumentParser(description="Run inference on SBB data")
+    add_model_arguments(parser)
+    add_sbb_arguments(parser)
+    add_output_arguments(parser)
     return parser
 
 
 def create_ocr_parser():
-    """Create an ArgumentParser for OCR on detected text blocks."""
+    """Create parser for OCR on detections."""
     parser = argparse.ArgumentParser(description="Apply OCR to detected text blocks")
-    parser = add_model_arguments(parser)
-    parser = add_source_argument(parser)
-    parser = add_sbb_arguments(parser)
-    parser = add_ocr_arguments(parser)
+    add_model_arguments(parser)
+    add_source_argument(parser)
+    add_sbb_arguments(parser)
+    add_ocr_arguments(parser)
+    add_output_arguments(parser)
     return parser
