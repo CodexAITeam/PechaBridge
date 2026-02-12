@@ -1,166 +1,172 @@
 #!/usr/bin/env python3
 """
-Skript zur Anwendung von Tesseract OCR auf erkannte Textblöcke aus einem YOLO-Modell.
-Unterstützt sowohl lokale Bilder als auch Bilder von der Staatsbibliothek zu Berlin.
+Apply OCR/layout parsing to images.
+
+Supports multiple parser backends:
+- legacy: YOLO detection + Tesseract OCR
+- mineru25: MinerU2.5 CLI integration
+- paddleocr_vl: Transformer-based PaddleOCR-VL backend
+- qwen25vl: Transformer-based Qwen-VL backend
+- granite_docling: Transformer-based Granite-Docling backend
+- deepseek_ocr: Transformer-based DeepSeek-VL backend
+- qwen3_vl: Qwen3-VL layout-only backend (no OCR text)
+- groundingdino: GroundingDINO layout-only backend (no OCR text)
+- florence2: Florence-2 layout-only backend (no OCR text)
 """
 
-import os
 from pathlib import Path
 
-# Importiere Funktionen aus der tibetan_utils-Bibliothek
 from tibetan_utils.arg_utils import create_ocr_parser
-from tibetan_utils.model_utils import ModelManager
-from tibetan_utils.ocr_utils import process_image_with_ocr
-from tibetan_utils.sbb_utils import process_sbb_images
-from tibetan_utils.io_utils import find_images, extract_filename
+from tibetan_utils.io_utils import find_images, save_json
+from tibetan_utils.parsers import create_parser, list_parser_specs, parser_availability
 
 
-def process_local_image(image_path, model, output_dir, lang, conf, tesseract_config, save_crops):
-    """
-    Process a local image with OCR.
-    
-    Args:
-        image_path: Path to the image
-        model: YOLO model
-        output_dir: Output directory
-        lang: Language for Tesseract OCR
-        conf: Confidence threshold
-        tesseract_config: Additional Tesseract configuration
-        save_crops: Whether to save cropped text regions
-        
-    Returns:
-        dict: OCR results
-    """
+def print_parser_table() -> None:
+    """Print registered parser backends and current availability."""
+    print("Verfügbare Parser:")
+    for spec in list_parser_specs():
+        available, reason = parser_availability(spec.key)
+        status = "OK" if available else "N/A"
+        print(
+            f"  - {spec.key:9s} | {status:3s} | {spec.display_name} | "
+            f"Layout={spec.supports_layout} OCR={spec.supports_ocr} | {reason}"
+        )
+
+
+def build_backend(args):
+    """Create selected parser backend from CLI args."""
+    if args.parser == "legacy":
+        return create_parser(
+            "legacy",
+            model_path=args.model,
+            lang=args.lang,
+            conf=args.conf,
+            tesseract_config=args.tesseract_config,
+            save_crops=args.save_crops,
+        )
+    if args.parser == "mineru25":
+        return create_parser(
+            "mineru25",
+            mineru_command=args.mineru_command,
+            timeout_sec=args.mineru_timeout,
+        )
+    if args.parser in (
+        "paddleocr_vl",
+        "qwen25vl",
+        "granite_docling",
+        "deepseek_ocr",
+        "qwen3_vl",
+        "groundingdino",
+        "florence2",
+    ):
+        kwargs = {
+            "prompt": args.vlm_prompt if args.vlm_prompt else None,
+            "max_new_tokens": args.vlm_max_new_tokens,
+            "hf_device": args.hf_device,
+            "hf_dtype": args.hf_dtype,
+        }
+        if args.hf_model_id:
+            kwargs["model_id"] = args.hf_model_id
+        return create_parser(args.parser, **kwargs)
+    raise ValueError(f"Unbekannter Parser: {args.parser}")
+
+
+def process_local_image(image_path, backend, output_dir):
+    """Process one local image with selected parser backend."""
     print(f"Verarbeite Bild: {image_path}")
-    
-    # Process image with OCR
-    ocr_results = process_image_with_ocr(
-        image_path,
-        model,
-        output_dir=output_dir,
-        lang=lang,
-        conf=conf,
-        save_crops=save_crops
-    )
-    
-    # Show a summary of the results
-    print(f"  Erkannt: {len(ocr_results['detections'])} Textblöcke")
-    for j, det in enumerate(ocr_results['detections']):
-        text_preview = det['text'].replace('\n', ' ')[:50] + ('...' if len(det['text']) > 50 else '')
-        print(f"    Block {j+1}: {text_preview}")
-    
-    return ocr_results
+    doc = backend.parse(image_path, output_dir=output_dir)
+    out_data = doc.to_dict()
+
+    output_path = Path(output_dir) / f"{Path(doc.image_name).stem}_ocr.json"
+    save_json(out_data, str(output_path))
+
+    print(f"  Erkannt: {len(out_data['detections'])} Blöcke")
+    for j, det in enumerate(out_data["detections"][:5]):
+        text_preview = det.get("text", "").replace("\n", " ")[:50]
+        if len(det.get("text", "")) > 50:
+            text_preview += "..."
+        print(f"    Block {j + 1}: {text_preview}")
+    if len(out_data["detections"]) > 5:
+        print(f"    ... +{len(out_data['detections']) - 5} weitere")
+    return out_data
 
 
-def process_sbb_image(image, model, output_dir, lang, conf, tesseract_config, save_crops):
-    """
-    Process an SBB image with OCR.
-    
-    Args:
-        image: Image data
-        model: YOLO model
-        output_dir: Output directory
-        lang: Language for Tesseract OCR
-        conf: Confidence threshold
-        tesseract_config: Additional Tesseract configuration
-        save_crops: Whether to save cropped text regions
-        
-    Returns:
-        dict: OCR results
-    """
-    # Process image with OCR
-    ocr_results = process_image_with_ocr(
-        image,
-        model,
-        output_dir=output_dir,
-        lang=lang,
-        conf=conf,
-        save_crops=save_crops
-    )
-    
-    # Show a summary of the results
-    print(f"  Erkannt: {len(ocr_results['detections'])} Textblöcke")
-    for j, det in enumerate(ocr_results['detections']):
-        text_preview = det['text'].replace('\n', ' ')[:50] + ('...' if len(det['text']) > 50 else '')
-        print(f"    Block {j+1}: {text_preview}")
-    
-    return ocr_results
+def process_sbb_image(image, backend, output_dir):
+    """Process one SBB image with selected parser backend."""
+    doc = backend.parse(image, output_dir=output_dir)
+    out_data = doc.to_dict()
+    output_path = Path(output_dir) / f"{Path(doc.image_name).stem}_ocr.json"
+    save_json(out_data, str(output_path))
+
+    print(f"  Erkannt: {len(out_data['detections'])} Blöcke")
+    for j, det in enumerate(out_data["detections"][:5]):
+        text_preview = det.get("text", "").replace("\n", " ")[:50]
+        if len(det.get("text", "")) > 50:
+            text_preview += "..."
+        print(f"    Block {j + 1}: {text_preview}")
+    if len(out_data["detections"]) > 5:
+        print(f"    ... +{len(out_data['detections']) - 5} weitere")
+    return out_data
 
 
 def main():
-    # Parse arguments
     parser = create_ocr_parser()
     args = parser.parse_args()
-    
-    # Check if either --source or --ppn is specified
+
+    if args.list_parsers:
+        print_parser_table()
+        return
+
     if not args.source and not args.ppn:
         parser.error("Entweder --source oder --ppn muss angegeben werden")
-    
-    # Check if model exists
-    model_path = Path(args.model)
-    if not model_path.exists():
-        print(f"Fehler: Modell nicht gefunden: {model_path}")
-        return
-    
-    # Load model
-    print(f"Lade Modell: {model_path}")
-    model = ModelManager.load_model(str(model_path))
-    
-    # Process local images
+
+    available, reason = parser_availability(args.parser)
+    if not available:
+        raise RuntimeError(
+            f"Parser '{args.parser}' ist nicht verfügbar: {reason}\n"
+            "Nutze --list-parsers für Status aller Backends."
+        )
+
+    backend = build_backend(args)
+    Path(args.output).mkdir(parents=True, exist_ok=True)
+
     if args.source:
         source_path = Path(args.source)
         if not source_path.exists():
             print(f"Fehler: Quelle nicht gefunden: {source_path}")
             return
-        
-        # Collect images
-        image_paths = []
+
         if source_path.is_file():
             image_paths = [str(source_path)]
         else:
             image_paths = find_images(str(source_path), recursive=True)
-        
+
         if not image_paths:
             print(f"Keine Bilder gefunden in: {source_path}")
             return
-        
+
         print(f"Gefunden: {len(image_paths)} Bilder")
-        
-        # Process each image
         for i, img_path in enumerate(image_paths):
-            print(f"Verarbeite Bild {i+1}/{len(image_paths)}: {img_path}")
-            process_local_image(
-                img_path,
-                model,
-                args.output,
-                args.lang,
-                args.conf,
-                args.tesseract_config,
-                args.save_crops
-            )
-    
-    # Process images from Staatsbibliothek zu Berlin
+            print(f"Verarbeite Bild {i + 1}/{len(image_paths)}: {img_path}")
+            process_local_image(img_path, backend, args.output)
+
     elif args.ppn:
-        # Process SBB images
+        from tibetan_utils.sbb_utils import process_sbb_images
+
         process_args = {
-            'model': model,
-            'output_dir': args.output,
-            'lang': args.lang,
-            'conf': args.conf,
-            'tesseract_config': args.tesseract_config,
-            'save_crops': args.save_crops
+            "backend": backend,
+            "output_dir": args.output,
         }
-        
-        results = process_sbb_images(
+        process_sbb_images(
             args.ppn,
             lambda img, **kwargs: process_sbb_image(img, **kwargs),
             max_images=args.max_images,
             download=args.download,
             output_dir=args.output,
             verify_ssl=not args.no_ssl_verify,
-            **process_args
+            **process_args,
         )
-    
+
     print(f"\nVerarbeitung abgeschlossen. Ergebnisse gespeichert unter: {args.output}")
 
 

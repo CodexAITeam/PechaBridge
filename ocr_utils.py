@@ -153,6 +153,41 @@ def extract_text_region(image, box):
     return text_region, (x_min, y_min, x_max, y_max)
 
 
-# Die add_common_arguments Funktion wurde entfernt, da sie nicht verwendet wird
-# und potentielle Konflikte mit den Funktionen in tibetan_utils/arg_utils.py verursachen könnte.
-# Alle Skripte verwenden jetzt die zentralisierten Argument-Funktionen aus tibetan_utils/arg_utils.py.
+def add_common_arguments(parser):
+    """
+    Fügt gemeinsame Kommandozeilenargumente zu einem ArgumentParser hinzu.
+    
+    Args:
+        parser: Der ArgumentParser, zu dem die Argumente hinzugefügt werden sollen
+        
+    Returns:
+        Der aktualisierte ArgumentParser
+    """
+    # Modelloptionen
+    model_group = parser.add_argument_group('Modelloptionen')
+    model_group.add_argument('--model', type=str, required=True,
+                        help='Pfad zum trainierten Modell (z.B. runs/detect/train/weights/best.pt)')
+    model_group.add_argument('--conf', type=float, default=0.25,
+                        help='Konfidenz-Schwellenwert für Detektionen')
+    model_group.add_argument('--imgsz', type=int, default=1024,
+                        help='Bildgröße für die Inferenz')
+    model_group.add_argument('--device', type=str, default='',
+                        help='Gerät für die Inferenz (z.B. cpu, 0, 0,1,2,3 für mehrere GPUs)')
+    
+    # SBB-spezifische Optionen
+    sbb_group = parser.add_argument_group('SBB-spezifische Optionen')
+    sbb_group.add_argument('--ppn', type=str, help='PPN (Pica Production Number) des Dokuments in der Staatsbibliothek zu Berlin')
+    sbb_group.add_argument('--download', action='store_true',
+                        help='Lade Bilder herunter anstatt sie direkt zu verarbeiten')
+    sbb_group.add_argument('--no-ssl-verify', action='store_true',
+                        help='Deaktiviere SSL-Zertifikatsverifizierung (nicht empfohlen für Produktionsumgebungen)')
+    sbb_group.add_argument('--max-images', type=int, default=0,
+                        help='Maximale Anzahl an Bildern für die Inferenz (0 = alle)')
+    
+    # Ausgabeoptionen
+    output_group = parser.add_argument_group('Ausgabeoptionen')
+    output_group.add_argument('--output', type=str, default='results',
+                        help='Verzeichnis zum Speichern der Ergebnisse')
+    output_group.add_argument('--source', type=str, help='Pfad zu Bildern oder Verzeichnis für die Inferenz')
+    
+    return parser

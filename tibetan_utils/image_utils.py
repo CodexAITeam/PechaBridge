@@ -4,7 +4,7 @@ Image processing utilities for the TibetanOCR project.
 
 import cv2
 import numpy as np
-from PIL import Image
+from PIL import Image, ImageDraw, ImageFont
 import io
 from typing import Tuple, List, Union, Dict, Any
 
@@ -217,3 +217,202 @@ def denormalize_box(box: List[float], image_size: Tuple[int, int]) -> Tuple[int,
     y_max = int((y + h/2) * height)
     
     return (x_min, y_min, x_max, y_max)
+
+
+class BoundingBoxCalculator:
+    """
+    Utility class for calculating bounding boxes and font sizes for text rendering.
+    """
+    
+    @staticmethod
+    def fit(text: str, box_size: Tuple[int, int], font_size: int = 24, font_path: str = 'ext/Microsoft Himalaya.ttf', debug: bool = False) -> Tuple[int, int]:
+        """
+        Calculate the true bounding box size for the specified text when it is wrapped and terminated to fit a given box size.
+        Enhanced with timeout protection and iteration limits.
+
+        Args:
+            text: Text to be measured
+            box_size: Tuple (width, height) specifying the size of the box to fit the text
+            font_size: Size of the font
+            font_path: Path to the font file
+            debug: Enable debug output
+
+        Returns:
+            Tuple (width, height) representing the actual bounding box size of the wrapped and terminated text
+        """
+        import time
+        start_time = time.time()
+        timeout_seconds = 5  # 5 second timeout for fit operation
+        max_lines = 100      # Maximum lines to process
+        max_chars_per_line = 1000  # Maximum characters per line to prevent infinite loops
+        
+        # Validate inputs
+        if not text or not text.strip():
+            return (0, 0)
+            
+        if box_size[0] <= 0 or box_size[1] <= 0:
+            if debug:
+                print(f"Warning: Invalid box size {box_size}")
+            return (0, 0)
+        
+        # Create a dummy image to get a drawing context
+        dummy_image = Image.new('RGB', (1, 1))
+        draw = ImageDraw.Draw(dummy_image)
+
+        # Define the font
+        try:
+            font = ImageFont.truetype(font_path, font_size)
+        except IOError:
+            font = ImageFont.load_default()
+            if debug:
+                print("Warning: Default font used, may not accurately measure text.")
+
+        box_w, box_h = box_size
+        actual_text_width, actual_text_height = 0, 0
+        y_offset = 0
+        lines_processed = 0
+
+        # Process each line with safety limits
+        for line in text.split('\n'):
+            if lines_processed >= max_lines:
+                if debug:
+                    print(f"Warning: Reached maximum line limit ({max_lines})")
+                break
+                
+            # Check timeout
+            if time.time() - start_time > timeout_seconds:
+                if debug:
+                    print(f"Warning: fit() timed out after {timeout_seconds}s")
+                break
+            
+            char_iterations = 0
+            while line and char_iterations < max_chars_per_line:
+                char_iterations += 1
+                
+                # Find the breakpoint for wrapping with safety limit
+                i = 0
+                try:
+                    for i in range(min(len(line), max_chars_per_line)):
+                        if draw.textlength(line[:i + 1], font=font) > box_w:
+                            break
+                    else:
+                        i = len(line)
+                except Exception as e:
+                    if debug:
+                        print(f"Error in textlength calculation: {e}")
+                    i = min(10, len(line))  # Fallback to small chunk
+
+                # Ensure we make progress
+                if i == 0:
+                    i = 1  # Take at least one character to avoid infinite loop
+
+                # Add the line to wrapped text
+                wrapped_line = line[:i]
+
+                try:
+                    left, top, right, bottom = font.getbbox(wrapped_line)
+                    line_width, line_height = right - left, bottom - top
+                except Exception as e:
+                    if debug:
+                        print(f"Error in getbbox calculation: {e}")
+                    # Fallback estimation
+                    line_width = len(wrapped_line) * font_size // 2
+                    line_height = font_size
+
+                actual_text_width = max(actual_text_width, line_width)
+                y_offset += line_height
+
+                # Check if the next line exceeds the box height
+                if y_offset > box_h:
+                    y_offset -= line_height  # Remove the last line's height if it exceeds
+                    break
+
+                line = line[i:]
+
+            lines_processed += 1
+            if y_offset > box_h:
+                break
+
+        elapsed = time.time() - start_time
+        if debug and elapsed > 1.0:
+            print(f"fit() took {elapsed:.2f}s for text length {len(text)}, font size {font_size}")
+
+        return actual_text_width, y_offset + 10
+
+    @staticmethod
+    def find_max_font(text: str, box_size: Tuple[int, int], font_path: str, max_size: int = 100, debug: bool = False) -> int:
+        """
+        Find maximum font size where text fits in box using binary search with timeout protection.
+        
+        Args:
+            text: Text to fit
+            box_size: Target box size (width, height)
+            font_path: Path to font file
+            max_size: Maximum font size to try
+            debug: Enable debug output
+            
+        Returns:
+            int: Maximum font size that fits
+        """
+        import time
+        start_time = time.time()
+        timeout_seconds = 10  # 10 second timeout
+        max_iterations = 50   # Maximum iterations to prevent infinite loops
+        
+        # Validate inputs
+        if not text or not text.strip():
+            if debug:
+                print("Warning: Empty text provided to find_max_font, returning minimum font size")
+            return 1
+            
+        if box_size[0] <= 0 or box_size[1] <= 0:
+            if debug:
+                print(f"Warning: Invalid box size {box_size}, returning minimum font size")
+            return 1
+        
+        low, high = 1, min(max_size, 200)  # Cap maximum size to prevent extreme values
+        best = 1
+        iterations = 0
+        
+        if debug:
+            print(f"Starting font size search for text: '{text[:50]}...' in box {box_size}")
+        
+        while low <= high and iterations < max_iterations:
+            # Check timeout
+            if time.time() - start_time > timeout_seconds:
+                if debug:
+                    print(f"find_max_font timed out after {timeout_seconds}s, returning best so far: {best}")
+                break
+                
+            iterations += 1
+            mid = (low + high) // 2
+            
+            try:
+                fit_start = time.time()
+                w, h = BoundingBoxCalculator.fit(text, box_size, mid, font_path)
+                fit_time = time.time() - fit_start
+                
+                if debug and fit_time > 1.0:  # Log slow fit operations
+                    print(f"Slow fit operation: {fit_time:.2f}s for font size {mid}")
+                
+                if w <= box_size[0] and h <= box_size[1]:
+                    best = mid
+                    low = mid + 1
+                    if debug:
+                        print(f"Font size {mid} fits ({w}x{h} <= {box_size})")
+                else:
+                    high = mid - 1
+                    if debug:
+                        print(f"Font size {mid} too large ({w}x{h} > {box_size})")
+                        
+            except Exception as e:
+                if debug:
+                    print(f"Error in fit calculation for font size {mid}: {e}")
+                # If fit fails, assume font is too large
+                high = mid - 1
+        
+        elapsed = time.time() - start_time
+        if debug:
+            print(f"find_max_font completed in {elapsed:.2f}s after {iterations} iterations, best font size: {best}")
+            
+        return best

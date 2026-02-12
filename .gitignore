@@ -160,3 +160,4 @@ cython_debug/
 #.idea/
 yolo11n.pt
 runs/
+.DS_Store

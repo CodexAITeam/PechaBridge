@@ -6,6 +6,8 @@ import os
 import re
 import json
 import yaml
+import hashlib
+import time
 from pathlib import Path
 from typing import Dict, List, Union, Any
 
@@ -36,12 +38,14 @@ def extract_filename(path_or_url: str, with_extension: bool = True) -> str:
         str: Extracted filename
     """
     # Extract PPN pattern from SBB URLs
-    ppn_match = re.search(r'PPN(\d{10})-(\d{8})', path_or_url)
+    ppn_match = re.search(r'PPN([0-9Xx]{10})-(\d{8})', path_or_url)
     if ppn_match:
+        ppn = ppn_match.group(1).upper()
+        page = ppn_match.group(2)
         if with_extension:
-            return f"PPN{ppn_match.group(1)}-{ppn_match.group(2)}.jpg"
+            return f"PPN{ppn}-{page}.jpg"
         else:
-            return f"PPN{ppn_match.group(1)}-{ppn_match.group(2)}"
+            return f"PPN{ppn}-{page}"
     
     # Extract filename from path
     filename = os.path.basename(path_or_url)
@@ -155,3 +159,28 @@ def get_output_path(base_dir: str, name: str, filename: str, create_dir: bool = 
         ensure_dir(output_dir)
     
     return os.path.join(output_dir, filename)
+
+
+def hash_current_time() -> str:
+    """
+    Generate a hash based on current time for unique identifiers.
+    
+    Returns:
+        str: SHA256 hash of current time in nanoseconds
+    """
+    # Get the current time
+    current_time = time.time_ns()
+
+    # Convert the current time to a string
+    time_str = str(current_time)
+
+    # Create a hash object (using SHA256)
+    hash_object = hashlib.sha256()
+
+    # Update the hash object with the time string
+    hash_object.update(time_str.encode())
+
+    # Get the hexadecimal digest of the hash
+    time_hash = hash_object.hexdigest()
+
+    return time_hash

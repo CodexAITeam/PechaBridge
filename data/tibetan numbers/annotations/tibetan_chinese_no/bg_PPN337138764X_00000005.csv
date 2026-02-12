@@ -1,0 +1,4 @@
+yolo_label,label_name,bbox_x,bbox_y,bbox_width,bbox_height,image_name,image_width,image_height
+0,tibetan_no,14,46,113,283,bg_PPN337138764X_00000005.png,1024,361
+1,text_body,130,45,772,284,bg_PPN337138764X_00000005.png,1024,361
+2,chinese_no,906,45,107,284,bg_PPN337138764X_00000005.png,1024,361

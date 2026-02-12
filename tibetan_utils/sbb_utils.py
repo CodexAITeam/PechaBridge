@@ -7,6 +7,7 @@ import re
 import urllib.request
 import ssl
 import xml.etree.ElementTree as ET
+import hashlib
 from typing import List, Optional, Union, Tuple
 import numpy as np
 from PIL import Image
@@ -97,7 +98,24 @@ def download_image(url: str, output_dir: Optional[str] = None, verify_ssl: bool 
             if output_dir:
                 # Save image to disk
                 ensure_dir(output_dir)
-                image_path = os.path.join(output_dir, filename)
+                base, ext = os.path.splitext(filename)
+                if not ext:
+                    ext = ".jpg"
+
+                # SBB URLs often end in generic names like default.jpg/png.
+                # Use a stable URL hash suffix in that case, or whenever a
+                # file collision would overwrite a different page.
+                generic_names = {"default", "image", "download"}
+                is_generic = base.lower() in generic_names
+                image_path = os.path.join(output_dir, f"{base}{ext}")
+                if is_generic or os.path.exists(image_path):
+                    url_hash = hashlib.sha1(url.encode("utf-8")).hexdigest()[:12]
+                    image_path = os.path.join(output_dir, f"{base}_{url_hash}{ext}")
+                    i = 2
+                    while os.path.exists(image_path):
+                        image_path = os.path.join(output_dir, f"{base}_{url_hash}_{i}{ext}")
+                        i += 1
+
                 with open(image_path, 'wb') as f:
                     f.write(image_data)
                 return image_path

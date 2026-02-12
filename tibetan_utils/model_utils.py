@@ -5,7 +5,10 @@ Model utilities for the TibetanOCR project.
 import os
 from pathlib import Path
 from typing import Dict, List, Union, Any, Optional
-import wandb
+try:
+    import wandb
+except ImportError:  # pragma: no cover - optional dependency
+    wandb = None
 from ultralytics import YOLO
 
 
@@ -128,8 +131,8 @@ class ModelManager:
         return results
     
     @staticmethod
-    def save_model_to_wandb(model_path: str, artifact_name: str, 
-                           artifact_type: str = 'model') -> Optional[wandb.Artifact]:
+    def save_model_to_wandb(model_path: str, artifact_name: str,
+                           artifact_type: str = 'model') -> Optional[Any]:
         """
         Save a model to Weights & Biases.
         
@@ -139,8 +142,12 @@ class ModelManager:
             artifact_type: Type of the artifact
             
         Returns:
-            Optional[wandb.Artifact]: Artifact if wandb is initialized, None otherwise
+            Optional[Any]: Artifact if wandb is initialized, None otherwise
         """
+        if wandb is None:
+            print("Warning: wandb is not installed. Skipping artifact logging.")
+            return None
+
         if wandb.run is None:
             print("Warning: wandb.run is None. Make sure wandb is initialized.")
             return None

@@ -172,8 +172,9 @@ def save_text_regions(image: np.ndarray, results: List[Dict[str, Any]],
     return saved_paths
 
 
-def process_image_with_ocr(image_path: Union[str, np.ndarray], model, output_dir: str = None, 
-                          lang: str = 'eng+deu', conf: float = 0.25, save_crops: bool = False) -> Dict[str, Any]:
+def process_image_with_ocr(image_path: Union[str, np.ndarray], model, output_dir: str = None,
+                          lang: str = 'eng+deu', conf: float = 0.25,
+                          tesseract_config: str = '', save_crops: bool = False) -> Dict[str, Any]:
     """
     Process an image with YOLO and apply OCR to detected text blocks.
     
@@ -201,7 +202,7 @@ def process_image_with_ocr(image_path: Union[str, np.ndarray], model, output_dir
     results = model.predict(source=image, conf=conf)
     
     # Process detections
-    ocr_results = process_detections(image, results, lang=lang)
+    ocr_results = process_detections(image, results, lang=lang, config=tesseract_config)
     
     # Save results if output directory is provided
     if output_dir:

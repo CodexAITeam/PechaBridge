@@ -11,6 +11,15 @@ DEFAULT_FONT_PATH = 'ext/Microsoft Himalaya.ttf'
 DEFAULT_OUTPUT_DIR = 'runs/detect'
 DEFAULT_DATASET_DIR = 'yolo_tibetan/'
 
+# Additional default constants for multi-class support
+DEFAULT_ANNOTATION_FILE_PATH = './data/tibetan numbers/annotations/tibetan_chinese_no/bg_PPN337138764X_00000005.txt'
+DEFAULT_BACKGROUND_TRAIN_PATH = './data/tibetan numbers/backgrounds/'
+DEFAULT_BACKGROUND_VAL_PATH = './data/tibetan numbers/backgrounds/'
+DEFAULT_CORPORA_PATH = './data/corpora/'
+DEFAULT_BATCH_SIZE = 16
+DEFAULT_EPOCHS = 100
+DEFAULT_WORKERS = 8
+
 # Default model settings
 DEFAULT_MODEL_PATH = 'yolov8n.pt'
 DEFAULT_IMAGE_SIZE = 1024
