@@ -16,7 +16,6 @@ if str(REPO_ROOT) not in sys.path:
     sys.path.insert(0, str(REPO_ROOT))
 
 from scripts.prepare_donut_ocr_dataset import run as run_prepare_donut_ocr_dataset
-from scripts.train_donut_ocr import run as run_train_donut_ocr
 from tibetan_utils.arg_utils import create_run_donut_ocr_workflow_parser
 
 LOGGER = logging.getLogger("run_donut_ocr_workflow")
@@ -151,6 +150,8 @@ def run(args) -> Dict[str, object]:
         LOGGER.warning("Validation manifest not found, training will run without eval: %s", val_manifest)
 
     if not args.skip_train:
+        from scripts.train_donut_ocr import run as run_train_donut_ocr
+
         train_args = argparse.Namespace(
             train_manifest=str(train_manifest),
             val_manifest=str(val_manifest) if val_manifest.exists() else "",

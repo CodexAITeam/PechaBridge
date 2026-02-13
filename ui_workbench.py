@@ -1584,6 +1584,299 @@ def run_train_text_encoder_live(
     yield final_msg, str(expected_backbone), str(expected_tokenizer), str(expected_head), str(expected_cfg)
 
 
+def run_donut_ocr_workflow_live(
+    dataset_name: str,
+    dataset_output_dir: str,
+    train_samples: int,
+    val_samples: int,
+    font_path_tibetan: str,
+    font_path_chinese: str,
+    augmentation: str,
+    target_newline_token: str,
+    prepared_output_dir: str,
+    model_output_dir: str,
+    model_name_or_path: str,
+    train_tokenizer: bool,
+    tokenizer_vocab_size: int,
+    per_device_train_batch_size: int,
+    per_device_eval_batch_size: int,
+    num_train_epochs: float,
+    learning_rate: float,
+    max_target_length: int,
+    image_size: int,
+    seed: int,
+    skip_generation: bool,
+    skip_prepare: bool,
+    skip_train: bool,
+    lora_augment_path: str,
+    lora_augment_model_family: str,
+    lora_augment_base_model_id: str,
+    lora_augment_controlnet_model_id: str,
+    lora_augment_prompt: str,
+    lora_augment_scale: float,
+    lora_augment_strength: float,
+    lora_augment_steps: int,
+    lora_augment_guidance_scale: float,
+    lora_augment_controlnet_scale: float,
+    lora_augment_seed: Optional[int],
+    lora_augment_splits: str,
+    lora_augment_targets: str,
+    lora_augment_canny_low: int,
+    lora_augment_canny_high: int,
+):
+    script_path = ROOT / "scripts" / "run_donut_ocr_workflow.py"
+    dataset_name_clean = (dataset_name or "tibetan-donut-ocr-label1").strip()
+    dataset_output_path = Path(dataset_output_dir).expanduser().resolve()
+    dataset_dir = dataset_output_path / dataset_name_clean
+    prepared_dir = (
+        Path(prepared_output_dir).expanduser().resolve()
+        if (prepared_output_dir or "").strip()
+        else (dataset_dir / "donut_ocr_label1")
+    )
+    model_output_path = Path(model_output_dir).expanduser().resolve()
+    summary_path = model_output_path / "workflow_summary.json"
+
+    if not script_path.exists():
+        msg = f"Failed: script not found: {script_path}"
+        yield msg, str(dataset_dir), str(prepared_dir), str(model_output_path), str(summary_path)
+        return
+
+    if not skip_generation:
+        tib_font = Path(font_path_tibetan).expanduser().resolve()
+        chi_font = Path(font_path_chinese).expanduser().resolve()
+        if not tib_font.exists():
+            msg = f"Failed: Tibetan font not found: {tib_font}"
+            yield msg, str(dataset_dir), str(prepared_dir), str(model_output_path), str(summary_path)
+            return
+        if not chi_font.exists():
+            msg = f"Failed: Chinese font not found: {chi_font}"
+            yield msg, str(dataset_dir), str(prepared_dir), str(model_output_path), str(summary_path)
+            return
+
+    model_output_path.mkdir(parents=True, exist_ok=True)
+
+    seed_arg = 42
+    try:
+        seed_arg = int(float(seed))
+    except Exception:
+        seed_arg = 42
+
+    cmd = [
+        sys.executable,
+        "-u",
+        str(script_path),
+        "--dataset_name",
+        dataset_name_clean,
+        "--dataset_output_dir",
+        str(dataset_output_path),
+        "--train_samples",
+        str(int(train_samples)),
+        "--val_samples",
+        str(int(val_samples)),
+        "--font_path_tibetan",
+        str(Path(font_path_tibetan).expanduser()),
+        "--font_path_chinese",
+        str(Path(font_path_chinese).expanduser()),
+        "--augmentation",
+        (augmentation or "noise").strip(),
+        "--target_newline_token",
+        (target_newline_token or "<NL>").strip(),
+        "--model_output_dir",
+        str(model_output_path),
+        "--model_name_or_path",
+        (model_name_or_path or "microsoft/trocr-base-stage1").strip(),
+        "--tokenizer_vocab_size",
+        str(int(tokenizer_vocab_size)),
+        "--per_device_train_batch_size",
+        str(int(per_device_train_batch_size)),
+        "--per_device_eval_batch_size",
+        str(int(per_device_eval_batch_size)),
+        "--num_train_epochs",
+        str(float(num_train_epochs)),
+        "--learning_rate",
+        str(float(learning_rate)),
+        "--max_target_length",
+        str(int(max_target_length)),
+        "--image_size",
+        str(int(image_size)),
+        "--seed",
+        str(seed_arg),
+    ]
+
+    prepared_output_clean = (prepared_output_dir or "").strip()
+    if prepared_output_clean:
+        cmd.extend(["--prepared_output_dir", str(Path(prepared_output_clean).expanduser())])
+    if train_tokenizer:
+        cmd.append("--train_tokenizer")
+    if skip_generation:
+        cmd.append("--skip_generation")
+    if skip_prepare:
+        cmd.append("--skip_prepare")
+    if skip_train:
+        cmd.append("--skip_train")
+
+    lora_path = (lora_augment_path or "").strip()
+    if lora_path:
+        cmd.extend(
+            [
+                "--lora_augment_path",
+                lora_path,
+                "--lora_augment_model_family",
+                (lora_augment_model_family or "sdxl").strip(),
+                "--lora_augment_base_model_id",
+                (lora_augment_base_model_id or "stabilityai/stable-diffusion-xl-base-1.0").strip(),
+                "--lora_augment_controlnet_model_id",
+                (lora_augment_controlnet_model_id or "diffusers/controlnet-canny-sdxl-1.0").strip(),
+                "--lora_augment_prompt",
+                (lora_augment_prompt or "scanned printed page").strip(),
+                "--lora_augment_scale",
+                str(float(lora_augment_scale)),
+                "--lora_augment_strength",
+                str(float(lora_augment_strength)),
+                "--lora_augment_steps",
+                str(int(lora_augment_steps)),
+                "--lora_augment_guidance_scale",
+                str(float(lora_augment_guidance_scale)),
+                "--lora_augment_controlnet_scale",
+                str(float(lora_augment_controlnet_scale)),
+                "--lora_augment_splits",
+                (lora_augment_splits or "train").strip(),
+                "--lora_augment_targets",
+                (lora_augment_targets or "images_and_ocr_crops").strip(),
+                "--lora_augment_canny_low",
+                str(int(lora_augment_canny_low)),
+                "--lora_augment_canny_high",
+                str(int(lora_augment_canny_high)),
+            ]
+        )
+        try:
+            if lora_augment_seed is not None:
+                lora_seed_int = int(float(lora_augment_seed))
+                if lora_seed_int >= 0:
+                    cmd.extend(["--lora_augment_seed", str(lora_seed_int)])
+        except Exception:
+            pass
+
+    try:
+        env = os.environ.copy()
+        env["PYTHONUNBUFFERED"] = "1"
+        proc = subprocess.Popen(
+            cmd,
+            cwd=str(ROOT),
+            env=env,
+            stdout=subprocess.PIPE,
+            stderr=subprocess.STDOUT,
+            text=False,
+            bufsize=0,
+        )
+    except Exception as exc:
+        msg = f"Failed\nModel output dir: {model_output_path}\n\n{type(exc).__name__}: {exc}"
+        yield msg, str(dataset_dir), str(prepared_dir), str(model_output_path), str(summary_path)
+        return
+
+    if proc.stdout is not None:
+        try:
+            os.set_blocking(proc.stdout.fileno(), False)
+        except Exception:
+            pass
+
+    log_lines: List[str] = []
+    partial = ""
+    last_emit_ts = 0.0
+    stream_failed = False
+    stream_fail_msg = ""
+
+    yield (
+        "Running Donut OCR workflow (label 1) ...\n"
+        f"Dataset dir: {dataset_dir}\n"
+        f"Prepared dir: {prepared_dir}\n"
+        f"Model output dir: {model_output_path}\n"
+        f"Summary path: {summary_path}\n"
+        f"Command: {shlex.join(cmd)}\n",
+        str(dataset_dir),
+        str(prepared_dir),
+        str(model_output_path),
+        str(summary_path),
+    )
+
+    while True:
+        got_output = False
+        if (not stream_failed) and proc.stdout is not None:
+            try:
+                chunk = proc.stdout.read()
+            except BlockingIOError:
+                chunk = b""
+            except Exception as exc:
+                stream_failed = True
+                stream_fail_msg = f"stdout stream disabled ({type(exc).__name__}: {exc})"
+                chunk = b""
+
+            if chunk:
+                got_output = True
+                if isinstance(chunk, bytes):
+                    chunk_text = chunk.decode("utf-8", errors="replace")
+                else:
+                    chunk_text = str(chunk)
+                partial += chunk_text.replace("\r", "\n")
+                parts = partial.splitlines(keepends=True)
+                keep = ""
+                for piece in parts:
+                    if piece.endswith("\n"):
+                        log_lines.append(piece.rstrip("\n"))
+                    else:
+                        keep = piece
+                partial = keep
+
+        now = time.time()
+        if now - last_emit_ts >= 1.0:
+            tail = _tail_lines_newest_first(log_lines, 800)
+            if stream_failed and stream_fail_msg:
+                tail = f"{tail}\n[warning] {stream_fail_msg}" if tail else f"[warning] {stream_fail_msg}"
+            running_msg = (
+                "Running Donut OCR workflow (label 1) ...\n"
+                f"Dataset dir: {dataset_dir}\n"
+                f"Prepared dir: {prepared_dir}\n"
+                f"Model output dir: {model_output_path}\n"
+                f"Summary path: {summary_path}\n\n{tail}"
+            )
+            yield (
+                running_msg,
+                str(dataset_dir),
+                str(prepared_dir),
+                str(model_output_path),
+                str(summary_path),
+            )
+            last_emit_ts = now
+
+        if proc.poll() is not None:
+            break
+
+        if not got_output:
+            time.sleep(0.15)
+
+    if proc.stdout is not None:
+        try:
+            rest = proc.stdout.read()
+        except Exception:
+            rest = b""
+        if rest:
+            if isinstance(rest, bytes):
+                partial += rest.decode("utf-8", errors="replace").replace("\r", "\n")
+            else:
+                partial += str(rest).replace("\r", "\n")
+        if partial:
+            log_lines.extend(partial.splitlines())
+
+    ok = proc.returncode == 0
+    status = "Success" if ok else "Failed"
+    final_msg = (
+        f"{status}\nDataset dir: {dataset_dir}\nPrepared dir: {prepared_dir}\n"
+        f"Model output dir: {model_output_path}\nSummary path: {summary_path}\n\n"
+        + _tail_lines_newest_first(log_lines, 3000)
+    )
+    yield final_msg, str(dataset_dir), str(prepared_dir), str(model_output_path), str(summary_path)
+
+
 def refresh_image_list(dataset_dir: str, split: str):
     split_images = Path(dataset_dir).expanduser().resolve() / split / "images"
     images = _list_images(split_images)
@@ -2677,6 +2970,11 @@ def build_ui() -> gr.Blocks:
     default_dataset_base = str((ROOT / "datasets").resolve())
     default_dataset = str((ROOT / "datasets" / "tibetan-yolo").resolve())
     default_split_dir = str((ROOT / "datasets" / "tibetan-yolo" / "train").resolve())
+    default_donut_dataset_name = "tibetan-donut-ocr-label1"
+    default_donut_dataset_output_dir = str((ROOT / "datasets").resolve())
+    default_donut_model_output_dir = str((ROOT / "models" / "donut-ocr-label1").resolve())
+    default_donut_font_tibetan = str((ROOT / "ext" / "Microsoft Himalaya.ttf").resolve())
+    default_donut_font_chinese = str((ROOT / "ext" / "simkai.ttf").resolve())
     default_texture_input_dir = str((ROOT / "datasets" / "tibetan-yolo-ui" / "train" / "images").resolve())
     default_texture_output_dir = str((ROOT / "datasets" / "tibetan-yolo-ui-textured").resolve())
     default_texture_real_pages_dir = str((ROOT / "sbb_images").resolve())
@@ -2712,7 +3010,7 @@ def build_ui() -> gr.Blocks:
             gr.Markdown("## Workflow Overview")
             gr.Markdown(
                 "Use the tabs left-to-right. A practical flow is: Synthetic Data -> Diffusion + LoRA (texture) -> "
-                "Retrieval Encoders -> Batch VLM Layout (SBB) -> Dataset Preview -> Ultralytics Training -> Model Inference -> "
+                "Donut OCR Workflow -> Retrieval Encoders -> Batch VLM Layout (SBB) -> Dataset Preview -> Ultralytics Training -> Model Inference -> "
                 "VLM Layout (single image) -> Label Studio Export."
             )
             gr.Markdown("### Tabs")
@@ -2727,8 +3025,9 @@ def build_ui() -> gr.Blocks:
                 "8. Label Studio Export: Convert YOLO split folders to Label Studio tasks and launch Label Studio.\n"
                 "9. PPN Downloader: Download and analyze SBB images.\n"
                 "10. Diffusion + LoRA: Prepare texture crops, train LoRA, and run SDXL/SD2.1 + ControlNet inference.\n"
-                "11. Retrieval Encoders: Train image and text encoders for future n-gram retrieval.\n"
-                "12. CLI Audit: Show all CLI options from project scripts."
+                "11. Donut OCR Workflow: Run synthetic generation + manifest prep + Donut-style OCR training on label 1.\n"
+                "12. Retrieval Encoders: Train image and text encoders for future n-gram retrieval.\n"
+                "13. CLI Audit: Show all CLI options from project scripts."
             )
 
         # 2) Data generation
@@ -3520,8 +3819,166 @@ def build_ui() -> gr.Blocks:
                 outputs=[diff_preview, diff_preview_status],
             )
 
-        # 11) Retrieval encoder training
-        with gr.Tab("11. Retrieval Encoders"):
+        # 11) Donut OCR workflow
+        with gr.Tab("11. Donut OCR Workflow"):
+            gr.Markdown(
+                "Run label-1 Donut-style OCR training end-to-end "
+                "(synthetic generation -> OCR manifest prep -> Vision Transformer encoder + autoregressive decoder training)."
+            )
+            with gr.Row():
+                with gr.Column(scale=1):
+                    donut_dataset_name = gr.Textbox(label="dataset_name", value=default_donut_dataset_name)
+                    donut_dataset_output_dir = gr.Textbox(label="dataset_output_dir", value=default_donut_dataset_output_dir)
+                    donut_prepared_output_dir = gr.Textbox(
+                        label="prepared_output_dir (optional)",
+                        value="",
+                        placeholder="Leave empty for <dataset>/donut_ocr_label1",
+                    )
+                    donut_model_output_dir = gr.Textbox(label="model_output_dir", value=default_donut_model_output_dir)
+                    donut_model_name = gr.Textbox(
+                        label="model_name_or_path",
+                        value="microsoft/trocr-base-stage1",
+                    )
+                    with gr.Row():
+                        donut_train_samples = gr.Number(label="train_samples", value=2000, precision=0)
+                        donut_val_samples = gr.Number(label="val_samples", value=200, precision=0)
+                    with gr.Row():
+                        donut_font_tibetan = gr.Textbox(label="font_path_tibetan", value=default_donut_font_tibetan)
+                        donut_font_chinese = gr.Textbox(label="font_path_chinese", value=default_donut_font_chinese)
+                    with gr.Row():
+                        donut_augmentation = gr.Dropdown(
+                            choices=["rotate", "noise", "none"],
+                            value="noise",
+                            label="augmentation",
+                        )
+                        donut_newline_token = gr.Dropdown(
+                            choices=["<NL>", "\\n"],
+                            value="<NL>",
+                            label="target_newline_token",
+                        )
+                    with gr.Row():
+                        donut_train_batch = gr.Number(label="per_device_train_batch_size", value=4, precision=0)
+                        donut_eval_batch = gr.Number(label="per_device_eval_batch_size", value=4, precision=0)
+                    with gr.Row():
+                        donut_epochs = gr.Number(label="num_train_epochs", value=8.0)
+                        donut_lr = gr.Number(label="learning_rate", value=5e-5)
+                    with gr.Row():
+                        donut_max_target_length = gr.Number(label="max_target_length", value=512, precision=0)
+                        donut_image_size = gr.Number(label="image_size", value=384, precision=0)
+                    with gr.Row():
+                        donut_seed = gr.Number(label="seed", value=42, precision=0)
+                        donut_tokenizer_vocab_size = gr.Number(label="tokenizer_vocab_size", value=16000, precision=0)
+                    with gr.Row():
+                        donut_train_tokenizer = gr.Checkbox(label="train_tokenizer", value=True)
+                        donut_skip_generation = gr.Checkbox(label="skip_generation", value=False)
+                        donut_skip_prepare = gr.Checkbox(label="skip_prepare", value=False)
+                        donut_skip_train = gr.Checkbox(label="skip_train", value=False)
+
+                    with gr.Accordion("Optional LoRA augmentation during generation", open=False):
+                        donut_lora_path = gr.Textbox(
+                            label="lora_augment_path",
+                            value="",
+                            placeholder="Optional path to LoRA .safetensors or folder",
+                        )
+                        with gr.Row():
+                            donut_lora_family = gr.Dropdown(
+                                choices=["sdxl", "sd21"],
+                                value="sdxl",
+                                label="lora_augment_model_family",
+                            )
+                            donut_lora_targets = gr.Dropdown(
+                                choices=["images", "images_and_ocr_crops"],
+                                value="images_and_ocr_crops",
+                                label="lora_augment_targets",
+                            )
+                        donut_lora_prompt = gr.Textbox(
+                            label="lora_augment_prompt",
+                            value="scanned printed page",
+                            lines=2,
+                        )
+                        with gr.Row():
+                            donut_lora_splits = gr.Textbox(label="lora_augment_splits", value="train")
+                            donut_lora_seed = gr.Number(label="lora_augment_seed (-1=unset)", value=-1, precision=0)
+                        with gr.Row():
+                            donut_lora_scale = gr.Slider(0.0, 2.0, value=0.8, step=0.05, label="lora_augment_scale")
+                            donut_lora_strength = gr.Slider(0.0, 0.25, value=0.2, step=0.01, label="lora_augment_strength")
+                            donut_lora_steps = gr.Number(label="lora_augment_steps", value=28, precision=0)
+                        with gr.Row():
+                            donut_lora_guidance = gr.Slider(0.0, 4.0, value=1.0, step=0.1, label="lora_augment_guidance_scale")
+                            donut_lora_controlnet = gr.Slider(0.5, 3.0, value=2.0, step=0.1, label="lora_augment_controlnet_scale")
+                        with gr.Row():
+                            donut_lora_canny_low = gr.Number(label="lora_augment_canny_low", value=100, precision=0)
+                            donut_lora_canny_high = gr.Number(label="lora_augment_canny_high", value=200, precision=0)
+                        donut_lora_base_model = gr.Textbox(
+                            label="lora_augment_base_model_id",
+                            value="stabilityai/stable-diffusion-xl-base-1.0",
+                        )
+                        donut_lora_controlnet_model = gr.Textbox(
+                            label="lora_augment_controlnet_model_id",
+                            value="diffusers/controlnet-canny-sdxl-1.0",
+                        )
+
+                    donut_run_btn = gr.Button("Run Donut OCR Workflow", variant="primary")
+                with gr.Column(scale=1):
+                    donut_log = gr.Textbox(label="Workflow Log", lines=24, interactive=False)
+                    donut_dataset_dir = gr.Textbox(label="Dataset Dir", interactive=False)
+                    donut_prepared_dir = gr.Textbox(label="Prepared Manifest Dir", interactive=False)
+                    donut_model_dir = gr.Textbox(label="Model Output Dir", interactive=False)
+                    donut_summary_path = gr.Textbox(label="Workflow Summary Path", interactive=False)
+
+            donut_run_btn.click(
+                fn=run_donut_ocr_workflow_live,
+                inputs=[
+                    donut_dataset_name,
+                    donut_dataset_output_dir,
+                    donut_train_samples,
+                    donut_val_samples,
+                    donut_font_tibetan,
+                    donut_font_chinese,
+                    donut_augmentation,
+                    donut_newline_token,
+                    donut_prepared_output_dir,
+                    donut_model_output_dir,
+                    donut_model_name,
+                    donut_train_tokenizer,
+                    donut_tokenizer_vocab_size,
+                    donut_train_batch,
+                    donut_eval_batch,
+                    donut_epochs,
+                    donut_lr,
+                    donut_max_target_length,
+                    donut_image_size,
+                    donut_seed,
+                    donut_skip_generation,
+                    donut_skip_prepare,
+                    donut_skip_train,
+                    donut_lora_path,
+                    donut_lora_family,
+                    donut_lora_base_model,
+                    donut_lora_controlnet_model,
+                    donut_lora_prompt,
+                    donut_lora_scale,
+                    donut_lora_strength,
+                    donut_lora_steps,
+                    donut_lora_guidance,
+                    donut_lora_controlnet,
+                    donut_lora_seed,
+                    donut_lora_splits,
+                    donut_lora_targets,
+                    donut_lora_canny_low,
+                    donut_lora_canny_high,
+                ],
+                outputs=[
+                    donut_log,
+                    donut_dataset_dir,
+                    donut_prepared_dir,
+                    donut_model_dir,
+                    donut_summary_path,
+                ],
+            )
+
+        # 12) Retrieval encoder training
+        with gr.Tab("12. Retrieval Encoders"):
             gr.Markdown(
                 "Train unpaired encoders for future Tibetan n-gram retrieval: "
                 "A) self-supervised image encoder on page images, "
@@ -3680,8 +4137,8 @@ def build_ui() -> gr.Blocks:
                 ],
             )
 
-        # 12) CLI reference
-        with gr.Tab("12. CLI Audit"):
+        # 13) CLI reference
+        with gr.Tab("13. CLI Audit"):
             audit_btn = gr.Button("Scan All CLI Options")
             audit_out = gr.Markdown()
             audit_btn.click(fn=collect_cli_help, inputs=[], outputs=[audit_out])
