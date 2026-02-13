@@ -8,6 +8,7 @@ import urllib.request
 import ssl
 import xml.etree.ElementTree as ET
 import hashlib
+from concurrent.futures import ThreadPoolExecutor, as_completed
 from typing import List, Optional, Union, Tuple
 import numpy as np
 from PIL import Image
@@ -133,8 +134,9 @@ def download_image(url: str, output_dir: Optional[str] = None, verify_ssl: bool 
         return None
 
 
-def process_sbb_images(ppn: str, processor_func, max_images: int = 0, download: bool = False, 
-                      output_dir: str = 'sbb_images', verify_ssl: bool = True, **kwargs) -> List[dict]:
+def process_sbb_images(ppn: str, processor_func, max_images: int = 0, download: bool = False,
+                      output_dir: str = 'sbb_images', verify_ssl: bool = True,
+                      download_workers: int = 8, **kwargs) -> List[dict]:
     """
     Process images from the Staatsbibliothek zu Berlin.
     
@@ -145,6 +147,7 @@ def process_sbb_images(ppn: str, processor_func, max_images: int = 0, download: 
         download: Whether to download images before processing
         output_dir: Directory to save downloaded images
         verify_ssl: Whether to verify SSL certificates
+        download_workers: Number of worker threads for parallel downloads
         **kwargs: Additional arguments for the processor function
         
     Returns:
@@ -171,10 +174,34 @@ def process_sbb_images(ppn: str, processor_func, max_images: int = 0, download: 
         print(f"Downloading images to directory: {temp_dir}")
         
         image_paths = []
-        for url in image_urls:
-            image_path = download_image(url, temp_dir, verify_ssl=verify_ssl)
-            if image_path:
-                image_paths.append(image_path)
+        worker_count = max(1, int(download_workers))
+        if worker_count == 1 or len(image_urls) <= 1:
+            for url in image_urls:
+                image_path = download_image(url, temp_dir, verify_ssl=verify_ssl)
+                if image_path:
+                    image_paths.append(image_path)
+        else:
+            max_workers = min(worker_count, len(image_urls))
+            print(f"Parallel download enabled (workers={max_workers})")
+
+            def _download_one(idx_url: Tuple[int, str]) -> Tuple[int, Optional[str], str]:
+                idx, url = idx_url
+                image_path = download_image(url, temp_dir, verify_ssl=verify_ssl)
+                return idx, image_path, url
+
+            ordered_paths: List[Optional[str]] = [None] * len(image_urls)
+            completed = 0
+            with ThreadPoolExecutor(max_workers=max_workers) as executor:
+                futures = [executor.submit(_download_one, pair) for pair in enumerate(image_urls)]
+                for future in as_completed(futures):
+                    idx, image_path, _url = future.result()
+                    if image_path:
+                        ordered_paths[idx] = image_path
+                    completed += 1
+                    if completed % 25 == 0 or completed == len(image_urls):
+                        print(f"Downloaded {completed}/{len(image_urls)}")
+
+            image_paths = [p for p in ordered_paths if p]
         
         if not image_paths:
             print("No images could be downloaded. Exiting.")

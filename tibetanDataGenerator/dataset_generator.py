@@ -4,6 +4,7 @@ import random
 import re
 import os
 import csv
+import json
 import time
 import traceback
 from typing import Tuple, Dict, List, Optional  # Added Optional
@@ -27,6 +28,9 @@ augmentation_strategies: Dict[str, AugmentationStrategy] = {
     'rotate': RotateAugmentation(),
     'noise': NoiseAugmentation()
 }
+
+_SUPPORTED_NEWLINE_TOKENS = {"\\n", "<NL>"}
+_DEFAULT_OCR_CROP_LABELS = (2,)
 
 def _parse_yolo_annotations(file_path: str) -> List[Tuple[int, float, float, float, float]]:
     """
@@ -117,6 +121,132 @@ def _is_plausible_rendered_bbox(
     return True
 
 
+def _normalize_newlines(text: str) -> str:
+    return text.replace("\r\n", "\n").replace("\r", "\n")
+
+
+def _linearize_rendered_text(rendered_text: str, newline_token: str = "\\n") -> str:
+    """
+    Deterministic text linearization for OCR targets.
+    - Keeps the exact rendered line order.
+    - Represents line breaks either as real '\n' or as '<NL>'.
+    """
+    token = newline_token if newline_token in _SUPPORTED_NEWLINE_TOKENS else "\\n"
+    normalized = _normalize_newlines(rendered_text).strip("\n")
+    if not normalized:
+        return ""
+    lines = normalized.split("\n")
+    joiner = "\n" if token == "\\n" else token
+    return joiner.join(lines)
+
+
+def _save_rendered_text_targets(
+        folder_for_train_data: str,
+        sample_id: str,
+        image_filename: str,
+        records: List[Dict],
+        newline_token: str
+) -> str:
+    targets_dir = os.path.join(folder_for_train_data, "ocr_targets")
+    os.makedirs(targets_dir, exist_ok=True)
+    target_path = os.path.join(targets_dir, f"{sample_id}.json")
+    payload = {
+        "image_rel_path": f"images/{image_filename}",
+        "newline_token": "\n" if newline_token == "\\n" else "<NL>",
+        "records": records,
+    }
+    with open(target_path, "w", encoding="utf-8") as f:
+        json.dump(payload, f, ensure_ascii=False, indent=2)
+    return target_path
+
+
+def _clamp_bbox_xywh(
+        x: int,
+        y: int,
+        w: int,
+        h: int,
+        image_width: int,
+        image_height: int,
+) -> Optional[Tuple[int, int, int, int]]:
+    x1 = max(0, int(x))
+    y1 = max(0, int(y))
+    x2 = min(int(image_width), int(x + w))
+    y2 = min(int(image_height), int(y + h))
+    if x2 <= x1 or y2 <= y1:
+        return None
+    return x1, y1, (x2 - x1), (y2 - y1)
+
+
+def _save_ocr_crops_for_sample(
+        folder_for_train_data: str,
+        sample_id: str,
+        image_obj,
+        records: List[Dict],
+        allowed_labels: Tuple[int, ...],
+) -> int:
+    allow = set(allowed_labels) if allowed_labels else set(_DEFAULT_OCR_CROP_LABELS)
+    crops_dir = os.path.join(folder_for_train_data, "ocr_crops")
+    os.makedirs(crops_dir, exist_ok=True)
+    image_w, image_h = image_obj.size
+    saved = 0
+    for idx, rec in enumerate(records):
+        class_id = rec.get("class_id")
+        if class_id is None or int(class_id) not in allow:
+            continue
+        bbox = rec.get("bbox_xywh")
+        if not isinstance(bbox, list) or len(bbox) != 4:
+            continue
+        clamped = _clamp_bbox_xywh(
+            bbox[0], bbox[1], bbox[2], bbox[3], image_w, image_h
+        )
+        if clamped is None:
+            continue
+        x1, y1, cw, ch = clamped
+        crop = image_obj.crop((x1, y1, x1 + cw, y1 + ch))
+        if crop.size[0] <= 0 or crop.size[1] <= 0:
+            continue
+        crop_filename = f"{sample_id}_{idx:03d}.png"
+        crop_path = os.path.join(crops_dir, crop_filename)
+        crop.save(crop_path)
+        rec["crop_rel_path"] = f"ocr_crops/{crop_filename}"
+        rec["crop_bbox_xywh"] = [int(x1), int(y1), int(cw), int(ch)]
+        saved += 1
+    return saved
+
+
+def _parse_ocr_crop_labels(spec) -> Tuple[int, ...]:
+    """
+    Normalize OCR crop label filter input to a sorted tuple of unique class IDs.
+    Supports: comma-separated strings, int lists/tuples/sets, or single ints.
+    """
+    if spec is None:
+        return _DEFAULT_OCR_CROP_LABELS
+
+    values: List[int] = []
+    if isinstance(spec, str):
+        chunks = [c.strip() for c in spec.split(",") if c.strip()]
+        for c in chunks:
+            try:
+                values.append(int(c))
+            except ValueError:
+                print(f"Warning: Ignoring invalid value in --ocr_crop_labels: {c!r}")
+    elif isinstance(spec, (list, tuple, set)):
+        for item in spec:
+            try:
+                values.append(int(item))
+            except (TypeError, ValueError):
+                print(f"Warning: Ignoring invalid value in --ocr_crop_labels: {item!r}")
+    else:
+        try:
+            values.append(int(spec))
+        except (TypeError, ValueError):
+            pass
+
+    # Keep only non-negative class IDs and remove duplicates.
+    filtered = sorted({v for v in values if v >= 0})
+    return tuple(filtered) if filtered else _DEFAULT_OCR_CROP_LABELS
+
+
 def generate_dataset(args: argparse.Namespace, validation: bool = False) -> Dict:
     """
     Generate a dataset for training or validation.
@@ -168,7 +298,11 @@ def generate_synthetic_image(
         image_width: int = 1024,
         image_height: int = 361,
         augmentation: str = "noise",
-        annotations_file_path: Optional[str] = None
+        annotations_file_path: Optional[str] = None,
+        save_rendered_text_targets: bool = False,
+        save_ocr_crops: bool = False,
+        ocr_crop_labels: Tuple[int, ...] = _DEFAULT_OCR_CROP_LABELS,
+        target_newline_token: str = "\\n",
 ) -> Tuple[str, str]:
     """
     Generate a synthetic image with improved error handling and resource management.
@@ -178,7 +312,8 @@ def generate_synthetic_image(
             images, label_dict, folder_with_background,
             corpora_tibetan_numbers_path, corpora_tibetan_text_path, corpora_chinese_numbers_path,
             folder_for_train_data, debug, font_path_tibetan, font_path_chinese,
-            single_label, image_width, image_height, augmentation, annotations_file_path
+            single_label, image_width, image_height, augmentation, annotations_file_path,
+            save_rendered_text_targets, save_ocr_crops, ocr_crop_labels, target_newline_token,
         )
     except Exception as e:
         # Log the error and return empty paths to indicate failure
@@ -204,7 +339,11 @@ def _generate_synthetic_image_impl(
         image_width: int = 1024,
         image_height: int = 361,
         augmentation: str = "noise",
-        annotations_file_path: Optional[str] = None
+        annotations_file_path: Optional[str] = None,
+        save_rendered_text_targets: bool = False,
+        save_ocr_crops: bool = False,
+        ocr_crop_labels: Tuple[int, ...] = _DEFAULT_OCR_CROP_LABELS,
+        target_newline_token: str = "\\n",
 ) -> Tuple[str, str]:
     # Font configuration
     BORDER_OFFSET_RATIO = 0.05
@@ -226,6 +365,7 @@ def _generate_synthetic_image_impl(
     )  # Font is set per-class below
 
     bbox_str_list = []  # Collect bounding box strings for all text instances
+    rendered_text_targets = []
     tibetan_number_match = None  # Store the matching number if we find a Tibetan number file
 
     # ---- Start: Draw bounding boxes from YOLO annotation file ----
@@ -405,6 +545,22 @@ def _generate_synthetic_image_impl(
                             f"(draw box {draw_box_size}). Skipping annotation."
                         )
                     continue
+                rendered_text = builder.last_rendered_text()
+                if not rendered_text:
+                    if debug:
+                        print(
+                            f"Debug: Missing rendered text payload for class {ann_class_id}. "
+                            "Skipping annotation."
+                        )
+                    continue
+                target_text = _linearize_rendered_text(rendered_text, target_newline_token)
+                if not target_text:
+                    if debug:
+                        print(
+                            f"Debug: Empty linearized text for class {ann_class_id}. "
+                            "Skipping annotation."
+                        )
+                    continue
                 yolo_box_center_pos = (int(round(rb_x + rb_w / 2)), int(round(rb_y + rb_h / 2)))
                 actual_text_box_size = (int(rb_w), int(rb_h))
                 # Get the base filename without extension
@@ -437,6 +593,13 @@ def _generate_synthetic_image_impl(
                     image_height
                 )
                 bbox_str_list.append(bbox_str)
+                rendered_text_targets.append({
+                    "class_id": int(label_id),
+                    "bbox_xywh": [int(rb_x), int(rb_y), int(rb_w), int(rb_h)],
+                    "yolo_bbox": bbox_str.strip(),
+                    "rendered_text": rendered_text,
+                    "target_text": target_text,
+                })
 
                 if debug:
                     builder.add_bounding_box(text_render_top_left_pos, actual_text_box_size, color=(0, 255, 0))  # Green
@@ -446,6 +609,17 @@ def _generate_synthetic_image_impl(
                 if debug:
                     print(
                         f"Debug: Skipping drawing annotation box from file (class {ann_class_id}) due to non-positive dimensions: size {draw_box_size}")
+
+    saved_crop_count = 0
+    if save_ocr_crops and rendered_text_targets:
+        # Save crops before geometric augmentation so bbox coordinates remain valid.
+        saved_crop_count = _save_ocr_crops_for_sample(
+            folder_for_train_data=str(folder_for_train_data),
+            sample_id=ctr,
+            image_obj=builder.image,
+            records=rendered_text_targets,
+            allowed_labels=ocr_crop_labels,
+        )
 
     if augmentation.lower() != 'none' and augmentation.lower() in augmentation_strategies:
         _apply_augmentation(builder, augmentation)
@@ -465,10 +639,24 @@ def _generate_synthetic_image_impl(
     with open(label_full_path, 'w', encoding='utf-8') as f:
         f.writelines(bbox_str_list)  # Write all bounding box strings into the file
 
+    target_path = ""
+    if save_rendered_text_targets and rendered_text_targets:
+        target_path = _save_rendered_text_targets(
+            folder_for_train_data=str(folder_for_train_data),
+            sample_id=ctr,
+            image_filename=image_filename_saved,
+            records=rendered_text_targets,
+            newline_token=target_newline_token,
+        )
+
     if debug:
         print(f"Generated sample: {image_full_path}")
         print(f"Label file: {label_full_path}")
         print(f"Bounding boxes (YOLO format for synthetic text):\n{''.join(bbox_str_list).strip()}")
+        if save_ocr_crops:
+            print(f"OCR crops saved: {saved_crop_count} (labels={list(ocr_crop_labels)})")
+        if target_path:
+            print(f"OCR target file: {target_path}")
 
     return image_full_path, label_full_path
 
@@ -745,6 +933,7 @@ def _load_background_images(folder: str) -> List[str]:
 def _prepare_generation_args(args: argparse.Namespace, dataset_info: Dict, label_dict: Dict,
                              images_bg_list: List[str]) -> Tuple:
     """Prepare arguments for each call to generate_synthetic_image."""
+    ocr_crop_labels = _parse_ocr_crop_labels(args.ocr_crop_labels)
     return (
         images_bg_list,
         label_dict,
@@ -760,7 +949,11 @@ def _prepare_generation_args(args: argparse.Namespace, dataset_info: Dict, label
         args.image_width,
         args.image_height,
         args.augmentation,
-        args.annotations_file_path
+        args.annotations_file_path,
+        args.save_rendered_text_targets,
+        args.save_ocr_crops,
+        ocr_crop_labels,
+        args.target_newline_token,
     )
 
 

@@ -13,6 +13,7 @@ _SUBMODULES = [
     "io_utils",
     "model_utils",
     "ocr_utils",
+    "retrieval_schema",
     "sbb_utils",
     "config",
     "parsers",
@@ -29,4 +30,3 @@ for _name in _SUBMODULES:
         # Optional dependencies may be missing; explicit submodule imports
         # (e.g. `from tibetan_utils.arg_utils import ...`) still work.
         continue
-

@@ -1,13 +1,13 @@
-# Pseudo-Labeling + Label Studio (Kurzfassung)
+# Pseudo-Labeling + Label Studio (Quick Guide)
 
-Diese Anleitung beschreibt nur den schlanken Ablauf für Layout-Pseudo-Labels mit drei Klassen:
-- `0`: `tibetan_number_word` (links)
-- `1`: `tibetan_text` (mitte)
-- `2`: `chinese_number_word` (rechts)
+This guide describes the streamlined workflow for layout pseudo-labeling with three classes:
+- `0`: `tibetan_number_word` (left)
+- `1`: `tibetan_text` (center)
+- `2`: `chinese_number_word` (right)
 
-Für den normalen Betrieb nutze primär die Workbench: [README.md](README.md)
+For regular day-to-day usage, prefer the Workbench-first flow: [README.md](README.md)
 
-## Option A: Empfohlen (ein Kommando)
+## Option A: Recommended (single command)
 
 ```bash
 python run_pseudo_label_workflow.py \
@@ -21,7 +21,7 @@ python run_pseudo_label_workflow.py \
   --image-ext .jpg
 ```
 
-Optional Label Studio direkt starten:
+Optionally launch Label Studio directly:
 
 ```bash
 python run_pseudo_label_workflow.py \
@@ -36,15 +36,15 @@ python run_pseudo_label_workflow.py \
   --start-label-studio
 ```
 
-Das Skript führt aus:
+The workflow executes:
 1. `pseudo_label_from_vlm.py`
 2. `layout_rule_filter.py`
 3. `label-studio-converter import yolo`
-4. optional `label-studio`
+4. optionally `label-studio`
 
-## Option B: Manuell (3 Schritte)
+## Option B: Manual (3 steps)
 
-### 1) Pseudo-Labels aus VLM erzeugen
+### 1) Generate pseudo-labels from VLM output
 
 ```bash
 python pseudo_label_from_vlm.py \
@@ -58,9 +58,9 @@ python pseudo_label_from_vlm.py \
   --min-confidence 0.2
 ```
 
-Alternative Parser: `qwen25vl`, `granite_docling`, `deepseek_ocr`, `mineru25`.
+Alternative parsers: `qwen25vl`, `granite_docling`, `deepseek_ocr`, `mineru25`.
 
-### 2) Layout-Regeln anwenden
+### 2) Apply layout rules
 
 ```bash
 python layout_rule_filter.py \
@@ -71,7 +71,7 @@ python layout_rule_filter.py \
   --copy-images
 ```
 
-### 3) Label Studio Tasks erzeugen
+### 3) Create Label Studio tasks
 
 ```bash
 export LABEL_STUDIO_LOCAL_FILES_SERVING_ENABLED=true
@@ -84,18 +84,18 @@ label-studio-converter import yolo \
   --image-root-url "/data/local-files/?d=train/images"
 ```
 
-Dann:
+Then run:
 
 ```bash
 label-studio
 ```
 
-## Hinweise
+## Notes
 
-- `--image-ext` muss zu den tatsächlichen Bilddateien passen (`.jpg` oder `.png`).
-- Die SBB/VLM-Outputs sollten als Review-/Pseudo-Label-Quelle behandelt werden; finale Trainingslabels nach manueller Korrektur übernehmen.
+- `--image-ext` must match the actual file extension (`.jpg` or `.png`).
+- Treat SBB/VLM outputs as review/pseudo-label sources; use manually corrected labels as final training data.
 
-## Weitere Doku
+## Additional Documentation
 
-- Workbench-first Nutzung: [README.md](README.md)
-- CLI-Sammelreferenz: [README_CLI.md](README_CLI.md)
+- Workbench-first usage: [README.md](README.md)
+- CLI reference: [README_CLI.md](README_CLI.md)

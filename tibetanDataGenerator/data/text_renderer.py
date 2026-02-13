@@ -12,6 +12,8 @@ class ImageBuilder:
         self.font = None
         self._last_text_drawn = False
         self._last_text_bbox = None  # (x, y, w, h) in absolute image coordinates
+        self._last_rendered_lines = []
+        self._last_rendered_text = ""
 
     def set_background(self, background_path):
         """
@@ -52,13 +54,18 @@ class ImageBuilder:
         if box_w <= 0 or box_h <= 0:
             self._last_text_drawn = False
             self._last_text_bbox = None
+            self._last_rendered_lines = []
+            self._last_rendered_text = ""
             return self
         if not text or not str(text).strip():
             self._last_text_drawn = False
             self._last_text_bbox = None
+            self._last_rendered_lines = []
+            self._last_rendered_text = ""
             return self
         max_y = box_y + box_h
         drew_any = False
+        drawn_lines = []
         before = self.image.copy()
 
         if rotation == 0:
@@ -73,6 +80,7 @@ class ImageBuilder:
                 self.draw.text((box_x, box_y + y_offset), line, font=self.font, fill=(0, 0, 0))
                 y_offset += line_height
                 drew_any = True
+                drawn_lines.append(line)
         
         elif rotation == 90:
             # Vertical text rendering (90 degrees clockwise)
@@ -91,6 +99,7 @@ class ImageBuilder:
                 temp_draw.text((0, y_offset), line, font=self.font, fill=(0, 0, 0))
                 y_offset += line_height
                 drew_any = True
+                drawn_lines.append(line)
             
             # Rotate the temporary image and paste it
             if drew_any:
@@ -114,11 +123,17 @@ class ImageBuilder:
             if bbox is not None:
                 x1, y1, x2, y2 = bbox
                 self._last_text_bbox = (x1, y1, max(1, x2 - x1), max(1, y2 - y1))
+                self._last_rendered_lines = list(drawn_lines)
+                self._last_rendered_text = "\n".join(drawn_lines)
             else:
                 self._last_text_bbox = None
                 self._last_text_drawn = False
+                self._last_rendered_lines = []
+                self._last_rendered_text = ""
         else:
             self._last_text_bbox = None
+            self._last_rendered_lines = []
+            self._last_rendered_text = ""
         return self
 
     def last_text_drawn(self):
@@ -126,6 +141,12 @@ class ImageBuilder:
 
     def last_text_bbox(self):
         return self._last_text_bbox
+
+    def last_rendered_lines(self):
+        return list(self._last_rendered_lines)
+
+    def last_rendered_text(self):
+        return self._last_rendered_text
 
     def _wrap_text_lines(self, draw_ctx, text, max_width, timeout_seconds=1.5, max_total_lines=300):
         """

@@ -3,8 +3,17 @@ __pycache__/
 *.py[cod]
 *$py.class
 
+
+datasets/
+sbb_images/
+
 # C extensions
 *.so
+*.yaml
+
+ls-tasks.json
+ls-tasks.label_config.xml
+launch.json
 
 # Distribution / packaging
 .Python

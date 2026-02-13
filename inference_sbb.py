@@ -51,19 +51,11 @@ def main():
                         help='Speichere Ergebnisse als .txt Dateien')
     parser.add_argument('--save-conf', action='store_true',
                         help='Speichere Konfidenzwerte in .txt Dateien')
+    parser.add_argument('--download-workers', type=int, default=8,
+                        help='Anzahl paralleler Downloader-Threads (nur mit --download)')
     
     args = parser.parse_args()
 
-    # Check if model exists
-    model_path = Path(args.model)
-    if not model_path.exists():
-        print(f"Fehler: Modell nicht gefunden: {model_path}")
-        return
-
-    # Load model
-    print(f"Lade Modell: {model_path}")
-    model = ModelManager.load_model(str(model_path))
-    
     # Get document metadata
     metadata = get_sbb_metadata(args.ppn, verify_ssl=not args.no_ssl_verify)
     if metadata['title']:
@@ -73,30 +65,59 @@ def main():
         if metadata['date']:
             print(f"Datum: {metadata['date']}")
         print(f"Seiten: {metadata['pages']}")
+
+    model = None
+    model_path = Path(args.model)
+    download_only = bool(args.download and not model_path.exists())
+    if download_only:
+        print(f"Hinweis: Modell nicht gefunden ({model_path}). Starte reinen Download-Modus.")
+    else:
+        # Check if model exists for inference mode
+        if not model_path.exists():
+            print(f"Fehler: Modell nicht gefunden: {model_path}")
+            return
+        # Load model
+        print(f"Lade Modell: {model_path}")
+        model = ModelManager.load_model(str(model_path))
     
     # Prepare prediction arguments
     predict_args = {
         'imgsz': args.imgsz,
         'conf': args.conf,
-        'device': args.device,
-        'save': args.save,
-        'project': args.project,
-        'name': args.name,
-        'show': args.show,
-        'save_txt': args.save_txt,
-        'save_conf': args.save_conf
+        'device': getattr(args, 'device', ''),
+        'save': getattr(args, 'save', True),
+        'project': getattr(args, 'project', 'runs/detect'),
+        'name': getattr(args, 'name', 'predict'),
+        'show': getattr(args, 'show', False),
+        'save_txt': getattr(args, 'save_txt', False),
+        'save_conf': getattr(args, 'save_conf', False)
     }
     
     # Process images
-    results = process_sbb_images(
-        args.ppn,
-        lambda img, **kwargs: process_image(img, model, **kwargs),
-        max_images=args.max_images,
-        download=args.download,
-        output_dir=args.output,
-        verify_ssl=not args.no_ssl_verify,
-        **predict_args
-    )
+    if download_only:
+        results = process_sbb_images(
+            args.ppn,
+            lambda img, **kwargs: {'downloaded_path': str(img)},
+            max_images=args.max_images,
+            download=True,
+            output_dir=args.output,
+            verify_ssl=not args.no_ssl_verify,
+            download_workers=max(1, int(args.download_workers)),
+        )
+        print(f"\nDownload abgeschlossen. Bilder gespeichert unter: {Path(args.output).resolve()}")
+        print(f"Heruntergeladene Bilder: {len(results)}")
+        return
+    else:
+        results = process_sbb_images(
+            args.ppn,
+            lambda img, **kwargs: process_image(img, model, **kwargs),
+            max_images=args.max_images,
+            download=args.download,
+            output_dir=args.output,
+            verify_ssl=not args.no_ssl_verify,
+            download_workers=max(1, int(args.download_workers)),
+            **predict_args
+        )
     
     # Output directory
     output_dir = Path(args.project) / args.name

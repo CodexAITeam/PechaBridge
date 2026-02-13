@@ -1,15 +1,3 @@
-# Core dependencies for transformer-based VLM parsing backends
-# (paddleocr_vl, qwen25vl, granite_docling) and VLM UI usage.
-
-gradio>=5.0.0
-transformers>=4.46.0
-torch>=2.2.0
-accelerate>=0.33.0
-safetensors>=0.4.5
-sentencepiece>=0.2.0
-huggingface_hub>=0.24.0
-numpy>=1.26.0
-pillow>=10.0.0
-
-# Optional: required only if you want to use parser=mineru25 via CLI backend.
-# Install MinerU separately and ensure `mineru` is available in PATH.
+# Compatibility wrapper.
+# Use `requirements.txt` as the unified dependency file.
+-r requirements.txt

@@ -19,6 +19,67 @@ from utils import hash_current_time
 import argparse
 import multiprocessing
 
+
+def _parse_csv_items(spec):
+    return [item.strip() for item in str(spec).split(",") if item.strip()]
+
+
+def _has_any_images(folder: Path) -> bool:
+    exts = {".png", ".jpg", ".jpeg", ".bmp", ".tif", ".tiff", ".webp"}
+    return any(p.is_file() and p.suffix.lower() in exts for p in folder.rglob("*"))
+
+
+def _run_lora_augmentation_on_dir(input_dir: Path, args, seed_offset: int = 0):
+    from scripts.texture_augment import run as run_texture_augment
+
+    if not input_dir.exists() or not input_dir.is_dir():
+        return {"images_processed": 0, "output_dir": str(input_dir), "skipped": "missing_dir"}
+    if not _has_any_images(input_dir):
+        return {"images_processed": 0, "output_dir": str(input_dir), "skipped": "no_images"}
+
+    effective_seed = None
+    if args.lora_augment_seed is not None:
+        effective_seed = int(args.lora_augment_seed) + int(seed_offset)
+
+    aug_args = argparse.Namespace(
+        model_family=args.lora_augment_model_family,
+        input_dir=str(input_dir),
+        output_dir=str(input_dir),
+        strength=float(args.lora_augment_strength),
+        steps=int(args.lora_augment_steps),
+        guidance_scale=float(args.lora_augment_guidance_scale),
+        seed=effective_seed,
+        controlnet_scale=float(args.lora_augment_controlnet_scale),
+        lora_path=str(args.lora_augment_path),
+        lora_scale=float(args.lora_augment_scale),
+        prompt=str(args.lora_augment_prompt),
+        base_model_id=str(args.lora_augment_base_model_id),
+        controlnet_model_id=str(args.lora_augment_controlnet_model_id),
+        canny_low=int(args.lora_augment_canny_low),
+        canny_high=int(args.lora_augment_canny_high),
+    )
+    return run_texture_augment(aug_args)
+
+
+def _augment_generated_dataset(dataset_root: Path, args):
+    if not str(args.lora_augment_path).strip():
+        return []
+
+    splits = _parse_csv_items(args.lora_augment_splits)
+    if not splits:
+        splits = ["train"]
+
+    reports = []
+    for idx, split in enumerate(splits):
+        folder = dataset_root / split / "images"
+        print(f"LoRA augmentation: split={split} target=images path={folder}")
+        rep = _run_lora_augmentation_on_dir(folder, args, seed_offset=idx * 1000)
+        rep["split"] = split
+        rep["target"] = "images"
+        reports.append(rep)
+    return reports
+
+
 def ensure_directory_exists(file_path):
     # Extract the directory part of the file_path
     directory = os.path.dirname(file_path)
@@ -282,6 +343,36 @@ def main():
                         help='Use a single label "tibetan" for all files instead of using filenames as labels')
     parser.add_argument('--image_size', type=int, default=1024,
                         help='size (pixels) of each image')
+    parser.add_argument('--lora_augment_path', type=str, default='',
+                        help='Optional LoRA path to texture-augment generated data in-place.')
+    parser.add_argument('--lora_augment_model_family', type=str, choices=['sdxl', 'sd21'], default='sdxl',
+                        help='Diffusion model family used for optional LoRA augmentation.')
+    parser.add_argument('--lora_augment_base_model_id', type=str,
+                        default='stabilityai/stable-diffusion-xl-base-1.0',
+                        help='Base model ID for optional LoRA augmentation.')
+    parser.add_argument('--lora_augment_controlnet_model_id', type=str,
+                        default='diffusers/controlnet-canny-sdxl-1.0',
+                        help='ControlNet model ID for optional LoRA augmentation.')
+    parser.add_argument('--lora_augment_prompt', type=str, default='scanned printed page',
+                        help='Prompt for optional LoRA augmentation.')
+    parser.add_argument('--lora_augment_scale', type=float, default=0.8,
+                        help='LoRA scale for optional LoRA augmentation.')
+    parser.add_argument('--lora_augment_strength', type=float, default=0.2,
+                        help='Img2img strength for optional LoRA augmentation.')
+    parser.add_argument('--lora_augment_steps', type=int, default=28,
+                        help='Diffusion steps for optional LoRA augmentation.')
+    parser.add_argument('--lora_augment_guidance_scale', type=float, default=1.0,
+                        help='Guidance scale for optional LoRA augmentation.')
+    parser.add_argument('--lora_augment_controlnet_scale', type=float, default=2.0,
+                        help='ControlNet scale for optional LoRA augmentation.')
+    parser.add_argument('--lora_augment_seed', type=int, default=None,
+                        help='Optional random seed for deterministic LoRA augmentation.')
+    parser.add_argument('--lora_augment_splits', type=str, default='train',
+                        help='Comma-separated splits for augmentation (e.g. "train" or "train,val").')
+    parser.add_argument('--lora_augment_canny_low', type=int, default=100,
+                        help='Canny low threshold for optional LoRA augmentation.')
+    parser.add_argument('--lora_augment_canny_high', type=int, default=200,
+                        help='Canny high threshold for optional LoRA augmentation.')
 
     args = parser.parse_args()
     # Read default settings
@@ -293,6 +384,7 @@ def main():
 
     dataset_dict = generate_data(args, validation = False)
     generate_data(args, validation = True)
+    lora_reports = _augment_generated_dataset(Path(args.dataset_name), args)
 
     dataset_dict['path'] = args.dataset_name
 
@@ -304,6 +396,12 @@ def main():
 
     with open(f"{args.dataset_name}/ultralytics.yml", 'w') as yaml_file:
         yaml.dump(dataset_dict, yaml_file, default_flow_style=False)
+
+    if lora_reports:
+        augmented_total = sum(int(r.get("images_processed", 0) or 0) for r in lora_reports)
+        print(f"LoRA augmentation complete. Processed images: {augmented_total}")
+        for rep in lora_reports:
+            print(f"  - {rep.get('split')}/{rep.get('target')}: {rep.get('images_processed', 0)}")
 
     print("Training can be started with the following command:\n\n"
           f"yolo detect train data=yolo detect train data={args.dataset_name}/ultralytics.yml epochs=100 imgsz=1024 model=yolo11n.pt\n"
