@@ -25,6 +25,11 @@ from .config import (
     DEFAULT_ANNOTATION_FILE_PATH
 )
 
+DEFAULT_TEXTURE_PROMPT = (
+    "scanned printed Tibetan pecha page, paper texture, ink bleed, aged grayscale scan, "
+    "realistic Tibetan glyph stroke thickness, subtle hand-written-like ink edge variation"
+)
+
 
 def add_model_arguments(parser):
     """Add model-related arguments."""
@@ -116,7 +121,7 @@ def add_dataset_generation_arguments(parser):
     parser.add_argument('--lora_augment_controlnet_model_id', type=str,
                        default='diffusers/controlnet-canny-sdxl-1.0',
                        help='ControlNet model ID for LoRA augmentation.')
-    parser.add_argument('--lora_augment_prompt', type=str, default='scanned printed page',
+    parser.add_argument('--lora_augment_prompt', type=str, default=DEFAULT_TEXTURE_PROMPT,
                        help='Prompt used for LoRA augmentation.')
     parser.add_argument('--lora_augment_scale', type=float, default=0.8,
                        help='LoRA cross-attention scale for augmentation.')
@@ -382,7 +387,7 @@ def add_prepare_texture_lora_dataset_arguments(parser):
     parser.add_argument('--lora_augment_controlnet_model_id', type=str,
                        default='diffusers/controlnet-canny-sdxl-1.0',
                        help='ControlNet model ID for optional crop augmentation.')
-    parser.add_argument('--lora_augment_prompt', type=str, default='scanned printed page',
+    parser.add_argument('--lora_augment_prompt', type=str, default=DEFAULT_TEXTURE_PROMPT,
                        help='Prompt used for optional crop augmentation.')
     parser.add_argument('--lora_augment_scale', type=float, default=0.8,
                        help='LoRA scale used for optional crop augmentation.')
@@ -428,7 +433,7 @@ def add_train_texture_lora_arguments(parser):
                        help='Accelerate mixed precision mode')
     parser.add_argument('--gradient_checkpointing', action='store_true',
                        help='Enable gradient checkpointing')
-    parser.add_argument('--prompt', type=str, default='scanned printed page',
+    parser.add_argument('--prompt', type=str, default=DEFAULT_TEXTURE_PROMPT,
                        help='Generic prompt used for texture LoRA training')
     parser.add_argument('--seed', type=int, default=42,
                        help='Random seed for deterministic training')
@@ -473,7 +478,7 @@ def add_texture_augment_arguments(parser):
                        help='Optional path to LoRA directory or .safetensors file')
     parser.add_argument('--lora_scale', type=float, default=0.8,
                        help='LoRA scale for cross attention')
-    parser.add_argument('--prompt', type=str, default='scanned printed page',
+    parser.add_argument('--prompt', type=str, default=DEFAULT_TEXTURE_PROMPT,
                        help='Prompt for texture transfer (can be empty)')
     parser.add_argument('--base_model_id', type=str,
                        default='stabilityai/stable-diffusion-xl-base-1.0',
@@ -812,7 +817,7 @@ def add_run_donut_ocr_workflow_arguments(parser):
     parser.add_argument('--lora_augment_controlnet_model_id', type=str,
                        default='diffusers/controlnet-canny-sdxl-1.0',
                        help='ControlNet model ID for optional LoRA augmentation.')
-    parser.add_argument('--lora_augment_prompt', type=str, default='scanned printed page',
+    parser.add_argument('--lora_augment_prompt', type=str, default=DEFAULT_TEXTURE_PROMPT,
                        help='Prompt for optional LoRA augmentation.')
     parser.add_argument('--lora_augment_scale', type=float, default=0.8,
                        help='LoRA scale for optional augmentation.')

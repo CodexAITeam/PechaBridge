@@ -29,6 +29,10 @@ from PIL import Image, ImageDraw
 
 
 ROOT = Path(__file__).resolve().parent
+DEFAULT_TEXTURE_PROMPT = (
+    "scanned printed Tibetan pecha page, paper texture, ink bleed, aged grayscale scan, "
+    "realistic Tibetan glyph stroke thickness, subtle hand-written-like ink edge variation"
+)
 
 CLI_SCRIPTS = [
     "generate_training_data.py",
@@ -714,7 +718,7 @@ def run_texture_augment_live(
         "--lora_scale",
         str(float(lora_scale)),
         "--prompt",
-        (prompt or "").strip(),
+        (prompt or DEFAULT_TEXTURE_PROMPT).strip(),
         "--base_model_id",
         (base_model_id or "stabilityai/stable-diffusion-xl-base-1.0").strip(),
         "--controlnet_model_id",
@@ -1082,7 +1086,7 @@ def run_train_texture_lora_live(
         "--mixed_precision",
         (mixed_precision or "fp16").strip(),
         "--prompt",
-        (prompt or "").strip(),
+        (prompt or DEFAULT_TEXTURE_PROMPT).strip(),
         "--seed",
         str(seed_arg),
         "--base_model_id",
@@ -1749,7 +1753,7 @@ def run_donut_ocr_workflow_live(
                 "--lora_augment_controlnet_model_id",
                 (lora_augment_controlnet_model_id or "diffusers/controlnet-canny-sdxl-1.0").strip(),
                 "--lora_augment_prompt",
-                (lora_augment_prompt or "scanned printed page").strip(),
+                (lora_augment_prompt or DEFAULT_TEXTURE_PROMPT).strip(),
                 "--lora_augment_scale",
                 str(float(lora_augment_scale)),
                 "--lora_augment_strength",
@@ -2939,6 +2943,18 @@ def scan_pretrained_models(models_dir: str):
     return gr.update(choices=models, value=(models[0] if models else None)), f"Found {len(models)} model(s) in {base}"
 
 
+def scan_lora_models(models_dir: str):
+    base = Path(models_dir).expanduser().resolve()
+    if not base.exists():
+        return gr.update(choices=[], value=None), "", f"Models directory not found: {base}"
+
+    exts = {".safetensors", ".safetensor"}
+    models = sorted([str(p.resolve()) for p in base.rglob("*") if p.is_file() and p.suffix.lower() in exts])
+    selected = models[0] if models else ""
+    msg = f"Found {len(models)} LoRA safetensor model(s) in {base}"
+    return gr.update(choices=models, value=(selected if selected else None)), selected, msg
+
+
 def run_ppn_image_analysis(
     output_dir: str,
     image_name: str,
@@ -3673,7 +3689,7 @@ def build_ui() -> gr.Blocks:
                     with gr.Row():
                         train_texture_gc = gr.Checkbox(label="gradient_checkpointing", value=True)
                         train_texture_te = gr.Checkbox(label="train_text_encoder", value=False)
-                    train_texture_prompt = gr.Textbox(label="prompt", value="scanned printed page", lines=2)
+                    train_texture_prompt = gr.Textbox(label="prompt", value=DEFAULT_TEXTURE_PROMPT, lines=2)
                     with gr.Row():
                         train_texture_seed = gr.Number(label="seed", value=42, precision=0)
                         train_texture_lora_name = gr.Textbox(label="lora_weights_name", value="texture_lora.safetensors")
@@ -3699,7 +3715,7 @@ def build_ui() -> gr.Blocks:
                     )
                     diff_prompt = gr.Textbox(
                         label="prompt",
-                        value="scanned printed page",
+                        value=DEFAULT_TEXTURE_PROMPT,
                         lines=2,
                     )
                     diff_lora_path = gr.Textbox(
@@ -3707,6 +3723,19 @@ def build_ui() -> gr.Blocks:
                         value="",
                         placeholder="Path to LoRA directory or *.safetensors",
                     )
+                    with gr.Row():
+                        diff_lora_models_dir = gr.Textbox(
+                            label="lora_models_dir",
+                            value=str((ROOT / "models").resolve()),
+                        )
+                        diff_scan_lora_btn = gr.Button("Scan LoRA Models")
+                    diff_lora_select = gr.Dropdown(
+                        label="Detected LoRA (.safetensor/.safetensors)",
+                        choices=[],
+                        value=None,
+                        allow_custom_value=True,
+                    )
+                    diff_lora_scan_msg = gr.Textbox(label="LoRA Scan Status", interactive=False)
                     diff_debug_upload_image = gr.Image(
                         type="numpy",
                         label="debug_upload_image (optional, for single-image test)",
@@ -3839,6 +3868,16 @@ def build_ui() -> gr.Blocks:
                 inputs=[diff_output_dir],
                 outputs=[diff_preview, diff_preview_status],
             )
+            diff_scan_lora_btn.click(
+                fn=scan_lora_models,
+                inputs=[diff_lora_models_dir],
+                outputs=[diff_lora_select, diff_lora_path, diff_lora_scan_msg],
+            )
+            diff_lora_select.change(
+                fn=lambda x: x or "",
+                inputs=[diff_lora_select],
+                outputs=[diff_lora_path],
+            )
 
         # 11) Donut OCR workflow
         with gr.Tab("11. Donut OCR Workflow"):
@@ -3914,7 +3953,7 @@ def build_ui() -> gr.Blocks:
                             )
                         donut_lora_prompt = gr.Textbox(
                             label="lora_augment_prompt",
-                            value="scanned printed page",
+                            value=DEFAULT_TEXTURE_PROMPT,
                             lines=2,
                         )
                         with gr.Row():
