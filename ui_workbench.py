@@ -514,7 +514,20 @@ def _list_images_recursive(root_dir: Path) -> List[Path]:
     return sorted([p for p in root_dir.rglob("*") if p.is_file() and p.suffix.lower() in exts])
 
 
-def _latest_image_from_folder(folder: str) -> Tuple[Optional[np.ndarray], str]:
+def _latest_output_mtime(folder: str) -> Optional[float]:
+    out_dir = Path(folder).expanduser().resolve()
+    if not out_dir.exists():
+        return None
+    mts: List[float] = []
+    for image_path in _list_images_recursive(out_dir):
+        try:
+            mts.append(float(image_path.stat().st_mtime))
+        except Exception:
+            continue
+    return max(mts) if mts else None
+
+
+def _latest_image_from_folder(folder: str, min_mtime: Optional[float] = None) -> Tuple[Optional[np.ndarray], str]:
     out_dir = Path(folder).expanduser().resolve()
     if not out_dir.exists():
         return None, f"Output folder not found: {out_dir}"
@@ -522,11 +535,16 @@ def _latest_image_from_folder(folder: str) -> Tuple[Optional[np.ndarray], str]:
     candidates: List[Tuple[float, Path]] = []
     for image_path in _list_images_recursive(out_dir):
         try:
-            candidates.append((image_path.stat().st_mtime, image_path))
+            mt = float(image_path.stat().st_mtime)
+            if min_mtime is not None and mt <= float(min_mtime):
+                continue
+            candidates.append((mt, image_path))
         except Exception:
             continue
 
     if not candidates:
+        if min_mtime is not None:
+            return None, f"No new images generated yet in {out_dir}"
         return None, f"No images found in {out_dir}"
 
     for _, image_path in sorted(candidates, key=lambda x: x[0], reverse=True):
@@ -664,6 +682,7 @@ def run_texture_augment_live(
         return
 
     out_dir.mkdir(parents=True, exist_ok=True)
+    pre_run_latest_mtime = _latest_output_mtime(str(out_dir))
 
     seed_arg: Optional[int] = None
     try:
@@ -741,7 +760,7 @@ def run_texture_augment_live(
     stream_failed = False
     stream_fail_msg = ""
 
-    preview_img, preview_txt = _latest_image_from_folder(str(out_dir))
+    preview_img, preview_txt = _latest_image_from_folder(str(out_dir), min_mtime=pre_run_latest_mtime)
     yield (
         f"Running {str(model_family).upper()} texture augmentation ...\\n"
         f"Input dir: {in_dir}\n"
@@ -781,7 +800,7 @@ def run_texture_augment_live(
 
         now = time.time()
         if now - last_emit_ts >= 1.0:
-            preview_img, preview_txt = _latest_image_from_folder(str(out_dir))
+            preview_img, preview_txt = _latest_image_from_folder(str(out_dir), min_mtime=pre_run_latest_mtime)
             tail = _tail_lines_newest_first(log_lines, 800)
             if stream_failed and stream_fail_msg:
                 tail = f"{tail}\n[warning] {stream_fail_msg}" if tail else f"[warning] {stream_fail_msg}"
@@ -814,7 +833,9 @@ def run_texture_augment_live(
 
     ok = proc.returncode == 0
     status = "Success" if ok else "Failed"
-    preview_img, preview_txt = _latest_image_from_folder(str(out_dir))
+    preview_img, preview_txt = _latest_image_from_folder(str(out_dir), min_mtime=pre_run_latest_mtime)
+    if preview_img is None:
+        preview_img, preview_txt = _latest_image_from_folder(str(out_dir))
     final_msg = (
         f"{status}\nInput dir: {in_dir}\nOutput dir: {out_dir}\n\n"
         + _tail_lines_newest_first(log_lines, 3000)
