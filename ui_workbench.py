@@ -70,9 +70,12 @@ VLM_VRAM_HINTS: Dict[str, str] = {
     "mineru25": "CLI backend, GPU optional",
 }
 
-SBB_GRID_PAGE_SIZE = 81
-SBB_GRID_COLS = 9
+SBB_GRID_COLS = 5
+SBB_GRID_ROWS = 9
+SBB_GRID_PAGE_SIZE = SBB_GRID_COLS * SBB_GRID_ROWS
 SBB_GRID_THUMB_SIZE = 160
+SBB_THUMB_CACHE_MAX = 1200
+_SBB_THUMB_CACHE: Dict[str, Tuple[float, np.ndarray]] = {}
 
 
 def _run_cmd(cmd: List[str], timeout: int = 3600) -> Tuple[bool, str]:
@@ -2994,6 +2997,41 @@ def _load_sbb_thumbnail(path: Path) -> np.ndarray:
     return np.array(canvas)
 
 
+def _get_sbb_thumbnail_cached(path: Path) -> np.ndarray:
+    key = str(path.resolve())
+    try:
+        mtime = float(path.stat().st_mtime)
+    except Exception:
+        mtime = 0.0
+
+    cached = _SBB_THUMB_CACHE.get(key)
+    if cached is not None:
+        cached_mtime, cached_img = cached
+        if abs(cached_mtime - mtime) < 1e-6:
+            return cached_img
+
+    thumb = _load_sbb_thumbnail(path)
+    _SBB_THUMB_CACHE[key] = (mtime, thumb)
+
+    # Keep cache bounded to avoid memory blowup on very large collections.
+    if len(_SBB_THUMB_CACHE) > SBB_THUMB_CACHE_MAX:
+        for old_key in list(_SBB_THUMB_CACHE.keys())[: len(_SBB_THUMB_CACHE) - SBB_THUMB_CACHE_MAX]:
+            _SBB_THUMB_CACHE.pop(old_key, None)
+    return thumb
+
+
+def _prefetch_sbb_page_thumbnails(paths: List[Path]) -> None:
+    if not paths:
+        return
+    with ThreadPoolExecutor(max_workers=8) as ex:
+        futures = [ex.submit(_get_sbb_thumbnail_cached, p) for p in paths]
+        for fut in futures:
+            try:
+                fut.result()
+            except Exception:
+                continue
+
+
 def _sbb_grid_render_page(sbb_images_dir: str, page_index: int, note: str = "") -> List[Any]:
     base = Path(sbb_images_dir).expanduser().resolve()
     if not base.exists() or not base.is_dir():
@@ -3025,6 +3063,9 @@ def _sbb_grid_render_page(sbb_images_dir: str, page_index: int, note: str = "") 
     start = page * SBB_GRID_PAGE_SIZE
     end = min(total, start + SBB_GRID_PAGE_SIZE)
     page_paths = all_images[start:end]
+    next_start = end
+    next_end = min(total, next_start + SBB_GRID_PAGE_SIZE)
+    next_page_paths = all_images[next_start:next_end]
 
     prefix = f"{note}\n" if note else ""
     status = f"{prefix}Page {page + 1}/{total_pages} | showing {start + 1}-{end} of {total}"
@@ -3036,7 +3077,7 @@ def _sbb_grid_render_page(sbb_images_dir: str, page_index: int, note: str = "") 
             rel = _sbb_rel(image_path, base)
             caption = f"{start + i + 1}/{total} - {rel}"
             try:
-                thumb = _load_sbb_thumbnail(image_path)
+                thumb = _get_sbb_thumbnail_cached(image_path)
                 img_update = gr.update(value=thumb, visible=True)
             except Exception as exc:
                 img_update = gr.update(value=None, visible=False)
@@ -3052,6 +3093,9 @@ def _sbb_grid_render_page(sbb_images_dir: str, page_index: int, note: str = "") 
                 gr.update(value=False, visible=False),
                 gr.update(value="", visible=False),
             ])
+
+    # Prefetch next page thumbnails so "Vor" displays instantly.
+    _prefetch_sbb_page_thumbnails(next_page_paths)
     return outputs
 
 
@@ -3797,7 +3841,7 @@ def build_ui() -> gr.Blocks:
             sbb_grid_checks: List[gr.Checkbox] = []
             sbb_grid_names: List[gr.Textbox] = []
 
-            for _row_idx in range(SBB_GRID_COLS):
+            for _row_idx in range(SBB_GRID_ROWS):
                 with gr.Row():
                     for _col_idx in range(SBB_GRID_COLS):
                         with gr.Column(min_width=110):
