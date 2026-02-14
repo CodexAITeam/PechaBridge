@@ -446,8 +446,10 @@ def add_train_texture_lora_arguments(parser):
                        help='Dataloader workers')
     parser.add_argument('--lora_weights_name', type=str, default='texture_lora.safetensors',
                        help='Output LoRA filename')
-    parser.add_argument('--checkpoint_every_epochs', type=int, default=5,
-                       help='Save checkpoint every N epochs (0 disables checkpointing)')
+    parser.add_argument('--checkpoint_every_steps', type=int, default=1000,
+                       help='Save checkpoint every N optimizer steps (0 disables checkpointing). Step checkpoints are never overwritten.')
+    parser.add_argument('--checkpoint_every_epochs', type=int, default=0,
+                       help='Optional: save checkpoint every N epochs (0 disables epoch checkpointing)')
     parser.add_argument('--checkpoint_weights_name', type=str, default='texture_lora_checkpoint.safetensors',
                        help='Checkpoint LoRA filename when overwriting is enabled')
     parser.add_argument('--checkpoint_keep_all', dest='checkpoint_overwrite', action='store_false',

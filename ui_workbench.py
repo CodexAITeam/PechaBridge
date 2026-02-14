@@ -76,6 +76,7 @@ SBB_GRID_PAGE_SIZE = SBB_GRID_COLS * SBB_GRID_ROWS
 SBB_GRID_THUMB_SIZE = 160
 SBB_THUMB_CACHE_MAX = 1200
 _SBB_THUMB_CACHE: Dict[str, Tuple[float, np.ndarray]] = {}
+_SBB_MEAN_CACHE: Dict[str, Tuple[float, float]] = {}
 
 
 def _run_cmd(cmd: List[str], timeout: int = 3600) -> Tuple[bool, str]:
@@ -3032,7 +3033,48 @@ def _prefetch_sbb_page_thumbnails(paths: List[Path]) -> None:
                 continue
 
 
-def _sbb_grid_render_page(sbb_images_dir: str, page_index: int, note: str = "") -> List[Any]:
+def _get_sbb_mean_cached(path: Path) -> float:
+    key = str(path.resolve())
+    try:
+        mtime = float(path.stat().st_mtime)
+    except Exception:
+        mtime = 0.0
+
+    cached = _SBB_MEAN_CACHE.get(key)
+    if cached is not None:
+        cached_mtime, cached_mean = cached
+        if abs(cached_mtime - mtime) < 1e-6:
+            return float(cached_mean)
+
+    thumb = _get_sbb_thumbnail_cached(path)
+    mean_val = float(np.mean(thumb))
+    _SBB_MEAN_CACHE[key] = (mtime, mean_val)
+    return mean_val
+
+
+def _sort_sbb_images(image_paths: List[Path], sort_mode: str) -> List[Path]:
+    mode = (sort_mode or "name").strip().lower()
+    if mode != "mean_color":
+        return sorted(image_paths)
+
+    with ThreadPoolExecutor(max_workers=8) as ex:
+        futures = {ex.submit(_get_sbb_mean_cached, p): p for p in image_paths}
+        pairs: List[Tuple[float, Path]] = []
+        for fut, path in futures.items():
+            try:
+                pairs.append((float(fut.result()), path))
+            except Exception:
+                pairs.append((255.0, path))
+    pairs.sort(key=lambda x: (x[0], str(x[1])))
+    return [p for _, p in pairs]
+
+
+def _sbb_grid_render_page(
+    sbb_images_dir: str,
+    page_index: int,
+    note: str = "",
+    sort_mode: str = "name",
+) -> List[Any]:
     base = Path(sbb_images_dir).expanduser().resolve()
     if not base.exists() or not base.is_dir():
         status = f"Folder not found: {base}"
@@ -3045,7 +3087,7 @@ def _sbb_grid_render_page(sbb_images_dir: str, page_index: int, note: str = "") 
             ])
         return outputs
 
-    all_images = _list_sbb_grid_images(base)
+    all_images = _sort_sbb_images(_list_sbb_grid_images(base), sort_mode=sort_mode)
     total = len(all_images)
     if total == 0:
         status = f"No images found in {base} (excluding quarantine)."
@@ -3068,8 +3110,9 @@ def _sbb_grid_render_page(sbb_images_dir: str, page_index: int, note: str = "") 
     next_page_paths = all_images[next_start:next_end]
 
     prefix = f"{note}\n" if note else ""
-    status = f"{prefix}Page {page + 1}/{total_pages} | showing {start + 1}-{end} of {total}"
-    outputs = [status, page, [str(p) for p in page_paths]]
+    mode_text = "mean_color (dark->bright)" if (sort_mode or "name").lower() == "mean_color" else "name"
+    status = f"{prefix}Page {page + 1}/{total_pages} | showing {start + 1}-{end} of {total} | sort={mode_text}"
+    outputs = [status, page, [str(p) for p in page_paths], sort_mode]
 
     for i in range(SBB_GRID_PAGE_SIZE):
         if i < len(page_paths):
@@ -3099,19 +3142,47 @@ def _sbb_grid_render_page(sbb_images_dir: str, page_index: int, note: str = "") 
     return outputs
 
 
-def sbb_grid_refresh(sbb_images_dir: str):
-    return _sbb_grid_render_page(sbb_images_dir=sbb_images_dir, page_index=0, note="Refreshed.")
+def sbb_grid_refresh(sbb_images_dir: str, sort_mode: str):
+    return _sbb_grid_render_page(
+        sbb_images_dir=sbb_images_dir,
+        page_index=0,
+        note="Refreshed.",
+        sort_mode=sort_mode,
+    )
 
 
-def sbb_grid_prev(sbb_images_dir: str, current_page: int):
-    return _sbb_grid_render_page(sbb_images_dir=sbb_images_dir, page_index=int(current_page) - 1)
+def sbb_grid_prev(sbb_images_dir: str, current_page: int, sort_mode: str):
+    return _sbb_grid_render_page(
+        sbb_images_dir=sbb_images_dir,
+        page_index=int(current_page) - 1,
+        sort_mode=sort_mode,
+    )
 
 
-def sbb_grid_next(sbb_images_dir: str, current_page: int):
-    return _sbb_grid_render_page(sbb_images_dir=sbb_images_dir, page_index=int(current_page) + 1)
+def sbb_grid_next(sbb_images_dir: str, current_page: int, sort_mode: str):
+    return _sbb_grid_render_page(
+        sbb_images_dir=sbb_images_dir,
+        page_index=int(current_page) + 1,
+        sort_mode=sort_mode,
+    )
 
 
-def sbb_grid_quarantine(sbb_images_dir: str, current_page: int, current_paths: List[str], *checked_flags):
+def sbb_grid_sort_by_mean(sbb_images_dir: str):
+    return _sbb_grid_render_page(
+        sbb_images_dir=sbb_images_dir,
+        page_index=0,
+        note="Sorted by mean color value (dark -> bright).",
+        sort_mode="mean_color",
+    )
+
+
+def sbb_grid_quarantine(
+    sbb_images_dir: str,
+    current_page: int,
+    current_paths: List[str],
+    sort_mode: str,
+    *checked_flags,
+):
     base = Path(sbb_images_dir).expanduser().resolve()
     quarantine_root = base / "quarantine"
     moved = 0
@@ -3145,7 +3216,12 @@ def sbb_grid_quarantine(sbb_images_dir: str, current_page: int, current_paths: L
             failed += 1
 
     note = f"Quarantine moved={moved}, skipped={skipped}, failed={failed} -> {quarantine_root}"
-    return _sbb_grid_render_page(sbb_images_dir=sbb_images_dir, page_index=int(current_page), note=note)
+    return _sbb_grid_render_page(
+        sbb_images_dir=sbb_images_dir,
+        page_index=int(current_page),
+        note=note,
+        sort_mode=sort_mode,
+    )
 
 
 def run_ppn_image_analysis(
@@ -3830,12 +3906,14 @@ def build_ui() -> gr.Blocks:
             with gr.Row():
                 sbb_grid_dir = gr.Textbox(label="sbb_images_dir", value=default_sbb_grid_dir)
                 sbb_grid_refresh_btn = gr.Button("Refresh", variant="secondary")
+                sbb_grid_sort_mean_btn = gr.Button("Sort by Mean Color")
                 sbb_grid_prev_btn = gr.Button("Zurueck", elem_id="sbb-grid-prev-btn")
                 sbb_grid_next_btn = gr.Button("Vor", elem_id="sbb-grid-next-btn")
                 sbb_grid_quarantine_btn = gr.Button("Quarantine Selected", variant="primary")
             sbb_grid_status = gr.Textbox(label="Grid Status", interactive=False)
             sbb_grid_page_state = gr.State(0)
             sbb_grid_paths_state = gr.State([])
+            sbb_grid_sort_state = gr.State("name")
             gr.HTML(
                 """
 <script>
@@ -3881,28 +3959,33 @@ def build_ui() -> gr.Blocks:
                             sbb_grid_checks.append(chk)
                             sbb_grid_names.append(name)
 
-            sbb_grid_outputs: List[Any] = [sbb_grid_status, sbb_grid_page_state, sbb_grid_paths_state]
+            sbb_grid_outputs: List[Any] = [sbb_grid_status, sbb_grid_page_state, sbb_grid_paths_state, sbb_grid_sort_state]
             for _img, _chk, _name in zip(sbb_grid_images, sbb_grid_checks, sbb_grid_names):
                 sbb_grid_outputs.extend([_img, _chk, _name])
 
             sbb_grid_refresh_btn.click(
                 fn=sbb_grid_refresh,
+                inputs=[sbb_grid_dir, sbb_grid_sort_state],
+                outputs=sbb_grid_outputs,
+            )
+            sbb_grid_sort_mean_btn.click(
+                fn=sbb_grid_sort_by_mean,
                 inputs=[sbb_grid_dir],
                 outputs=sbb_grid_outputs,
             )
             sbb_grid_prev_btn.click(
                 fn=sbb_grid_prev,
-                inputs=[sbb_grid_dir, sbb_grid_page_state],
+                inputs=[sbb_grid_dir, sbb_grid_page_state, sbb_grid_sort_state],
                 outputs=sbb_grid_outputs,
             )
             sbb_grid_next_btn.click(
                 fn=sbb_grid_next,
-                inputs=[sbb_grid_dir, sbb_grid_page_state],
+                inputs=[sbb_grid_dir, sbb_grid_page_state, sbb_grid_sort_state],
                 outputs=sbb_grid_outputs,
             )
             sbb_grid_quarantine_btn.click(
                 fn=sbb_grid_quarantine,
-                inputs=[sbb_grid_dir, sbb_grid_page_state, sbb_grid_paths_state, *sbb_grid_checks],
+                inputs=[sbb_grid_dir, sbb_grid_page_state, sbb_grid_paths_state, sbb_grid_sort_state, *sbb_grid_checks],
                 outputs=sbb_grid_outputs,
             )
 
