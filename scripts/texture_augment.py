@@ -112,10 +112,20 @@ def _load_pipeline(args, base_model_id: str, controlnet_model_id: str, device: t
             LOGGER.info("Loading LoRA directory: %s", lora_path)
             pipe.load_lora_weights(str(lora_path))
 
+    # Some builds may replace outputs with black frames via safety checker.
+    if hasattr(pipe, "safety_checker"):
+        pipe.safety_checker = None
+
     pipe.to(device)
 
     if device.type == "cuda":
         pipe.enable_vae_tiling()
+        # SDXL is prone to black outputs when VAE decode stays in fp16 on some GPU stacks.
+        if args.model_family == "sdxl":
+            if hasattr(pipe, "upcast_vae"):
+                pipe.upcast_vae()
+            elif hasattr(pipe, "vae"):
+                pipe.vae.to(dtype=torch.float32)
 
     return pipe
 
@@ -191,12 +201,8 @@ def run(args) -> dict:
             if cross_attention_kwargs:
                 call_kwargs["cross_attention_kwargs"] = cross_attention_kwargs
 
-            if device.type == "cuda":
-                with torch.inference_mode(), torch.autocast("cuda", dtype=dtype):
-                    result = pipe(**call_kwargs).images[0]
-            else:
-                with torch.inference_mode():
-                    result = pipe(**call_kwargs).images[0]
+            with torch.inference_mode():
+                result = pipe(**call_kwargs).images[0]
 
             result.save(out_path)
             generated += 1
