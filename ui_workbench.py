@@ -3830,12 +3830,34 @@ def build_ui() -> gr.Blocks:
             with gr.Row():
                 sbb_grid_dir = gr.Textbox(label="sbb_images_dir", value=default_sbb_grid_dir)
                 sbb_grid_refresh_btn = gr.Button("Refresh", variant="secondary")
-                sbb_grid_prev_btn = gr.Button("Zurueck")
-                sbb_grid_next_btn = gr.Button("Vor")
+                sbb_grid_prev_btn = gr.Button("Zurueck", elem_id="sbb-grid-prev-btn")
+                sbb_grid_next_btn = gr.Button("Vor", elem_id="sbb-grid-next-btn")
                 sbb_grid_quarantine_btn = gr.Button("Quarantine Selected", variant="primary")
             sbb_grid_status = gr.Textbox(label="Grid Status", interactive=False)
             sbb_grid_page_state = gr.State(0)
             sbb_grid_paths_state = gr.State([])
+            gr.HTML(
+                """
+<script>
+(() => {
+  if (window.__sbbGridHotkeysInstalled) return;
+  window.__sbbGridHotkeysInstalled = true;
+  document.addEventListener("keydown", (ev) => {
+    const tag = (ev.target && ev.target.tagName ? ev.target.tagName.toLowerCase() : "");
+    const isTyping = tag === "input" || tag === "textarea" || ev.target?.isContentEditable;
+    if (isTyping) return;
+    if (ev.key === "ArrowLeft") {
+      const btn = document.getElementById("sbb-grid-prev-btn");
+      if (btn) btn.click();
+    } else if (ev.key === "ArrowRight") {
+      const btn = document.getElementById("sbb-grid-next-btn");
+      if (btn) btn.click();
+    }
+  });
+})();
+</script>
+                """
+            )
 
             sbb_grid_images: List[gr.Image] = []
             sbb_grid_checks: List[gr.Checkbox] = []
