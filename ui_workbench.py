@@ -14,6 +14,7 @@ from __future__ import annotations
 import json
 import os
 import shlex
+import shutil
 import subprocess
 import sys
 import tempfile
@@ -68,6 +69,10 @@ VLM_VRAM_HINTS: Dict[str, str] = {
     "florence2": "~8-16 GB",
     "mineru25": "CLI backend, GPU optional",
 }
+
+SBB_GRID_PAGE_SIZE = 81
+SBB_GRID_COLS = 9
+SBB_GRID_THUMB_SIZE = 160
 
 
 def _run_cmd(cmd: List[str], timeout: int = 3600) -> Tuple[bool, str]:
@@ -2955,6 +2960,150 @@ def scan_lora_models(models_dir: str):
     return gr.update(choices=models, value=(selected if selected else None)), selected, msg
 
 
+def _list_sbb_grid_images(sbb_dir: Path) -> List[Path]:
+    if not sbb_dir.exists():
+        return []
+    images: List[Path] = []
+    for p in _list_images_recursive(sbb_dir):
+        try:
+            rel_parts = [part.lower() for part in p.relative_to(sbb_dir).parts]
+        except Exception:
+            rel_parts = [part.lower() for part in p.parts]
+        if "quarantine" in rel_parts:
+            continue
+        images.append(p)
+    return sorted(images)
+
+
+def _sbb_rel(path: Path, root: Path) -> str:
+    try:
+        return str(path.relative_to(root))
+    except Exception:
+        return path.name
+
+
+def _load_sbb_thumbnail(path: Path) -> np.ndarray:
+    with Image.open(path) as im:
+        rgb = im.convert("RGB")
+        resample = Image.Resampling.LANCZOS if hasattr(Image, "Resampling") else Image.LANCZOS
+        rgb.thumbnail((SBB_GRID_THUMB_SIZE, SBB_GRID_THUMB_SIZE), resample=resample)
+        canvas = Image.new("RGB", (SBB_GRID_THUMB_SIZE, SBB_GRID_THUMB_SIZE), (245, 245, 245))
+        ox = max(0, (SBB_GRID_THUMB_SIZE - rgb.width) // 2)
+        oy = max(0, (SBB_GRID_THUMB_SIZE - rgb.height) // 2)
+        canvas.paste(rgb, (ox, oy))
+    return np.array(canvas)
+
+
+def _sbb_grid_render_page(sbb_images_dir: str, page_index: int, note: str = "") -> List[Any]:
+    base = Path(sbb_images_dir).expanduser().resolve()
+    if not base.exists() or not base.is_dir():
+        status = f"Folder not found: {base}"
+        outputs: List[Any] = [status, 0, []]
+        for _ in range(SBB_GRID_PAGE_SIZE):
+            outputs.extend([
+                gr.update(value=None, visible=False),
+                gr.update(value=False, visible=False),
+                gr.update(value="", visible=False),
+            ])
+        return outputs
+
+    all_images = _list_sbb_grid_images(base)
+    total = len(all_images)
+    if total == 0:
+        status = f"No images found in {base} (excluding quarantine)."
+        outputs = [status, 0, []]
+        for _ in range(SBB_GRID_PAGE_SIZE):
+            outputs.extend([
+                gr.update(value=None, visible=False),
+                gr.update(value=False, visible=False),
+                gr.update(value="", visible=False),
+            ])
+        return outputs
+
+    total_pages = (total + SBB_GRID_PAGE_SIZE - 1) // SBB_GRID_PAGE_SIZE
+    page = max(0, min(int(page_index), total_pages - 1))
+    start = page * SBB_GRID_PAGE_SIZE
+    end = min(total, start + SBB_GRID_PAGE_SIZE)
+    page_paths = all_images[start:end]
+
+    prefix = f"{note}\n" if note else ""
+    status = f"{prefix}Page {page + 1}/{total_pages} | showing {start + 1}-{end} of {total}"
+    outputs = [status, page, [str(p) for p in page_paths]]
+
+    for i in range(SBB_GRID_PAGE_SIZE):
+        if i < len(page_paths):
+            image_path = page_paths[i]
+            rel = _sbb_rel(image_path, base)
+            caption = f"{start + i + 1}/{total} - {rel}"
+            try:
+                thumb = _load_sbb_thumbnail(image_path)
+                img_update = gr.update(value=thumb, visible=True)
+            except Exception as exc:
+                img_update = gr.update(value=None, visible=False)
+                caption = f"{caption} (preview error: {type(exc).__name__})"
+            outputs.extend([
+                img_update,
+                gr.update(value=False, visible=True),
+                gr.update(value=caption, visible=True),
+            ])
+        else:
+            outputs.extend([
+                gr.update(value=None, visible=False),
+                gr.update(value=False, visible=False),
+                gr.update(value="", visible=False),
+            ])
+    return outputs
+
+
+def sbb_grid_refresh(sbb_images_dir: str):
+    return _sbb_grid_render_page(sbb_images_dir=sbb_images_dir, page_index=0, note="Refreshed.")
+
+
+def sbb_grid_prev(sbb_images_dir: str, current_page: int):
+    return _sbb_grid_render_page(sbb_images_dir=sbb_images_dir, page_index=int(current_page) - 1)
+
+
+def sbb_grid_next(sbb_images_dir: str, current_page: int):
+    return _sbb_grid_render_page(sbb_images_dir=sbb_images_dir, page_index=int(current_page) + 1)
+
+
+def sbb_grid_quarantine(sbb_images_dir: str, current_page: int, current_paths: List[str], *checked_flags):
+    base = Path(sbb_images_dir).expanduser().resolve()
+    quarantine_root = base / "quarantine"
+    moved = 0
+    skipped = 0
+    failed = 0
+
+    selected_paths = list(current_paths or [])
+    for path_str, checked in zip(selected_paths, checked_flags):
+        if not checked:
+            continue
+        src = Path(path_str).expanduser().resolve()
+        if not src.exists():
+            skipped += 1
+            continue
+        try:
+            rel = src.relative_to(base)
+        except Exception:
+            skipped += 1
+            continue
+        if rel.parts and rel.parts[0].lower() == "quarantine":
+            skipped += 1
+            continue
+        dst = quarantine_root / rel
+        dst.parent.mkdir(parents=True, exist_ok=True)
+        if dst.exists():
+            dst = dst.with_name(f"{dst.stem}_{int(time.time())}{dst.suffix}")
+        try:
+            shutil.move(str(src), str(dst))
+            moved += 1
+        except Exception:
+            failed += 1
+
+    note = f"Quarantine moved={moved}, skipped={skipped}, failed={failed} -> {quarantine_root}"
+    return _sbb_grid_render_page(sbb_images_dir=sbb_images_dir, page_index=int(current_page), note=note)
+
+
 def run_ppn_image_analysis(
     output_dir: str,
     image_name: str,
@@ -3015,6 +3164,7 @@ def build_ui() -> gr.Blocks:
     default_texture_input_dir = str((ROOT / "datasets" / "tibetan-yolo-ui" / "train" / "images").resolve())
     default_texture_output_dir = str((ROOT / "datasets" / "tibetan-yolo-ui-textured").resolve())
     default_texture_real_pages_dir = str((ROOT / "sbb_images").resolve())
+    default_sbb_grid_dir = str((ROOT / "sbb_images").resolve())
     default_texture_lora_dataset_dir = str((ROOT / "datasets" / "texture-lora-dataset").resolve())
     default_texture_lora_output_dir = str((ROOT / "models" / "texture-lora-sdxl").resolve())
     default_image_encoder_input_dir = str((ROOT / "sbb_images").resolve())
@@ -3061,10 +3211,11 @@ def build_ui() -> gr.Blocks:
                 "7. VLM Layout: Run transformer-based layout parsing on a single image.\n"
                 "8. Label Studio Export: Convert YOLO split folders to Label Studio tasks and launch Label Studio.\n"
                 "9. PPN Downloader: Download and analyze SBB images.\n"
-                "10. Diffusion + LoRA: Prepare texture crops, train LoRA, and run SDXL/SD2.1 + ControlNet inference.\n"
-                "11. Donut OCR Workflow: Run synthetic generation + manifest prep + Donut-style OCR training on label 1.\n"
-                "12. Retrieval Encoders: Train image and text encoders for future n-gram retrieval.\n"
-                "13. CLI Audit: Show all CLI options from project scripts."
+                "10. SBB Grid Review: Browse sbb_images in 9x9 pages and move selected pages to quarantine.\n"
+                "11. Diffusion + LoRA: Prepare texture crops, train LoRA, and run SDXL/SD2.1 + ControlNet inference.\n"
+                "12. Donut OCR Workflow: Run synthetic generation + manifest prep + Donut-style OCR training on label 1.\n"
+                "13. Retrieval Encoders: Train image and text encoders for future n-gram retrieval.\n"
+                "14. CLI Audit: Show all CLI options from project scripts."
             )
 
         # 2) Data generation
@@ -3626,8 +3777,71 @@ def build_ui() -> gr.Blocks:
                 outputs=[ppn_overlay, ppn_analysis_status, ppn_analysis_json],
             )
 
-        # 10) Diffusion + LoRA texture augmentation
-        with gr.Tab("10. Diffusion + LoRA"):
+        # 10) SBB grid review + quarantine
+        with gr.Tab("10. SBB Grid Review"):
+            gr.Markdown(
+                "Browse images from `sbb_images` as lightweight 9x9 thumbnails. "
+                "Select pages via checkboxes and move them to `sbb_images/quarantine`."
+            )
+            with gr.Row():
+                sbb_grid_dir = gr.Textbox(label="sbb_images_dir", value=default_sbb_grid_dir)
+                sbb_grid_refresh_btn = gr.Button("Refresh", variant="secondary")
+                sbb_grid_prev_btn = gr.Button("Zurueck")
+                sbb_grid_next_btn = gr.Button("Vor")
+                sbb_grid_quarantine_btn = gr.Button("Quarantine Selected", variant="primary")
+            sbb_grid_status = gr.Textbox(label="Grid Status", interactive=False)
+            sbb_grid_page_state = gr.State(0)
+            sbb_grid_paths_state = gr.State([])
+
+            sbb_grid_images: List[gr.Image] = []
+            sbb_grid_checks: List[gr.Checkbox] = []
+            sbb_grid_names: List[gr.Textbox] = []
+
+            for _row_idx in range(SBB_GRID_COLS):
+                with gr.Row():
+                    for _col_idx in range(SBB_GRID_COLS):
+                        with gr.Column(min_width=110):
+                            img = gr.Image(
+                                type="numpy",
+                                label=None,
+                                show_label=False,
+                                height=SBB_GRID_THUMB_SIZE,
+                                width=SBB_GRID_THUMB_SIZE,
+                                visible=False,
+                            )
+                            chk = gr.Checkbox(label="Q", value=False, visible=False)
+                            name = gr.Textbox(show_label=False, value="", interactive=False, visible=False)
+                            sbb_grid_images.append(img)
+                            sbb_grid_checks.append(chk)
+                            sbb_grid_names.append(name)
+
+            sbb_grid_outputs: List[Any] = [sbb_grid_status, sbb_grid_page_state, sbb_grid_paths_state]
+            for _img, _chk, _name in zip(sbb_grid_images, sbb_grid_checks, sbb_grid_names):
+                sbb_grid_outputs.extend([_img, _chk, _name])
+
+            sbb_grid_refresh_btn.click(
+                fn=sbb_grid_refresh,
+                inputs=[sbb_grid_dir],
+                outputs=sbb_grid_outputs,
+            )
+            sbb_grid_prev_btn.click(
+                fn=sbb_grid_prev,
+                inputs=[sbb_grid_dir, sbb_grid_page_state],
+                outputs=sbb_grid_outputs,
+            )
+            sbb_grid_next_btn.click(
+                fn=sbb_grid_next,
+                inputs=[sbb_grid_dir, sbb_grid_page_state],
+                outputs=sbb_grid_outputs,
+            )
+            sbb_grid_quarantine_btn.click(
+                fn=sbb_grid_quarantine,
+                inputs=[sbb_grid_dir, sbb_grid_page_state, sbb_grid_paths_state, *sbb_grid_checks],
+                outputs=sbb_grid_outputs,
+            )
+
+        # 11) Diffusion + LoRA texture augmentation
+        with gr.Tab("11. Diffusion + LoRA"):
             gr.Markdown(
                 "End-to-end texture workflow: "
                 "A) prepare LoRA crop dataset from real/SBB pages, "
@@ -3879,8 +4093,8 @@ def build_ui() -> gr.Blocks:
                 outputs=[diff_lora_path],
             )
 
-        # 11) Donut OCR workflow
-        with gr.Tab("11. Donut OCR Workflow"):
+        # 12) Donut OCR workflow
+        with gr.Tab("12. Donut OCR Workflow"):
             gr.Markdown(
                 "Run label-1 Donut-style OCR training end-to-end "
                 "(synthetic generation -> OCR manifest prep -> Vision Transformer encoder + autoregressive decoder training)."
@@ -4037,8 +4251,8 @@ def build_ui() -> gr.Blocks:
                 ],
             )
 
-        # 12) Retrieval encoder training
-        with gr.Tab("12. Retrieval Encoders"):
+        # 13) Retrieval encoder training
+        with gr.Tab("13. Retrieval Encoders"):
             gr.Markdown(
                 "Train unpaired encoders for future Tibetan n-gram retrieval: "
                 "A) self-supervised image encoder on page images, "
@@ -4197,8 +4411,8 @@ def build_ui() -> gr.Blocks:
                 ],
             )
 
-        # 13) CLI reference
-        with gr.Tab("13. CLI Audit"):
+        # 14) CLI reference
+        with gr.Tab("14. CLI Audit"):
             audit_btn = gr.Button("Scan All CLI Options")
             audit_out = gr.Markdown()
             audit_btn.click(fn=collect_cli_help, inputs=[], outputs=[audit_out])
