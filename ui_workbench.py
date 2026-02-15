@@ -13,6 +13,7 @@ from __future__ import annotations
 
 import json
 import os
+import re
 import shlex
 import shutil
 import subprocess
@@ -148,8 +149,8 @@ def _list_images(split_images_dir: Path) -> List[str]:
     return sorted([p.name for p in split_images_dir.iterdir() if p.is_file() and p.suffix.lower() in exts])
 
 
-def _read_yolo_labels(label_path: Path) -> List[Tuple[int, float, float, float, float]]:
-    rows = []
+def _read_yolo_labels(label_path: Path) -> List[Dict[str, Any]]:
+    rows: List[Dict[str, Any]] = []
     if not label_path.exists():
         return rows
     for raw in label_path.read_text(encoding="utf-8").splitlines():
@@ -157,12 +158,52 @@ def _read_yolo_labels(label_path: Path) -> List[Tuple[int, float, float, float, 
         if not line:
             continue
         parts = line.split()
-        if len(parts) != 5:
-            continue
         try:
-            rows.append((int(parts[0]), float(parts[1]), float(parts[2]), float(parts[3]), float(parts[4])))
+            cls = int(parts[0])
         except Exception:
             continue
+
+        # YOLO detect format: class cx cy w h
+        if len(parts) == 5:
+            try:
+                cx, cy, bw, bh = float(parts[1]), float(parts[2]), float(parts[3]), float(parts[4])
+                rows.append(
+                    {
+                        "class": cls,
+                        "type": "bbox",
+                        "cx": cx,
+                        "cy": cy,
+                        "bw": bw,
+                        "bh": bh,
+                    }
+                )
+            except Exception:
+                continue
+            continue
+
+        # YOLO segment format: class x1 y1 x2 y2 ... xn yn
+        if len(parts) >= 7 and (len(parts) - 1) % 2 == 0:
+            coords: List[float] = []
+            ok = True
+            for tok in parts[1:]:
+                try:
+                    coords.append(float(tok))
+                except Exception:
+                    ok = False
+                    break
+            if not ok:
+                continue
+            points = [(coords[i], coords[i + 1]) for i in range(0, len(coords), 2)]
+            if len(points) >= 3:
+                rows.append(
+                    {
+                        "class": cls,
+                        "type": "polygon",
+                        "points": points,
+                    }
+                )
+            continue
+
     return rows
 
 
@@ -246,15 +287,44 @@ def _draw_yolo_boxes(image_path: Path, label_path: Path) -> Tuple[np.ndarray, st
         2: (130, 255, 130),
     }
     lines = []
-    for i, (cls, cx, cy, bw, bh) in enumerate(labels, start=1):
-        x1 = int((cx - bw / 2) * w)
-        y1 = int((cy - bh / 2) * h)
-        x2 = int((cx + bw / 2) * w)
-        y2 = int((cy + bh / 2) * h)
+    for i, ann in enumerate(labels, start=1):
+        cls = int(ann.get("class", -1))
         color = class_colors.get(cls, (255, 80, 80))
-        draw.rectangle((x1, y1, x2, y2), outline=color, width=3)
+
+        if ann.get("type") == "bbox":
+            cx = float(ann["cx"])
+            cy = float(ann["cy"])
+            bw = float(ann["bw"])
+            bh = float(ann["bh"])
+            x1 = int((cx - bw / 2) * w)
+            y1 = int((cy - bh / 2) * h)
+            x2 = int((cx + bw / 2) * w)
+            y2 = int((cy + bh / 2) * h)
+            draw.rectangle((x1, y1, x2, y2), outline=color, width=3)
+            draw.text((x1 + 2, max(0, y1 - 14)), f"{cls}", fill=color)
+            lines.append(f"{i}. class={cls} bbox cx={cx:.4f} cy={cy:.4f} w={bw:.4f} h={bh:.4f}")
+            continue
+
+        points = ann.get("points") or []
+        if not isinstance(points, list) or len(points) < 3:
+            continue
+
+        norm = True
+        for x, y in points:
+            if abs(float(x)) > 1.5 or abs(float(y)) > 1.5:
+                norm = False
+                break
+        if norm:
+            pts_px = [(int(float(x) * w), int(float(y) * h)) for x, y in points]
+        else:
+            pts_px = [(int(float(x)), int(float(y))) for x, y in points]
+
+        draw.polygon(pts_px, outline=color)
+        xs = [p[0] for p in pts_px]
+        ys = [p[1] for p in pts_px]
+        x1, y1, x2, y2 = min(xs), min(ys), max(xs), max(ys)
         draw.text((x1 + 2, max(0, y1 - 14)), f"{cls}", fill=color)
-        lines.append(f"{i}. class={cls} cx={cx:.4f} cy={cy:.4f} w={bw:.4f} h={bh:.4f}")
+        lines.append(f"{i}. class={cls} polygon n={len(pts_px)} bbox=({x1},{y1},{x2},{y2})")
 
     summary = f"Found {len(labels)} boxes\n" + ("\n".join(lines[:25]) if lines else "")
     if len(lines) > 25:
@@ -2229,9 +2299,36 @@ def run_ultralytics_train(
             cmd.extend(["--wandb-name", wandb_name.strip()])
 
     ok, out = _run_cmd(cmd, timeout=86400)
-    best_model = Path(project).expanduser().resolve() / name / "weights" / "best.pt"
     status = "Success" if ok else "Failed"
-    return f"{status}\nBest model path: {best_model}\n\n{out}", str(best_model)
+
+    best_model = _find_latest_best_model(project=project, name=name)
+    expected_best_model = _project_dir_abs(project) / name / "weights" / "best.pt"
+
+    if ok and best_model is not None:
+        copied_model, copy_msg = _archive_layout_best_model(
+            best_model_path=best_model,
+            dataset=dataset,
+            model=model,
+            name=name,
+            epochs=epochs,
+            batch=batch,
+            imgsz=imgsz,
+            patience=patience,
+        )
+        final_path = copied_model or best_model
+        return (
+            f"{status}\nBest model path: {best_model}\nArchived model path: {final_path}\n{copy_msg}\n\n{out}",
+            str(final_path),
+        )
+
+    if ok and best_model is None:
+        locate_msg = (
+            f"Could not locate best.pt under project={_project_dir_abs(project)} name={name}. "
+            "Check whether Ultralytics auto-incremented run naming."
+        )
+        return f"{status}\nExpected best model path: {expected_best_model}\n{locate_msg}\n\n{out}", str(expected_best_model)
+
+    return f"{status}\nExpected best model path: {expected_best_model}\n\n{out}", str(expected_best_model)
 
 
 def _build_ultralytics_train_cmd(
@@ -2292,6 +2389,94 @@ def _build_ultralytics_train_cmd(
     return cmd
 
 
+def _sanitize_slug(value: str, default: str = "na", max_len: int = 48) -> str:
+    txt = (value or "").strip()
+    if not txt:
+        return default
+    txt = txt.replace(os.sep, "_")
+    txt = re.sub(r"[^A-Za-z0-9._-]+", "-", txt)
+    txt = re.sub(r"-{2,}", "-", txt).strip("-._")
+    if not txt:
+        return default
+    return txt[:max_len]
+
+
+def _project_dir_abs(project: str) -> Path:
+    p = Path(project).expanduser()
+    if not p.is_absolute():
+        p = (ROOT / p).resolve()
+    return p
+
+
+def _find_latest_best_model(project: str, name: str) -> Optional[Path]:
+    project_dir = _project_dir_abs(project)
+    candidates: List[Path] = []
+
+    exact = project_dir / name / "weights" / "best.pt"
+    if exact.exists():
+        candidates.append(exact)
+
+    if project_dir.exists():
+        for p in project_dir.glob(f"{name}*/weights/best.pt"):
+            if p.is_file():
+                candidates.append(p)
+
+    if not candidates:
+        return None
+
+    candidates = sorted(set(candidates), key=lambda p: p.stat().st_mtime, reverse=True)
+    return candidates[0]
+
+
+def _extract_lr0_from_run_dir(run_dir: Optional[Path]) -> str:
+    if run_dir is None:
+        return "unknown"
+    args_yaml = run_dir / "args.yaml"
+    if not args_yaml.exists():
+        return "unknown"
+    try:
+        for raw in args_yaml.read_text(encoding="utf-8", errors="replace").splitlines():
+            line = raw.strip()
+            if line.startswith("lr0:"):
+                val = line.split(":", 1)[1].strip()
+                return _sanitize_slug(val, default="unknown", max_len=20)
+    except Exception:
+        return "unknown"
+    return "unknown"
+
+
+def _archive_layout_best_model(
+    best_model_path: Path,
+    dataset: str,
+    model: str,
+    name: str,
+    epochs: int,
+    batch: int,
+    imgsz: int,
+    patience: int,
+) -> Tuple[Optional[Path], str]:
+    if not best_model_path.exists():
+        return None, f"best.pt not found at {best_model_path}"
+
+    run_dir = best_model_path.parent.parent
+    lr0 = _extract_lr0_from_run_dir(run_dir)
+    dataset_tok = _sanitize_slug(Path(str(dataset)).stem if dataset else "", default="dataset")
+    model_tok = _sanitize_slug(Path(str(model)).name, default="model")
+    run_tok = _sanitize_slug(name, default="run")
+    ts = time.strftime("%Y%m%d-%H%M%S")
+
+    target_dir = (ROOT / "models" / "layoutModels").resolve()
+    target_dir.mkdir(parents=True, exist_ok=True)
+
+    filename = (
+        f"layout_{dataset_tok}_{model_tok}_lr{lr0}_ep{int(epochs)}_bs{int(batch)}_"
+        f"sz{int(imgsz)}_pat{int(patience)}_{run_tok}_{ts}.pt"
+    )
+    target = target_dir / filename
+    shutil.copy2(best_model_path, target)
+    return target, f"Copied best model to {target}"
+
+
 def run_ultralytics_train_live(
     dataset: str,
     model: str,
@@ -2328,7 +2513,7 @@ def run_ultralytics_train_live(
         wandb_tags=wandb_tags,
         wandb_name=wandb_name,
     )
-    best_model = Path(project).expanduser().resolve() / name / "weights" / "best.pt"
+    expected_best_model = _project_dir_abs(project) / name / "weights" / "best.pt"
 
     try:
         env = os.environ.copy()
@@ -2343,8 +2528,8 @@ def run_ultralytics_train_live(
             bufsize=0,
         )
     except Exception as exc:
-        msg = f"Failed\nBest model path: {best_model}\n\n{type(exc).__name__}: {exc}"
-        yield msg, str(best_model)
+        msg = f"Failed\nExpected best model path: {expected_best_model}\n\n{type(exc).__name__}: {exc}"
+        yield msg, str(expected_best_model)
         return
 
     if proc.stdout is not None:
@@ -2360,7 +2545,7 @@ def run_ultralytics_train_live(
     stream_failed = False
     stream_fail_msg = ""
 
-    yield f"Running ...\nBest model path: {best_model}\n", str(best_model)
+    yield f"Running ...\nExpected best model path: {expected_best_model}\n", str(expected_best_model)
 
     while True:
         got_output = False
@@ -2398,8 +2583,8 @@ def run_ultralytics_train_live(
             tail = _tail_lines_newest_first(log_lines, 800)
             if stream_failed and stream_fail_msg:
                 tail = f"{tail}\n[warning] {stream_fail_msg}" if tail else f"[warning] {stream_fail_msg}"
-            running_msg = f"Running ...\nBest model path: {best_model}\n\n{tail}"
-            yield running_msg, str(best_model)
+            running_msg = f"Running ...\nExpected best model path: {expected_best_model}\n\n{tail}"
+            yield running_msg, str(expected_best_model)
             last_emit_ts = now
             last_emit_count = len(log_lines)
 
@@ -2424,8 +2609,37 @@ def run_ultralytics_train_live(
 
     ok = proc.returncode == 0
     status = "Success" if ok else "Failed"
-    final_msg = f"{status}\nBest model path: {best_model}\n\n" + _tail_lines_newest_first(log_lines, 3000)
-    yield final_msg, str(best_model)
+    best_model = _find_latest_best_model(project=project, name=name)
+    if ok and best_model is not None:
+        copied_model, copy_msg = _archive_layout_best_model(
+            best_model_path=best_model,
+            dataset=dataset,
+            model=model,
+            name=name,
+            epochs=epochs,
+            batch=batch,
+            imgsz=imgsz,
+            patience=patience,
+        )
+        final_path = copied_model or best_model
+        final_msg = (
+            f"{status}\nBest model path: {best_model}\nArchived model path: {final_path}\n{copy_msg}\n\n"
+            + _tail_lines_newest_first(log_lines, 3000)
+        )
+        yield final_msg, str(final_path)
+        return
+
+    if ok and best_model is None:
+        locate_msg = (
+            f"Could not locate best.pt under project={_project_dir_abs(project)} name={name}. "
+            "Check whether Ultralytics auto-incremented run naming."
+        )
+        final_msg = f"{status}\nExpected best model path: {expected_best_model}\n{locate_msg}\n\n" + _tail_lines_newest_first(log_lines, 3000)
+        yield final_msg, str(expected_best_model)
+        return
+
+    final_msg = f"{status}\nExpected best model path: {expected_best_model}\n\n" + _tail_lines_newest_first(log_lines, 3000)
+    yield final_msg, str(expected_best_model)
 
 
 def _ultralytics_model_presets() -> List[str]:
@@ -3674,7 +3888,7 @@ def build_ui() -> gr.Blocks:
                 with gr.Column():
                     train_workers = gr.Number(label="workers", value=8, precision=0)
                     train_device = gr.Textbox(label="device", value="cuda:0")
-                    train_project = gr.Textbox(label="project", value="runs/detect")
+                    train_project = gr.Textbox(label="project", value=str((workspace_root / "runs" / "detect").resolve()))
                     train_name = gr.Textbox(label="name", value="train-ui")
                     train_patience = gr.Number(label="patience", value=50, precision=0)
                     train_export = gr.Checkbox(label="export", value=True)
