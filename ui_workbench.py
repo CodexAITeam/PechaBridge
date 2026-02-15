@@ -1093,7 +1093,7 @@ def run_train_texture_lora_live(
         "--lora_alpha",
         str(float(lora_alpha)),
         "--mixed_precision",
-        (mixed_precision or "fp16").strip(),
+        (mixed_precision or "no").strip(),
         "--prompt",
         (prompt or DEFAULT_TEXTURE_PROMPT).strip(),
         "--seed",
@@ -3167,6 +3167,46 @@ def sbb_grid_next(sbb_images_dir: str, current_page: int, sort_mode: str):
     )
 
 
+def sbb_grid_first(sbb_images_dir: str, sort_mode: str):
+    return _sbb_grid_render_page(
+        sbb_images_dir=sbb_images_dir,
+        page_index=0,
+        sort_mode=sort_mode,
+    )
+
+
+def sbb_grid_last(sbb_images_dir: str, sort_mode: str):
+    base = Path(sbb_images_dir).expanduser().resolve()
+    all_images = _sort_sbb_images(_list_sbb_grid_images(base), sort_mode=sort_mode)
+    total = len(all_images)
+    if total <= 0:
+        return _sbb_grid_render_page(
+            sbb_images_dir=sbb_images_dir,
+            page_index=0,
+            sort_mode=sort_mode,
+        )
+    last_page = max(0, (total - 1) // SBB_GRID_PAGE_SIZE)
+    return _sbb_grid_render_page(
+        sbb_images_dir=sbb_images_dir,
+        page_index=last_page,
+        sort_mode=sort_mode,
+    )
+
+
+def sbb_grid_go_to_page(sbb_images_dir: str, page_number: int, sort_mode: str):
+    try:
+        page_int = int(float(page_number))
+    except Exception:
+        page_int = 1
+    # UI input is 1-based; internal is 0-based.
+    page_index = max(0, page_int - 1)
+    return _sbb_grid_render_page(
+        sbb_images_dir=sbb_images_dir,
+        page_index=page_index,
+        sort_mode=sort_mode,
+    )
+
+
 def sbb_grid_sort_by_mean(sbb_images_dir: str):
     return _sbb_grid_render_page(
         sbb_images_dir=sbb_images_dir,
@@ -3273,24 +3313,27 @@ def run_ppn_image_analysis(
 
 
 def build_ui() -> gr.Blocks:
-    default_dataset_base = str((ROOT / "datasets").resolve())
-    default_dataset = str((ROOT / "datasets" / "tibetan-yolo").resolve())
-    default_split_dir = str((ROOT / "datasets" / "tibetan-yolo" / "train").resolve())
+    preferred_root = Path("/home/ubuntu/data/PechaBridge").resolve()
+    workspace_root = preferred_root if preferred_root.exists() else ROOT
+
+    default_dataset_base = str((workspace_root / "datasets").resolve())
+    default_dataset = str((workspace_root / "datasets" / "tibetan-yolo").resolve())
+    default_split_dir = str((workspace_root / "datasets" / "tibetan-yolo" / "train").resolve())
     default_donut_dataset_name = "tibetan-donut-ocr-label1"
-    default_donut_dataset_output_dir = str((ROOT / "datasets").resolve())
-    default_donut_model_output_dir = str((ROOT / "models" / "donut-ocr-label1").resolve())
-    default_donut_font_tibetan = str((ROOT / "ext" / "Microsoft Himalaya.ttf").resolve())
-    default_donut_font_chinese = str((ROOT / "ext" / "simkai.ttf").resolve())
-    default_texture_input_dir = str((ROOT / "datasets" / "tibetan-yolo-ui" / "train" / "images").resolve())
-    default_texture_output_dir = str((ROOT / "datasets" / "tibetan-yolo-ui-textured").resolve())
-    default_texture_real_pages_dir = str((ROOT / "sbb_images").resolve())
-    default_sbb_grid_dir = str((ROOT / "sbb_images").resolve())
-    default_texture_lora_dataset_dir = str((ROOT / "datasets" / "texture-lora-dataset").resolve())
-    default_texture_lora_output_dir = str((ROOT / "models" / "texture-lora-sdxl").resolve())
-    default_image_encoder_input_dir = str((ROOT / "sbb_images").resolve())
-    default_image_encoder_output_dir = str((ROOT / "models" / "image-encoder").resolve())
-    default_text_encoder_input_dir = str((ROOT / "data" / "corpora").resolve())
-    default_text_encoder_output_dir = str((ROOT / "models" / "text-encoder").resolve())
+    default_donut_dataset_output_dir = str((workspace_root / "datasets").resolve())
+    default_donut_model_output_dir = str((workspace_root / "models" / "donut-ocr-label1").resolve())
+    default_donut_font_tibetan = str((workspace_root / "ext" / "Microsoft Himalaya.ttf").resolve())
+    default_donut_font_chinese = str((workspace_root / "ext" / "simkai.ttf").resolve())
+    default_texture_input_dir = str((workspace_root / "datasets" / "tibetan-yolo-ui" / "train" / "images").resolve())
+    default_texture_output_dir = str((workspace_root / "datasets" / "tibetan-yolo-ui-textured").resolve())
+    default_texture_real_pages_dir = str((workspace_root / "sbb_images").resolve())
+    default_sbb_grid_dir = str((workspace_root / "sbb_images").resolve())
+    default_texture_lora_dataset_dir = str((workspace_root / "datasets" / "texture-lora-dataset").resolve())
+    default_texture_lora_output_dir = str((workspace_root / "models" / "texture-lora-sdxl").resolve())
+    default_image_encoder_input_dir = str((workspace_root / "sbb_images").resolve())
+    default_image_encoder_output_dir = str((workspace_root / "models" / "image-encoder").resolve())
+    default_text_encoder_input_dir = str((workspace_root / "data" / "corpora").resolve())
+    default_text_encoder_output_dir = str((workspace_root / "models" / "text-encoder").resolve())
     default_prompt = (
         "Extract page layout blocks and OCR text. "
         "Return strict JSON with key 'detections' containing a list of objects with: "
@@ -3907,9 +3950,14 @@ def build_ui() -> gr.Blocks:
                 sbb_grid_dir = gr.Textbox(label="sbb_images_dir", value=default_sbb_grid_dir)
                 sbb_grid_refresh_btn = gr.Button("Refresh", variant="secondary")
                 sbb_grid_sort_mean_btn = gr.Button("Sort by Mean Color")
+                sbb_grid_first_btn = gr.Button("Anfang")
                 sbb_grid_prev_btn = gr.Button("Zurueck", elem_id="sbb-grid-prev-btn")
                 sbb_grid_next_btn = gr.Button("Vor", elem_id="sbb-grid-next-btn")
+                sbb_grid_last_btn = gr.Button("Ende")
                 sbb_grid_quarantine_btn = gr.Button("Quarantine Selected", variant="primary")
+            with gr.Row():
+                sbb_grid_page_input = gr.Number(label="Page (1-based)", value=1, precision=0)
+                sbb_grid_go_btn = gr.Button("Go to Page")
             sbb_grid_status = gr.Textbox(label="Grid Status", interactive=False)
             sbb_grid_page_state = gr.State(0)
             sbb_grid_paths_state = gr.State([])
@@ -3983,6 +4031,21 @@ def build_ui() -> gr.Blocks:
                 inputs=[sbb_grid_dir, sbb_grid_page_state, sbb_grid_sort_state],
                 outputs=sbb_grid_outputs,
             )
+            sbb_grid_first_btn.click(
+                fn=sbb_grid_first,
+                inputs=[sbb_grid_dir, sbb_grid_sort_state],
+                outputs=sbb_grid_outputs,
+            )
+            sbb_grid_last_btn.click(
+                fn=sbb_grid_last,
+                inputs=[sbb_grid_dir, sbb_grid_sort_state],
+                outputs=sbb_grid_outputs,
+            )
+            sbb_grid_go_btn.click(
+                fn=sbb_grid_go_to_page,
+                inputs=[sbb_grid_dir, sbb_grid_page_input, sbb_grid_sort_state],
+                outputs=sbb_grid_outputs,
+            )
             sbb_grid_quarantine_btn.click(
                 fn=sbb_grid_quarantine,
                 inputs=[sbb_grid_dir, sbb_grid_page_state, sbb_grid_paths_state, sbb_grid_sort_state, *sbb_grid_checks],
@@ -4045,7 +4108,7 @@ def build_ui() -> gr.Blocks:
                     with gr.Row():
                         train_texture_mixed_precision = gr.Dropdown(
                             choices=["no", "fp16", "bf16"],
-                            value="fp16",
+                            value="no",
                             label="mixed_precision",
                         )
                         train_texture_workers = gr.Number(label="num_workers", value=4, precision=0)

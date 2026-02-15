@@ -428,7 +428,7 @@ def add_train_texture_lora_arguments(parser):
                        help='LoRA rank')
     parser.add_argument('--lora_alpha', type=float, default=16.0,
                        help='LoRA alpha')
-    parser.add_argument('--mixed_precision', type=str, default='fp16',
+    parser.add_argument('--mixed_precision', type=str, default='no',
                        choices=['no', 'fp16', 'bf16'],
                        help='Accelerate mixed precision mode')
     parser.add_argument('--gradient_checkpointing', action='store_true',
