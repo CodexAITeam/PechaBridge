@@ -31,6 +31,11 @@ import numpy as np
 from PIL import Image, ImageDraw, ImageFont
 import yaml
 
+try:
+    import cv2
+except Exception:
+    cv2 = None
+
 
 ROOT = Path(__file__).resolve().parent
 DEFAULT_TEXTURE_PROMPT = (
@@ -3172,6 +3177,278 @@ def run_trained_model_inference(
         return image, f"Inference failed: {type(exc).__name__}: {exc}", "[]"
 
 
+def _normalize_layout_label(label: str) -> str:
+    return re.sub(r"[^a-z0-9]+", "", (label or "").strip().lower())
+
+
+def _is_tibetan_text_detection(class_id: int, label: str) -> bool:
+    norm = _normalize_layout_label(label)
+    if norm in {"tibetantext", "tibetantextbox", "tibetanlines", "tibetanline"}:
+        return True
+    if norm in {"", f"class{class_id}"} and class_id == 1:
+        return True
+    return False
+
+
+def _segment_lines_in_text_crop(
+    crop_rgb: np.ndarray,
+    min_line_height: int,
+    projection_smooth: int,
+    projection_threshold_rel: float,
+    merge_gap_px: int,
+) -> List[Tuple[int, int, int, int]]:
+    if cv2 is None:
+        return []
+    if crop_rgb is None or crop_rgb.size == 0:
+        return []
+
+    h, w = crop_rgb.shape[:2]
+    if h < 4 or w < 4:
+        return []
+
+    gray = cv2.cvtColor(crop_rgb, cv2.COLOR_RGB2GRAY)
+    gray = cv2.GaussianBlur(gray, (3, 3), 0)
+    _, bw = cv2.threshold(gray, 0, 255, cv2.THRESH_BINARY_INV + cv2.THRESH_OTSU)
+
+    open_kernel = cv2.getStructuringElement(cv2.MORPH_RECT, (2, 2))
+    bw = cv2.morphologyEx(bw, cv2.MORPH_OPEN, open_kernel, iterations=1)
+
+    kernel_w = max(3, int(round(w * 0.04)))
+    kernel_w = min(kernel_w, max(1, w))
+    line_kernel = cv2.getStructuringElement(cv2.MORPH_RECT, (kernel_w, 1))
+    joined = cv2.morphologyEx(bw, cv2.MORPH_CLOSE, line_kernel, iterations=1)
+
+    projection = (joined > 0).sum(axis=1).astype(np.float32)
+    if projection.size == 0 or float(np.max(projection)) <= 0.0:
+        return []
+
+    smooth = max(1, int(projection_smooth))
+    if smooth % 2 == 0:
+        smooth += 1
+    if smooth > 1:
+        conv = np.ones((smooth,), dtype=np.float32) / float(smooth)
+        projection = np.convolve(projection, conv, mode="same")
+
+    threshold_rel = min(max(float(projection_threshold_rel), 0.01), 0.95)
+    threshold = max(1.0, float(np.max(projection)) * threshold_rel)
+    mask = projection >= threshold
+
+    min_h = max(3, int(min_line_height))
+    line_candidates: List[Tuple[int, int, int, int]] = []
+    y = 0
+    while y < h:
+        if not bool(mask[y]):
+            y += 1
+            continue
+        y1 = y
+        while y < h and bool(mask[y]):
+            y += 1
+        y2 = y
+        if y2 - y1 < min_h:
+            continue
+
+        sub = bw[y1:y2, :]
+        if sub.size == 0:
+            continue
+        foreground_pixels = int((sub > 0).sum())
+        min_foreground = max(24, int((y2 - y1) * w * 0.002))
+        if foreground_pixels < min_foreground:
+            continue
+
+        cols = np.where((sub > 0).sum(axis=0) > 0)[0]
+        if cols.size == 0:
+            continue
+        x1 = max(0, int(cols[0]) - 2)
+        x2 = min(w, int(cols[-1]) + 3)
+        if x2 - x1 < 4:
+            continue
+        line_candidates.append((x1, y1, x2, y2))
+
+    if not line_candidates:
+        return []
+
+    merged: List[Tuple[int, int, int, int]] = []
+    merge_gap = max(0, int(merge_gap_px))
+    for x1, y1, x2, y2 in line_candidates:
+        if not merged:
+            merged.append((x1, y1, x2, y2))
+            continue
+        px1, py1, px2, py2 = merged[-1]
+        if y1 - py2 <= merge_gap:
+            merged[-1] = (min(px1, x1), py1, max(px2, x2), y2)
+        else:
+            merged.append((x1, y1, x2, y2))
+
+    tightened: List[Tuple[int, int, int, int]] = []
+    for x1, y1, x2, y2 in merged:
+        sub = bw[y1:y2, x1:x2]
+        if sub.size == 0:
+            continue
+        rows = np.where((sub > 0).sum(axis=1) > 0)[0]
+        if rows.size > 0:
+            y1 = y1 + int(rows[0])
+            y2 = y1 + int(rows[-1] - rows[0] + 1)
+        pad = 1
+        tx1 = max(0, x1 - pad)
+        ty1 = max(0, y1 - pad)
+        tx2 = min(w, x2 + pad)
+        ty2 = min(h, y2 + pad)
+        if tx2 > tx1 and ty2 > ty1:
+            tightened.append((tx1, ty1, tx2, ty2))
+
+    return tightened
+
+
+def run_tibetan_text_line_split_classical(
+    image: np.ndarray,
+    model_path: str,
+    conf: float,
+    imgsz: int,
+    device: str,
+    min_line_height: int,
+    projection_smooth: int,
+    projection_threshold_rel: float,
+    merge_gap_px: int,
+    draw_parent_boxes: bool,
+):
+    if image is None:
+        return None, "Please provide an image.", "{}"
+    if cv2 is None:
+        return image, "opencv-python is required for classical line segmentation.", "{}"
+
+    model_file = Path(model_path).expanduser().resolve()
+    if not model_file.exists():
+        return image, f"Model not found: {model_file}", "{}"
+
+    try:
+        model = _load_yolo_model(str(model_file))
+        kwargs: Dict[str, Any] = {"conf": float(conf), "imgsz": int(imgsz)}
+        if (device or "").strip():
+            kwargs["device"] = (device or "").strip()
+        results = model.predict(source=image, **kwargs)
+    except Exception as exc:
+        return image, f"Inference failed: {type(exc).__name__}: {exc}", "{}"
+
+    h, w = image.shape[:2]
+    overlay = Image.fromarray(image.astype(np.uint8)).convert("RGB")
+    draw = ImageDraw.Draw(overlay)
+    font = _load_overlay_font()
+
+    line_color = (255, 170, 0)
+    text_box_color = (0, 220, 255)
+    unknown_box_color = (190, 190, 190)
+
+    detections: List[Dict[str, Any]] = []
+    for res in results:
+        if not hasattr(res, "boxes") or res.boxes is None:
+            continue
+        boxes = res.boxes
+        xyxy = boxes.xyxy.cpu().numpy() if hasattr(boxes, "xyxy") else []
+        confs = boxes.conf.cpu().numpy() if hasattr(boxes, "conf") else []
+        clss = boxes.cls.cpu().numpy() if hasattr(boxes, "cls") else []
+        names = getattr(res, "names", None) or getattr(model, "names", None) or {}
+
+        for i in range(len(xyxy)):
+            x1, y1, x2, y2 = [int(v) for v in xyxy[i]]
+            x1 = max(0, min(w - 1, x1))
+            y1 = max(0, min(h - 1, y1))
+            x2 = max(0, min(w, x2))
+            y2 = max(0, min(h, y2))
+            if x2 <= x1 or y2 <= y1:
+                continue
+
+            c = float(confs[i]) if i < len(confs) else 0.0
+            cls = int(clss[i]) if i < len(clss) else 0
+            if isinstance(names, dict):
+                class_name = str(names.get(cls, f"class_{cls}"))
+            elif isinstance(names, list) and 0 <= cls < len(names):
+                class_name = str(names[cls])
+            else:
+                class_name = f"class_{cls}"
+
+            detections.append(
+                {
+                    "class": cls,
+                    "label": class_name,
+                    "confidence": c,
+                    "box": [x1, y1, x2, y2],
+                }
+            )
+
+    tibetan_results: List[Dict[str, Any]] = []
+    all_line_count = 0
+
+    for det in detections:
+        cls = int(det["class"])
+        label = str(det["label"])
+        x1, y1, x2, y2 = [int(v) for v in det["box"]]
+
+        is_tibetan = _is_tibetan_text_detection(cls, label)
+        if draw_parent_boxes:
+            color = text_box_color if is_tibetan else unknown_box_color
+            draw.rectangle((x1, y1, x2, y2), outline=color, width=2)
+            tag = f"{label} ({cls}) {float(det['confidence']):.2f}"
+            tx, ty = x1 + 2, max(0, y1 - 16)
+            draw.rectangle((tx, ty, tx + 9 * len(tag), ty + 14), fill=(0, 0, 0))
+            draw.text((tx + 2, ty + 1), tag, fill=color, font=font)
+
+        if not is_tibetan:
+            continue
+
+        crop = image[y1:y2, x1:x2]
+        line_boxes_local = _segment_lines_in_text_crop(
+            crop_rgb=crop,
+            min_line_height=int(min_line_height),
+            projection_smooth=int(projection_smooth),
+            projection_threshold_rel=float(projection_threshold_rel),
+            merge_gap_px=int(merge_gap_px),
+        )
+
+        line_boxes_global: List[List[int]] = []
+        for lx1, ly1, lx2, ly2 in line_boxes_local:
+            gx1 = max(0, min(w, x1 + int(lx1)))
+            gy1 = max(0, min(h, y1 + int(ly1)))
+            gx2 = max(0, min(w, x1 + int(lx2)))
+            gy2 = max(0, min(h, y1 + int(ly2)))
+            if gx2 <= gx1 or gy2 <= gy1:
+                continue
+            draw.rectangle((gx1, gy1, gx2, gy2), outline=line_color, width=3)
+            all_line_count += 1
+            line_tag = f"line {all_line_count}"
+            ltx, lty = gx1 + 2, max(0, gy1 - 14)
+            draw.rectangle((ltx, lty, ltx + 9 * len(line_tag), lty + 13), fill=(0, 0, 0))
+            draw.text((ltx + 2, lty + 1), line_tag, fill=line_color, font=font)
+            line_boxes_global.append([gx1, gy1, gx2, gy2])
+
+        tibetan_results.append(
+            {
+                "class": cls,
+                "label": label,
+                "confidence": float(det["confidence"]),
+                "text_box": [x1, y1, x2, y2],
+                "lines": line_boxes_global,
+            }
+        )
+
+    labels_seen = sorted({str(d["label"]) for d in detections})
+    status = (
+        f"Detected {len(detections)} boxes. "
+        f"Matched {len(tibetan_results)} tibetan_text box(es). "
+        f"Extracted {all_line_count} line box(es)."
+    )
+    if not tibetan_results and labels_seen:
+        status += f" Labels found: {', '.join(labels_seen[:8])}"
+
+    payload = {
+        "model_path": str(model_file),
+        "image_size": {"width": int(w), "height": int(h)},
+        "detections_total": len(detections),
+        "tibetan_text_boxes": tibetan_results,
+        "line_boxes_total": all_line_count,
+    }
+    return np.array(overlay), status, json.dumps(payload, ensure_ascii=False, indent=2)
+
+
 def download_ppn_images(
     ppn: str,
     output_dir: str,
@@ -4182,7 +4459,7 @@ def build_ui() -> gr.Blocks:
             gr.Markdown(
                 "Use the tabs left-to-right. A practical flow is: Synthetic Data -> Diffusion + LoRA (texture) -> "
                 "Donut OCR Workflow -> Retrieval Encoders -> Batch VLM Layout (SBB) -> Dataset Preview -> Ultralytics Training -> Model Inference -> "
-                "VLM Layout (single image) -> Label Studio Export."
+                "Tibetan Line Split (CV) -> VLM Layout (single image) -> Label Studio Export."
             )
             gr.Markdown("### Tabs")
             gr.Markdown(
@@ -4192,6 +4469,7 @@ def build_ui() -> gr.Blocks:
                 "4. Dataset Preview: Visual QA with bounding boxes.\n"
                 "5. Ultralytics Training: Train YOLO models.\n"
                 "6. Model Inference: Run inference with trained models.\n"
+                "6b. Tibetan Line Split (CV): Detect `tibetan_text` boxes and split them into line boxes.\n"
                 "7. VLM Layout: Run transformer-based layout parsing on a single image.\n"
                 "8. Label Studio Export: Convert YOLO split folders to Label Studio tasks and launch Label Studio.\n"
                 "9. PPN Downloader: Download and analyze SBB images.\n"
@@ -4626,6 +4904,74 @@ def build_ui() -> gr.Blocks:
                 fn=lambda x: x or "",
                 inputs=[infer_model_select],
                 outputs=[infer_model],
+            )
+
+        # 6b) Classical CV line splitting inside tibetan_text boxes
+        with gr.Tab("6b. Tibetan Line Split (CV)"):
+            gr.Markdown(
+                "Upload an image, run YOLO detection, then split only `tibetan_text` boxes into line boxes "
+                "using classical image processing (thresholding + horizontal projection)."
+            )
+            with gr.Row():
+                with gr.Column(scale=1):
+                    line_models_dir = gr.Textbox(label="models_dir", value=str((workspace_root / "models").resolve()))
+                    line_scan_models_btn = gr.Button("Scan Models")
+                    line_model_select = gr.Dropdown(label="Detected Ultralytics Model", choices=[], allow_custom_value=True)
+                    line_model_scan_msg = gr.Textbox(label="Model Scan Status", interactive=False)
+                    line_model = gr.Textbox(
+                        label="model_path",
+                        value=str((ROOT / "runs" / "detect" / "train" / "weights" / "best.pt").resolve()),
+                    )
+                    line_conf = gr.Slider(0.01, 0.99, value=0.25, step=0.01, label="conf")
+                    line_imgsz = gr.Number(label="imgsz", value=1024, precision=0)
+                    line_device = gr.Textbox(label="device", value="")
+
+                    with gr.Accordion("Classical Segmentation Parameters", open=False):
+                        line_min_height = gr.Number(label="min_line_height_px", value=10, precision=0)
+                        line_projection_smooth = gr.Number(label="projection_smooth_rows", value=9, precision=0)
+                        line_projection_thresh = gr.Slider(
+                            minimum=0.05,
+                            maximum=0.80,
+                            value=0.20,
+                            step=0.01,
+                            label="projection_threshold_rel",
+                        )
+                        line_merge_gap = gr.Number(label="merge_gap_px", value=5, precision=0)
+                        line_draw_parents = gr.Checkbox(label="draw_detected_text_boxes", value=True)
+
+                    line_run_btn = gr.Button("Split Tibetan Text into Lines", variant="primary")
+
+                with gr.Column(scale=1):
+                    line_image_in = gr.Image(type="numpy", label="Input Image", sources=["upload", "clipboard"])
+                    line_image_out = gr.Image(type="numpy", label="Overlay (Text + Line Boxes)")
+                    line_status = gr.Textbox(label="Status", interactive=False)
+                    line_json = gr.Code(label="Line Segmentation JSON", language="json")
+
+            line_run_btn.click(
+                fn=run_tibetan_text_line_split_classical,
+                inputs=[
+                    line_image_in,
+                    line_model,
+                    line_conf,
+                    line_imgsz,
+                    line_device,
+                    line_min_height,
+                    line_projection_smooth,
+                    line_projection_thresh,
+                    line_merge_gap,
+                    line_draw_parents,
+                ],
+                outputs=[line_image_out, line_status, line_json],
+            )
+            line_scan_models_btn.click(
+                fn=scan_ultralytics_inference_models,
+                inputs=[line_models_dir],
+                outputs=[line_model_select, line_model_scan_msg],
+            )
+            line_model_select.change(
+                fn=lambda x: x or "",
+                inputs=[line_model_select],
+                outputs=[line_model],
             )
 
         # 7) VLM parsing
