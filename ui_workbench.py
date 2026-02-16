@@ -13,7 +13,9 @@ from __future__ import annotations
 
 import json
 import os
+import re
 import shlex
+import shutil
 import subprocess
 import sys
 import tempfile
@@ -26,9 +28,14 @@ from typing import Any, Dict, List, Optional, Tuple
 import gradio as gr
 import numpy as np
 from PIL import Image, ImageDraw
+import yaml
 
 
 ROOT = Path(__file__).resolve().parent
+DEFAULT_TEXTURE_PROMPT = (
+    "scanned printed Tibetan pecha page, paper texture, ink bleed, aged grayscale scan, "
+    "realistic Tibetan glyph stroke thickness, subtle hand-written-like ink edge variation"
+)
 
 CLI_SCRIPTS = [
     "generate_training_data.py",
@@ -64,6 +71,14 @@ VLM_VRAM_HINTS: Dict[str, str] = {
     "florence2": "~8-16 GB",
     "mineru25": "CLI backend, GPU optional",
 }
+
+SBB_GRID_COLS = 5
+SBB_GRID_ROWS = 9
+SBB_GRID_PAGE_SIZE = SBB_GRID_COLS * SBB_GRID_ROWS
+SBB_GRID_THUMB_SIZE = 160
+SBB_THUMB_CACHE_MAX = 1200
+_SBB_THUMB_CACHE: Dict[str, Tuple[float, np.ndarray]] = {}
+_SBB_MEAN_CACHE: Dict[str, Tuple[float, float]] = {}
 
 
 def _run_cmd(cmd: List[str], timeout: int = 3600) -> Tuple[bool, str]:
@@ -135,8 +150,8 @@ def _list_images(split_images_dir: Path) -> List[str]:
     return sorted([p.name for p in split_images_dir.iterdir() if p.is_file() and p.suffix.lower() in exts])
 
 
-def _read_yolo_labels(label_path: Path) -> List[Tuple[int, float, float, float, float]]:
-    rows = []
+def _read_yolo_labels(label_path: Path) -> List[Dict[str, Any]]:
+    rows: List[Dict[str, Any]] = []
     if not label_path.exists():
         return rows
     for raw in label_path.read_text(encoding="utf-8").splitlines():
@@ -144,12 +159,52 @@ def _read_yolo_labels(label_path: Path) -> List[Tuple[int, float, float, float, 
         if not line:
             continue
         parts = line.split()
-        if len(parts) != 5:
-            continue
         try:
-            rows.append((int(parts[0]), float(parts[1]), float(parts[2]), float(parts[3]), float(parts[4])))
+            cls = int(parts[0])
         except Exception:
             continue
+
+        # YOLO detect format: class cx cy w h
+        if len(parts) == 5:
+            try:
+                cx, cy, bw, bh = float(parts[1]), float(parts[2]), float(parts[3]), float(parts[4])
+                rows.append(
+                    {
+                        "class": cls,
+                        "type": "bbox",
+                        "cx": cx,
+                        "cy": cy,
+                        "bw": bw,
+                        "bh": bh,
+                    }
+                )
+            except Exception:
+                continue
+            continue
+
+        # YOLO segment format: class x1 y1 x2 y2 ... xn yn
+        if len(parts) >= 7 and (len(parts) - 1) % 2 == 0:
+            coords: List[float] = []
+            ok = True
+            for tok in parts[1:]:
+                try:
+                    coords.append(float(tok))
+                except Exception:
+                    ok = False
+                    break
+            if not ok:
+                continue
+            points = [(coords[i], coords[i + 1]) for i in range(0, len(coords), 2)]
+            if len(points) >= 3:
+                rows.append(
+                    {
+                        "class": cls,
+                        "type": "polygon",
+                        "points": points,
+                    }
+                )
+            continue
+
     return rows
 
 
@@ -233,20 +288,250 @@ def _draw_yolo_boxes(image_path: Path, label_path: Path) -> Tuple[np.ndarray, st
         2: (130, 255, 130),
     }
     lines = []
-    for i, (cls, cx, cy, bw, bh) in enumerate(labels, start=1):
-        x1 = int((cx - bw / 2) * w)
-        y1 = int((cy - bh / 2) * h)
-        x2 = int((cx + bw / 2) * w)
-        y2 = int((cy + bh / 2) * h)
+    for i, ann in enumerate(labels, start=1):
+        cls = int(ann.get("class", -1))
         color = class_colors.get(cls, (255, 80, 80))
-        draw.rectangle((x1, y1, x2, y2), outline=color, width=3)
+
+        if ann.get("type") == "bbox":
+            cx = float(ann["cx"])
+            cy = float(ann["cy"])
+            bw = float(ann["bw"])
+            bh = float(ann["bh"])
+            x1 = int((cx - bw / 2) * w)
+            y1 = int((cy - bh / 2) * h)
+            x2 = int((cx + bw / 2) * w)
+            y2 = int((cy + bh / 2) * h)
+            draw.rectangle((x1, y1, x2, y2), outline=color, width=3)
+            draw.text((x1 + 2, max(0, y1 - 14)), f"{cls}", fill=color)
+            lines.append(f"{i}. class={cls} bbox cx={cx:.4f} cy={cy:.4f} w={bw:.4f} h={bh:.4f}")
+            continue
+
+        points = ann.get("points") or []
+        if not isinstance(points, list) or len(points) < 3:
+            continue
+
+        norm = True
+        for x, y in points:
+            if abs(float(x)) > 1.5 or abs(float(y)) > 1.5:
+                norm = False
+                break
+        if norm:
+            pts_px = [(int(float(x) * w), int(float(y) * h)) for x, y in points]
+        else:
+            pts_px = [(int(float(x)), int(float(y))) for x, y in points]
+
+        draw.polygon(pts_px, outline=color)
+        xs = [p[0] for p in pts_px]
+        ys = [p[1] for p in pts_px]
+        x1, y1, x2, y2 = min(xs), min(ys), max(xs), max(ys)
         draw.text((x1 + 2, max(0, y1 - 14)), f"{cls}", fill=color)
-        lines.append(f"{i}. class={cls} cx={cx:.4f} cy={cy:.4f} w={bw:.4f} h={bh:.4f}")
+        lines.append(f"{i}. class={cls} polygon n={len(pts_px)} bbox=({x1},{y1},{x2},{y2})")
 
     summary = f"Found {len(labels)} boxes\n" + ("\n".join(lines[:25]) if lines else "")
     if len(lines) > 25:
         summary += f"\n... +{len(lines)-25} more"
     return np.array(img), summary
+
+
+def _normalize_to_bbox_lines(label_src: Path, image_path: Path) -> List[str]:
+    anns = _read_yolo_labels(label_src)
+    if not anns:
+        return []
+
+    img_w = 0
+    img_h = 0
+    try:
+        with Image.open(image_path) as im:
+            img_w, img_h = im.size
+    except Exception:
+        img_w, img_h = 0, 0
+
+    out_lines: List[str] = []
+    for ann in anns:
+        cls = int(ann.get("class", -1))
+        if cls < 0:
+            continue
+        if ann.get("type") == "bbox":
+            cx = float(ann["cx"])
+            cy = float(ann["cy"])
+            bw = float(ann["bw"])
+            bh = float(ann["bh"])
+            cx = min(max(cx, 0.0), 1.0)
+            cy = min(max(cy, 0.0), 1.0)
+            bw = min(max(bw, 1e-6), 1.0)
+            bh = min(max(bh, 1e-6), 1.0)
+            out_lines.append(f"{cls} {cx:.6f} {cy:.6f} {bw:.6f} {bh:.6f}")
+            continue
+
+        points = ann.get("points") or []
+        if not isinstance(points, list) or len(points) < 3:
+            continue
+
+        norm = True
+        for x, y in points:
+            if abs(float(x)) > 1.5 or abs(float(y)) > 1.5:
+                norm = False
+                break
+
+        if norm:
+            xs = [float(x) for x, _ in points]
+            ys = [float(y) for _, y in points]
+        else:
+            if img_w <= 0 or img_h <= 0:
+                continue
+            xs = [float(x) / float(img_w) for x, _ in points]
+            ys = [float(y) / float(img_h) for _, y in points]
+
+        x1, x2 = min(xs), max(xs)
+        y1, y2 = min(ys), max(ys)
+        x1 = min(max(x1, 0.0), 1.0)
+        y1 = min(max(y1, 0.0), 1.0)
+        x2 = min(max(x2, 0.0), 1.0)
+        y2 = min(max(y2, 0.0), 1.0)
+        bw = max(1e-6, x2 - x1)
+        bh = max(1e-6, y2 - y1)
+        cx = x1 + (bw / 2.0)
+        cy = y1 + (bh / 2.0)
+        out_lines.append(f"{cls} {cx:.6f} {cy:.6f} {bw:.6f} {bh:.6f}")
+
+    return out_lines
+
+
+def _resolve_dataset_train_split(dataset_choice: str, datasets_base: str) -> Tuple[Optional[Path], str]:
+    ds = (dataset_choice or "").strip()
+    if not ds:
+        return None, "Synthetic dataset is empty."
+
+    base = Path(datasets_base).expanduser().resolve()
+    raw = Path(ds).expanduser()
+    candidates: List[Path] = []
+
+    if raw.is_absolute():
+        candidates.append(raw)
+    else:
+        candidates.append((Path.cwd() / raw).resolve())
+        candidates.append((base / raw).resolve())
+
+    if raw.suffix.lower() not in {".yaml", ".yml"}:
+        candidates.append((base / f"{ds}.yaml").resolve())
+        candidates.append((base / f"{ds}.yml").resolve())
+
+    for cand in candidates:
+        if cand.is_dir():
+            if (cand / "train" / "images").exists() and (cand / "train" / "labels").exists():
+                return (cand / "train").resolve(), f"Resolved synthetic split: {cand / 'train'}"
+            if (cand / "images").exists() and (cand / "labels").exists():
+                return cand.resolve(), f"Resolved synthetic split: {cand}"
+            yml = cand / "data.yml"
+            yaml_alt = cand / "data.yaml"
+            for y in (yml, yaml_alt):
+                if y.exists():
+                    cand = y
+                    break
+
+        if cand.is_file() and cand.suffix.lower() in {".yaml", ".yml"}:
+            try:
+                cfg = yaml.safe_load(cand.read_text(encoding="utf-8")) or {}
+            except Exception:
+                continue
+            root = Path(str(cfg.get("path", ""))).expanduser()
+            if not str(root):
+                root = cand.parent
+            elif not root.is_absolute():
+                root = (cand.parent / root).resolve()
+            train_rel = str(cfg.get("train", "train/images")).strip() or "train/images"
+            train_images = (root / train_rel).resolve() if not Path(train_rel).is_absolute() else Path(train_rel).resolve()
+            if train_images.name == "images":
+                split_dir = train_images.parent
+            else:
+                split_dir = (root / "train").resolve()
+            if (split_dir / "images").exists() and (split_dir / "labels").exists():
+                return split_dir, f"Resolved synthetic split from YAML: {split_dir}"
+
+    return None, f"Could not resolve synthetic dataset: {ds}"
+
+
+def _resolve_ls_export_split(ls_export_dir: str) -> Tuple[Optional[Path], str]:
+    base = Path(ls_export_dir).expanduser().resolve()
+    if not base.exists() or not base.is_dir():
+        return None, f"LS export directory not found: {base}"
+
+    if (base / "images").exists() and (base / "labels").exists():
+        return base, f"Resolved LS split: {base}"
+
+    for split_name in ("train", "val", "test"):
+        split_dir = base / split_name
+        if (split_dir / "images").exists() and (split_dir / "labels").exists():
+            return split_dir, f"Resolved LS split: {split_dir}"
+
+    yml = base / "data.yml"
+    yaml_alt = base / "data.yaml"
+    yaml_path = yml if yml.exists() else (yaml_alt if yaml_alt.exists() else None)
+    if yaml_path is not None:
+        try:
+            cfg = yaml.safe_load(yaml_path.read_text(encoding="utf-8")) or {}
+            root = Path(str(cfg.get("path", ""))).expanduser()
+            if not str(root):
+                root = yaml_path.parent
+            elif not root.is_absolute():
+                root = (yaml_path.parent / root).resolve()
+            train_rel = str(cfg.get("train", "train/images")).strip() or "train/images"
+            train_images = (root / train_rel).resolve() if not Path(train_rel).is_absolute() else Path(train_rel).resolve()
+            split_dir = train_images.parent if train_images.name == "images" else (root / "train").resolve()
+            if (split_dir / "images").exists() and (split_dir / "labels").exists():
+                return split_dir, f"Resolved LS split from YAML: {split_dir}"
+        except Exception:
+            pass
+
+    return None, f"Could not find images/labels under LS export dir: {base}"
+
+
+def _inspect_label_format(split_dir: Path) -> Dict[str, int]:
+    labels_dir = split_dir / "labels"
+    stats = {"files": 0, "rows": 0, "bbox_rows": 0, "polygon_rows": 0, "invalid_rows": 0}
+    if not labels_dir.exists():
+        return stats
+
+    label_files = sorted(labels_dir.glob("*.txt"))
+    stats["files"] = len(label_files)
+    for lf in label_files:
+        for raw in lf.read_text(encoding="utf-8", errors="replace").splitlines():
+            line = raw.strip()
+            if not line:
+                continue
+            parts = line.split()
+            stats["rows"] += 1
+            if len(parts) == 5:
+                stats["bbox_rows"] += 1
+            elif len(parts) >= 7 and (len(parts) - 1) % 2 == 0:
+                stats["polygon_rows"] += 1
+            else:
+                stats["invalid_rows"] += 1
+    return stats
+
+
+def _label_format_summary(stats: Dict[str, int]) -> str:
+    rows = int(stats.get("rows", 0))
+    bbox_rows = int(stats.get("bbox_rows", 0))
+    poly_rows = int(stats.get("polygon_rows", 0))
+    invalid_rows = int(stats.get("invalid_rows", 0))
+    files = int(stats.get("files", 0))
+
+    if rows == 0:
+        fmt = "empty"
+    elif invalid_rows == rows:
+        fmt = "invalid"
+    elif poly_rows > 0 and bbox_rows == 0 and invalid_rows == 0:
+        fmt = "polygon"
+    elif bbox_rows > 0 and poly_rows == 0 and invalid_rows == 0:
+        fmt = "bbox"
+    else:
+        fmt = "mixed"
+
+    return (
+        f"Label format check: {fmt} "
+        f"(files={files}, rows={rows}, bbox={bbox_rows}, polygon={poly_rows}, invalid={invalid_rows})"
+    )
 
 
 def run_generate_synthetic(
@@ -514,7 +799,20 @@ def _list_images_recursive(root_dir: Path) -> List[Path]:
     return sorted([p for p in root_dir.rglob("*") if p.is_file() and p.suffix.lower() in exts])
 
 
-def _latest_image_from_folder(folder: str) -> Tuple[Optional[np.ndarray], str]:
+def _latest_output_mtime(folder: str) -> Optional[float]:
+    out_dir = Path(folder).expanduser().resolve()
+    if not out_dir.exists():
+        return None
+    mts: List[float] = []
+    for image_path in _list_images_recursive(out_dir):
+        try:
+            mts.append(float(image_path.stat().st_mtime))
+        except Exception:
+            continue
+    return max(mts) if mts else None
+
+
+def _latest_image_from_folder(folder: str, min_mtime: Optional[float] = None) -> Tuple[Optional[np.ndarray], str]:
     out_dir = Path(folder).expanduser().resolve()
     if not out_dir.exists():
         return None, f"Output folder not found: {out_dir}"
@@ -522,11 +820,16 @@ def _latest_image_from_folder(folder: str) -> Tuple[Optional[np.ndarray], str]:
     candidates: List[Tuple[float, Path]] = []
     for image_path in _list_images_recursive(out_dir):
         try:
-            candidates.append((image_path.stat().st_mtime, image_path))
+            mt = float(image_path.stat().st_mtime)
+            if min_mtime is not None and mt <= float(min_mtime):
+                continue
+            candidates.append((mt, image_path))
         except Exception:
             continue
 
     if not candidates:
+        if min_mtime is not None:
+            return None, f"No new images generated yet in {out_dir}"
         return None, f"No images found in {out_dir}"
 
     for _, image_path in sorted(candidates, key=lambda x: x[0], reverse=True):
@@ -664,6 +967,7 @@ def run_texture_augment_live(
         return
 
     out_dir.mkdir(parents=True, exist_ok=True)
+    pre_run_latest_mtime = _latest_output_mtime(str(out_dir))
 
     seed_arg: Optional[int] = None
     try:
@@ -695,7 +999,7 @@ def run_texture_augment_live(
         "--lora_scale",
         str(float(lora_scale)),
         "--prompt",
-        (prompt or "").strip(),
+        (prompt or DEFAULT_TEXTURE_PROMPT).strip(),
         "--base_model_id",
         (base_model_id or "stabilityai/stable-diffusion-xl-base-1.0").strip(),
         "--controlnet_model_id",
@@ -741,7 +1045,7 @@ def run_texture_augment_live(
     stream_failed = False
     stream_fail_msg = ""
 
-    preview_img, preview_txt = _latest_image_from_folder(str(out_dir))
+    preview_img, preview_txt = _latest_image_from_folder(str(out_dir), min_mtime=pre_run_latest_mtime)
     yield (
         f"Running {str(model_family).upper()} texture augmentation ...\\n"
         f"Input dir: {in_dir}\n"
@@ -781,7 +1085,7 @@ def run_texture_augment_live(
 
         now = time.time()
         if now - last_emit_ts >= 1.0:
-            preview_img, preview_txt = _latest_image_from_folder(str(out_dir))
+            preview_img, preview_txt = _latest_image_from_folder(str(out_dir), min_mtime=pre_run_latest_mtime)
             tail = _tail_lines_newest_first(log_lines, 800)
             if stream_failed and stream_fail_msg:
                 tail = f"{tail}\n[warning] {stream_fail_msg}" if tail else f"[warning] {stream_fail_msg}"
@@ -814,7 +1118,9 @@ def run_texture_augment_live(
 
     ok = proc.returncode == 0
     status = "Success" if ok else "Failed"
-    preview_img, preview_txt = _latest_image_from_folder(str(out_dir))
+    preview_img, preview_txt = _latest_image_from_folder(str(out_dir), min_mtime=pre_run_latest_mtime)
+    if preview_img is None:
+        preview_img, preview_txt = _latest_image_from_folder(str(out_dir))
     final_msg = (
         f"{status}\nInput dir: {in_dir}\nOutput dir: {out_dir}\n\n"
         + _tail_lines_newest_first(log_lines, 3000)
@@ -1059,9 +1365,9 @@ def run_train_texture_lora_live(
         "--lora_alpha",
         str(float(lora_alpha)),
         "--mixed_precision",
-        (mixed_precision or "fp16").strip(),
+        (mixed_precision or "no").strip(),
         "--prompt",
-        (prompt or "").strip(),
+        (prompt or DEFAULT_TEXTURE_PROMPT).strip(),
         "--seed",
         str(seed_arg),
         "--base_model_id",
@@ -1584,6 +1890,299 @@ def run_train_text_encoder_live(
     yield final_msg, str(expected_backbone), str(expected_tokenizer), str(expected_head), str(expected_cfg)
 
 
+def run_donut_ocr_workflow_live(
+    dataset_name: str,
+    dataset_output_dir: str,
+    train_samples: int,
+    val_samples: int,
+    font_path_tibetan: str,
+    font_path_chinese: str,
+    augmentation: str,
+    target_newline_token: str,
+    prepared_output_dir: str,
+    model_output_dir: str,
+    model_name_or_path: str,
+    train_tokenizer: bool,
+    tokenizer_vocab_size: int,
+    per_device_train_batch_size: int,
+    per_device_eval_batch_size: int,
+    num_train_epochs: float,
+    learning_rate: float,
+    max_target_length: int,
+    image_size: int,
+    seed: int,
+    skip_generation: bool,
+    skip_prepare: bool,
+    skip_train: bool,
+    lora_augment_path: str,
+    lora_augment_model_family: str,
+    lora_augment_base_model_id: str,
+    lora_augment_controlnet_model_id: str,
+    lora_augment_prompt: str,
+    lora_augment_scale: float,
+    lora_augment_strength: float,
+    lora_augment_steps: int,
+    lora_augment_guidance_scale: float,
+    lora_augment_controlnet_scale: float,
+    lora_augment_seed: Optional[int],
+    lora_augment_splits: str,
+    lora_augment_targets: str,
+    lora_augment_canny_low: int,
+    lora_augment_canny_high: int,
+):
+    script_path = ROOT / "scripts" / "run_donut_ocr_workflow.py"
+    dataset_name_clean = (dataset_name or "tibetan-donut-ocr-label1").strip()
+    dataset_output_path = Path(dataset_output_dir).expanduser().resolve()
+    dataset_dir = dataset_output_path / dataset_name_clean
+    prepared_dir = (
+        Path(prepared_output_dir).expanduser().resolve()
+        if (prepared_output_dir or "").strip()
+        else (dataset_dir / "donut_ocr_label1")
+    )
+    model_output_path = Path(model_output_dir).expanduser().resolve()
+    summary_path = model_output_path / "workflow_summary.json"
+
+    if not script_path.exists():
+        msg = f"Failed: script not found: {script_path}"
+        yield msg, str(dataset_dir), str(prepared_dir), str(model_output_path), str(summary_path)
+        return
+
+    if not skip_generation:
+        tib_font = Path(font_path_tibetan).expanduser().resolve()
+        chi_font = Path(font_path_chinese).expanduser().resolve()
+        if not tib_font.exists():
+            msg = f"Failed: Tibetan font not found: {tib_font}"
+            yield msg, str(dataset_dir), str(prepared_dir), str(model_output_path), str(summary_path)
+            return
+        if not chi_font.exists():
+            msg = f"Failed: Chinese font not found: {chi_font}"
+            yield msg, str(dataset_dir), str(prepared_dir), str(model_output_path), str(summary_path)
+            return
+
+    model_output_path.mkdir(parents=True, exist_ok=True)
+
+    seed_arg = 42
+    try:
+        seed_arg = int(float(seed))
+    except Exception:
+        seed_arg = 42
+
+    cmd = [
+        sys.executable,
+        "-u",
+        str(script_path),
+        "--dataset_name",
+        dataset_name_clean,
+        "--dataset_output_dir",
+        str(dataset_output_path),
+        "--train_samples",
+        str(int(train_samples)),
+        "--val_samples",
+        str(int(val_samples)),
+        "--font_path_tibetan",
+        str(Path(font_path_tibetan).expanduser()),
+        "--font_path_chinese",
+        str(Path(font_path_chinese).expanduser()),
+        "--augmentation",
+        (augmentation or "noise").strip(),
+        "--target_newline_token",
+        (target_newline_token or "<NL>").strip(),
+        "--model_output_dir",
+        str(model_output_path),
+        "--model_name_or_path",
+        (model_name_or_path or "microsoft/trocr-base-stage1").strip(),
+        "--tokenizer_vocab_size",
+        str(int(tokenizer_vocab_size)),
+        "--per_device_train_batch_size",
+        str(int(per_device_train_batch_size)),
+        "--per_device_eval_batch_size",
+        str(int(per_device_eval_batch_size)),
+        "--num_train_epochs",
+        str(float(num_train_epochs)),
+        "--learning_rate",
+        str(float(learning_rate)),
+        "--max_target_length",
+        str(int(max_target_length)),
+        "--image_size",
+        str(int(image_size)),
+        "--seed",
+        str(seed_arg),
+    ]
+
+    prepared_output_clean = (prepared_output_dir or "").strip()
+    if prepared_output_clean:
+        cmd.extend(["--prepared_output_dir", str(Path(prepared_output_clean).expanduser())])
+    if train_tokenizer:
+        cmd.append("--train_tokenizer")
+    if skip_generation:
+        cmd.append("--skip_generation")
+    if skip_prepare:
+        cmd.append("--skip_prepare")
+    if skip_train:
+        cmd.append("--skip_train")
+
+    lora_path = (lora_augment_path or "").strip()
+    if lora_path:
+        cmd.extend(
+            [
+                "--lora_augment_path",
+                lora_path,
+                "--lora_augment_model_family",
+                (lora_augment_model_family or "sdxl").strip(),
+                "--lora_augment_base_model_id",
+                (lora_augment_base_model_id or "stabilityai/stable-diffusion-xl-base-1.0").strip(),
+                "--lora_augment_controlnet_model_id",
+                (lora_augment_controlnet_model_id or "diffusers/controlnet-canny-sdxl-1.0").strip(),
+                "--lora_augment_prompt",
+                (lora_augment_prompt or DEFAULT_TEXTURE_PROMPT).strip(),
+                "--lora_augment_scale",
+                str(float(lora_augment_scale)),
+                "--lora_augment_strength",
+                str(float(lora_augment_strength)),
+                "--lora_augment_steps",
+                str(int(lora_augment_steps)),
+                "--lora_augment_guidance_scale",
+                str(float(lora_augment_guidance_scale)),
+                "--lora_augment_controlnet_scale",
+                str(float(lora_augment_controlnet_scale)),
+                "--lora_augment_splits",
+                (lora_augment_splits or "train").strip(),
+                "--lora_augment_targets",
+                (lora_augment_targets or "images_and_ocr_crops").strip(),
+                "--lora_augment_canny_low",
+                str(int(lora_augment_canny_low)),
+                "--lora_augment_canny_high",
+                str(int(lora_augment_canny_high)),
+            ]
+        )
+        try:
+            if lora_augment_seed is not None:
+                lora_seed_int = int(float(lora_augment_seed))
+                if lora_seed_int >= 0:
+                    cmd.extend(["--lora_augment_seed", str(lora_seed_int)])
+        except Exception:
+            pass
+
+    try:
+        env = os.environ.copy()
+        env["PYTHONUNBUFFERED"] = "1"
+        proc = subprocess.Popen(
+            cmd,
+            cwd=str(ROOT),
+            env=env,
+            stdout=subprocess.PIPE,
+            stderr=subprocess.STDOUT,
+            text=False,
+            bufsize=0,
+        )
+    except Exception as exc:
+        msg = f"Failed\nModel output dir: {model_output_path}\n\n{type(exc).__name__}: {exc}"
+        yield msg, str(dataset_dir), str(prepared_dir), str(model_output_path), str(summary_path)
+        return
+
+    if proc.stdout is not None:
+        try:
+            os.set_blocking(proc.stdout.fileno(), False)
+        except Exception:
+            pass
+
+    log_lines: List[str] = []
+    partial = ""
+    last_emit_ts = 0.0
+    stream_failed = False
+    stream_fail_msg = ""
+
+    yield (
+        "Running Donut OCR workflow (label 1) ...\n"
+        f"Dataset dir: {dataset_dir}\n"
+        f"Prepared dir: {prepared_dir}\n"
+        f"Model output dir: {model_output_path}\n"
+        f"Summary path: {summary_path}\n"
+        f"Command: {shlex.join(cmd)}\n",
+        str(dataset_dir),
+        str(prepared_dir),
+        str(model_output_path),
+        str(summary_path),
+    )
+
+    while True:
+        got_output = False
+        if (not stream_failed) and proc.stdout is not None:
+            try:
+                chunk = proc.stdout.read()
+            except BlockingIOError:
+                chunk = b""
+            except Exception as exc:
+                stream_failed = True
+                stream_fail_msg = f"stdout stream disabled ({type(exc).__name__}: {exc})"
+                chunk = b""
+
+            if chunk:
+                got_output = True
+                if isinstance(chunk, bytes):
+                    chunk_text = chunk.decode("utf-8", errors="replace")
+                else:
+                    chunk_text = str(chunk)
+                partial += chunk_text.replace("\r", "\n")
+                parts = partial.splitlines(keepends=True)
+                keep = ""
+                for piece in parts:
+                    if piece.endswith("\n"):
+                        log_lines.append(piece.rstrip("\n"))
+                    else:
+                        keep = piece
+                partial = keep
+
+        now = time.time()
+        if now - last_emit_ts >= 1.0:
+            tail = _tail_lines_newest_first(log_lines, 800)
+            if stream_failed and stream_fail_msg:
+                tail = f"{tail}\n[warning] {stream_fail_msg}" if tail else f"[warning] {stream_fail_msg}"
+            running_msg = (
+                "Running Donut OCR workflow (label 1) ...\n"
+                f"Dataset dir: {dataset_dir}\n"
+                f"Prepared dir: {prepared_dir}\n"
+                f"Model output dir: {model_output_path}\n"
+                f"Summary path: {summary_path}\n\n{tail}"
+            )
+            yield (
+                running_msg,
+                str(dataset_dir),
+                str(prepared_dir),
+                str(model_output_path),
+                str(summary_path),
+            )
+            last_emit_ts = now
+
+        if proc.poll() is not None:
+            break
+
+        if not got_output:
+            time.sleep(0.15)
+
+    if proc.stdout is not None:
+        try:
+            rest = proc.stdout.read()
+        except Exception:
+            rest = b""
+        if rest:
+            if isinstance(rest, bytes):
+                partial += rest.decode("utf-8", errors="replace").replace("\r", "\n")
+            else:
+                partial += str(rest).replace("\r", "\n")
+        if partial:
+            log_lines.extend(partial.splitlines())
+
+    ok = proc.returncode == 0
+    status = "Success" if ok else "Failed"
+    final_msg = (
+        f"{status}\nDataset dir: {dataset_dir}\nPrepared dir: {prepared_dir}\n"
+        f"Model output dir: {model_output_path}\nSummary path: {summary_path}\n\n"
+        + _tail_lines_newest_first(log_lines, 3000)
+    )
+    yield final_msg, str(dataset_dir), str(prepared_dir), str(model_output_path), str(summary_path)
+
+
 def refresh_image_list(dataset_dir: str, split: str):
     split_images = Path(dataset_dir).expanduser().resolve() / split / "images"
     images = _list_images(split_images)
@@ -1902,9 +2501,36 @@ def run_ultralytics_train(
             cmd.extend(["--wandb-name", wandb_name.strip()])
 
     ok, out = _run_cmd(cmd, timeout=86400)
-    best_model = Path(project).expanduser().resolve() / name / "weights" / "best.pt"
     status = "Success" if ok else "Failed"
-    return f"{status}\nBest model path: {best_model}\n\n{out}", str(best_model)
+
+    best_model = _find_latest_best_model(project=project, name=name)
+    expected_best_model = _project_dir_abs(project) / name / "weights" / "best.pt"
+
+    if ok and best_model is not None:
+        copied_model, copy_msg = _archive_layout_best_model(
+            best_model_path=best_model,
+            dataset=dataset,
+            model=model,
+            name=name,
+            epochs=epochs,
+            batch=batch,
+            imgsz=imgsz,
+            patience=patience,
+        )
+        final_path = copied_model or best_model
+        return (
+            f"{status}\nBest model path: {best_model}\nArchived model path: {final_path}\n{copy_msg}\n\n{out}",
+            str(final_path),
+        )
+
+    if ok and best_model is None:
+        locate_msg = (
+            f"Could not locate best.pt under project={_project_dir_abs(project)} name={name}. "
+            "Check whether Ultralytics auto-incremented run naming."
+        )
+        return f"{status}\nExpected best model path: {expected_best_model}\n{locate_msg}\n\n{out}", str(expected_best_model)
+
+    return f"{status}\nExpected best model path: {expected_best_model}\n\n{out}", str(expected_best_model)
 
 
 def _build_ultralytics_train_cmd(
@@ -1965,6 +2591,94 @@ def _build_ultralytics_train_cmd(
     return cmd
 
 
+def _sanitize_slug(value: str, default: str = "na", max_len: int = 48) -> str:
+    txt = (value or "").strip()
+    if not txt:
+        return default
+    txt = txt.replace(os.sep, "_")
+    txt = re.sub(r"[^A-Za-z0-9._-]+", "-", txt)
+    txt = re.sub(r"-{2,}", "-", txt).strip("-._")
+    if not txt:
+        return default
+    return txt[:max_len]
+
+
+def _project_dir_abs(project: str) -> Path:
+    p = Path(project).expanduser()
+    if not p.is_absolute():
+        p = (ROOT / p).resolve()
+    return p
+
+
+def _find_latest_best_model(project: str, name: str) -> Optional[Path]:
+    project_dir = _project_dir_abs(project)
+    candidates: List[Path] = []
+
+    exact = project_dir / name / "weights" / "best.pt"
+    if exact.exists():
+        candidates.append(exact)
+
+    if project_dir.exists():
+        for p in project_dir.glob(f"{name}*/weights/best.pt"):
+            if p.is_file():
+                candidates.append(p)
+
+    if not candidates:
+        return None
+
+    candidates = sorted(set(candidates), key=lambda p: p.stat().st_mtime, reverse=True)
+    return candidates[0]
+
+
+def _extract_lr0_from_run_dir(run_dir: Optional[Path]) -> str:
+    if run_dir is None:
+        return "unknown"
+    args_yaml = run_dir / "args.yaml"
+    if not args_yaml.exists():
+        return "unknown"
+    try:
+        for raw in args_yaml.read_text(encoding="utf-8", errors="replace").splitlines():
+            line = raw.strip()
+            if line.startswith("lr0:"):
+                val = line.split(":", 1)[1].strip()
+                return _sanitize_slug(val, default="unknown", max_len=20)
+    except Exception:
+        return "unknown"
+    return "unknown"
+
+
+def _archive_layout_best_model(
+    best_model_path: Path,
+    dataset: str,
+    model: str,
+    name: str,
+    epochs: int,
+    batch: int,
+    imgsz: int,
+    patience: int,
+) -> Tuple[Optional[Path], str]:
+    if not best_model_path.exists():
+        return None, f"best.pt not found at {best_model_path}"
+
+    run_dir = best_model_path.parent.parent
+    lr0 = _extract_lr0_from_run_dir(run_dir)
+    dataset_tok = _sanitize_slug(Path(str(dataset)).stem if dataset else "", default="dataset")
+    model_tok = _sanitize_slug(Path(str(model)).name, default="model")
+    run_tok = _sanitize_slug(name, default="run")
+    ts = time.strftime("%Y%m%d-%H%M%S")
+
+    target_dir = (ROOT / "models" / "layoutModels").resolve()
+    target_dir.mkdir(parents=True, exist_ok=True)
+
+    filename = (
+        f"layout_{dataset_tok}_{model_tok}_lr{lr0}_ep{int(epochs)}_bs{int(batch)}_"
+        f"sz{int(imgsz)}_pat{int(patience)}_{run_tok}_{ts}.pt"
+    )
+    target = target_dir / filename
+    shutil.copy2(best_model_path, target)
+    return target, f"Copied best model to {target}"
+
+
 def run_ultralytics_train_live(
     dataset: str,
     model: str,
@@ -2001,7 +2715,7 @@ def run_ultralytics_train_live(
         wandb_tags=wandb_tags,
         wandb_name=wandb_name,
     )
-    best_model = Path(project).expanduser().resolve() / name / "weights" / "best.pt"
+    expected_best_model = _project_dir_abs(project) / name / "weights" / "best.pt"
 
     try:
         env = os.environ.copy()
@@ -2016,8 +2730,8 @@ def run_ultralytics_train_live(
             bufsize=0,
         )
     except Exception as exc:
-        msg = f"Failed\nBest model path: {best_model}\n\n{type(exc).__name__}: {exc}"
-        yield msg, str(best_model)
+        msg = f"Failed\nExpected best model path: {expected_best_model}\n\n{type(exc).__name__}: {exc}"
+        yield msg, str(expected_best_model)
         return
 
     if proc.stdout is not None:
@@ -2033,7 +2747,7 @@ def run_ultralytics_train_live(
     stream_failed = False
     stream_fail_msg = ""
 
-    yield f"Running ...\nBest model path: {best_model}\n", str(best_model)
+    yield f"Running ...\nExpected best model path: {expected_best_model}\n", str(expected_best_model)
 
     while True:
         got_output = False
@@ -2071,8 +2785,8 @@ def run_ultralytics_train_live(
             tail = _tail_lines_newest_first(log_lines, 800)
             if stream_failed and stream_fail_msg:
                 tail = f"{tail}\n[warning] {stream_fail_msg}" if tail else f"[warning] {stream_fail_msg}"
-            running_msg = f"Running ...\nBest model path: {best_model}\n\n{tail}"
-            yield running_msg, str(best_model)
+            running_msg = f"Running ...\nExpected best model path: {expected_best_model}\n\n{tail}"
+            yield running_msg, str(expected_best_model)
             last_emit_ts = now
             last_emit_count = len(log_lines)
 
@@ -2097,8 +2811,37 @@ def run_ultralytics_train_live(
 
     ok = proc.returncode == 0
     status = "Success" if ok else "Failed"
-    final_msg = f"{status}\nBest model path: {best_model}\n\n" + _tail_lines_newest_first(log_lines, 3000)
-    yield final_msg, str(best_model)
+    best_model = _find_latest_best_model(project=project, name=name)
+    if ok and best_model is not None:
+        copied_model, copy_msg = _archive_layout_best_model(
+            best_model_path=best_model,
+            dataset=dataset,
+            model=model,
+            name=name,
+            epochs=epochs,
+            batch=batch,
+            imgsz=imgsz,
+            patience=patience,
+        )
+        final_path = copied_model or best_model
+        final_msg = (
+            f"{status}\nBest model path: {best_model}\nArchived model path: {final_path}\n{copy_msg}\n\n"
+            + _tail_lines_newest_first(log_lines, 3000)
+        )
+        yield final_msg, str(final_path)
+        return
+
+    if ok and best_model is None:
+        locate_msg = (
+            f"Could not locate best.pt under project={_project_dir_abs(project)} name={name}. "
+            "Check whether Ultralytics auto-incremented run naming."
+        )
+        final_msg = f"{status}\nExpected best model path: {expected_best_model}\n{locate_msg}\n\n" + _tail_lines_newest_first(log_lines, 3000)
+        yield final_msg, str(expected_best_model)
+        return
+
+    final_msg = f"{status}\nExpected best model path: {expected_best_model}\n\n" + _tail_lines_newest_first(log_lines, 3000)
+    yield final_msg, str(expected_best_model)
 
 
 def _ultralytics_model_presets() -> List[str]:
@@ -2535,6 +3278,7 @@ def prepare_combined_labelstudio_split(
 
     def _copy_split(src_split: Path, prefix: str):
         cnt = 0
+        converted = 0
         for img in sorted((src_split / "images").glob("*")):
             if not img.is_file():
                 continue
@@ -2544,14 +3288,16 @@ def prepare_combined_labelstudio_split(
             lbl_src = src_split / "labels" / f"{img.stem}.txt"
             target_img.write_bytes(img.read_bytes())
             if lbl_src.exists():
-                target_lbl.write_text(lbl_src.read_text(encoding="utf-8"), encoding="utf-8")
+                bbox_lines = _normalize_to_bbox_lines(lbl_src, img)
+                target_lbl.write_text("\n".join(bbox_lines) + ("\n" if bbox_lines else ""), encoding="utf-8")
+                converted += 1
             else:
                 target_lbl.write_text("", encoding="utf-8")
             cnt += 1
-        return cnt
+        return cnt, converted
 
-    syn_count = _copy_split(syn, "syn")
-    sbb_count = _copy_split(sbb, "sbb")
+    syn_count, syn_converted = _copy_split(syn, "syn")
+    sbb_count, sbb_converted = _copy_split(sbb, "sbb")
 
     (out / "classes.txt").write_text(
         "tibetan_number_word\ntibetan_text\nchinese_number_word\n",
@@ -2562,9 +3308,91 @@ def prepare_combined_labelstudio_split(
         f"Combined split created at {out}\n"
         f"Synthetic images: {syn_count}\n"
         f"SBB test images: {sbb_count}\n"
+        f"Label files normalized to YOLO bbox format: syn={syn_converted}, sbb={sbb_converted}\n"
         "Use this split only for annotation/review; keep SBB out of train/val model training."
     )
     return msg, str(out)
+
+
+def prepare_labelstudio_from_ls_export_ui(
+    ls_export_dir: str,
+    synthetic_dataset: str,
+    datasets_base_dir: str,
+    combined_output_split_dir: str,
+    current_split_dir: str,
+    current_local_files_root: str,
+    current_image_root_url: str,
+    current_tasks_json: str,
+    current_vlm_export_split_dir: str,
+    current_vlm_export_image_root_url: str,
+    current_vlm_export_tasks_json: str,
+):
+    syn_split, syn_msg = _resolve_dataset_train_split(synthetic_dataset, datasets_base_dir)
+    if syn_split is None:
+        return (
+            f"Prepare failed: {syn_msg}",
+            "",
+            current_split_dir,
+            current_local_files_root,
+            current_image_root_url,
+            current_tasks_json,
+            current_vlm_export_split_dir,
+            current_vlm_export_image_root_url,
+            current_vlm_export_tasks_json,
+        )
+
+    ls_split, ls_msg = _resolve_ls_export_split(ls_export_dir)
+    if ls_split is None:
+        return (
+            f"Prepare failed: {ls_msg}",
+            "",
+            current_split_dir,
+            current_local_files_root,
+            current_image_root_url,
+            current_tasks_json,
+            current_vlm_export_split_dir,
+            current_vlm_export_image_root_url,
+            current_vlm_export_tasks_json,
+        )
+
+    ls_label_stats = _inspect_label_format(ls_split)
+    ls_label_msg = _label_format_summary(ls_label_stats)
+
+    msg, combined = prepare_combined_labelstudio_split(
+        synthetic_split_dir=str(syn_split),
+        sbb_test_split_dir=str(ls_split),
+        combined_output_split_dir=combined_output_split_dir,
+    )
+    if not combined:
+        return (
+            f"{syn_msg}\n{ls_msg}\n{ls_label_msg}\n{msg}",
+            "",
+            current_split_dir,
+            current_local_files_root,
+            current_image_root_url,
+            current_tasks_json,
+            current_vlm_export_split_dir,
+            current_vlm_export_image_root_url,
+            current_vlm_export_tasks_json,
+        )
+
+    combined_path = Path(combined).expanduser().resolve()
+    local_files_root = str(combined_path.parent)
+    image_root_url = f"/data/local-files/?d={combined_path.name}/images"
+    tasks_json = str((ROOT / "ls-tasks-combined-ui.json").resolve())
+    msg2 = f"{syn_msg}\n{ls_msg}\n{ls_label_msg}\n\n{msg}\n\nLabel Studio fields updated in tab 8."
+
+    return (
+        msg2,
+        str(combined_path),
+        str(combined_path),
+        local_files_root,
+        image_root_url,
+        tasks_json,
+        str(combined_path),
+        image_root_url,
+        tasks_json,
+    )
 
 
 def prepare_combined_for_labelstudio_ui(
@@ -2625,6 +3453,318 @@ def scan_pretrained_models(models_dir: str):
     return gr.update(choices=models, value=(models[0] if models else None)), f"Found {len(models)} model(s) in {base}"
 
 
+def scan_lora_models(models_dir: str):
+    base = Path(models_dir).expanduser().resolve()
+    if not base.exists():
+        return gr.update(choices=[], value=None), "", f"Models directory not found: {base}"
+
+    exts = {".safetensors", ".safetensor"}
+    models = sorted([str(p.resolve()) for p in base.rglob("*") if p.is_file() and p.suffix.lower() in exts])
+    selected = models[0] if models else ""
+    msg = f"Found {len(models)} LoRA safetensor model(s) in {base}"
+    return gr.update(choices=models, value=(selected if selected else None)), selected, msg
+
+
+def _list_sbb_grid_images(sbb_dir: Path) -> List[Path]:
+    if not sbb_dir.exists():
+        return []
+    images: List[Path] = []
+    for p in _list_images_recursive(sbb_dir):
+        try:
+            rel_parts = [part.lower() for part in p.relative_to(sbb_dir).parts]
+        except Exception:
+            rel_parts = [part.lower() for part in p.parts]
+        if "quarantine" in rel_parts:
+            continue
+        images.append(p)
+    return sorted(images)
+
+
+def _sbb_rel(path: Path, root: Path) -> str:
+    try:
+        return str(path.relative_to(root))
+    except Exception:
+        return path.name
+
+
+def _load_sbb_thumbnail(path: Path) -> np.ndarray:
+    with Image.open(path) as im:
+        rgb = im.convert("RGB")
+        resample = Image.Resampling.LANCZOS if hasattr(Image, "Resampling") else Image.LANCZOS
+        rgb.thumbnail((SBB_GRID_THUMB_SIZE, SBB_GRID_THUMB_SIZE), resample=resample)
+        canvas = Image.new("RGB", (SBB_GRID_THUMB_SIZE, SBB_GRID_THUMB_SIZE), (245, 245, 245))
+        ox = max(0, (SBB_GRID_THUMB_SIZE - rgb.width) // 2)
+        oy = max(0, (SBB_GRID_THUMB_SIZE - rgb.height) // 2)
+        canvas.paste(rgb, (ox, oy))
+    return np.array(canvas)
+
+
+def _get_sbb_thumbnail_cached(path: Path) -> np.ndarray:
+    key = str(path.resolve())
+    try:
+        mtime = float(path.stat().st_mtime)
+    except Exception:
+        mtime = 0.0
+
+    cached = _SBB_THUMB_CACHE.get(key)
+    if cached is not None:
+        cached_mtime, cached_img = cached
+        if abs(cached_mtime - mtime) < 1e-6:
+            return cached_img
+
+    thumb = _load_sbb_thumbnail(path)
+    _SBB_THUMB_CACHE[key] = (mtime, thumb)
+
+    # Keep cache bounded to avoid memory blowup on very large collections.
+    if len(_SBB_THUMB_CACHE) > SBB_THUMB_CACHE_MAX:
+        for old_key in list(_SBB_THUMB_CACHE.keys())[: len(_SBB_THUMB_CACHE) - SBB_THUMB_CACHE_MAX]:
+            _SBB_THUMB_CACHE.pop(old_key, None)
+    return thumb
+
+
+def _prefetch_sbb_page_thumbnails(paths: List[Path]) -> None:
+    if not paths:
+        return
+    with ThreadPoolExecutor(max_workers=8) as ex:
+        futures = [ex.submit(_get_sbb_thumbnail_cached, p) for p in paths]
+        for fut in futures:
+            try:
+                fut.result()
+            except Exception:
+                continue
+
+
+def _get_sbb_mean_cached(path: Path) -> float:
+    key = str(path.resolve())
+    try:
+        mtime = float(path.stat().st_mtime)
+    except Exception:
+        mtime = 0.0
+
+    cached = _SBB_MEAN_CACHE.get(key)
+    if cached is not None:
+        cached_mtime, cached_mean = cached
+        if abs(cached_mtime - mtime) < 1e-6:
+            return float(cached_mean)
+
+    thumb = _get_sbb_thumbnail_cached(path)
+    mean_val = float(np.mean(thumb))
+    _SBB_MEAN_CACHE[key] = (mtime, mean_val)
+    return mean_val
+
+
+def _sort_sbb_images(image_paths: List[Path], sort_mode: str) -> List[Path]:
+    mode = (sort_mode or "name").strip().lower()
+    if mode != "mean_color":
+        return sorted(image_paths)
+
+    with ThreadPoolExecutor(max_workers=8) as ex:
+        futures = {ex.submit(_get_sbb_mean_cached, p): p for p in image_paths}
+        pairs: List[Tuple[float, Path]] = []
+        for fut, path in futures.items():
+            try:
+                pairs.append((float(fut.result()), path))
+            except Exception:
+                pairs.append((255.0, path))
+    pairs.sort(key=lambda x: (x[0], str(x[1])))
+    return [p for _, p in pairs]
+
+
+def _sbb_grid_render_page(
+    sbb_images_dir: str,
+    page_index: int,
+    note: str = "",
+    sort_mode: str = "name",
+) -> List[Any]:
+    base = Path(sbb_images_dir).expanduser().resolve()
+    if not base.exists() or not base.is_dir():
+        status = f"Folder not found: {base}"
+        outputs: List[Any] = [status, 0, []]
+        for _ in range(SBB_GRID_PAGE_SIZE):
+            outputs.extend([
+                gr.update(value=None, visible=False),
+                gr.update(value=False, visible=False),
+                gr.update(value="", visible=False),
+            ])
+        return outputs
+
+    all_images = _sort_sbb_images(_list_sbb_grid_images(base), sort_mode=sort_mode)
+    total = len(all_images)
+    if total == 0:
+        status = f"No images found in {base} (excluding quarantine)."
+        outputs = [status, 0, []]
+        for _ in range(SBB_GRID_PAGE_SIZE):
+            outputs.extend([
+                gr.update(value=None, visible=False),
+                gr.update(value=False, visible=False),
+                gr.update(value="", visible=False),
+            ])
+        return outputs
+
+    total_pages = (total + SBB_GRID_PAGE_SIZE - 1) // SBB_GRID_PAGE_SIZE
+    page = max(0, min(int(page_index), total_pages - 1))
+    start = page * SBB_GRID_PAGE_SIZE
+    end = min(total, start + SBB_GRID_PAGE_SIZE)
+    page_paths = all_images[start:end]
+    next_start = end
+    next_end = min(total, next_start + SBB_GRID_PAGE_SIZE)
+    next_page_paths = all_images[next_start:next_end]
+
+    prefix = f"{note}\n" if note else ""
+    mode_text = "mean_color (dark->bright)" if (sort_mode or "name").lower() == "mean_color" else "name"
+    status = f"{prefix}Page {page + 1}/{total_pages} | showing {start + 1}-{end} of {total} | sort={mode_text}"
+    outputs = [status, page, [str(p) for p in page_paths], sort_mode]
+
+    for i in range(SBB_GRID_PAGE_SIZE):
+        if i < len(page_paths):
+            image_path = page_paths[i]
+            rel = _sbb_rel(image_path, base)
+            caption = f"{start + i + 1}/{total} - {rel}"
+            try:
+                thumb = _get_sbb_thumbnail_cached(image_path)
+                img_update = gr.update(value=thumb, visible=True)
+            except Exception as exc:
+                img_update = gr.update(value=None, visible=False)
+                caption = f"{caption} (preview error: {type(exc).__name__})"
+            outputs.extend([
+                img_update,
+                gr.update(value=False, visible=True),
+                gr.update(value=caption, visible=True),
+            ])
+        else:
+            outputs.extend([
+                gr.update(value=None, visible=False),
+                gr.update(value=False, visible=False),
+                gr.update(value="", visible=False),
+            ])
+
+    # Prefetch next page thumbnails so "Vor" displays instantly.
+    _prefetch_sbb_page_thumbnails(next_page_paths)
+    return outputs
+
+
+def sbb_grid_refresh(sbb_images_dir: str, sort_mode: str):
+    return _sbb_grid_render_page(
+        sbb_images_dir=sbb_images_dir,
+        page_index=0,
+        note="Refreshed.",
+        sort_mode=sort_mode,
+    )
+
+
+def sbb_grid_prev(sbb_images_dir: str, current_page: int, sort_mode: str):
+    return _sbb_grid_render_page(
+        sbb_images_dir=sbb_images_dir,
+        page_index=int(current_page) - 1,
+        sort_mode=sort_mode,
+    )
+
+
+def sbb_grid_next(sbb_images_dir: str, current_page: int, sort_mode: str):
+    return _sbb_grid_render_page(
+        sbb_images_dir=sbb_images_dir,
+        page_index=int(current_page) + 1,
+        sort_mode=sort_mode,
+    )
+
+
+def sbb_grid_first(sbb_images_dir: str, sort_mode: str):
+    return _sbb_grid_render_page(
+        sbb_images_dir=sbb_images_dir,
+        page_index=0,
+        sort_mode=sort_mode,
+    )
+
+
+def sbb_grid_last(sbb_images_dir: str, sort_mode: str):
+    base = Path(sbb_images_dir).expanduser().resolve()
+    all_images = _sort_sbb_images(_list_sbb_grid_images(base), sort_mode=sort_mode)
+    total = len(all_images)
+    if total <= 0:
+        return _sbb_grid_render_page(
+            sbb_images_dir=sbb_images_dir,
+            page_index=0,
+            sort_mode=sort_mode,
+        )
+    last_page = max(0, (total - 1) // SBB_GRID_PAGE_SIZE)
+    return _sbb_grid_render_page(
+        sbb_images_dir=sbb_images_dir,
+        page_index=last_page,
+        sort_mode=sort_mode,
+    )
+
+
+def sbb_grid_go_to_page(sbb_images_dir: str, page_number: int, sort_mode: str):
+    try:
+        page_int = int(float(page_number))
+    except Exception:
+        page_int = 1
+    # UI input is 1-based; internal is 0-based.
+    page_index = max(0, page_int - 1)
+    return _sbb_grid_render_page(
+        sbb_images_dir=sbb_images_dir,
+        page_index=page_index,
+        sort_mode=sort_mode,
+    )
+
+
+def sbb_grid_sort_by_mean(sbb_images_dir: str):
+    return _sbb_grid_render_page(
+        sbb_images_dir=sbb_images_dir,
+        page_index=0,
+        note="Sorted by mean color value (dark -> bright).",
+        sort_mode="mean_color",
+    )
+
+
+def sbb_grid_quarantine(
+    sbb_images_dir: str,
+    current_page: int,
+    current_paths: List[str],
+    sort_mode: str,
+    *checked_flags,
+):
+    base = Path(sbb_images_dir).expanduser().resolve()
+    quarantine_root = base / "quarantine"
+    moved = 0
+    skipped = 0
+    failed = 0
+
+    selected_paths = list(current_paths or [])
+    for path_str, checked in zip(selected_paths, checked_flags):
+        if not checked:
+            continue
+        src = Path(path_str).expanduser().resolve()
+        if not src.exists():
+            skipped += 1
+            continue
+        try:
+            rel = src.relative_to(base)
+        except Exception:
+            skipped += 1
+            continue
+        if rel.parts and rel.parts[0].lower() == "quarantine":
+            skipped += 1
+            continue
+        dst = quarantine_root / rel
+        dst.parent.mkdir(parents=True, exist_ok=True)
+        if dst.exists():
+            dst = dst.with_name(f"{dst.stem}_{int(time.time())}{dst.suffix}")
+        try:
+            shutil.move(str(src), str(dst))
+            moved += 1
+        except Exception:
+            failed += 1
+
+    note = f"Quarantine moved={moved}, skipped={skipped}, failed={failed} -> {quarantine_root}"
+    return _sbb_grid_render_page(
+        sbb_images_dir=sbb_images_dir,
+        page_index=int(current_page),
+        note=note,
+        sort_mode=sort_mode,
+    )
+
+
 def run_ppn_image_analysis(
     output_dir: str,
     image_name: str,
@@ -2674,18 +3814,27 @@ def run_ppn_image_analysis(
 
 
 def build_ui() -> gr.Blocks:
-    default_dataset_base = str((ROOT / "datasets").resolve())
-    default_dataset = str((ROOT / "datasets" / "tibetan-yolo").resolve())
-    default_split_dir = str((ROOT / "datasets" / "tibetan-yolo" / "train").resolve())
-    default_texture_input_dir = str((ROOT / "datasets" / "tibetan-yolo-ui" / "train" / "images").resolve())
-    default_texture_output_dir = str((ROOT / "datasets" / "tibetan-yolo-ui-textured").resolve())
-    default_texture_real_pages_dir = str((ROOT / "sbb_images").resolve())
-    default_texture_lora_dataset_dir = str((ROOT / "datasets" / "texture-lora-dataset").resolve())
-    default_texture_lora_output_dir = str((ROOT / "models" / "texture-lora-sdxl").resolve())
-    default_image_encoder_input_dir = str((ROOT / "sbb_images").resolve())
-    default_image_encoder_output_dir = str((ROOT / "models" / "image-encoder").resolve())
-    default_text_encoder_input_dir = str((ROOT / "data" / "corpora").resolve())
-    default_text_encoder_output_dir = str((ROOT / "models" / "text-encoder").resolve())
+    preferred_root = Path("/home/ubuntu/data/PechaBridge").resolve()
+    workspace_root = preferred_root if preferred_root.exists() else ROOT
+
+    default_dataset_base = str((workspace_root / "datasets").resolve())
+    default_dataset = str((workspace_root / "datasets" / "tibetan-yolo").resolve())
+    default_split_dir = str((workspace_root / "datasets" / "tibetan-yolo" / "train").resolve())
+    default_donut_dataset_name = "tibetan-donut-ocr-label1"
+    default_donut_dataset_output_dir = str((workspace_root / "datasets").resolve())
+    default_donut_model_output_dir = str((workspace_root / "models" / "donut-ocr-label1").resolve())
+    default_donut_font_tibetan = str((workspace_root / "ext" / "Microsoft Himalaya.ttf").resolve())
+    default_donut_font_chinese = str((workspace_root / "ext" / "simkai.ttf").resolve())
+    default_texture_input_dir = str((workspace_root / "datasets" / "tibetan-yolo-ui" / "train" / "images").resolve())
+    default_texture_output_dir = str((workspace_root / "datasets" / "tibetan-yolo-ui-textured").resolve())
+    default_texture_real_pages_dir = str((workspace_root / "sbb_images").resolve())
+    default_sbb_grid_dir = str((workspace_root / "sbb_images").resolve())
+    default_texture_lora_dataset_dir = str((workspace_root / "datasets" / "texture-lora-dataset").resolve())
+    default_texture_lora_output_dir = str((workspace_root / "models" / "texture-lora-sdxl").resolve())
+    default_image_encoder_input_dir = str((workspace_root / "sbb_images").resolve())
+    default_image_encoder_output_dir = str((workspace_root / "models" / "image-encoder").resolve())
+    default_text_encoder_input_dir = str((workspace_root / "data" / "corpora").resolve())
+    default_text_encoder_output_dir = str((workspace_root / "models" / "text-encoder").resolve())
     default_prompt = (
         "Extract page layout blocks and OCR text. "
         "Return strict JSON with key 'detections' containing a list of objects with: "
@@ -2712,7 +3861,7 @@ def build_ui() -> gr.Blocks:
             gr.Markdown("## Workflow Overview")
             gr.Markdown(
                 "Use the tabs left-to-right. A practical flow is: Synthetic Data -> Diffusion + LoRA (texture) -> "
-                "Retrieval Encoders -> Batch VLM Layout (SBB) -> Dataset Preview -> Ultralytics Training -> Model Inference -> "
+                "Donut OCR Workflow -> Retrieval Encoders -> Batch VLM Layout (SBB) -> Dataset Preview -> Ultralytics Training -> Model Inference -> "
                 "VLM Layout (single image) -> Label Studio Export."
             )
             gr.Markdown("### Tabs")
@@ -2726,9 +3875,11 @@ def build_ui() -> gr.Blocks:
                 "7. VLM Layout: Run transformer-based layout parsing on a single image.\n"
                 "8. Label Studio Export: Convert YOLO split folders to Label Studio tasks and launch Label Studio.\n"
                 "9. PPN Downloader: Download and analyze SBB images.\n"
-                "10. Diffusion + LoRA: Prepare texture crops, train LoRA, and run SDXL/SD2.1 + ControlNet inference.\n"
-                "11. Retrieval Encoders: Train image and text encoders for future n-gram retrieval.\n"
-                "12. CLI Audit: Show all CLI options from project scripts."
+                "10. SBB Grid Review: Browse sbb_images in 9x9 pages and move selected pages to quarantine.\n"
+                "11. Diffusion + LoRA: Prepare texture crops, train LoRA, and run SDXL/SD2.1 + ControlNet inference.\n"
+                "12. Donut OCR Workflow: Run synthetic generation + manifest prep + Donut-style OCR training on label 1.\n"
+                "13. Retrieval Encoders: Train image and text encoders for future n-gram retrieval.\n"
+                "14. CLI Audit: Show all CLI options from project scripts."
             )
 
         # 2) Data generation
@@ -3024,7 +4175,7 @@ def build_ui() -> gr.Blocks:
                 with gr.Column():
                     train_workers = gr.Number(label="workers", value=8, precision=0)
                     train_device = gr.Textbox(label="device", value="cuda:0")
-                    train_project = gr.Textbox(label="project", value="runs/detect")
+                    train_project = gr.Textbox(label="project", value=str((workspace_root / "runs" / "detect").resolve()))
                     train_name = gr.Textbox(label="name", value="train-ui")
                     train_patience = gr.Number(label="patience", value=50, precision=0)
                     train_export = gr.Checkbox(label="export", value=True)
@@ -3143,7 +4294,32 @@ def build_ui() -> gr.Blocks:
 
         # 8) Export to Label Studio
         with gr.Tab("8. Label Studio Export"):
-            gr.Markdown("Convert YOLO split directory to Label Studio tasks.")
+            gr.Markdown(
+                "Simplified flow: pick your Label-Studio export folder + synthetic dataset, "
+                "then auto-prepare a combined split (including polygon->bbox normalization)."
+            )
+            with gr.Row():
+                ls_export_dir_input = gr.Textbox(
+                    label="Label Studio export folder",
+                    value=str((workspace_root / "datasets" / "ls-sbb").resolve()),
+                )
+                ls_syn_dataset_base = gr.Textbox(
+                    label="Synthetic datasets base",
+                    value=default_dataset_base,
+                )
+                ls_scan_syn_btn = gr.Button("Scan Synthetic Datasets")
+            ls_syn_dataset = gr.Dropdown(
+                label="Synthetic dataset (train split)",
+                choices=train_dataset_choices,
+                value=default_train_dataset,
+                allow_custom_value=True,
+            )
+            ls_combined_out = gr.Textbox(
+                label="Combined output split dir",
+                value=str((workspace_root / "datasets" / "combined-layout-labelstudio" / "train").resolve()),
+            )
+            ls_prepare_btn = gr.Button("Prepare Combined Split from LS Export + Synthetic", variant="primary")
+            ls_prepare_status = gr.Textbox(label="Prepare Status", lines=8, interactive=False)
             split_dir = gr.Textbox(label="YOLO Split Directory", value=default_split_dir)
             image_ext = gr.Dropdown(label="image-ext", choices=[".jpg", ".png", ".jpeg", ".bmp", ".tif", ".tiff"], value=".png")
             tasks_json = gr.Textbox(label="tasks json output", value=str((ROOT / "ls-tasks-ui.json").resolve()))
@@ -3167,6 +4343,39 @@ def build_ui() -> gr.Blocks:
                 fn=start_label_studio,
                 inputs=[local_files_root],
                 outputs=[start_ls_msg],
+            )
+
+            ls_scan_syn_btn.click(
+                fn=_scan_train_datasets,
+                inputs=[ls_syn_dataset_base],
+                outputs=[ls_syn_dataset],
+            )
+            ls_prepare_btn.click(
+                fn=prepare_labelstudio_from_ls_export_ui,
+                inputs=[
+                    ls_export_dir_input,
+                    ls_syn_dataset,
+                    ls_syn_dataset_base,
+                    ls_combined_out,
+                    split_dir,
+                    local_files_root,
+                    image_root_url,
+                    tasks_json,
+                    batch_vlm_export_split_dir,
+                    batch_vlm_export_image_root_url,
+                    batch_vlm_export_tasks_json,
+                ],
+                outputs=[
+                    ls_prepare_status,
+                    batch_vlm_combine_result,
+                    split_dir,
+                    local_files_root,
+                    image_root_url,
+                    tasks_json,
+                    batch_vlm_export_split_dir,
+                    batch_vlm_export_image_root_url,
+                    batch_vlm_export_tasks_json,
+                ],
             )
 
             batch_vlm_combine_btn.click(
@@ -3290,8 +4499,120 @@ def build_ui() -> gr.Blocks:
                 outputs=[ppn_overlay, ppn_analysis_status, ppn_analysis_json],
             )
 
-        # 10) Diffusion + LoRA texture augmentation
-        with gr.Tab("10. Diffusion + LoRA"):
+        # 10) SBB grid review + quarantine
+        with gr.Tab("10. SBB Grid Review"):
+            gr.Markdown(
+                "Browse images from `sbb_images` as lightweight 9x9 thumbnails. "
+                "Select pages via checkboxes and move them to `sbb_images/quarantine`."
+            )
+            with gr.Row():
+                sbb_grid_dir = gr.Textbox(label="sbb_images_dir", value=default_sbb_grid_dir)
+                sbb_grid_refresh_btn = gr.Button("Refresh", variant="secondary")
+                sbb_grid_sort_mean_btn = gr.Button("Sort by Mean Color")
+                sbb_grid_first_btn = gr.Button("Anfang")
+                sbb_grid_prev_btn = gr.Button("Zurueck", elem_id="sbb-grid-prev-btn")
+                sbb_grid_next_btn = gr.Button("Vor", elem_id="sbb-grid-next-btn")
+                sbb_grid_last_btn = gr.Button("Ende")
+                sbb_grid_quarantine_btn = gr.Button("Quarantine Selected", variant="primary")
+            with gr.Row():
+                sbb_grid_page_input = gr.Number(label="Page (1-based)", value=1, precision=0)
+                sbb_grid_go_btn = gr.Button("Go to Page")
+            sbb_grid_status = gr.Textbox(label="Grid Status", interactive=False)
+            sbb_grid_page_state = gr.State(0)
+            sbb_grid_paths_state = gr.State([])
+            sbb_grid_sort_state = gr.State("name")
+            gr.HTML(
+                """
+<script>
+(() => {
+  if (window.__sbbGridHotkeysInstalled) return;
+  window.__sbbGridHotkeysInstalled = true;
+  document.addEventListener("keydown", (ev) => {
+    const tag = (ev.target && ev.target.tagName ? ev.target.tagName.toLowerCase() : "");
+    const isTyping = tag === "input" || tag === "textarea" || ev.target?.isContentEditable;
+    if (isTyping) return;
+    if (ev.key === "ArrowLeft") {
+      const btn = document.getElementById("sbb-grid-prev-btn");
+      if (btn) btn.click();
+    } else if (ev.key === "ArrowRight") {
+      const btn = document.getElementById("sbb-grid-next-btn");
+      if (btn) btn.click();
+    }
+  });
+})();
+</script>
+                """
+            )
+
+            sbb_grid_images: List[gr.Image] = []
+            sbb_grid_checks: List[gr.Checkbox] = []
+            sbb_grid_names: List[gr.Textbox] = []
+
+            for _row_idx in range(SBB_GRID_ROWS):
+                with gr.Row():
+                    for _col_idx in range(SBB_GRID_COLS):
+                        with gr.Column(min_width=110):
+                            img = gr.Image(
+                                type="numpy",
+                                label=None,
+                                show_label=False,
+                                height=SBB_GRID_THUMB_SIZE,
+                                width=SBB_GRID_THUMB_SIZE,
+                                visible=False,
+                            )
+                            chk = gr.Checkbox(label="Q", value=False, visible=False)
+                            name = gr.Textbox(show_label=False, value="", interactive=False, visible=False)
+                            sbb_grid_images.append(img)
+                            sbb_grid_checks.append(chk)
+                            sbb_grid_names.append(name)
+
+            sbb_grid_outputs: List[Any] = [sbb_grid_status, sbb_grid_page_state, sbb_grid_paths_state, sbb_grid_sort_state]
+            for _img, _chk, _name in zip(sbb_grid_images, sbb_grid_checks, sbb_grid_names):
+                sbb_grid_outputs.extend([_img, _chk, _name])
+
+            sbb_grid_refresh_btn.click(
+                fn=sbb_grid_refresh,
+                inputs=[sbb_grid_dir, sbb_grid_sort_state],
+                outputs=sbb_grid_outputs,
+            )
+            sbb_grid_sort_mean_btn.click(
+                fn=sbb_grid_sort_by_mean,
+                inputs=[sbb_grid_dir],
+                outputs=sbb_grid_outputs,
+            )
+            sbb_grid_prev_btn.click(
+                fn=sbb_grid_prev,
+                inputs=[sbb_grid_dir, sbb_grid_page_state, sbb_grid_sort_state],
+                outputs=sbb_grid_outputs,
+            )
+            sbb_grid_next_btn.click(
+                fn=sbb_grid_next,
+                inputs=[sbb_grid_dir, sbb_grid_page_state, sbb_grid_sort_state],
+                outputs=sbb_grid_outputs,
+            )
+            sbb_grid_first_btn.click(
+                fn=sbb_grid_first,
+                inputs=[sbb_grid_dir, sbb_grid_sort_state],
+                outputs=sbb_grid_outputs,
+            )
+            sbb_grid_last_btn.click(
+                fn=sbb_grid_last,
+                inputs=[sbb_grid_dir, sbb_grid_sort_state],
+                outputs=sbb_grid_outputs,
+            )
+            sbb_grid_go_btn.click(
+                fn=sbb_grid_go_to_page,
+                inputs=[sbb_grid_dir, sbb_grid_page_input, sbb_grid_sort_state],
+                outputs=sbb_grid_outputs,
+            )
+            sbb_grid_quarantine_btn.click(
+                fn=sbb_grid_quarantine,
+                inputs=[sbb_grid_dir, sbb_grid_page_state, sbb_grid_paths_state, sbb_grid_sort_state, *sbb_grid_checks],
+                outputs=sbb_grid_outputs,
+            )
+
+        # 11) Diffusion + LoRA texture augmentation
+        with gr.Tab("11. Diffusion + LoRA"):
             gr.Markdown(
                 "End-to-end texture workflow: "
                 "A) prepare LoRA crop dataset from real/SBB pages, "
@@ -3346,14 +4667,14 @@ def build_ui() -> gr.Blocks:
                     with gr.Row():
                         train_texture_mixed_precision = gr.Dropdown(
                             choices=["no", "fp16", "bf16"],
-                            value="fp16",
+                            value="no",
                             label="mixed_precision",
                         )
                         train_texture_workers = gr.Number(label="num_workers", value=4, precision=0)
                     with gr.Row():
                         train_texture_gc = gr.Checkbox(label="gradient_checkpointing", value=True)
                         train_texture_te = gr.Checkbox(label="train_text_encoder", value=False)
-                    train_texture_prompt = gr.Textbox(label="prompt", value="scanned printed page", lines=2)
+                    train_texture_prompt = gr.Textbox(label="prompt", value=DEFAULT_TEXTURE_PROMPT, lines=2)
                     with gr.Row():
                         train_texture_seed = gr.Number(label="seed", value=42, precision=0)
                         train_texture_lora_name = gr.Textbox(label="lora_weights_name", value="texture_lora.safetensors")
@@ -3379,7 +4700,7 @@ def build_ui() -> gr.Blocks:
                     )
                     diff_prompt = gr.Textbox(
                         label="prompt",
-                        value="scanned printed page",
+                        value=DEFAULT_TEXTURE_PROMPT,
                         lines=2,
                     )
                     diff_lora_path = gr.Textbox(
@@ -3387,6 +4708,19 @@ def build_ui() -> gr.Blocks:
                         value="",
                         placeholder="Path to LoRA directory or *.safetensors",
                     )
+                    with gr.Row():
+                        diff_lora_models_dir = gr.Textbox(
+                            label="lora_models_dir",
+                            value=str((ROOT / "models").resolve()),
+                        )
+                        diff_scan_lora_btn = gr.Button("Scan LoRA Models")
+                    diff_lora_select = gr.Dropdown(
+                        label="Detected LoRA (.safetensor/.safetensors)",
+                        choices=[],
+                        value=None,
+                        allow_custom_value=True,
+                    )
+                    diff_lora_scan_msg = gr.Textbox(label="LoRA Scan Status", interactive=False)
                     diff_debug_upload_image = gr.Image(
                         type="numpy",
                         label="debug_upload_image (optional, for single-image test)",
@@ -3519,9 +4853,177 @@ def build_ui() -> gr.Blocks:
                 inputs=[diff_output_dir],
                 outputs=[diff_preview, diff_preview_status],
             )
+            diff_scan_lora_btn.click(
+                fn=scan_lora_models,
+                inputs=[diff_lora_models_dir],
+                outputs=[diff_lora_select, diff_lora_path, diff_lora_scan_msg],
+            )
+            diff_lora_select.change(
+                fn=lambda x: x or "",
+                inputs=[diff_lora_select],
+                outputs=[diff_lora_path],
+            )
 
-        # 11) Retrieval encoder training
-        with gr.Tab("11. Retrieval Encoders"):
+        # 12) Donut OCR workflow
+        with gr.Tab("12. Donut OCR Workflow"):
+            gr.Markdown(
+                "Run label-1 Donut-style OCR training end-to-end "
+                "(synthetic generation -> OCR manifest prep -> Vision Transformer encoder + autoregressive decoder training)."
+            )
+            with gr.Row():
+                with gr.Column(scale=1):
+                    donut_dataset_name = gr.Textbox(label="dataset_name", value=default_donut_dataset_name)
+                    donut_dataset_output_dir = gr.Textbox(label="dataset_output_dir", value=default_donut_dataset_output_dir)
+                    donut_prepared_output_dir = gr.Textbox(
+                        label="prepared_output_dir (optional)",
+                        value="",
+                        placeholder="Leave empty for <dataset>/donut_ocr_label1",
+                    )
+                    donut_model_output_dir = gr.Textbox(label="model_output_dir", value=default_donut_model_output_dir)
+                    donut_model_name = gr.Textbox(
+                        label="model_name_or_path",
+                        value="microsoft/trocr-base-stage1",
+                    )
+                    with gr.Row():
+                        donut_train_samples = gr.Number(label="train_samples", value=2000, precision=0)
+                        donut_val_samples = gr.Number(label="val_samples", value=200, precision=0)
+                    with gr.Row():
+                        donut_font_tibetan = gr.Textbox(label="font_path_tibetan", value=default_donut_font_tibetan)
+                        donut_font_chinese = gr.Textbox(label="font_path_chinese", value=default_donut_font_chinese)
+                    with gr.Row():
+                        donut_augmentation = gr.Dropdown(
+                            choices=["rotate", "noise", "none"],
+                            value="noise",
+                            label="augmentation",
+                        )
+                        donut_newline_token = gr.Dropdown(
+                            choices=["<NL>", "\\n"],
+                            value="<NL>",
+                            label="target_newline_token",
+                        )
+                    with gr.Row():
+                        donut_train_batch = gr.Number(label="per_device_train_batch_size", value=4, precision=0)
+                        donut_eval_batch = gr.Number(label="per_device_eval_batch_size", value=4, precision=0)
+                    with gr.Row():
+                        donut_epochs = gr.Number(label="num_train_epochs", value=8.0)
+                        donut_lr = gr.Number(label="learning_rate", value=5e-5)
+                    with gr.Row():
+                        donut_max_target_length = gr.Number(label="max_target_length", value=512, precision=0)
+                        donut_image_size = gr.Number(label="image_size", value=384, precision=0)
+                    with gr.Row():
+                        donut_seed = gr.Number(label="seed", value=42, precision=0)
+                        donut_tokenizer_vocab_size = gr.Number(label="tokenizer_vocab_size", value=16000, precision=0)
+                    with gr.Row():
+                        donut_train_tokenizer = gr.Checkbox(label="train_tokenizer", value=True)
+                        donut_skip_generation = gr.Checkbox(label="skip_generation", value=False)
+                        donut_skip_prepare = gr.Checkbox(label="skip_prepare", value=False)
+                        donut_skip_train = gr.Checkbox(label="skip_train", value=False)
+
+                    with gr.Accordion("Optional LoRA augmentation during generation", open=False):
+                        donut_lora_path = gr.Textbox(
+                            label="lora_augment_path",
+                            value="",
+                            placeholder="Optional path to LoRA .safetensors or folder",
+                        )
+                        with gr.Row():
+                            donut_lora_family = gr.Dropdown(
+                                choices=["sdxl", "sd21"],
+                                value="sdxl",
+                                label="lora_augment_model_family",
+                            )
+                            donut_lora_targets = gr.Dropdown(
+                                choices=["images", "images_and_ocr_crops"],
+                                value="images_and_ocr_crops",
+                                label="lora_augment_targets",
+                            )
+                        donut_lora_prompt = gr.Textbox(
+                            label="lora_augment_prompt",
+                            value=DEFAULT_TEXTURE_PROMPT,
+                            lines=2,
+                        )
+                        with gr.Row():
+                            donut_lora_splits = gr.Textbox(label="lora_augment_splits", value="train")
+                            donut_lora_seed = gr.Number(label="lora_augment_seed (-1=unset)", value=-1, precision=0)
+                        with gr.Row():
+                            donut_lora_scale = gr.Slider(0.0, 2.0, value=0.8, step=0.05, label="lora_augment_scale")
+                            donut_lora_strength = gr.Slider(0.0, 0.25, value=0.2, step=0.01, label="lora_augment_strength")
+                            donut_lora_steps = gr.Number(label="lora_augment_steps", value=28, precision=0)
+                        with gr.Row():
+                            donut_lora_guidance = gr.Slider(0.0, 4.0, value=1.0, step=0.1, label="lora_augment_guidance_scale")
+                            donut_lora_controlnet = gr.Slider(0.5, 3.0, value=2.0, step=0.1, label="lora_augment_controlnet_scale")
+                        with gr.Row():
+                            donut_lora_canny_low = gr.Number(label="lora_augment_canny_low", value=100, precision=0)
+                            donut_lora_canny_high = gr.Number(label="lora_augment_canny_high", value=200, precision=0)
+                        donut_lora_base_model = gr.Textbox(
+                            label="lora_augment_base_model_id",
+                            value="stabilityai/stable-diffusion-xl-base-1.0",
+                        )
+                        donut_lora_controlnet_model = gr.Textbox(
+                            label="lora_augment_controlnet_model_id",
+                            value="diffusers/controlnet-canny-sdxl-1.0",
+                        )
+
+                    donut_run_btn = gr.Button("Run Donut OCR Workflow", variant="primary")
+                with gr.Column(scale=1):
+                    donut_log = gr.Textbox(label="Workflow Log", lines=24, interactive=False)
+                    donut_dataset_dir = gr.Textbox(label="Dataset Dir", interactive=False)
+                    donut_prepared_dir = gr.Textbox(label="Prepared Manifest Dir", interactive=False)
+                    donut_model_dir = gr.Textbox(label="Model Output Dir", interactive=False)
+                    donut_summary_path = gr.Textbox(label="Workflow Summary Path", interactive=False)
+
+            donut_run_btn.click(
+                fn=run_donut_ocr_workflow_live,
+                inputs=[
+                    donut_dataset_name,
+                    donut_dataset_output_dir,
+                    donut_train_samples,
+                    donut_val_samples,
+                    donut_font_tibetan,
+                    donut_font_chinese,
+                    donut_augmentation,
+                    donut_newline_token,
+                    donut_prepared_output_dir,
+                    donut_model_output_dir,
+                    donut_model_name,
+                    donut_train_tokenizer,
+                    donut_tokenizer_vocab_size,
+                    donut_train_batch,
+                    donut_eval_batch,
+                    donut_epochs,
+                    donut_lr,
+                    donut_max_target_length,
+                    donut_image_size,
+                    donut_seed,
+                    donut_skip_generation,
+                    donut_skip_prepare,
+                    donut_skip_train,
+                    donut_lora_path,
+                    donut_lora_family,
+                    donut_lora_base_model,
+                    donut_lora_controlnet_model,
+                    donut_lora_prompt,
+                    donut_lora_scale,
+                    donut_lora_strength,
+                    donut_lora_steps,
+                    donut_lora_guidance,
+                    donut_lora_controlnet,
+                    donut_lora_seed,
+                    donut_lora_splits,
+                    donut_lora_targets,
+                    donut_lora_canny_low,
+                    donut_lora_canny_high,
+                ],
+                outputs=[
+                    donut_log,
+                    donut_dataset_dir,
+                    donut_prepared_dir,
+                    donut_model_dir,
+                    donut_summary_path,
+                ],
+            )
+
+        # 13) Retrieval encoder training
+        with gr.Tab("13. Retrieval Encoders"):
             gr.Markdown(
                 "Train unpaired encoders for future Tibetan n-gram retrieval: "
                 "A) self-supervised image encoder on page images, "
@@ -3680,8 +5182,8 @@ def build_ui() -> gr.Blocks:
                 ],
             )
 
-        # 12) CLI reference
-        with gr.Tab("12. CLI Audit"):
+        # 14) CLI reference
+        with gr.Tab("14. CLI Audit"):
             audit_btn = gr.Button("Scan All CLI Options")
             audit_out = gr.Markdown()
             audit_btn.click(fn=collect_cli_help, inputs=[], outputs=[audit_out])

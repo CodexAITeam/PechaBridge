@@ -25,6 +25,11 @@ from .config import (
     DEFAULT_ANNOTATION_FILE_PATH
 )
 
+DEFAULT_TEXTURE_PROMPT = (
+    "scanned printed Tibetan pecha page, paper texture, ink bleed, aged grayscale scan, "
+    "realistic Tibetan glyph stroke thickness, subtle hand-written-like ink edge variation"
+)
+
 
 def add_model_arguments(parser):
     """Add model-related arguments."""
@@ -116,7 +121,7 @@ def add_dataset_generation_arguments(parser):
     parser.add_argument('--lora_augment_controlnet_model_id', type=str,
                        default='diffusers/controlnet-canny-sdxl-1.0',
                        help='ControlNet model ID for LoRA augmentation.')
-    parser.add_argument('--lora_augment_prompt', type=str, default='scanned printed page',
+    parser.add_argument('--lora_augment_prompt', type=str, default=DEFAULT_TEXTURE_PROMPT,
                        help='Prompt used for LoRA augmentation.')
     parser.add_argument('--lora_augment_scale', type=float, default=0.8,
                        help='LoRA cross-attention scale for augmentation.')
@@ -382,7 +387,7 @@ def add_prepare_texture_lora_dataset_arguments(parser):
     parser.add_argument('--lora_augment_controlnet_model_id', type=str,
                        default='diffusers/controlnet-canny-sdxl-1.0',
                        help='ControlNet model ID for optional crop augmentation.')
-    parser.add_argument('--lora_augment_prompt', type=str, default='scanned printed page',
+    parser.add_argument('--lora_augment_prompt', type=str, default=DEFAULT_TEXTURE_PROMPT,
                        help='Prompt used for optional crop augmentation.')
     parser.add_argument('--lora_augment_scale', type=float, default=0.8,
                        help='LoRA scale used for optional crop augmentation.')
@@ -423,12 +428,12 @@ def add_train_texture_lora_arguments(parser):
                        help='LoRA rank')
     parser.add_argument('--lora_alpha', type=float, default=16.0,
                        help='LoRA alpha')
-    parser.add_argument('--mixed_precision', type=str, default='fp16',
+    parser.add_argument('--mixed_precision', type=str, default='no',
                        choices=['no', 'fp16', 'bf16'],
                        help='Accelerate mixed precision mode')
     parser.add_argument('--gradient_checkpointing', action='store_true',
                        help='Enable gradient checkpointing')
-    parser.add_argument('--prompt', type=str, default='scanned printed page',
+    parser.add_argument('--prompt', type=str, default=DEFAULT_TEXTURE_PROMPT,
                        help='Generic prompt used for texture LoRA training')
     parser.add_argument('--seed', type=int, default=42,
                        help='Random seed for deterministic training')
@@ -441,8 +446,10 @@ def add_train_texture_lora_arguments(parser):
                        help='Dataloader workers')
     parser.add_argument('--lora_weights_name', type=str, default='texture_lora.safetensors',
                        help='Output LoRA filename')
-    parser.add_argument('--checkpoint_every_epochs', type=int, default=5,
-                       help='Save checkpoint every N epochs (0 disables checkpointing)')
+    parser.add_argument('--checkpoint_every_steps', type=int, default=1000,
+                       help='Save checkpoint every N optimizer steps (0 disables checkpointing). Step checkpoints are never overwritten.')
+    parser.add_argument('--checkpoint_every_epochs', type=int, default=0,
+                       help='Optional: save checkpoint every N epochs (0 disables epoch checkpointing)')
     parser.add_argument('--checkpoint_weights_name', type=str, default='texture_lora_checkpoint.safetensors',
                        help='Checkpoint LoRA filename when overwriting is enabled')
     parser.add_argument('--checkpoint_keep_all', dest='checkpoint_overwrite', action='store_false',
@@ -473,7 +480,7 @@ def add_texture_augment_arguments(parser):
                        help='Optional path to LoRA directory or .safetensors file')
     parser.add_argument('--lora_scale', type=float, default=0.8,
                        help='LoRA scale for cross attention')
-    parser.add_argument('--prompt', type=str, default='scanned printed page',
+    parser.add_argument('--prompt', type=str, default=DEFAULT_TEXTURE_PROMPT,
                        help='Prompt for texture transfer (can be empty)')
     parser.add_argument('--base_model_id', type=str,
                        default='stabilityai/stable-diffusion-xl-base-1.0',
@@ -812,7 +819,7 @@ def add_run_donut_ocr_workflow_arguments(parser):
     parser.add_argument('--lora_augment_controlnet_model_id', type=str,
                        default='diffusers/controlnet-canny-sdxl-1.0',
                        help='ControlNet model ID for optional LoRA augmentation.')
-    parser.add_argument('--lora_augment_prompt', type=str, default='scanned printed page',
+    parser.add_argument('--lora_augment_prompt', type=str, default=DEFAULT_TEXTURE_PROMPT,
                        help='Prompt for optional LoRA augmentation.')
     parser.add_argument('--lora_augment_scale', type=float, default=0.8,
                        help='LoRA scale for optional augmentation.')
