@@ -20,6 +20,7 @@ import subprocess
 import sys
 import tempfile
 import time
+import zipfile
 from concurrent.futures import ThreadPoolExecutor, as_completed
 from functools import lru_cache
 from pathlib import Path
@@ -605,6 +606,48 @@ def _resolve_ls_export_split(ls_export_dir: str) -> Tuple[Optional[Path], str]:
             pass
 
     return None, f"Could not find images/labels under LS export dir: {base}"
+
+
+def _resolve_uploaded_file_path(upload_obj: Any) -> Optional[Path]:
+    if upload_obj is None:
+        return None
+    if isinstance(upload_obj, str):
+        p = Path(upload_obj).expanduser().resolve()
+        return p if p.exists() else None
+    if isinstance(upload_obj, dict):
+        for key in ("name", "path"):
+            v = upload_obj.get(key)
+            if isinstance(v, str) and v:
+                p = Path(v).expanduser().resolve()
+                if p.exists():
+                    return p
+    return None
+
+
+def _resolve_ls_export_split_from_path_or_zip(ls_export_dir: str, ls_export_zip: Any) -> Tuple[Optional[Path], str]:
+    zip_path = _resolve_uploaded_file_path(ls_export_zip)
+    if zip_path is not None:
+        if zip_path.suffix.lower() != ".zip":
+            return None, f"Uploaded file is not a .zip: {zip_path}"
+        extract_root = Path(tempfile.gettempdir()) / "pechabridge_ls_exports" / f"lszip_{int(time.time() * 1000)}"
+        extract_root.mkdir(parents=True, exist_ok=True)
+        try:
+            with zipfile.ZipFile(zip_path, "r") as zf:
+                zf.extractall(extract_root)
+        except Exception as exc:
+            return None, f"Failed to extract ZIP {zip_path}: {type(exc).__name__}: {exc}"
+
+        # Try extraction root first, then direct child dirs (common: single top-level folder).
+        split, msg = _resolve_ls_export_split(str(extract_root))
+        if split is not None:
+            return split, f"{msg} (from ZIP: {zip_path.name})"
+        for child in sorted([p for p in extract_root.iterdir() if p.is_dir()]):
+            split, msg = _resolve_ls_export_split(str(child))
+            if split is not None:
+                return split, f"{msg} (from ZIP: {zip_path.name})"
+        return None, f"Could not resolve LS export structure after ZIP extraction: {extract_root}"
+
+    return _resolve_ls_export_split(ls_export_dir)
 
 
 def _inspect_label_format(split_dir: Path) -> Dict[str, int]:
@@ -3517,6 +3560,7 @@ def prepare_combined_labelstudio_split(
 
 def prepare_labelstudio_from_ls_export_ui(
     ls_export_dir: str,
+    ls_export_zip: Any,
     synthetic_dataset: str,
     datasets_base_dir: str,
     combined_output_split_dir: str,
@@ -3542,7 +3586,7 @@ def prepare_labelstudio_from_ls_export_ui(
             current_vlm_export_tasks_json,
         )
 
-    ls_split, ls_msg = _resolve_ls_export_split(ls_export_dir)
+    ls_split, ls_msg = _resolve_ls_export_split_from_path_or_zip(ls_export_dir, ls_export_zip)
     if ls_split is None:
         return (
             f"Prepare failed: {ls_msg}",
@@ -3599,6 +3643,7 @@ def prepare_labelstudio_from_ls_export_ui(
 def prepare_combined_for_labelstudio_ui(
     synthetic_split_dir: str,
     sbb_test_split_dir: str,
+    sbb_export_zip: Any,
     combined_output_split_dir: str,
     sbb_train_ratio: float,
     split_seed: int,
@@ -3610,9 +3655,23 @@ def prepare_combined_for_labelstudio_ui(
     current_vlm_export_image_root_url: str,
     current_vlm_export_tasks_json: str,
 ):
+    resolved_sbb_split, sbb_msg = _resolve_ls_export_split_from_path_or_zip(sbb_test_split_dir, sbb_export_zip)
+    if resolved_sbb_split is None:
+        return (
+            f"Combine failed: {sbb_msg}",
+            "",
+            current_split_dir,
+            current_local_files_root,
+            current_image_root_url,
+            current_tasks_json,
+            current_vlm_export_split_dir,
+            current_vlm_export_image_root_url,
+            current_vlm_export_tasks_json,
+        )
+
     msg, combined = prepare_combined_labelstudio_split(
         synthetic_split_dir=synthetic_split_dir,
-        sbb_test_split_dir=sbb_test_split_dir,
+        sbb_test_split_dir=str(resolved_sbb_split),
         combined_output_split_dir=combined_output_split_dir,
         sbb_train_ratio=float(sbb_train_ratio),
         seed=int(split_seed),
@@ -3634,7 +3693,7 @@ def prepare_combined_for_labelstudio_ui(
     local_files_root = str(combined_path.parent)
     image_root_url = f"/data/local-files/?d={combined_path.name}/images"
     tasks_json = str((ROOT / "ls-tasks-combined-ui.json").resolve())
-    msg2 = f"{msg}\n\nLabel Studio fields updated in tab 3."
+    msg2 = f"{sbb_msg}\n{msg}\n\nLabel Studio fields updated in tab 3."
 
     return (
         msg2,
@@ -4310,6 +4369,11 @@ def build_ui() -> gr.Blocks:
                             value=str((ROOT / "datasets" / "sbb-vlm-layout" / "test").resolve()),
                         )
                         batch_vlm_combine_sbb_scan_btn = gr.Button("Scan SBB", variant="secondary")
+                    batch_vlm_combine_sbb_zip = gr.File(
+                        label="Label Studio export ZIP (optional)",
+                        file_types=[".zip"],
+                        type="filepath",
+                    )
                     batch_vlm_combine_sbb_select = gr.Dropdown(
                         label="Detected SBB split dirs",
                         choices=[],
@@ -4624,6 +4688,11 @@ def build_ui() -> gr.Blocks:
                     label="Label Studio export folder",
                     value=str((workspace_root / "datasets" / "ls-sbb").resolve()),
                 )
+                ls_export_zip_input = gr.File(
+                    label="Label Studio export ZIP (optional)",
+                    file_types=[".zip"],
+                    type="filepath",
+                )
                 ls_syn_dataset_base = gr.Textbox(
                     label="Synthetic datasets base",
                     value=default_dataset_base,
@@ -4675,6 +4744,7 @@ def build_ui() -> gr.Blocks:
                 fn=prepare_labelstudio_from_ls_export_ui,
                 inputs=[
                     ls_export_dir_input,
+                    ls_export_zip_input,
                     ls_syn_dataset,
                     ls_syn_dataset_base,
                     ls_combined_out,
@@ -4704,6 +4774,7 @@ def build_ui() -> gr.Blocks:
                 inputs=[
                     batch_vlm_combine_syn_split,
                     batch_vlm_combine_sbb_split,
+                    batch_vlm_combine_sbb_zip,
                     batch_vlm_combine_out_split,
                     batch_vlm_sbb_train_ratio,
                     batch_vlm_split_seed,
