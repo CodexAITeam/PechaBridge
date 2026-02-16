@@ -27,7 +27,7 @@ from typing import Any, Dict, List, Optional, Tuple
 
 import gradio as gr
 import numpy as np
-from PIL import Image, ImageDraw
+from PIL import Image, ImageDraw, ImageFont
 import yaml
 
 
@@ -84,6 +84,14 @@ DEFAULT_LAYOUT_CLASS_NAMES: Dict[int, str] = {
     1: "tibetan_text",
     2: "chinese_number_word",
 }
+LABEL_FONT_SIZE = 12
+
+
+def _load_overlay_font() -> ImageFont.ImageFont:
+    try:
+        return ImageFont.truetype("DejaVuSans.ttf", LABEL_FONT_SIZE)
+    except Exception:
+        return ImageFont.load_default()
 
 
 def _run_cmd(cmd: List[str], timeout: int = 3600) -> Tuple[bool, str]:
@@ -285,6 +293,7 @@ def _draw_yolo_boxes(image_path: Path, label_path: Path) -> Tuple[np.ndarray, st
 
     w, h = img.size
     draw = ImageDraw.Draw(img)
+    font = _load_overlay_font()
     labels = _read_yolo_labels(label_path)
 
     class_colors = {
@@ -306,6 +315,20 @@ def _draw_yolo_boxes(image_path: Path, label_path: Path) -> Tuple[np.ndarray, st
         pass
 
     lines = []
+
+    def _draw_tag(x: int, y: int, tag_text: str, color: Tuple[int, int, int]) -> None:
+        tx = int(max(0, x))
+        ty = int(max(0, y - 16))
+        try:
+            bbox = draw.textbbox((tx + 2, ty + 1), tag_text, font=font)
+            tw = max(12, int(bbox[2] - bbox[0]) + 4)
+            th = max(12, int(bbox[3] - bbox[1]) + 2)
+        except Exception:
+            tw = max(12, 9 * len(tag_text))
+            th = 14
+        draw.rectangle((tx, ty, tx + tw, ty + th), fill=(0, 0, 0))
+        draw.text((tx + 2, ty + 1), tag_text, fill=color, font=font)
+
     for i, ann in enumerate(labels, start=1):
         cls = int(ann.get("class", -1))
         color = class_colors.get(cls, (255, 80, 80))
@@ -322,7 +345,7 @@ def _draw_yolo_boxes(image_path: Path, label_path: Path) -> Tuple[np.ndarray, st
             x2 = int((cx + bw / 2) * w)
             y2 = int((cy + bh / 2) * h)
             draw.rectangle((x1, y1, x2, y2), outline=color, width=3)
-            draw.text((x1 + 2, max(0, y1 - 14)), tag, fill=color)
+            _draw_tag(x1 + 2, y1, tag, color)
             lines.append(f"{i}. class={cls} label={cls_name} bbox cx={cx:.4f} cy={cy:.4f} w={bw:.4f} h={bh:.4f}")
             continue
 
@@ -344,7 +367,7 @@ def _draw_yolo_boxes(image_path: Path, label_path: Path) -> Tuple[np.ndarray, st
         xs = [p[0] for p in pts_px]
         ys = [p[1] for p in pts_px]
         x1, y1, x2, y2 = min(xs), min(ys), max(xs), max(ys)
-        draw.text((x1 + 2, max(0, y1 - 14)), tag, fill=color)
+        _draw_tag(x1 + 2, y1, tag, color)
         lines.append(f"{i}. class={cls} label={cls_name} polygon n={len(pts_px)} bbox=({x1},{y1},{x2},{y2})")
 
     summary = f"Found {len(labels)} boxes\n" + ("\n".join(lines[:25]) if lines else "")
@@ -2478,6 +2501,7 @@ def _to_xyxy(
 def _render_detected_regions(image: np.ndarray, detections: List[Dict[str, Any]]) -> np.ndarray:
     base = Image.fromarray(image.astype(np.uint8)).convert("RGB")
     draw = ImageDraw.Draw(base)
+    font = _load_overlay_font()
     color_by_class = {0: (255, 120, 0), 1: (0, 200, 255), 2: (120, 255, 120)}
 
     width, height = base.size
@@ -2493,8 +2517,15 @@ def _render_detected_regions(image: np.ndarray, detections: List[Dict[str, Any]]
         conf = float(det.get("confidence", 0.0))
         tag = f"{label} ({conf:.2f})"
         tx, ty = xyxy[0], max(0, xyxy[1] - 16)
-        draw.rectangle((tx, ty, tx + 9 * len(tag), ty + 14), fill=(0, 0, 0))
-        draw.text((tx + 2, ty + 1), tag, fill=color)
+        try:
+            bbox = draw.textbbox((tx + 2, ty + 1), tag, font=font)
+            tw = max(12, int(bbox[2] - bbox[0]) + 4)
+            th = max(12, int(bbox[3] - bbox[1]) + 2)
+        except Exception:
+            tw = max(12, 9 * len(tag))
+            th = 14
+        draw.rectangle((tx, ty, tx + tw, ty + th), fill=(0, 0, 0))
+        draw.text((tx + 2, ty + 1), tag, fill=color, font=font)
 
     return np.array(base)
 
