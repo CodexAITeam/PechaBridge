@@ -28,6 +28,7 @@ from typing import Any, Dict, List, Optional, Tuple
 import gradio as gr
 import numpy as np
 from PIL import Image, ImageDraw
+import yaml
 
 
 ROOT = Path(__file__).resolve().parent
@@ -330,6 +331,207 @@ def _draw_yolo_boxes(image_path: Path, label_path: Path) -> Tuple[np.ndarray, st
     if len(lines) > 25:
         summary += f"\n... +{len(lines)-25} more"
     return np.array(img), summary
+
+
+def _normalize_to_bbox_lines(label_src: Path, image_path: Path) -> List[str]:
+    anns = _read_yolo_labels(label_src)
+    if not anns:
+        return []
+
+    img_w = 0
+    img_h = 0
+    try:
+        with Image.open(image_path) as im:
+            img_w, img_h = im.size
+    except Exception:
+        img_w, img_h = 0, 0
+
+    out_lines: List[str] = []
+    for ann in anns:
+        cls = int(ann.get("class", -1))
+        if cls < 0:
+            continue
+        if ann.get("type") == "bbox":
+            cx = float(ann["cx"])
+            cy = float(ann["cy"])
+            bw = float(ann["bw"])
+            bh = float(ann["bh"])
+            cx = min(max(cx, 0.0), 1.0)
+            cy = min(max(cy, 0.0), 1.0)
+            bw = min(max(bw, 1e-6), 1.0)
+            bh = min(max(bh, 1e-6), 1.0)
+            out_lines.append(f"{cls} {cx:.6f} {cy:.6f} {bw:.6f} {bh:.6f}")
+            continue
+
+        points = ann.get("points") or []
+        if not isinstance(points, list) or len(points) < 3:
+            continue
+
+        norm = True
+        for x, y in points:
+            if abs(float(x)) > 1.5 or abs(float(y)) > 1.5:
+                norm = False
+                break
+
+        if norm:
+            xs = [float(x) for x, _ in points]
+            ys = [float(y) for _, y in points]
+        else:
+            if img_w <= 0 or img_h <= 0:
+                continue
+            xs = [float(x) / float(img_w) for x, _ in points]
+            ys = [float(y) / float(img_h) for _, y in points]
+
+        x1, x2 = min(xs), max(xs)
+        y1, y2 = min(ys), max(ys)
+        x1 = min(max(x1, 0.0), 1.0)
+        y1 = min(max(y1, 0.0), 1.0)
+        x2 = min(max(x2, 0.0), 1.0)
+        y2 = min(max(y2, 0.0), 1.0)
+        bw = max(1e-6, x2 - x1)
+        bh = max(1e-6, y2 - y1)
+        cx = x1 + (bw / 2.0)
+        cy = y1 + (bh / 2.0)
+        out_lines.append(f"{cls} {cx:.6f} {cy:.6f} {bw:.6f} {bh:.6f}")
+
+    return out_lines
+
+
+def _resolve_dataset_train_split(dataset_choice: str, datasets_base: str) -> Tuple[Optional[Path], str]:
+    ds = (dataset_choice or "").strip()
+    if not ds:
+        return None, "Synthetic dataset is empty."
+
+    base = Path(datasets_base).expanduser().resolve()
+    raw = Path(ds).expanduser()
+    candidates: List[Path] = []
+
+    if raw.is_absolute():
+        candidates.append(raw)
+    else:
+        candidates.append((Path.cwd() / raw).resolve())
+        candidates.append((base / raw).resolve())
+
+    if raw.suffix.lower() not in {".yaml", ".yml"}:
+        candidates.append((base / f"{ds}.yaml").resolve())
+        candidates.append((base / f"{ds}.yml").resolve())
+
+    for cand in candidates:
+        if cand.is_dir():
+            if (cand / "train" / "images").exists() and (cand / "train" / "labels").exists():
+                return (cand / "train").resolve(), f"Resolved synthetic split: {cand / 'train'}"
+            if (cand / "images").exists() and (cand / "labels").exists():
+                return cand.resolve(), f"Resolved synthetic split: {cand}"
+            yml = cand / "data.yml"
+            yaml_alt = cand / "data.yaml"
+            for y in (yml, yaml_alt):
+                if y.exists():
+                    cand = y
+                    break
+
+        if cand.is_file() and cand.suffix.lower() in {".yaml", ".yml"}:
+            try:
+                cfg = yaml.safe_load(cand.read_text(encoding="utf-8")) or {}
+            except Exception:
+                continue
+            root = Path(str(cfg.get("path", ""))).expanduser()
+            if not str(root):
+                root = cand.parent
+            elif not root.is_absolute():
+                root = (cand.parent / root).resolve()
+            train_rel = str(cfg.get("train", "train/images")).strip() or "train/images"
+            train_images = (root / train_rel).resolve() if not Path(train_rel).is_absolute() else Path(train_rel).resolve()
+            if train_images.name == "images":
+                split_dir = train_images.parent
+            else:
+                split_dir = (root / "train").resolve()
+            if (split_dir / "images").exists() and (split_dir / "labels").exists():
+                return split_dir, f"Resolved synthetic split from YAML: {split_dir}"
+
+    return None, f"Could not resolve synthetic dataset: {ds}"
+
+
+def _resolve_ls_export_split(ls_export_dir: str) -> Tuple[Optional[Path], str]:
+    base = Path(ls_export_dir).expanduser().resolve()
+    if not base.exists() or not base.is_dir():
+        return None, f"LS export directory not found: {base}"
+
+    if (base / "images").exists() and (base / "labels").exists():
+        return base, f"Resolved LS split: {base}"
+
+    for split_name in ("train", "val", "test"):
+        split_dir = base / split_name
+        if (split_dir / "images").exists() and (split_dir / "labels").exists():
+            return split_dir, f"Resolved LS split: {split_dir}"
+
+    yml = base / "data.yml"
+    yaml_alt = base / "data.yaml"
+    yaml_path = yml if yml.exists() else (yaml_alt if yaml_alt.exists() else None)
+    if yaml_path is not None:
+        try:
+            cfg = yaml.safe_load(yaml_path.read_text(encoding="utf-8")) or {}
+            root = Path(str(cfg.get("path", ""))).expanduser()
+            if not str(root):
+                root = yaml_path.parent
+            elif not root.is_absolute():
+                root = (yaml_path.parent / root).resolve()
+            train_rel = str(cfg.get("train", "train/images")).strip() or "train/images"
+            train_images = (root / train_rel).resolve() if not Path(train_rel).is_absolute() else Path(train_rel).resolve()
+            split_dir = train_images.parent if train_images.name == "images" else (root / "train").resolve()
+            if (split_dir / "images").exists() and (split_dir / "labels").exists():
+                return split_dir, f"Resolved LS split from YAML: {split_dir}"
+        except Exception:
+            pass
+
+    return None, f"Could not find images/labels under LS export dir: {base}"
+
+
+def _inspect_label_format(split_dir: Path) -> Dict[str, int]:
+    labels_dir = split_dir / "labels"
+    stats = {"files": 0, "rows": 0, "bbox_rows": 0, "polygon_rows": 0, "invalid_rows": 0}
+    if not labels_dir.exists():
+        return stats
+
+    label_files = sorted(labels_dir.glob("*.txt"))
+    stats["files"] = len(label_files)
+    for lf in label_files:
+        for raw in lf.read_text(encoding="utf-8", errors="replace").splitlines():
+            line = raw.strip()
+            if not line:
+                continue
+            parts = line.split()
+            stats["rows"] += 1
+            if len(parts) == 5:
+                stats["bbox_rows"] += 1
+            elif len(parts) >= 7 and (len(parts) - 1) % 2 == 0:
+                stats["polygon_rows"] += 1
+            else:
+                stats["invalid_rows"] += 1
+    return stats
+
+
+def _label_format_summary(stats: Dict[str, int]) -> str:
+    rows = int(stats.get("rows", 0))
+    bbox_rows = int(stats.get("bbox_rows", 0))
+    poly_rows = int(stats.get("polygon_rows", 0))
+    invalid_rows = int(stats.get("invalid_rows", 0))
+    files = int(stats.get("files", 0))
+
+    if rows == 0:
+        fmt = "empty"
+    elif invalid_rows == rows:
+        fmt = "invalid"
+    elif poly_rows > 0 and bbox_rows == 0 and invalid_rows == 0:
+        fmt = "polygon"
+    elif bbox_rows > 0 and poly_rows == 0 and invalid_rows == 0:
+        fmt = "bbox"
+    else:
+        fmt = "mixed"
+
+    return (
+        f"Label format check: {fmt} "
+        f"(files={files}, rows={rows}, bbox={bbox_rows}, polygon={poly_rows}, invalid={invalid_rows})"
+    )
 
 
 def run_generate_synthetic(
@@ -3076,6 +3278,7 @@ def prepare_combined_labelstudio_split(
 
     def _copy_split(src_split: Path, prefix: str):
         cnt = 0
+        converted = 0
         for img in sorted((src_split / "images").glob("*")):
             if not img.is_file():
                 continue
@@ -3085,14 +3288,16 @@ def prepare_combined_labelstudio_split(
             lbl_src = src_split / "labels" / f"{img.stem}.txt"
             target_img.write_bytes(img.read_bytes())
             if lbl_src.exists():
-                target_lbl.write_text(lbl_src.read_text(encoding="utf-8"), encoding="utf-8")
+                bbox_lines = _normalize_to_bbox_lines(lbl_src, img)
+                target_lbl.write_text("\n".join(bbox_lines) + ("\n" if bbox_lines else ""), encoding="utf-8")
+                converted += 1
             else:
                 target_lbl.write_text("", encoding="utf-8")
             cnt += 1
-        return cnt
+        return cnt, converted
 
-    syn_count = _copy_split(syn, "syn")
-    sbb_count = _copy_split(sbb, "sbb")
+    syn_count, syn_converted = _copy_split(syn, "syn")
+    sbb_count, sbb_converted = _copy_split(sbb, "sbb")
 
     (out / "classes.txt").write_text(
         "tibetan_number_word\ntibetan_text\nchinese_number_word\n",
@@ -3103,9 +3308,91 @@ def prepare_combined_labelstudio_split(
         f"Combined split created at {out}\n"
         f"Synthetic images: {syn_count}\n"
         f"SBB test images: {sbb_count}\n"
+        f"Label files normalized to YOLO bbox format: syn={syn_converted}, sbb={sbb_converted}\n"
         "Use this split only for annotation/review; keep SBB out of train/val model training."
     )
     return msg, str(out)
+
+
+def prepare_labelstudio_from_ls_export_ui(
+    ls_export_dir: str,
+    synthetic_dataset: str,
+    datasets_base_dir: str,
+    combined_output_split_dir: str,
+    current_split_dir: str,
+    current_local_files_root: str,
+    current_image_root_url: str,
+    current_tasks_json: str,
+    current_vlm_export_split_dir: str,
+    current_vlm_export_image_root_url: str,
+    current_vlm_export_tasks_json: str,
+):
+    syn_split, syn_msg = _resolve_dataset_train_split(synthetic_dataset, datasets_base_dir)
+    if syn_split is None:
+        return (
+            f"Prepare failed: {syn_msg}",
+            "",
+            current_split_dir,
+            current_local_files_root,
+            current_image_root_url,
+            current_tasks_json,
+            current_vlm_export_split_dir,
+            current_vlm_export_image_root_url,
+            current_vlm_export_tasks_json,
+        )
+
+    ls_split, ls_msg = _resolve_ls_export_split(ls_export_dir)
+    if ls_split is None:
+        return (
+            f"Prepare failed: {ls_msg}",
+            "",
+            current_split_dir,
+            current_local_files_root,
+            current_image_root_url,
+            current_tasks_json,
+            current_vlm_export_split_dir,
+            current_vlm_export_image_root_url,
+            current_vlm_export_tasks_json,
+        )
+
+    ls_label_stats = _inspect_label_format(ls_split)
+    ls_label_msg = _label_format_summary(ls_label_stats)
+
+    msg, combined = prepare_combined_labelstudio_split(
+        synthetic_split_dir=str(syn_split),
+        sbb_test_split_dir=str(ls_split),
+        combined_output_split_dir=combined_output_split_dir,
+    )
+    if not combined:
+        return (
+            f"{syn_msg}\n{ls_msg}\n{ls_label_msg}\n{msg}",
+            "",
+            current_split_dir,
+            current_local_files_root,
+            current_image_root_url,
+            current_tasks_json,
+            current_vlm_export_split_dir,
+            current_vlm_export_image_root_url,
+            current_vlm_export_tasks_json,
+        )
+
+    combined_path = Path(combined).expanduser().resolve()
+    local_files_root = str(combined_path.parent)
+    image_root_url = f"/data/local-files/?d={combined_path.name}/images"
+    tasks_json = str((ROOT / "ls-tasks-combined-ui.json").resolve())
+    msg2 = f"{syn_msg}\n{ls_msg}\n{ls_label_msg}\n\n{msg}\n\nLabel Studio fields updated in tab 8."
+
+    return (
+        msg2,
+        str(combined_path),
+        str(combined_path),
+        local_files_root,
+        image_root_url,
+        tasks_json,
+        str(combined_path),
+        image_root_url,
+        tasks_json,
+    )
 
 
 def prepare_combined_for_labelstudio_ui(
@@ -4007,7 +4294,32 @@ def build_ui() -> gr.Blocks:
 
         # 8) Export to Label Studio
         with gr.Tab("8. Label Studio Export"):
-            gr.Markdown("Convert YOLO split directory to Label Studio tasks.")
+            gr.Markdown(
+                "Simplified flow: pick your Label-Studio export folder + synthetic dataset, "
+                "then auto-prepare a combined split (including polygon->bbox normalization)."
+            )
+            with gr.Row():
+                ls_export_dir_input = gr.Textbox(
+                    label="Label Studio export folder",
+                    value=str((workspace_root / "datasets" / "ls-sbb").resolve()),
+                )
+                ls_syn_dataset_base = gr.Textbox(
+                    label="Synthetic datasets base",
+                    value=default_dataset_base,
+                )
+                ls_scan_syn_btn = gr.Button("Scan Synthetic Datasets")
+            ls_syn_dataset = gr.Dropdown(
+                label="Synthetic dataset (train split)",
+                choices=train_dataset_choices,
+                value=default_train_dataset,
+                allow_custom_value=True,
+            )
+            ls_combined_out = gr.Textbox(
+                label="Combined output split dir",
+                value=str((workspace_root / "datasets" / "combined-layout-labelstudio" / "train").resolve()),
+            )
+            ls_prepare_btn = gr.Button("Prepare Combined Split from LS Export + Synthetic", variant="primary")
+            ls_prepare_status = gr.Textbox(label="Prepare Status", lines=8, interactive=False)
             split_dir = gr.Textbox(label="YOLO Split Directory", value=default_split_dir)
             image_ext = gr.Dropdown(label="image-ext", choices=[".jpg", ".png", ".jpeg", ".bmp", ".tif", ".tiff"], value=".png")
             tasks_json = gr.Textbox(label="tasks json output", value=str((ROOT / "ls-tasks-ui.json").resolve()))
@@ -4031,6 +4343,39 @@ def build_ui() -> gr.Blocks:
                 fn=start_label_studio,
                 inputs=[local_files_root],
                 outputs=[start_ls_msg],
+            )
+
+            ls_scan_syn_btn.click(
+                fn=_scan_train_datasets,
+                inputs=[ls_syn_dataset_base],
+                outputs=[ls_syn_dataset],
+            )
+            ls_prepare_btn.click(
+                fn=prepare_labelstudio_from_ls_export_ui,
+                inputs=[
+                    ls_export_dir_input,
+                    ls_syn_dataset,
+                    ls_syn_dataset_base,
+                    ls_combined_out,
+                    split_dir,
+                    local_files_root,
+                    image_root_url,
+                    tasks_json,
+                    batch_vlm_export_split_dir,
+                    batch_vlm_export_image_root_url,
+                    batch_vlm_export_tasks_json,
+                ],
+                outputs=[
+                    ls_prepare_status,
+                    batch_vlm_combine_result,
+                    split_dir,
+                    local_files_root,
+                    image_root_url,
+                    tasks_json,
+                    batch_vlm_export_split_dir,
+                    batch_vlm_export_image_root_url,
+                    batch_vlm_export_tasks_json,
+                ],
             )
 
             batch_vlm_combine_btn.click(

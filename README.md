@@ -1,3 +1,5 @@
+![PechaBridge Hero](assets/hero_pb.jpeg)
+
 # PechaBridge Workbench
 
 ## Project Description
