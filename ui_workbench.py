@@ -3483,6 +3483,23 @@ def prepare_combined_labelstudio_split(
         "tibetan_number_word\ntibetan_text\nchinese_number_word\n",
         encoding="utf-8",
     )
+    yaml_path = out_root.parent / f"{out_root.name}.yaml"
+    data_yaml = {
+        "path": str(out_root),
+        "train": "train/images",
+        "val": "val/images",
+        "test": "",
+        "nc": 3,
+        "names": {
+            0: "tibetan_number_word",
+            1: "tibetan_text",
+            2: "chinese_number_word",
+        },
+    }
+    yaml_path.write_text(
+        yaml.safe_dump(data_yaml, sort_keys=False, allow_unicode=True),
+        encoding="utf-8",
+    )
 
     msg = (
         f"Combined dataset created at {out_root}\n"
@@ -3491,6 +3508,7 @@ def prepare_combined_labelstudio_split(
         f"SBB total copied: {sbb_count}\n"
         f"{sbb_class_map_msg}\n"
         f"Label files normalized to YOLO bbox format: syn={syn_converted}, sbb={sbb_converted}\n"
+        f"Wrote dataset YAML: {yaml_path}\n"
         f"Train split: {out_root / 'train'}\n"
         f"Val split: {out_root / 'val'}"
     )
