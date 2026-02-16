@@ -476,6 +476,8 @@ def add_texture_augment_arguments(parser):
                        help='Base random seed; if set, outputs are deterministic')
     parser.add_argument('--controlnet_scale', type=float, default=2.0,
                        help='ControlNet conditioning scale (high to preserve structure)')
+    parser.add_argument('--disable_controlnet', action='store_true',
+                       help='Disable ControlNet completely and run plain img2img inference.')
     parser.add_argument('--lora_path', type=str, default='',
                        help='Optional path to LoRA directory or .safetensors file')
     parser.add_argument('--lora_scale', type=float, default=0.8,

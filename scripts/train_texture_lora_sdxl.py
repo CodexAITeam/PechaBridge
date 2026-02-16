@@ -332,6 +332,7 @@ def run(args) -> dict:
 
     base_model_id = _resolve_base_model_id(args)
     LOGGER.info("Training family=%s base_model=%s", args.model_family, base_model_id)
+    LOGGER.info("ControlNet usage: disabled (default for this LoRA training script).")
 
     set_seed(args.seed)
 

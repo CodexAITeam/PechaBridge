@@ -894,6 +894,7 @@ def run_texture_augment_upload_live(
     guidance_scale: float,
     seed: Optional[int],
     controlnet_scale: float,
+    disable_controlnet: bool,
     lora_path: str,
     lora_scale: float,
     prompt: str,
@@ -920,6 +921,7 @@ def run_texture_augment_upload_live(
         guidance_scale=guidance_scale,
         seed=seed,
         controlnet_scale=controlnet_scale,
+        disable_controlnet=disable_controlnet,
         lora_path=lora_path,
         lora_scale=lora_scale,
         prompt=prompt,
@@ -943,6 +945,7 @@ def run_texture_augment_live(
     guidance_scale: float,
     seed: Optional[int],
     controlnet_scale: float,
+    disable_controlnet: bool,
     lora_path: str,
     lora_scale: float,
     prompt: str,
@@ -1009,6 +1012,8 @@ def run_texture_augment_live(
         "--canny_high",
         str(int(canny_high)),
     ]
+    if disable_controlnet:
+        cmd.append("--disable_controlnet")
     if seed_arg is not None:
         cmd.extend(["--seed", str(seed_arg)])
     lora = (lora_path or "").strip()
@@ -4738,6 +4743,10 @@ def build_ui() -> gr.Blocks:
                     with gr.Row():
                         diff_guidance_scale = gr.Slider(0.0, 4.0, value=1.0, step=0.1, label="guidance_scale")
                         diff_controlnet_scale = gr.Slider(0.5, 3.0, value=2.0, step=0.1, label="controlnet_scale")
+                    diff_disable_controlnet = gr.Checkbox(
+                        label="disable_controlnet (plain img2img)",
+                        value=False,
+                    )
                     with gr.Row():
                         diff_lora_scale = gr.Slider(0.0, 2.0, value=0.8, step=0.05, label="lora_scale")
                         diff_seed = gr.Number(
@@ -4817,6 +4826,7 @@ def build_ui() -> gr.Blocks:
                     diff_guidance_scale,
                     diff_seed,
                     diff_controlnet_scale,
+                    diff_disable_controlnet,
                     diff_lora_path,
                     diff_lora_scale,
                     diff_prompt,
@@ -4838,6 +4848,7 @@ def build_ui() -> gr.Blocks:
                     diff_guidance_scale,
                     diff_seed,
                     diff_controlnet_scale,
+                    diff_disable_controlnet,
                     diff_lora_path,
                     diff_lora_scale,
                     diff_prompt,
