@@ -3458,6 +3458,37 @@ def scan_pretrained_models(models_dir: str):
     return gr.update(choices=models, value=(models[0] if models else None)), f"Found {len(models)} model(s) in {base}"
 
 
+def scan_ultralytics_inference_models(models_dir: str):
+    base = Path(models_dir).expanduser().resolve()
+    if not base.exists():
+        return gr.update(choices=[], value=None), f"Models directory not found: {base}"
+
+    exts = {".pt", ".torchscript", ".onnx"}
+    blocked_exts = {".safetensor", ".safetensors"}
+    models: List[str] = []
+    ignored_lora = 0
+
+    for p in sorted(base.rglob("*")):
+        if not p.is_file():
+            continue
+        sfx = p.suffix.lower()
+        if sfx in blocked_exts:
+            ignored_lora += 1
+            continue
+        if sfx not in exts:
+            continue
+        lname = p.name.lower()
+        if "lora" in lname:
+            ignored_lora += 1
+            continue
+        models.append(str(p.resolve()))
+
+    return (
+        gr.update(choices=models, value=(models[0] if models else None)),
+        f"Found {len(models)} Ultralytics model(s) in {base}. Ignored LoRA-like files: {ignored_lora}.",
+    )
+
+
 def scan_lora_models(models_dir: str):
     base = Path(models_dir).expanduser().resolve()
     if not base.exists():
@@ -4231,6 +4262,10 @@ def build_ui() -> gr.Blocks:
             gr.Markdown("Run inference with a trained Ultralytics model and preview detections.")
             with gr.Row():
                 with gr.Column(scale=1):
+                    infer_models_dir = gr.Textbox(label="models_dir", value=str((workspace_root / "models").resolve()))
+                    infer_scan_models_btn = gr.Button("Scan Models")
+                    infer_model_select = gr.Dropdown(label="Detected Ultralytics Model", choices=[], allow_custom_value=True)
+                    infer_model_scan_msg = gr.Textbox(label="Model Scan Status", interactive=False)
                     infer_model = gr.Textbox(label="model_path", value=str((ROOT / "runs" / "detect" / "train" / "weights" / "best.pt").resolve()))
                     infer_conf = gr.Slider(0.01, 0.99, value=0.25, step=0.01, label="conf")
                     infer_imgsz = gr.Number(label="imgsz", value=1024, precision=0)
@@ -4246,6 +4281,16 @@ def build_ui() -> gr.Blocks:
                 fn=run_trained_model_inference,
                 inputs=[infer_image_in, infer_model, infer_conf, infer_imgsz, infer_device],
                 outputs=[infer_image_out, infer_status, infer_json],
+            )
+            infer_scan_models_btn.click(
+                fn=scan_ultralytics_inference_models,
+                inputs=[infer_models_dir],
+                outputs=[infer_model_select, infer_model_scan_msg],
+            )
+            infer_model_select.change(
+                fn=lambda x: x or "",
+                inputs=[infer_model_select],
+                outputs=[infer_model],
             )
 
         # 7) VLM parsing
