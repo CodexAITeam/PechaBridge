@@ -3299,6 +3299,123 @@ def _segment_lines_in_text_crop(
     return tightened
 
 
+def _segment_red_runs_in_line_crop(
+    line_crop_rgb: np.ndarray,
+    min_redness: int,
+    min_saturation: int,
+    min_column_fill_rel: float,
+    merge_gap_px: int,
+    min_width_px: int,
+) -> List[Tuple[int, int, int, int]]:
+    if cv2 is None:
+        return []
+    if line_crop_rgb is None or line_crop_rgb.size == 0:
+        return []
+
+    h, w = line_crop_rgb.shape[:2]
+    if h < 3 or w < 3:
+        return []
+
+    rgb = line_crop_rgb.astype(np.uint8, copy=False)
+    r = rgb[:, :, 0].astype(np.int16)
+    g = rgb[:, :, 1].astype(np.int16)
+    b = rgb[:, :, 2].astype(np.int16)
+    redness = r - np.maximum(g, b)
+
+    hsv = cv2.cvtColor(rgb, cv2.COLOR_RGB2HSV)
+    hue = hsv[:, :, 0].astype(np.int16)
+    sat = hsv[:, :, 1].astype(np.int16)
+
+    red_floor = max(0, int(min_redness))
+    positive = redness[redness > 0]
+    if positive.size >= 40:
+        red_floor = max(red_floor, int(np.percentile(positive, 72)))
+
+    sat_floor = max(0, int(min_saturation))
+    hue_mask = (hue <= 24) | (hue >= 150)
+    red_mask = (redness >= red_floor) & (sat >= sat_floor) & hue_mask
+    if not bool(np.any(red_mask)):
+        return []
+
+    mask = (red_mask.astype(np.uint8) * 255)
+    open_kernel = cv2.getStructuringElement(cv2.MORPH_RECT, (2, 2))
+    mask = cv2.morphologyEx(mask, cv2.MORPH_OPEN, open_kernel, iterations=1)
+    close_w = max(3, int(round(w * 0.02)))
+    close_w = min(close_w, max(1, w))
+    close_kernel = cv2.getStructuringElement(cv2.MORPH_RECT, (close_w, 1))
+    mask = cv2.morphologyEx(mask, cv2.MORPH_CLOSE, close_kernel, iterations=1)
+
+    col_fill = (mask > 0).sum(axis=0).astype(np.float32)
+    if col_fill.size == 0 or float(np.max(col_fill)) <= 0.0:
+        return []
+
+    smooth = max(1, int(round(w * 0.01)))
+    if smooth % 2 == 0:
+        smooth += 1
+    if smooth > 1:
+        conv = np.ones((smooth,), dtype=np.float32) / float(smooth)
+        col_fill = np.convolve(col_fill, conv, mode="same")
+
+    col_rel = min(max(float(min_column_fill_rel), 0.01), 0.95)
+    col_threshold = max(1.0, float(h) * col_rel)
+    active_cols = col_fill >= col_threshold
+    if not bool(np.any(active_cols)):
+        return []
+
+    runs: List[Tuple[int, int]] = []
+    x = 0
+    while x < w:
+        if not bool(active_cols[x]):
+            x += 1
+            continue
+        x1 = x
+        while x < w and bool(active_cols[x]):
+            x += 1
+        runs.append((x1, x))
+
+    merged: List[Tuple[int, int]] = []
+    merge_gap = max(0, int(merge_gap_px))
+    for x1, x2 in runs:
+        if not merged:
+            merged.append((x1, x2))
+            continue
+        px1, px2 = merged[-1]
+        if x1 - px2 <= merge_gap:
+            merged[-1] = (px1, x2)
+        else:
+            merged.append((x1, x2))
+
+    min_width = max(2, int(min_width_px))
+    out_boxes: List[Tuple[int, int, int, int]] = []
+    for x1, x2 in merged:
+        if x2 - x1 < min_width:
+            continue
+        sub = mask[:, x1:x2]
+        if sub.size == 0:
+            continue
+        rows = np.where((sub > 0).sum(axis=1) > 0)[0]
+        cols = np.where((sub > 0).sum(axis=0) > 0)[0]
+        if rows.size == 0 or cols.size == 0:
+            continue
+
+        rx1 = x1 + int(cols[0])
+        rx2 = x1 + int(cols[-1]) + 1
+        ry1 = int(rows[0])
+        ry2 = int(rows[-1]) + 1
+        if rx2 - rx1 < min_width or ry2 - ry1 < 2:
+            continue
+
+        pad = 1
+        bx1 = max(0, rx1 - pad)
+        by1 = max(0, ry1 - pad)
+        bx2 = min(w, rx2 + pad)
+        by2 = min(h, ry2 + pad)
+        if bx2 > bx1 and by2 > by1:
+            out_boxes.append((bx1, by1, bx2, by2))
+
+    return out_boxes
+
+
 def run_tibetan_text_line_split_classical(
     image: np.ndarray,
     model_path: str,
@@ -3310,6 +3427,13 @@ def run_tibetan_text_line_split_classical(
     projection_threshold_rel: float,
     merge_gap_px: int,
     draw_parent_boxes: bool,
+    detect_red_text: bool,
+    red_min_redness: int,
+    red_min_saturation: int,
+    red_column_fill_rel: float,
+    red_merge_gap_px: int,
+    red_min_width_px: int,
+    draw_red_boxes: bool,
 ):
     if image is None:
         return None, "Please provide an image.", "{}"
@@ -3336,6 +3460,7 @@ def run_tibetan_text_line_split_classical(
 
     line_color = (255, 170, 0)
     text_box_color = (0, 220, 255)
+    red_box_color = (255, 70, 110)
     unknown_box_color = (190, 190, 190)
 
     detections: List[Dict[str, Any]] = []
@@ -3377,6 +3502,7 @@ def run_tibetan_text_line_split_classical(
 
     tibetan_results: List[Dict[str, Any]] = []
     all_line_count = 0
+    all_red_count = 0
 
     for det in detections:
         cls = int(det["class"])
@@ -3405,6 +3531,8 @@ def run_tibetan_text_line_split_classical(
         )
 
         line_boxes_global: List[List[int]] = []
+        line_details: List[Dict[str, Any]] = []
+        red_boxes_for_text: List[List[int]] = []
         for lx1, ly1, lx2, ly2 in line_boxes_local:
             gx1 = max(0, min(w, x1 + int(lx1)))
             gy1 = max(0, min(h, y1 + int(ly1)))
@@ -3420,6 +3548,41 @@ def run_tibetan_text_line_split_classical(
             draw.text((ltx + 2, lty + 1), line_tag, fill=line_color, font=font)
             line_boxes_global.append([gx1, gy1, gx2, gy2])
 
+            line_red_boxes_global: List[List[int]] = []
+            if bool(detect_red_text):
+                line_crop = crop[int(ly1) : int(ly2), int(lx1) : int(lx2)]
+                red_boxes_local = _segment_red_runs_in_line_crop(
+                    line_crop_rgb=line_crop,
+                    min_redness=int(red_min_redness),
+                    min_saturation=int(red_min_saturation),
+                    min_column_fill_rel=float(red_column_fill_rel),
+                    merge_gap_px=int(red_merge_gap_px),
+                    min_width_px=int(red_min_width_px),
+                )
+                for rx1, ry1, rx2, ry2 in red_boxes_local:
+                    rgx1 = max(0, min(w, x1 + int(lx1) + int(rx1)))
+                    rgy1 = max(0, min(h, y1 + int(ly1) + int(ry1)))
+                    rgx2 = max(0, min(w, x1 + int(lx1) + int(rx2)))
+                    rgy2 = max(0, min(h, y1 + int(ly1) + int(ry2)))
+                    if rgx2 <= rgx1 or rgy2 <= rgy1:
+                        continue
+                    line_red_boxes_global.append([rgx1, rgy1, rgx2, rgy2])
+                    red_boxes_for_text.append([rgx1, rgy1, rgx2, rgy2])
+                    all_red_count += 1
+                    if draw_red_boxes:
+                        draw.rectangle((rgx1, rgy1, rgx2, rgy2), outline=red_box_color, width=3)
+                        red_tag = f"red {all_red_count}"
+                        rtx, rty = rgx1 + 2, max(0, rgy1 - 14)
+                        draw.rectangle((rtx, rty, rtx + 9 * len(red_tag), rty + 13), fill=(0, 0, 0))
+                        draw.text((rtx + 2, rty + 1), red_tag, fill=red_box_color, font=font)
+
+            line_details.append(
+                {
+                    "line_box": [gx1, gy1, gx2, gy2],
+                    "red_boxes": line_red_boxes_global,
+                }
+            )
+
         tibetan_results.append(
             {
                 "class": cls,
@@ -3427,6 +3590,8 @@ def run_tibetan_text_line_split_classical(
                 "confidence": float(det["confidence"]),
                 "text_box": [x1, y1, x2, y2],
                 "lines": line_boxes_global,
+                "line_details": line_details,
+                "red_boxes": red_boxes_for_text,
             }
         )
 
@@ -3436,6 +3601,8 @@ def run_tibetan_text_line_split_classical(
         f"Matched {len(tibetan_results)} tibetan_text box(es). "
         f"Extracted {all_line_count} line box(es)."
     )
+    if bool(detect_red_text):
+        status += f" Found {all_red_count} red segment box(es)."
     if not tibetan_results and labels_seen:
         status += f" Labels found: {', '.join(labels_seen[:8])}"
 
@@ -3445,6 +3612,8 @@ def run_tibetan_text_line_split_classical(
         "detections_total": len(detections),
         "tibetan_text_boxes": tibetan_results,
         "line_boxes_total": all_line_count,
+        "red_boxes_total": all_red_count,
+        "red_detection_enabled": bool(detect_red_text),
     }
     return np.array(overlay), status, json.dumps(payload, ensure_ascii=False, indent=2)
 
@@ -4469,7 +4638,7 @@ def build_ui() -> gr.Blocks:
                 "4. Dataset Preview: Visual QA with bounding boxes.\n"
                 "5. Ultralytics Training: Train YOLO models.\n"
                 "6. Model Inference: Run inference with trained models.\n"
-                "6b. Tibetan Line Split (CV): Detect `tibetan_text` boxes and split them into line boxes.\n"
+                "6b. Tibetan Line Split (CV): Detect `tibetan_text` boxes, split into lines, and optionally detect red text boxes per line.\n"
                 "7. VLM Layout: Run transformer-based layout parsing on a single image.\n"
                 "8. Label Studio Export: Convert YOLO split folders to Label Studio tasks and launch Label Studio.\n"
                 "9. PPN Downloader: Download and analyze SBB images.\n"
@@ -4910,7 +5079,8 @@ def build_ui() -> gr.Blocks:
         with gr.Tab("6b. Tibetan Line Split (CV)"):
             gr.Markdown(
                 "Upload an image, run YOLO detection, then split only `tibetan_text` boxes into line boxes "
-                "using classical image processing (thresholding + horizontal projection)."
+                "using classical image processing (thresholding + horizontal projection). "
+                "Optionally, detect red annotations as separate boxes inside each detected line."
             )
             with gr.Row():
                 with gr.Column(scale=1):
@@ -4939,11 +5109,26 @@ def build_ui() -> gr.Blocks:
                         line_merge_gap = gr.Number(label="merge_gap_px", value=5, precision=0)
                         line_draw_parents = gr.Checkbox(label="draw_detected_text_boxes", value=True)
 
+                    with gr.Accordion("Red Text Detection (per line)", open=False):
+                        line_detect_red = gr.Checkbox(label="detect_red_text_in_lines", value=True)
+                        line_draw_red_boxes = gr.Checkbox(label="draw_red_text_boxes", value=True)
+                        line_red_min_redness = gr.Number(label="red_min_redness (R-max(G,B))", value=26, precision=0)
+                        line_red_min_saturation = gr.Number(label="red_min_saturation", value=35, precision=0)
+                        line_red_col_fill_rel = gr.Slider(
+                            minimum=0.01,
+                            maximum=0.50,
+                            value=0.07,
+                            step=0.01,
+                            label="red_column_fill_rel",
+                        )
+                        line_red_merge_gap = gr.Number(label="red_merge_gap_px", value=14, precision=0)
+                        line_red_min_width = gr.Number(label="red_min_width_px", value=18, precision=0)
+
                     line_run_btn = gr.Button("Split Tibetan Text into Lines", variant="primary")
 
                 with gr.Column(scale=1):
                     line_image_in = gr.Image(type="numpy", label="Input Image", sources=["upload", "clipboard"])
-                    line_image_out = gr.Image(type="numpy", label="Overlay (Text + Line Boxes)")
+                    line_image_out = gr.Image(type="numpy", label="Overlay (Text + Line + Red Boxes)")
                     line_status = gr.Textbox(label="Status", interactive=False)
                     line_json = gr.Code(label="Line Segmentation JSON", language="json")
 
@@ -4960,6 +5145,13 @@ def build_ui() -> gr.Blocks:
                     line_projection_thresh,
                     line_merge_gap,
                     line_draw_parents,
+                    line_detect_red,
+                    line_red_min_redness,
+                    line_red_min_saturation,
+                    line_red_col_fill_rel,
+                    line_red_merge_gap,
+                    line_red_min_width,
+                    line_draw_red_boxes,
                 ],
                 outputs=[line_image_out, line_status, line_json],
             )
