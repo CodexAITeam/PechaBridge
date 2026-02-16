@@ -27,6 +27,13 @@ The primary entrypoint for end-to-end usage is the **Workbench UI** (`ui_workben
 - **Diffusion texture adaptation**: Includes SDXL/SD2.1 + ControlNet augmentation and optional LoRA integration for more realistic page textures.
 - **Retrieval encoder preparation**: Adds unpaired image/text encoder training as a base for future Tibetan n-gram retrieval.
 
+## Example: SBB Layout Analysis
+
+The figure below shows an example layout analysis result for a Tibetan pecha page from the Staatsbibliothek zu Berlin (SBB).
+Detected layout regions are overlaid on the original page image and illustrate the intended detection quality for real-world scans.
+
+![Example layout analysis on an SBB pecha page](assets/pecha_layout%20analysis.jpeg)
+
 ## Project Goals
 
 1. Build a robust pipeline for Tibetan page layout analysis that works with limited labeled data.
