@@ -79,6 +79,11 @@ SBB_GRID_THUMB_SIZE = 160
 SBB_THUMB_CACHE_MAX = 1200
 _SBB_THUMB_CACHE: Dict[str, Tuple[float, np.ndarray]] = {}
 _SBB_MEAN_CACHE: Dict[str, Tuple[float, float]] = {}
+DEFAULT_LAYOUT_CLASS_NAMES: Dict[int, str] = {
+    0: "tibetan_number_word",
+    1: "tibetan_text",
+    2: "chinese_number_word",
+}
 
 
 def _run_cmd(cmd: List[str], timeout: int = 3600) -> Tuple[bool, str]:
@@ -287,10 +292,25 @@ def _draw_yolo_boxes(image_path: Path, label_path: Path) -> Tuple[np.ndarray, st
         1: (0, 220, 255),
         2: (130, 255, 130),
     }
+    class_names = dict(DEFAULT_LAYOUT_CLASS_NAMES)
+    try:
+        # label path pattern: <dataset>/<split>/labels/<file>.txt
+        split_dir = label_path.parent.parent
+        dataset_root = split_dir.parent
+        classes_file = dataset_root / "classes.txt"
+        if classes_file.exists():
+            lines = [ln.strip() for ln in classes_file.read_text(encoding="utf-8", errors="replace").splitlines() if ln.strip()]
+            for i, name in enumerate(lines):
+                class_names[i] = name
+    except Exception:
+        pass
+
     lines = []
     for i, ann in enumerate(labels, start=1):
         cls = int(ann.get("class", -1))
         color = class_colors.get(cls, (255, 80, 80))
+        cls_name = class_names.get(cls, f"class_{cls}")
+        tag = f"{cls}:{cls_name}"
 
         if ann.get("type") == "bbox":
             cx = float(ann["cx"])
@@ -302,8 +322,8 @@ def _draw_yolo_boxes(image_path: Path, label_path: Path) -> Tuple[np.ndarray, st
             x2 = int((cx + bw / 2) * w)
             y2 = int((cy + bh / 2) * h)
             draw.rectangle((x1, y1, x2, y2), outline=color, width=3)
-            draw.text((x1 + 2, max(0, y1 - 14)), f"{cls}", fill=color)
-            lines.append(f"{i}. class={cls} bbox cx={cx:.4f} cy={cy:.4f} w={bw:.4f} h={bh:.4f}")
+            draw.text((x1 + 2, max(0, y1 - 14)), tag, fill=color)
+            lines.append(f"{i}. class={cls} label={cls_name} bbox cx={cx:.4f} cy={cy:.4f} w={bw:.4f} h={bh:.4f}")
             continue
 
         points = ann.get("points") or []
@@ -324,8 +344,8 @@ def _draw_yolo_boxes(image_path: Path, label_path: Path) -> Tuple[np.ndarray, st
         xs = [p[0] for p in pts_px]
         ys = [p[1] for p in pts_px]
         x1, y1, x2, y2 = min(xs), min(ys), max(xs), max(ys)
-        draw.text((x1 + 2, max(0, y1 - 14)), f"{cls}", fill=color)
-        lines.append(f"{i}. class={cls} polygon n={len(pts_px)} bbox=({x1},{y1},{x2},{y2})")
+        draw.text((x1 + 2, max(0, y1 - 14)), tag, fill=color)
+        lines.append(f"{i}. class={cls} label={cls_name} polygon n={len(pts_px)} bbox=({x1},{y1},{x2},{y2})")
 
     summary = f"Found {len(labels)} boxes\n" + ("\n".join(lines[:25]) if lines else "")
     if len(lines) > 25:
