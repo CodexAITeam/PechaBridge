@@ -120,16 +120,36 @@ class TransformersVLMParser(DocumentParser):
         except Exception as exc:
             errors.append(f"AutoModel path failed: {type(exc).__name__}: {exc}")
 
+        # Some custom VLM configs (for example PaddleOCR-VL) are not compatible
+        # with the generic `image-text-to-text` pipeline factory in certain
+        # transformers versions.
+        if self.parser_name == "paddleocr_vl":
+            raise RuntimeError(" | ".join(errors))
+
         try:
             return self._generate_with_pipeline(image)
         except Exception as exc:
             errors.append(f"pipeline path failed: {type(exc).__name__}: {exc}")
 
-        raise RuntimeError(" | ".join(errors))
+        raise RuntimeError(self._with_model_specific_hint(" | ".join(errors)))
+
+    def _with_model_specific_hint(self, message: str) -> str:
+        msg = message or ""
+        low = msg.lower()
+        if self.parser_name == "deepseek_ocr" and (
+            "deepseek_vl_v2" in low or "does not recognize this architecture" in low
+        ):
+            hint = (
+                "Hint: installed transformers version is too old for deepseek_vl_v2. "
+                "Upgrade transformers (and restart the UI process), e.g. "
+                "`pip install -U transformers accelerate`."
+            )
+            return f"{msg} | {hint}"
+        return msg
 
     def _generate_with_auto_model(self, image: Image.Image) -> str:
         import torch
-        from transformers import AutoModelForImageTextToText, AutoProcessor
+        from transformers import AutoModel, AutoModelForImageTextToText, AutoProcessor
 
         if self._processor is None:
             self._processor = AutoProcessor.from_pretrained(self.model_id, trust_remote_code=True)
@@ -141,21 +161,43 @@ class TransformersVLMParser(DocumentParser):
                 model_kwargs["torch_dtype"] = dtype
             if self.hf_device == "auto":
                 model_kwargs["device_map"] = "auto"
-            self._model = AutoModelForImageTextToText.from_pretrained(self.model_id, **model_kwargs)
+            try:
+                self._model = AutoModelForImageTextToText.from_pretrained(self.model_id, **model_kwargs)
+            except Exception as exc:
+                # Compatibility fallback for custom VLM configs that do not expose
+                # the text_config expected by AutoModelForImageTextToText.
+                if self.parser_name == "paddleocr_vl" and "text_config" in str(exc):
+                    self._model = AutoModel.from_pretrained(self.model_id, **model_kwargs)
+                else:
+                    raise
             self._model.eval()
 
-        inputs = self._processor(images=image, text=self.prompt, return_tensors="pt")
+        inputs = self._build_model_inputs(image)
         model_device = getattr(self._model, "device", None)
         if model_device is not None:
             for key, value in list(inputs.items()):
                 if hasattr(value, "to"):
                     inputs[key] = value.to(model_device)
 
-        with torch.no_grad():
-            output_ids = self._model.generate(**inputs, max_new_tokens=self.max_new_tokens)
+        if hasattr(self._model, "generate"):
+            with torch.no_grad():
+                output_ids = self._model.generate(**inputs, max_new_tokens=self.max_new_tokens)
+            if hasattr(self._processor, "batch_decode"):
+                text = self._processor.batch_decode(output_ids, skip_special_tokens=True)
+                return text[0] if text else ""
+            return str(output_ids)
 
-        text = self._processor.batch_decode(output_ids, skip_special_tokens=True)
-        return text[0] if text else ""
+        if hasattr(self._model, "chat"):
+            # Trust-remote-code models sometimes expose a chat-like interface.
+            try:
+                out = self._model.chat(self._processor, image, self.prompt, max_new_tokens=self.max_new_tokens)
+            except TypeError:
+                out = self._model.chat(self._processor, image, self.prompt)
+            if isinstance(out, (list, tuple)) and out:
+                return str(out[0])
+            return str(out)
+
+        raise RuntimeError(f"Model {type(self._model).__name__} exposes neither generate() nor chat().")
 
     def _generate_with_pipeline(self, image: Image.Image) -> str:
         from transformers import pipeline
@@ -166,7 +208,26 @@ class TransformersVLMParser(DocumentParser):
                 pipe_kwargs["device_map"] = "auto"
             self._pipeline = pipeline("image-text-to-text", **pipe_kwargs)
 
-        result = self._pipeline(image, prompt=self.prompt, max_new_tokens=self.max_new_tokens)
+        # Try multiple invocation styles because HF multimodal pipelines vary
+        # across model families and transformers versions.
+        errors: List[str] = []
+        result = None
+        for fn in (
+            lambda: self._pipeline(image, text=self.prompt, max_new_tokens=self.max_new_tokens),
+            lambda: self._pipeline(image, prompt=self.prompt, max_new_tokens=self.max_new_tokens),
+            lambda: self._pipeline(images=image, text=self.prompt, max_new_tokens=self.max_new_tokens),
+            lambda: self._pipeline(text=self.prompt, images=image, max_new_tokens=self.max_new_tokens),
+            lambda: self._pipeline(text=f"<image>\n{self.prompt}", images=image, max_new_tokens=self.max_new_tokens),
+        ):
+            try:
+                result = fn()
+                break
+            except Exception as exc:
+                errors.append(f"{type(exc).__name__}: {exc}")
+                continue
+        if result is None:
+            raise RuntimeError(" | ".join(errors))
+
         if isinstance(result, list) and result:
             first = result[0]
             if isinstance(first, dict):
@@ -177,6 +238,25 @@ class TransformersVLMParser(DocumentParser):
                     or first
                 )
         return str(result)
+
+    def _build_model_inputs(self, image: Image.Image):
+        # Processor signatures differ between models; some require image token(s)
+        # in the text prompt and strict image/text count matching.
+        attempts = [
+            lambda: self._processor(images=image, text=self.prompt, return_tensors="pt"),
+            lambda: self._processor(images=[image], text=[self.prompt], return_tensors="pt"),
+            lambda: self._processor(images=image, text=f"<image>\n{self.prompt}", return_tensors="pt"),
+            lambda: self._processor(images=[image], text=[f"<image>\n{self.prompt}"], return_tensors="pt"),
+            lambda: self._processor(images=image, return_tensors="pt"),
+        ]
+        errors: List[str] = []
+        for fn in attempts:
+            try:
+                return fn()
+            except Exception as exc:
+                errors.append(f"{type(exc).__name__}: {exc}")
+                continue
+        raise RuntimeError("Could not build model inputs: " + " | ".join(errors))
 
     def _parse_json_response(self, raw_text: str) -> Dict[str, Any]:
         clean = raw_text.strip()
@@ -443,13 +523,55 @@ class GroundingDINOLayoutParser(DocumentParser):
             outputs = self._model(**inputs)
 
         target_sizes = [(image.height, image.width)]
-        processed = self._processor.post_process_grounded_object_detection(
-            outputs,
-            inputs.input_ids,
-            box_threshold=self.box_threshold,
-            text_threshold=self.text_threshold,
-            target_sizes=target_sizes,
-        )
+        input_ids = inputs.get("input_ids", None) if isinstance(inputs, dict) else getattr(inputs, "input_ids", None)
+        post_errors: List[str] = []
+        processed = None
+
+        # transformers changed this API across versions. Try the common
+        # signatures in order and use the first that works.
+        post_attempts = [
+            lambda: self._processor.post_process_grounded_object_detection(
+                outputs,
+                input_ids=input_ids,
+                box_threshold=self.box_threshold,
+                text_threshold=self.text_threshold,
+                target_sizes=target_sizes,
+            ),
+            lambda: self._processor.post_process_grounded_object_detection(
+                outputs,
+                input_ids=input_ids,
+                threshold=self.box_threshold,
+                text_threshold=self.text_threshold,
+                target_sizes=target_sizes,
+            ),
+            lambda: self._processor.post_process_grounded_object_detection(
+                outputs,
+                input_ids,
+                threshold=self.box_threshold,
+                target_sizes=target_sizes,
+            ),
+            lambda: self._processor.post_process_grounded_object_detection(
+                outputs,
+                input_ids,
+                target_sizes=target_sizes,
+            ),
+            lambda: self._processor.post_process_grounded_object_detection(
+                outputs,
+                target_sizes=target_sizes,
+            ),
+        ]
+        for fn in post_attempts:
+            try:
+                processed = fn()
+                break
+            except Exception as exc:
+                post_errors.append(f"{type(exc).__name__}: {exc}")
+                continue
+
+        if processed is None:
+            raise RuntimeError(
+                "GroundingDINO post-process API mismatch: " + " | ".join(post_errors)
+            )
         if not processed:
             return []
 

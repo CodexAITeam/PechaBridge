@@ -333,7 +333,11 @@ def _draw_yolo_boxes(image_path: Path, label_path: Path) -> Tuple[np.ndarray, st
     return np.array(img), summary
 
 
-def _normalize_to_bbox_lines(label_src: Path, image_path: Path) -> List[str]:
+def _normalize_to_bbox_lines(
+    label_src: Path,
+    image_path: Path,
+    class_id_map: Optional[Dict[int, int]] = None,
+) -> List[str]:
     anns = _read_yolo_labels(label_src)
     if not anns:
         return []
@@ -351,6 +355,8 @@ def _normalize_to_bbox_lines(label_src: Path, image_path: Path) -> List[str]:
         cls = int(ann.get("class", -1))
         if cls < 0:
             continue
+        if class_id_map and cls in class_id_map:
+            cls = int(class_id_map[cls])
         if ann.get("type") == "bbox":
             cx = float(ann["cx"])
             cy = float(ann["cy"])
@@ -395,6 +401,78 @@ def _normalize_to_bbox_lines(label_src: Path, image_path: Path) -> List[str]:
         out_lines.append(f"{cls} {cx:.6f} {cy:.6f} {bw:.6f} {bh:.6f}")
 
     return out_lines
+
+
+def _canonical_class_id_from_name(name: str) -> Optional[int]:
+    txt = (name or "").strip().lower().replace("_", " ")
+    if not txt:
+        return None
+    if "chinese" in txt:
+        return 2
+    if "tibetan" in txt and "number" in txt:
+        return 0
+    if "tibetan" in txt and ("text" in txt or "body" in txt):
+        return 1
+    if txt in {"text body", "text", "body text"}:
+        return 1
+    return None
+
+
+def _infer_ls_class_id_map(split_dir: Path) -> Tuple[Dict[int, int], str]:
+    candidates = [split_dir, split_dir.parent]
+    classes_by_id: Dict[int, str] = {}
+
+    for base in candidates:
+        notes = base / "notes.json"
+        if notes.exists():
+            try:
+                payload = json.loads(notes.read_text(encoding="utf-8"))
+                categories = payload.get("categories", []) if isinstance(payload, dict) else []
+                for cat in categories:
+                    if not isinstance(cat, dict):
+                        continue
+                    cid = cat.get("id")
+                    cname = cat.get("name")
+                    if isinstance(cid, int) and isinstance(cname, str):
+                        classes_by_id[cid] = cname
+            except Exception:
+                pass
+        if classes_by_id:
+            break
+
+    if not classes_by_id:
+        for base in candidates:
+            classes_file = base / "classes.txt"
+            if not classes_file.exists():
+                continue
+            try:
+                lines = [ln.strip() for ln in classes_file.read_text(encoding="utf-8").splitlines() if ln.strip()]
+            except Exception:
+                lines = []
+            for i, name in enumerate(lines):
+                classes_by_id[i] = name
+            if classes_by_id:
+                break
+
+    if not classes_by_id:
+        return {}, "No notes.json/classes.txt found; using class ids as-is."
+
+    class_id_map: Dict[int, int] = {}
+    mapped = 0
+    unknown = 0
+    for src_id, src_name in sorted(classes_by_id.items()):
+        target = _canonical_class_id_from_name(src_name)
+        if target is None:
+            unknown += 1
+            continue
+        class_id_map[int(src_id)] = int(target)
+        mapped += 1
+
+    msg = (
+        f"Class remap from Label Studio metadata: mapped={mapped}, unknown={unknown}, "
+        f"map={{{', '.join([f'{k}->{v}' for k, v in sorted(class_id_map.items())])}}}"
+    )
+    return class_id_map, msg
 
 
 def _resolve_dataset_train_split(dataset_choice: str, datasets_base: str) -> Tuple[Optional[Path], str]:
@@ -3267,29 +3345,40 @@ def prepare_combined_labelstudio_split(
     synthetic_split_dir: str,
     sbb_test_split_dir: str,
     combined_output_split_dir: str,
+    sbb_train_ratio: float = 0.7,
+    seed: int = 42,
 ):
     syn = Path(synthetic_split_dir).expanduser().resolve()
     sbb = Path(sbb_test_split_dir).expanduser().resolve()
     out = Path(combined_output_split_dir).expanduser().resolve()
-    out_images = out / "images"
-    out_labels = out / "labels"
-    out_images.mkdir(parents=True, exist_ok=True)
-    out_labels.mkdir(parents=True, exist_ok=True)
+    out_root = out.parent if out.name.lower() in {"train", "val", "test"} else out
+    out_train_images = out_root / "train" / "images"
+    out_train_labels = out_root / "train" / "labels"
+    out_val_images = out_root / "val" / "images"
+    out_val_labels = out_root / "val" / "labels"
+    out_train_images.mkdir(parents=True, exist_ok=True)
+    out_train_labels.mkdir(parents=True, exist_ok=True)
+    out_val_images.mkdir(parents=True, exist_ok=True)
+    out_val_labels.mkdir(parents=True, exist_ok=True)
 
     if not (syn / "images").exists() or not (syn / "labels").exists():
         return f"Synthetic split invalid: {syn}", ""
     if not (sbb / "images").exists() or not (sbb / "labels").exists():
         return f"SBB test split invalid: {sbb}", ""
 
-    def _copy_split(src_split: Path, prefix: str):
+    sbb_class_id_map, sbb_class_map_msg = _infer_ls_class_id_map(sbb)
+
+    ratio = min(max(float(sbb_train_ratio), 0.0), 1.0)
+
+    def _copy_split(src_split: Path, prefix: str, dst_images: Path, dst_labels: Path):
         cnt = 0
         converted = 0
         for img in sorted((src_split / "images").glob("*")):
             if not img.is_file():
                 continue
             new_name = f"{prefix}_{img.name}"
-            target_img = out_images / new_name
-            target_lbl = out_labels / f"{Path(new_name).stem}.txt"
+            target_img = dst_images / new_name
+            target_lbl = dst_labels / f"{Path(new_name).stem}.txt"
             lbl_src = src_split / "labels" / f"{img.stem}.txt"
             target_img.write_bytes(img.read_bytes())
             if lbl_src.exists():
@@ -3301,22 +3390,60 @@ def prepare_combined_labelstudio_split(
             cnt += 1
         return cnt, converted
 
-    syn_count, syn_converted = _copy_split(syn, "syn")
-    sbb_count, sbb_converted = _copy_split(sbb, "sbb")
+    syn_to_val = syn.name.lower() == "val"
+    syn_dst_images = out_val_images if syn_to_val else out_train_images
+    syn_dst_labels = out_val_labels if syn_to_val else out_train_labels
+    syn_count, syn_converted = _copy_split(syn, "syn", syn_dst_images, syn_dst_labels)
 
-    (out / "classes.txt").write_text(
+    sbb_images = sorted([p for p in (sbb / "images").glob("*") if p.is_file()])
+    rng = np.random.default_rng(int(seed))
+    if sbb_images:
+        perm = list(rng.permutation(len(sbb_images)))
+        sbb_images = [sbb_images[i] for i in perm]
+    split_idx = int(round(len(sbb_images) * ratio))
+    split_idx = max(0, min(split_idx, len(sbb_images)))
+    sbb_train = sbb_images[:split_idx]
+    sbb_val = sbb_images[split_idx:]
+
+    def _copy_sbb_subset(images: List[Path], dst_images: Path, dst_labels: Path):
+        cnt = 0
+        converted = 0
+        for img in images:
+            new_name = f"sbb_{img.name}"
+            target_img = dst_images / new_name
+            target_lbl = dst_labels / f"{Path(new_name).stem}.txt"
+            lbl_src = sbb / "labels" / f"{img.stem}.txt"
+            target_img.write_bytes(img.read_bytes())
+            if lbl_src.exists():
+                bbox_lines = _normalize_to_bbox_lines(lbl_src, img, class_id_map=sbb_class_id_map)
+                target_lbl.write_text("\n".join(bbox_lines) + ("\n" if bbox_lines else ""), encoding="utf-8")
+                converted += 1
+            else:
+                target_lbl.write_text("", encoding="utf-8")
+            cnt += 1
+        return cnt, converted
+
+    sbb_train_count, sbb_train_converted = _copy_sbb_subset(sbb_train, out_train_images, out_train_labels)
+    sbb_val_count, sbb_val_converted = _copy_sbb_subset(sbb_val, out_val_images, out_val_labels)
+    sbb_count = sbb_train_count + sbb_val_count
+    sbb_converted = sbb_train_converted + sbb_val_converted
+
+    (out_root / "classes.txt").write_text(
         "tibetan_number_word\ntibetan_text\nchinese_number_word\n",
         encoding="utf-8",
     )
 
     msg = (
-        f"Combined split created at {out}\n"
-        f"Synthetic images: {syn_count}\n"
-        f"SBB test images: {sbb_count}\n"
+        f"Combined dataset created at {out_root}\n"
+        f"Synthetic images copied: {syn_count} -> {'val' if syn_to_val else 'train'}\n"
+        f"SBB images split train/val: {sbb_train_count}/{sbb_val_count} (ratio={ratio:.2f}, seed={int(seed)})\n"
+        f"SBB total copied: {sbb_count}\n"
+        f"{sbb_class_map_msg}\n"
         f"Label files normalized to YOLO bbox format: syn={syn_converted}, sbb={sbb_converted}\n"
-        "Use this split only for annotation/review; keep SBB out of train/val model training."
+        f"Train split: {out_root / 'train'}\n"
+        f"Val split: {out_root / 'val'}"
     )
-    return msg, str(out)
+    return msg, str((out_root / "train").resolve())
 
 
 def prepare_labelstudio_from_ls_export_ui(
@@ -3404,6 +3531,8 @@ def prepare_combined_for_labelstudio_ui(
     synthetic_split_dir: str,
     sbb_test_split_dir: str,
     combined_output_split_dir: str,
+    sbb_train_ratio: float,
+    split_seed: int,
     current_split_dir: str,
     current_local_files_root: str,
     current_image_root_url: str,
@@ -3416,6 +3545,8 @@ def prepare_combined_for_labelstudio_ui(
         synthetic_split_dir=synthetic_split_dir,
         sbb_test_split_dir=sbb_test_split_dir,
         combined_output_split_dir=combined_output_split_dir,
+        sbb_train_ratio=float(sbb_train_ratio),
+        seed=int(split_seed),
     )
     if not combined:
         return (
@@ -3456,6 +3587,31 @@ def scan_pretrained_models(models_dir: str):
     exts = {".pt", ".torchscript", ".onnx"}
     models = sorted([str(p.resolve()) for p in base.rglob("*") if p.is_file() and p.suffix.lower() in exts])
     return gr.update(choices=models, value=(models[0] if models else None)), f"Found {len(models)} model(s) in {base}"
+
+
+def scan_yolo_split_dirs(base_dir: str):
+    base = Path(base_dir).expanduser().resolve()
+    if not base.exists() or not base.is_dir():
+        return gr.update(choices=[], value=None), f"Directory not found: {base}"
+
+    found: List[str] = []
+    if (base / "images").exists() and (base / "labels").exists():
+        found.append(str(base.resolve()))
+    # Typical split roots first.
+    for split in ("train", "val", "test"):
+        candidate = base / split
+        if (candidate / "images").exists() and (candidate / "labels").exists():
+            found.append(str(candidate.resolve()))
+    # Recursive fallback.
+    for p in sorted(base.rglob("*")):
+        if not p.is_dir():
+            continue
+        if (p / "images").exists() and (p / "labels").exists():
+            path_str = str(p.resolve())
+            if path_str not in found:
+                found.append(path_str)
+
+    return gr.update(choices=found, value=(found[0] if found else None)), f"Found {len(found)} split dir(s) in {base}"
 
 
 def scan_ultralytics_inference_models(models_dir: str):
@@ -4067,26 +4223,72 @@ def build_ui() -> gr.Blocks:
             gr.Markdown("### Combine Synthetic + SBB Test for Label Studio")
             with gr.Row():
                 with gr.Column(scale=1):
-                    batch_vlm_combine_syn_split = gr.Textbox(
-                        label="Synthetic split directory (train or val)",
-                        value=str((ROOT / "datasets" / "tibetan-yolo" / "train").resolve()),
+                    with gr.Row():
+                        batch_vlm_combine_syn_split = gr.Textbox(
+                            label="Synthetic split directory (train or val)",
+                            value=str((ROOT / "datasets" / "tibetan-yolo" / "train").resolve()),
+                        )
+                        batch_vlm_combine_syn_scan_btn = gr.Button("Scan Synthetic", variant="secondary")
+                    batch_vlm_combine_syn_select = gr.Dropdown(
+                        label="Detected synthetic split dirs",
+                        choices=[],
+                        value=None,
+                        allow_custom_value=True,
                     )
-                    batch_vlm_combine_sbb_split = gr.Textbox(
-                        label="SBB test split directory",
-                        value=str((ROOT / "datasets" / "sbb-vlm-layout" / "test").resolve()),
+                    with gr.Row():
+                        batch_vlm_combine_sbb_split = gr.Textbox(
+                            label="SBB split directory",
+                            value=str((ROOT / "datasets" / "sbb-vlm-layout" / "test").resolve()),
+                        )
+                        batch_vlm_combine_sbb_scan_btn = gr.Button("Scan SBB", variant="secondary")
+                    batch_vlm_combine_sbb_select = gr.Dropdown(
+                        label="Detected SBB split dirs",
+                        choices=[],
+                        value=None,
+                        allow_custom_value=True,
                     )
+                    with gr.Row():
+                        batch_vlm_sbb_train_ratio = gr.Slider(
+                            minimum=0.0,
+                            maximum=1.0,
+                            value=0.7,
+                            step=0.01,
+                            label="SBB train ratio (val = 1-ratio)",
+                        )
+                        batch_vlm_split_seed = gr.Number(label="split_seed", value=42, precision=0)
                     batch_vlm_combine_out_split = gr.Textbox(
-                        label="Combined output split directory",
-                        value=str((ROOT / "datasets" / "combined-layout-labelstudio" / "train").resolve()),
+                        label="Combined output root (creates train/ and val/)",
+                        value=str((ROOT / "datasets" / "combined-layout-labelstudio").resolve()),
                     )
                     batch_vlm_combine_btn = gr.Button("Prepare Combined Split + Fill Label Studio Tab", variant="secondary")
                 with gr.Column(scale=1):
                     batch_vlm_combine_status = gr.Textbox(label="Combine Status", lines=8, interactive=False)
                     batch_vlm_combine_result = gr.Textbox(label="Combined Split Path", interactive=False)
+                    batch_vlm_combine_scan_status = gr.Textbox(label="Split Scan Status", interactive=False)
 
             batch_vlm_ppn_test_split.change(
                 fn=lambda x: x,
                 inputs=[batch_vlm_ppn_test_split],
+                outputs=[batch_vlm_combine_sbb_split],
+            )
+            batch_vlm_combine_syn_scan_btn.click(
+                fn=scan_yolo_split_dirs,
+                inputs=[batch_vlm_combine_syn_split],
+                outputs=[batch_vlm_combine_syn_select, batch_vlm_combine_scan_status],
+            )
+            batch_vlm_combine_sbb_scan_btn.click(
+                fn=scan_yolo_split_dirs,
+                inputs=[batch_vlm_combine_sbb_split],
+                outputs=[batch_vlm_combine_sbb_select, batch_vlm_combine_scan_status],
+            )
+            batch_vlm_combine_syn_select.change(
+                fn=lambda x: x or "",
+                inputs=[batch_vlm_combine_syn_select],
+                outputs=[batch_vlm_combine_syn_split],
+            )
+            batch_vlm_combine_sbb_select.change(
+                fn=lambda x: x or "",
+                inputs=[batch_vlm_combine_sbb_select],
                 outputs=[batch_vlm_combine_sbb_split],
             )
 
@@ -4434,6 +4636,8 @@ def build_ui() -> gr.Blocks:
                     batch_vlm_combine_syn_split,
                     batch_vlm_combine_sbb_split,
                     batch_vlm_combine_out_split,
+                    batch_vlm_sbb_train_ratio,
+                    batch_vlm_split_seed,
                     split_dir,
                     local_files_root,
                     image_root_url,
