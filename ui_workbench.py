@@ -3304,9 +3304,9 @@ def _compute_horizontal_projection_state(
     gray = cv2.cvtColor(crop_rgb, cv2.COLOR_RGB2GRAY)
     gray = cv2.GaussianBlur(gray, (3, 3), 0)
     _, bw = cv2.threshold(gray, 0, 255, cv2.THRESH_BINARY_INV + cv2.THRESH_OTSU)
-
-    open_kernel = cv2.getStructuringElement(cv2.MORPH_RECT, (2, 2))
-    bw = cv2.morphologyEx(bw, cv2.MORPH_OPEN, open_kernel, iterations=1)
+    # Keep thin strokes while bridging tiny vertical breaks.
+    close_kernel = cv2.getStructuringElement(cv2.MORPH_RECT, (1, 3))
+    bw = cv2.morphologyEx(bw, cv2.MORPH_CLOSE, close_kernel, iterations=1)
 
     projection = (bw > 0).sum(axis=0).astype(np.float32)
     if projection.size == 0 or float(np.max(projection)) <= 0.0:
@@ -3321,10 +3321,12 @@ def _compute_horizontal_projection_state(
 
     thr_rel = min(max(float(threshold_rel), 0.01), 0.95)
     threshold = max(1.0, float(np.max(projection)) * thr_rel)
+    threshold = min(threshold, max(1.0, float(np.percentile(projection, 82.0))))
     mask = projection >= threshold
 
     return {
         "ok": True,
+        "bw": bw,
         "projection": projection,
         "threshold": float(threshold),
         "mask": mask,
@@ -3340,6 +3342,8 @@ def _render_horizontal_profile_plot(
     threshold: float,
     mask: np.ndarray,
     title: str,
+    peaks: Optional[List[int]] = None,
+    runs: Optional[List[List[int]]] = None,
 ) -> np.ndarray:
     if projection is None or projection.size == 0:
         return _line_profile_placeholder("No horizontal profile data available.")
@@ -3361,6 +3365,16 @@ def _render_horizontal_profile_plot(
         t = float(max(0, min(n - 1, int(col_idx)))) / float(n - 1)
         return left + int(round(t * inner_w))
 
+    if runs:
+        for r in runs:
+            if not isinstance(r, (tuple, list)) or len(r) != 2:
+                continue
+            rx1 = _x_from_col(int(r[0]))
+            rx2 = _x_from_col(max(int(r[0]), int(r[1]) - 1))
+            if rx2 <= rx1:
+                rx2 = rx1 + 1
+            draw.rectangle((rx1, top + 1, rx2, bottom - 1), fill=(255, 245, 220))
+
     if mask is not None and mask.size == n:
         i = 0
         while i < n:
@@ -3376,6 +3390,11 @@ def _render_horizontal_profile_plot(
                 mx2 = mx1 + 1
             draw.rectangle((mx1, top + 1, mx2, bottom - 1), fill=(233, 248, 235))
             i = j
+
+    for peak in (peaks or []):
+        px = _x_from_col(int(peak))
+        draw.line((px, top + 1, px, bottom - 1), fill=(46, 158, 78), width=1)
+        draw.ellipse((px - 2, top + 3, px + 2, top + 7), fill=(46, 158, 78))
 
     vmax = max(1.0, float(np.max(projection)), float(threshold))
     threshold_y = top + int(round((1.0 - (min(vmax, max(0.0, float(threshold))) / vmax)) * inner_h))
@@ -3397,7 +3416,7 @@ def _render_horizontal_profile_plot(
     draw.text((left, bottom + 8), f"cols: {n}", fill=(80, 80, 80), font=font)
     draw.text((left + 130, bottom + 8), f"max: {float(np.max(projection)):.1f}", fill=(80, 80, 80), font=font)
     draw.text((left + 275, bottom + 8), f"threshold: {float(threshold):.1f}", fill=(220, 60, 60), font=font)
-    draw.text((left + 470, bottom + 8), "blue=horizontal profile, red=threshold, green=active spans", fill=(90, 90, 90), font=font)
+    draw.text((left + 470, bottom + 8), "blue=profile, red=threshold, green=peaks, orange=peak-runs", fill=(90, 90, 90), font=font)
     return np.array(img)
 
 
@@ -3405,6 +3424,7 @@ def _render_clicked_line_overlay(
     line_crop_rgb: np.ndarray,
     boxes_local: List[Tuple[int, int, int, int]],
     peaks: Optional[List[int]] = None,
+    peak_axis: str = "y",
 ) -> np.ndarray:
     if line_crop_rgb is None or line_crop_rgb.size == 0:
         return _line_profile_placeholder("No line crop available.")
@@ -3420,11 +3440,140 @@ def _render_clicked_line_overlay(
         draw.rectangle((tx, ty, tx + 8 * len(tag), ty + 12), fill=(0, 0, 0))
         draw.text((tx + 2, ty + 1), tag, fill=(255, 170, 0), font=font)
 
-    for p in (peaks or []):
-        py = int(max(0, min(overlay.height - 1, int(p))))
-        draw.line((0, py, overlay.width - 1, py), fill=(46, 158, 78), width=1)
+    if peak_axis == "x":
+        for p in (peaks or []):
+            px = int(max(0, min(overlay.width - 1, int(p))))
+            draw.line((px, 0, px, overlay.height - 1), fill=(46, 158, 78), width=1)
+    else:
+        for p in (peaks or []):
+            py = int(max(0, min(overlay.height - 1, int(p))))
+            draw.line((0, py, overlay.width - 1, py), fill=(46, 158, 78), width=1)
 
     return np.array(overlay)
+
+
+def _segment_horizontal_runs_in_line_crop(
+    line_crop_rgb: np.ndarray,
+    smooth_cols: int,
+    threshold_rel: float,
+    min_width_px: int,
+    merge_gap_px: int,
+    horizontal_state: Optional[Dict[str, Any]] = None,
+) -> Tuple[List[Tuple[int, int, int, int]], Dict[str, Any]]:
+    state = horizontal_state
+    if state is None:
+        state = _compute_horizontal_projection_state(
+            crop_rgb=line_crop_rgb,
+            smooth_cols=int(smooth_cols),
+            threshold_rel=float(threshold_rel),
+        )
+    if not bool(state.get("ok")):
+        return [], state
+
+    bw = np.asarray(state.get("bw"))
+    projection = np.asarray(state.get("projection"), dtype=np.float32)
+    threshold = float(state.get("threshold", 1.0))
+    h = int(state.get("height", 0))
+    w = int(state.get("width", 0))
+    if projection.size == 0 or h <= 0 or w <= 0:
+        state["horizontal_peaks"] = []
+        state["horizontal_runs"] = []
+        state["horizontal_method"] = "empty"
+        return [], state
+
+    min_w = max(3, int(min_width_px))
+    merge_gap = max(0, int(merge_gap_px))
+    peaks_used: List[int] = []
+    runs: List[Tuple[int, int]] = []
+
+    if find_peaks is not None and projection.size >= 5:
+        maxv = float(np.max(projection))
+        distance = max(3, int(round(w * 0.03)))
+        prominence = max(1.0, maxv * max(0.05, float(threshold_rel) * 0.45))
+        peaks, _ = find_peaks(projection, distance=distance, prominence=prominence)
+        if peaks.size > 0:
+            keep = projection[peaks] >= max(1.0, threshold * 0.65)
+            if bool(np.any(keep)):
+                peaks = peaks[keep]
+
+        if peaks.size > 0:
+            peaks = np.sort(peaks.astype(np.int32))
+            peaks_used = [int(p) for p in peaks.tolist()]
+            boundaries: List[int] = [0]
+            for i in range(len(peaks) - 1):
+                lo = int(peaks[i])
+                hi = int(peaks[i + 1])
+                if hi - lo < 2:
+                    continue
+                valley = lo + int(np.argmin(projection[lo : hi + 1]))
+                valley = max(boundaries[-1] + 1, min(w - 1, valley))
+                boundaries.append(valley)
+            boundaries.append(w)
+            for i in range(len(boundaries) - 1):
+                x1 = int(boundaries[i])
+                x2 = int(boundaries[i + 1])
+                if x2 - x1 < min_w:
+                    continue
+                if float(np.max(projection[x1:x2])) < max(1.0, threshold * 0.55):
+                    continue
+                runs.append((x1, x2))
+
+    if not runs:
+        soft = max(1.0, threshold * 0.75)
+        active = projection >= soft
+        x = 0
+        while x < w:
+            if not bool(active[x]):
+                x += 1
+                continue
+            x1 = x
+            while x < w and bool(active[x]):
+                x += 1
+            x2 = x
+            if x2 - x1 >= min_w:
+                runs.append((x1, x2))
+
+    if runs:
+        merged: List[Tuple[int, int]] = []
+        for x1, x2 in runs:
+            if not merged:
+                merged.append((x1, x2))
+                continue
+            px1, px2 = merged[-1]
+            if x1 - px2 <= merge_gap:
+                merged[-1] = (px1, x2)
+            else:
+                merged.append((x1, x2))
+        runs = [(x1, x2) for x1, x2 in merged if (x2 - x1) >= min_w]
+
+    state["horizontal_peaks"] = peaks_used
+    state["horizontal_runs"] = [[int(x1), int(x2)] for x1, x2 in runs]
+    state["horizontal_method"] = ("scipy_find_peaks" if peaks_used else "threshold_mask_fallback")
+
+    boxes: List[Tuple[int, int, int, int]] = []
+    for x1, x2 in runs:
+        sub = bw[:, x1:x2]
+        if sub.size == 0:
+            continue
+        rows = np.where((sub > 0).sum(axis=1) > 0)[0]
+        cols = np.where((sub > 0).sum(axis=0) > 0)[0]
+        if rows.size == 0 or cols.size == 0:
+            continue
+        bx1 = x1 + int(cols[0])
+        bx2 = x1 + int(cols[-1]) + 1
+        by1 = int(rows[0])
+        by2 = int(rows[-1]) + 1
+        if bx2 - bx1 < min_w or by2 - by1 < 2:
+            continue
+        pad = 1
+        bx1 = max(0, bx1 - pad)
+        by1 = max(0, by1 - pad)
+        bx2 = min(w, bx2 + pad)
+        by2 = min(h, by2 + pad)
+        if bx2 > bx1 and by2 > by1:
+            boxes.append((bx1, by1, bx2, by2))
+
+    return boxes, state
 
 
 def preview_clicked_line_horizontal_profile(
@@ -3487,30 +3636,26 @@ def preview_clicked_line_horizontal_profile(
         return view_placeholder, profile_placeholder, "Selected line box is out of bounds."
 
     line_crop = src[y1:y2, x1:x2]
-    line_state = _compute_line_projection_state(
-        crop_rgb=line_crop,
-        projection_smooth=int(click_state.get("line_projection_smooth", 9)),
-        projection_threshold_rel=float(click_state.get("line_projection_threshold_rel", 0.20)),
-    )
-    local_boxes = _segment_lines_in_text_crop(
-        crop_rgb=line_crop,
-        min_line_height=int(click_state.get("line_min_height", 10)),
-        projection_smooth=int(click_state.get("line_projection_smooth", 9)),
-        projection_threshold_rel=float(click_state.get("line_projection_threshold_rel", 0.20)),
-        merge_gap_px=int(click_state.get("line_merge_gap_px", 5)),
-        projection_state=line_state,
-    )
-    selected_view = _render_clicked_line_overlay(
-        line_crop_rgb=line_crop,
-        boxes_local=local_boxes,
-        peaks=[int(p) for p in (line_state.get("peaks") or [])] if bool(line_state.get("ok")) else [],
-    )
-
     hstate = _compute_horizontal_projection_state(
         crop_rgb=line_crop,
         smooth_cols=int(click_state.get("horizontal_profile_smooth_cols", 21)),
         threshold_rel=float(click_state.get("horizontal_profile_threshold_rel", 0.20)),
     )
+    local_boxes, hstate = _segment_horizontal_runs_in_line_crop(
+        line_crop_rgb=line_crop,
+        smooth_cols=int(click_state.get("horizontal_profile_smooth_cols", 21)),
+        threshold_rel=float(click_state.get("horizontal_profile_threshold_rel", 0.20)),
+        min_width_px=int(click_state.get("horizontal_seg_min_width_px", 14)),
+        merge_gap_px=int(click_state.get("horizontal_seg_merge_gap_px", 6)),
+        horizontal_state=hstate,
+    )
+    selected_view = _render_clicked_line_overlay(
+        line_crop_rgb=line_crop,
+        boxes_local=local_boxes,
+        peaks=[int(p) for p in (hstate.get("horizontal_peaks") or [])] if bool(hstate.get("ok")) else [],
+        peak_axis="x",
+    )
+
     if not bool(hstate.get("ok")):
         reason = str(hstate.get("reason", "unknown"))
         return selected_view, profile_placeholder, f"Could not compute horizontal profile ({reason})."
@@ -3521,11 +3666,14 @@ def preview_clicked_line_horizontal_profile(
         threshold=float(hstate["threshold"]),
         mask=np.asarray(hstate["mask"], dtype=bool),
         title=f"Horizontal profile for line {int(chosen.get('line_id', -1))} [{x1}, {y1}, {x2}, {y2}]",
+        peaks=[int(p) for p in (hstate.get("horizontal_peaks") or [])],
+        runs=[list(r) for r in (hstate.get("horizontal_runs") or [])],
     )
-    method = "scipy_find_peaks" if bool(line_state.get("peaks")) else "threshold_mask_fallback"
+    method = str(hstate.get("horizontal_method", "unknown"))
     status = (
         f"Selected line {int(chosen.get('line_id', -1))} at ({click_x}, {click_y}) "
-        f"box=[{x1}, {y1}, {x2}, {y2}] local_boxes={len(local_boxes)} method={method}"
+        f"box=[{x1}, {y1}, {x2}, {y2}] peaks={len(hstate.get('horizontal_peaks') or [])} "
+        f"boxes={len(local_boxes)} method={method}"
     )
     return selected_view, profile, status
 
@@ -3899,6 +4047,8 @@ def run_tibetan_text_line_split_classical(
         "line_boxes": [],
         "horizontal_profile_smooth_cols": 21,
         "horizontal_profile_threshold_rel": 0.20,
+        "horizontal_seg_min_width_px": 14,
+        "horizontal_seg_merge_gap_px": 6,
         "line_min_height": 10,
         "line_projection_smooth": 9,
         "line_projection_threshold_rel": 0.20,
@@ -4140,6 +4290,8 @@ def run_tibetan_text_line_split_classical(
         "line_boxes": line_click_records,
         "horizontal_profile_smooth_cols": 21,
         "horizontal_profile_threshold_rel": 0.20,
+        "horizontal_seg_min_width_px": 14,
+        "horizontal_seg_merge_gap_px": 6,
         "line_min_height": int(min_line_height),
         "line_projection_smooth": int(projection_smooth),
         "line_projection_threshold_rel": float(projection_threshold_rel),
