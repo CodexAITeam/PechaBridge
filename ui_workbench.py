@@ -3401,27 +3401,54 @@ def _render_horizontal_profile_plot(
     return np.array(img)
 
 
+def _render_clicked_line_overlay(
+    line_crop_rgb: np.ndarray,
+    boxes_local: List[Tuple[int, int, int, int]],
+    peaks: Optional[List[int]] = None,
+) -> np.ndarray:
+    if line_crop_rgb is None or line_crop_rgb.size == 0:
+        return _line_profile_placeholder("No line crop available.")
+
+    overlay = Image.fromarray(line_crop_rgb.astype(np.uint8)).convert("RGB")
+    draw = ImageDraw.Draw(overlay)
+    font = _load_overlay_font()
+
+    for i, (x1, y1, x2, y2) in enumerate(boxes_local, start=1):
+        draw.rectangle((x1, y1, x2, y2), outline=(255, 170, 0), width=2)
+        tag = f"peak-box {i}"
+        tx, ty = x1 + 2, max(0, y1 - 14)
+        draw.rectangle((tx, ty, tx + 8 * len(tag), ty + 12), fill=(0, 0, 0))
+        draw.text((tx + 2, ty + 1), tag, fill=(255, 170, 0), font=font)
+
+    for p in (peaks or []):
+        py = int(max(0, min(overlay.height - 1, int(p))))
+        draw.line((0, py, overlay.width - 1, py), fill=(46, 158, 78), width=1)
+
+    return np.array(overlay)
+
+
 def preview_clicked_line_horizontal_profile(
     click_state: Dict[str, Any],
     evt: gr.SelectData,
 ):
-    placeholder = _line_profile_placeholder("Click a line box in the overlay to inspect its horizontal profile.")
+    profile_placeholder = _line_profile_placeholder("Click a line box in the overlay to inspect its horizontal profile.")
+    view_placeholder = _line_profile_placeholder("Click a line box in the overlay to open the extracted line view.")
     if not isinstance(click_state, dict):
-        return placeholder, "Run the line split first."
+        return view_placeholder, profile_placeholder, "Run the line split first."
 
     image = click_state.get("image")
     line_boxes = click_state.get("line_boxes") or []
     if image is None or not line_boxes:
-        return placeholder, "No line boxes available. Run inference first."
+        return view_placeholder, profile_placeholder, "No line boxes available. Run inference first."
 
     idx = getattr(evt, "index", None)
     if not isinstance(idx, (tuple, list)) or len(idx) < 2:
-        return placeholder, "Click position not available."
+        return view_placeholder, profile_placeholder, "Click position not available."
     try:
         click_x = int(idx[0])
         click_y = int(idx[1])
     except Exception:
-        return placeholder, "Invalid click position."
+        return view_placeholder, profile_placeholder, "Invalid click position."
 
     def _hits_for(px: int, py: int) -> List[Dict[str, Any]]:
         out: List[Dict[str, Any]] = []
@@ -3443,12 +3470,12 @@ def preview_clicked_line_horizontal_profile(
         hits = _hits_for(click_y, click_x)
 
     if not hits:
-        return placeholder, f"No line box at click ({click_x}, {click_y})."
+        return view_placeholder, profile_placeholder, f"No line box at click ({click_x}, {click_y})."
 
     chosen = sorted(hits, key=lambda r: float(r.get("_area", 1.0)))[0]
     x1, y1, x2, y2 = [int(v) for v in (chosen.get("line_box") or [0, 0, 0, 0])]
     if x2 <= x1 or y2 <= y1:
-        return placeholder, "Selected line box is invalid."
+        return view_placeholder, profile_placeholder, "Selected line box is invalid."
 
     src = np.asarray(image)
     h, w = src.shape[:2]
@@ -3457,30 +3484,50 @@ def preview_clicked_line_horizontal_profile(
     x2 = max(0, min(w, x2))
     y2 = max(0, min(h, y2))
     if x2 <= x1 or y2 <= y1:
-        return placeholder, "Selected line box is out of bounds."
+        return view_placeholder, profile_placeholder, "Selected line box is out of bounds."
 
     line_crop = src[y1:y2, x1:x2]
-    state = _compute_horizontal_projection_state(
+    line_state = _compute_line_projection_state(
+        crop_rgb=line_crop,
+        projection_smooth=int(click_state.get("line_projection_smooth", 9)),
+        projection_threshold_rel=float(click_state.get("line_projection_threshold_rel", 0.20)),
+    )
+    local_boxes = _segment_lines_in_text_crop(
+        crop_rgb=line_crop,
+        min_line_height=int(click_state.get("line_min_height", 10)),
+        projection_smooth=int(click_state.get("line_projection_smooth", 9)),
+        projection_threshold_rel=float(click_state.get("line_projection_threshold_rel", 0.20)),
+        merge_gap_px=int(click_state.get("line_merge_gap_px", 5)),
+        projection_state=line_state,
+    )
+    selected_view = _render_clicked_line_overlay(
+        line_crop_rgb=line_crop,
+        boxes_local=local_boxes,
+        peaks=[int(p) for p in (line_state.get("peaks") or [])] if bool(line_state.get("ok")) else [],
+    )
+
+    hstate = _compute_horizontal_projection_state(
         crop_rgb=line_crop,
         smooth_cols=int(click_state.get("horizontal_profile_smooth_cols", 21)),
         threshold_rel=float(click_state.get("horizontal_profile_threshold_rel", 0.20)),
     )
-    if not bool(state.get("ok")):
-        reason = str(state.get("reason", "unknown"))
-        return placeholder, f"Could not compute horizontal profile ({reason})."
+    if not bool(hstate.get("ok")):
+        reason = str(hstate.get("reason", "unknown"))
+        return selected_view, profile_placeholder, f"Could not compute horizontal profile ({reason})."
 
-    projection = np.asarray(state["projection"], dtype=np.float32)
+    projection = np.asarray(hstate["projection"], dtype=np.float32)
     profile = _render_horizontal_profile_plot(
         projection=projection,
-        threshold=float(state["threshold"]),
-        mask=np.asarray(state["mask"], dtype=bool),
+        threshold=float(hstate["threshold"]),
+        mask=np.asarray(hstate["mask"], dtype=bool),
         title=f"Horizontal profile for line {int(chosen.get('line_id', -1))} [{x1}, {y1}, {x2}, {y2}]",
     )
+    method = "scipy_find_peaks" if bool(line_state.get("peaks")) else "threshold_mask_fallback"
     status = (
         f"Selected line {int(chosen.get('line_id', -1))} at ({click_x}, {click_y}) "
-        f"box=[{x1}, {y1}, {x2}, {y2}]"
+        f"box=[{x1}, {y1}, {x2}, {y2}] local_boxes={len(local_boxes)} method={method}"
     )
-    return profile, status
+    return selected_view, profile, status
 
 
 def _compute_line_projection_state(
@@ -3844,6 +3891,7 @@ def run_tibetan_text_line_split_classical(
     draw_red_boxes: bool,
 ):
     empty_profile = _line_profile_placeholder("Run inference to see the projection profile used for line splitting.")
+    empty_selected_view = _line_profile_placeholder("Click a line box in the overlay to open the extracted line view.")
     empty_selected_profile = _line_profile_placeholder("Click a line box in the overlay to inspect its horizontal profile.")
     empty_selected_status = "Click a line box in the overlay."
     empty_click_state = {
@@ -3851,15 +3899,19 @@ def run_tibetan_text_line_split_classical(
         "line_boxes": [],
         "horizontal_profile_smooth_cols": 21,
         "horizontal_profile_threshold_rel": 0.20,
+        "line_min_height": 10,
+        "line_projection_smooth": 9,
+        "line_projection_threshold_rel": 0.20,
+        "line_merge_gap_px": 5,
     }
     if image is None:
-        return None, "Please provide an image.", "{}", empty_profile, empty_selected_profile, empty_selected_status, empty_click_state
+        return None, "Please provide an image.", "{}", empty_profile, empty_selected_view, empty_selected_profile, empty_selected_status, empty_click_state
     if cv2 is None:
-        return image, "opencv-python is required for classical line segmentation.", "{}", empty_profile, empty_selected_profile, empty_selected_status, empty_click_state
+        return image, "opencv-python is required for classical line segmentation.", "{}", empty_profile, empty_selected_view, empty_selected_profile, empty_selected_status, empty_click_state
 
     model_file = Path(model_path).expanduser().resolve()
     if not model_file.exists():
-        return image, f"Model not found: {model_file}", "{}", empty_profile, empty_selected_profile, empty_selected_status, empty_click_state
+        return image, f"Model not found: {model_file}", "{}", empty_profile, empty_selected_view, empty_selected_profile, empty_selected_status, empty_click_state
 
     try:
         model = _load_yolo_model(str(model_file))
@@ -3868,7 +3920,7 @@ def run_tibetan_text_line_split_classical(
             kwargs["device"] = (device or "").strip()
         results = model.predict(source=image, **kwargs)
     except Exception as exc:
-        return image, f"Inference failed: {type(exc).__name__}: {exc}", "{}", empty_profile, empty_selected_profile, empty_selected_status, empty_click_state
+        return image, f"Inference failed: {type(exc).__name__}: {exc}", "{}", empty_profile, empty_selected_view, empty_selected_profile, empty_selected_status, empty_click_state
 
     h, w = image.shape[:2]
     overlay = Image.fromarray(image.astype(np.uint8)).convert("RGB")
@@ -4088,12 +4140,17 @@ def run_tibetan_text_line_split_classical(
         "line_boxes": line_click_records,
         "horizontal_profile_smooth_cols": 21,
         "horizontal_profile_threshold_rel": 0.20,
+        "line_min_height": int(min_line_height),
+        "line_projection_smooth": int(projection_smooth),
+        "line_projection_threshold_rel": float(projection_threshold_rel),
+        "line_merge_gap_px": int(merge_gap_px),
     }
     return (
         np.array(overlay),
         status,
         json.dumps(payload, ensure_ascii=False, indent=2),
         profile_image,
+        empty_selected_view,
         empty_selected_profile,
         empty_selected_status,
         click_state,
@@ -5613,6 +5670,7 @@ def build_ui() -> gr.Blocks:
                     line_image_in = gr.Image(type="numpy", label="Input Image", sources=["upload", "clipboard"])
                     line_image_out = gr.Image(type="numpy", label="Overlay (Text + Line + Red Boxes)", interactive=True)
                     line_profile_out = gr.Image(type="numpy", label="Line Projection Profile (used for segmentation)")
+                    line_selected_view = gr.Image(type="numpy", label="Selected Line Block + Peak-Boxes (same algorithm)")
                     line_selected_profile = gr.Image(type="numpy", label="Selected Line Horizontal Profile (click in overlay)")
                     line_click_status = gr.Textbox(label="Clicked Line", interactive=False)
                     line_status = gr.Textbox(label="Status", interactive=False)
@@ -5644,6 +5702,7 @@ def build_ui() -> gr.Blocks:
                     line_status,
                     line_json,
                     line_profile_out,
+                    line_selected_view,
                     line_selected_profile,
                     line_click_status,
                     line_click_state,
@@ -5652,7 +5711,7 @@ def build_ui() -> gr.Blocks:
             line_image_out.select(
                 fn=preview_clicked_line_horizontal_profile,
                 inputs=[line_click_state],
-                outputs=[line_selected_profile, line_click_status],
+                outputs=[line_selected_view, line_selected_profile, line_click_status],
             )
             line_scan_models_btn.click(
                 fn=scan_ultralytics_inference_models,
