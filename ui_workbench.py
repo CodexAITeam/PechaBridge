@@ -3190,21 +3190,105 @@ def _is_tibetan_text_detection(class_id: int, label: str) -> bool:
     return False
 
 
-def _segment_lines_in_text_crop(
+def _line_profile_placeholder(message: str) -> np.ndarray:
+    img = Image.new("RGB", (980, 320), (246, 246, 246))
+    draw = ImageDraw.Draw(img)
+    font = _load_overlay_font()
+    draw.rectangle((1, 1, 978, 318), outline=(180, 180, 180), width=2)
+    draw.text((24, 20), "Line Projection Profile", fill=(40, 40, 40), font=font)
+    draw.text((24, 52), message, fill=(90, 90, 90), font=font)
+    return np.array(img)
+
+
+def _render_line_profile_plot(
+    projection: np.ndarray,
+    threshold: float,
+    mask: np.ndarray,
+    line_boxes_local: List[Tuple[int, int, int, int]],
+    title: str,
+) -> np.ndarray:
+    if projection is None or projection.size == 0:
+        return _line_profile_placeholder("No projection data available.")
+
+    n = int(projection.size)
+    plot_w, plot_h = 980, 320
+    left, top, right, bottom = 56, 34, 960, 276
+    inner_w = max(1, right - left)
+    inner_h = max(1, bottom - top)
+
+    img = Image.new("RGB", (plot_w, plot_h), (248, 248, 248))
+    draw = ImageDraw.Draw(img)
+    font = _load_overlay_font()
+
+    draw.rectangle((left, top, right, bottom), outline=(140, 140, 140), width=2)
+
+    def _x_from_row(row_idx: int) -> int:
+        if n <= 1:
+            return left
+        t = float(max(0, min(n - 1, int(row_idx)))) / float(n - 1)
+        return left + int(round(t * inner_w))
+
+    if mask is not None and mask.size == n:
+        i = 0
+        while i < n:
+            if not bool(mask[i]):
+                i += 1
+                continue
+            j = i
+            while j < n and bool(mask[j]):
+                j += 1
+            mx1 = _x_from_row(i)
+            mx2 = _x_from_row(max(i, j - 1))
+            if mx2 <= mx1:
+                mx2 = mx1 + 1
+            draw.rectangle((mx1, top + 1, mx2, bottom - 1), fill=(255, 247, 215))
+            i = j
+
+    for _, y1, _, y2 in line_boxes_local:
+        lx1 = _x_from_row(int(y1))
+        lx2 = _x_from_row(max(int(y1), int(y2) - 1))
+        if lx2 <= lx1:
+            lx2 = lx1 + 1
+        draw.rectangle((lx1, top + 2, lx2, bottom - 2), outline=(255, 168, 0), width=2)
+
+    vmax = max(1.0, float(np.max(projection)), float(threshold))
+    threshold_y = top + int(round((1.0 - (min(vmax, max(0.0, float(threshold))) / vmax)) * inner_h))
+    draw.line((left, threshold_y, right, threshold_y), fill=(230, 70, 70), width=2)
+
+    pts: List[Tuple[int, int]] = []
+    for i in range(n):
+        px = _x_from_row(i)
+        val = float(max(0.0, projection[i]))
+        py = top + int(round((1.0 - min(1.0, val / vmax)) * inner_h))
+        pts.append((px, py))
+    if len(pts) == 1:
+        x0, y0 = pts[0]
+        draw.ellipse((x0 - 2, y0 - 2, x0 + 2, y0 + 2), fill=(35, 105, 225))
+    else:
+        draw.line(pts, fill=(35, 105, 225), width=2)
+
+    draw.text((left, 8), title, fill=(30, 30, 30), font=font)
+    draw.text((left, bottom + 8), f"rows: {n}", fill=(80, 80, 80), font=font)
+    draw.text((left + 130, bottom + 8), f"max: {float(np.max(projection)):.1f}", fill=(80, 80, 80), font=font)
+    draw.text((left + 275, bottom + 8), f"threshold: {float(threshold):.1f}", fill=(220, 60, 60), font=font)
+    draw.text((left + 470, bottom + 8), "blue=profile, red=threshold, orange=final lines", fill=(90, 90, 90), font=font)
+
+    return np.array(img)
+
+
+def _compute_line_projection_state(
     crop_rgb: np.ndarray,
-    min_line_height: int,
     projection_smooth: int,
     projection_threshold_rel: float,
-    merge_gap_px: int,
-) -> List[Tuple[int, int, int, int]]:
+) -> Dict[str, Any]:
     if cv2 is None:
-        return []
+        return {"ok": False, "reason": "opencv_missing"}
     if crop_rgb is None or crop_rgb.size == 0:
-        return []
+        return {"ok": False, "reason": "empty_crop"}
 
     h, w = crop_rgb.shape[:2]
     if h < 4 or w < 4:
-        return []
+        return {"ok": False, "reason": "crop_too_small"}
 
     gray = cv2.cvtColor(crop_rgb, cv2.COLOR_RGB2GRAY)
     gray = cv2.GaussianBlur(gray, (3, 3), 0)
@@ -3220,7 +3304,7 @@ def _segment_lines_in_text_crop(
 
     projection = (joined > 0).sum(axis=1).astype(np.float32)
     if projection.size == 0 or float(np.max(projection)) <= 0.0:
-        return []
+        return {"ok": False, "reason": "empty_projection"}
 
     smooth = max(1, int(projection_smooth))
     if smooth % 2 == 0:
@@ -3232,6 +3316,42 @@ def _segment_lines_in_text_crop(
     threshold_rel = min(max(float(projection_threshold_rel), 0.01), 0.95)
     threshold = max(1.0, float(np.max(projection)) * threshold_rel)
     mask = projection >= threshold
+
+    return {
+        "ok": True,
+        "bw": bw,
+        "projection": projection,
+        "threshold": float(threshold),
+        "mask": mask,
+        "height": int(h),
+        "width": int(w),
+        "projection_smooth": int(smooth),
+        "projection_threshold_rel": float(threshold_rel),
+    }
+
+
+def _segment_lines_in_text_crop(
+    crop_rgb: np.ndarray,
+    min_line_height: int,
+    projection_smooth: int,
+    projection_threshold_rel: float,
+    merge_gap_px: int,
+    projection_state: Optional[Dict[str, Any]] = None,
+) -> List[Tuple[int, int, int, int]]:
+    state = projection_state
+    if state is None:
+        state = _compute_line_projection_state(
+            crop_rgb=crop_rgb,
+            projection_smooth=int(projection_smooth),
+            projection_threshold_rel=float(projection_threshold_rel),
+        )
+    if not bool(state.get("ok")):
+        return []
+
+    bw = state["bw"]
+    h = int(state["height"])
+    w = int(state["width"])
+    mask = state["mask"]
 
     min_h = max(3, int(min_line_height))
     line_candidates: List[Tuple[int, int, int, int]] = []
@@ -3279,18 +3399,24 @@ def _segment_lines_in_text_crop(
         else:
             merged.append((x1, y1, x2, y2))
 
-    # Keep the detected line count, but enforce equal-height tiles that
-    # cover the full tibetan_text crop (no vertical gaps, full width).
-    line_count = max(1, len(merged))
-    uniform_lines: List[Tuple[int, int, int, int]] = []
-    for i in range(line_count):
-        y1 = (i * h) // line_count
-        y2 = ((i + 1) * h) // line_count
-        if y2 <= y1:
+    tightened: List[Tuple[int, int, int, int]] = []
+    for x1, y1, x2, y2 in merged:
+        sub = bw[y1:y2, x1:x2]
+        if sub.size == 0:
             continue
-        uniform_lines.append((0, y1, w, y2))
+        rows = np.where((sub > 0).sum(axis=1) > 0)[0]
+        if rows.size > 0:
+            y1 = y1 + int(rows[0])
+            y2 = y1 + int(rows[-1] - rows[0] + 1)
+        pad = 1
+        tx1 = max(0, x1 - pad)
+        ty1 = max(0, y1 - pad)
+        tx2 = min(w, x2 + pad)
+        ty2 = min(h, y2 + pad)
+        if tx2 > tx1 and ty2 > ty1:
+            tightened.append((tx1, ty1, tx2, ty2))
 
-    return uniform_lines
+    return tightened
 
 
 def _segment_red_runs_in_line_crop(
@@ -3429,14 +3555,15 @@ def run_tibetan_text_line_split_classical(
     red_min_width_px: int,
     draw_red_boxes: bool,
 ):
+    empty_profile = _line_profile_placeholder("Run inference to see the projection profile used for line splitting.")
     if image is None:
-        return None, "Please provide an image.", "{}"
+        return None, "Please provide an image.", "{}", empty_profile
     if cv2 is None:
-        return image, "opencv-python is required for classical line segmentation.", "{}"
+        return image, "opencv-python is required for classical line segmentation.", "{}", empty_profile
 
     model_file = Path(model_path).expanduser().resolve()
     if not model_file.exists():
-        return image, f"Model not found: {model_file}", "{}"
+        return image, f"Model not found: {model_file}", "{}", empty_profile
 
     try:
         model = _load_yolo_model(str(model_file))
@@ -3445,7 +3572,7 @@ def run_tibetan_text_line_split_classical(
             kwargs["device"] = (device or "").strip()
         results = model.predict(source=image, **kwargs)
     except Exception as exc:
-        return image, f"Inference failed: {type(exc).__name__}: {exc}", "{}"
+        return image, f"Inference failed: {type(exc).__name__}: {exc}", "{}", empty_profile
 
     h, w = image.shape[:2]
     overlay = Image.fromarray(image.astype(np.uint8)).convert("RGB")
@@ -3497,6 +3624,9 @@ def run_tibetan_text_line_split_classical(
     tibetan_results: List[Dict[str, Any]] = []
     all_line_count = 0
     all_red_count = 0
+    profile_image = _line_profile_placeholder("No tibetan_text box selected.")
+    profile_selected_area = -1
+    profile_meta: Dict[str, Any] = {}
 
     for det in detections:
         cls = int(det["class"])
@@ -3516,13 +3646,39 @@ def run_tibetan_text_line_split_classical(
             continue
 
         crop = image[y1:y2, x1:x2]
+        line_state = _compute_line_projection_state(
+            crop_rgb=crop,
+            projection_smooth=int(projection_smooth),
+            projection_threshold_rel=float(projection_threshold_rel),
+        )
         line_boxes_local = _segment_lines_in_text_crop(
             crop_rgb=crop,
             min_line_height=int(min_line_height),
             projection_smooth=int(projection_smooth),
             projection_threshold_rel=float(projection_threshold_rel),
             merge_gap_px=int(merge_gap_px),
+            projection_state=line_state,
         )
+        if bool(line_state.get("ok")):
+            crop_area = max(1, int((x2 - x1) * (y2 - y1)))
+            if crop_area > profile_selected_area:
+                projection = np.asarray(line_state.get("projection"), dtype=np.float32)
+                profile_image = _render_line_profile_plot(
+                    projection=projection,
+                    threshold=float(line_state.get("threshold", 0.0)),
+                    mask=np.asarray(line_state.get("mask"), dtype=bool),
+                    line_boxes_local=line_boxes_local,
+                    title=f"Line profile for tibetan_text box [{x1}, {y1}, {x2}, {y2}]",
+                )
+                profile_selected_area = crop_area
+                profile_meta = {
+                    "source_text_box": [x1, y1, x2, y2],
+                    "projection_length": int(projection.size),
+                    "threshold": float(line_state.get("threshold", 0.0)),
+                    "projection_smooth_rows": int(line_state.get("projection_smooth", 1)),
+                    "projection_threshold_rel": float(line_state.get("projection_threshold_rel", 0.0)),
+                    "line_count": len(line_boxes_local),
+                }
 
         line_boxes_global: List[List[int]] = []
         line_details: List[Dict[str, Any]] = []
@@ -3599,6 +3755,12 @@ def run_tibetan_text_line_split_classical(
         status += f" Found {all_red_count} red segment box(es)."
     if not tibetan_results and labels_seen:
         status += f" Labels found: {', '.join(labels_seen[:8])}"
+    if tibetan_results and profile_selected_area < 0:
+        profile_image = _line_profile_placeholder(
+            "tibetan_text boxes were detected, but projection profile could not be computed."
+        )
+    if not tibetan_results:
+        profile_image = _line_profile_placeholder("No tibetan_text detections. No line profile available.")
 
     payload = {
         "model_path": str(model_file),
@@ -3608,8 +3770,9 @@ def run_tibetan_text_line_split_classical(
         "line_boxes_total": all_line_count,
         "red_boxes_total": all_red_count,
         "red_detection_enabled": bool(detect_red_text),
+        "line_profile_preview": (profile_meta if profile_meta else None),
     }
-    return np.array(overlay), status, json.dumps(payload, ensure_ascii=False, indent=2)
+    return np.array(overlay), status, json.dumps(payload, ensure_ascii=False, indent=2), profile_image
 
 
 def download_ppn_images(
@@ -5123,6 +5286,7 @@ def build_ui() -> gr.Blocks:
                 with gr.Column(scale=1):
                     line_image_in = gr.Image(type="numpy", label="Input Image", sources=["upload", "clipboard"])
                     line_image_out = gr.Image(type="numpy", label="Overlay (Text + Line + Red Boxes)")
+                    line_profile_out = gr.Image(type="numpy", label="Line Projection Profile (used for segmentation)")
                     line_status = gr.Textbox(label="Status", interactive=False)
                     line_json = gr.Code(label="Line Segmentation JSON", language="json")
 
@@ -5147,7 +5311,7 @@ def build_ui() -> gr.Blocks:
                     line_red_min_width,
                     line_draw_red_boxes,
                 ],
-                outputs=[line_image_out, line_status, line_json],
+                outputs=[line_image_out, line_status, line_json, line_profile_out],
             )
             line_scan_models_btn.click(
                 fn=scan_ultralytics_inference_models,
