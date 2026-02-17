@@ -32,6 +32,11 @@ from PIL import Image, ImageDraw, ImageFont
 import yaml
 
 try:
+    from scipy.signal import find_peaks
+except Exception:
+    find_peaks = None
+
+try:
     import cv2
 except Exception:
     cv2 = None
@@ -3206,6 +3211,7 @@ def _render_line_profile_plot(
     mask: np.ndarray,
     line_boxes_local: List[Tuple[int, int, int, int]],
     title: str,
+    peaks: Optional[List[int]] = None,
 ) -> np.ndarray:
     if projection is None or projection.size == 0:
         return _line_profile_placeholder("No projection data available.")
@@ -3251,6 +3257,11 @@ def _render_line_profile_plot(
             lx2 = lx1 + 1
         draw.rectangle((lx1, top + 2, lx2, bottom - 2), outline=(255, 168, 0), width=2)
 
+    for peak in (peaks or []):
+        px = _x_from_row(int(peak))
+        draw.line((px, top + 1, px, bottom - 1), fill=(46, 158, 78), width=1)
+        draw.ellipse((px - 3, top + 3, px + 3, top + 9), fill=(46, 158, 78))
+
     vmax = max(1.0, float(np.max(projection)), float(threshold))
     threshold_y = top + int(round((1.0 - (min(vmax, max(0.0, float(threshold))) / vmax)) * inner_h))
     draw.line((left, threshold_y, right, threshold_y), fill=(230, 70, 70), width=2)
@@ -3271,7 +3282,7 @@ def _render_line_profile_plot(
     draw.text((left, bottom + 8), f"rows: {n}", fill=(80, 80, 80), font=font)
     draw.text((left + 130, bottom + 8), f"max: {float(np.max(projection)):.1f}", fill=(80, 80, 80), font=font)
     draw.text((left + 275, bottom + 8), f"threshold: {float(threshold):.1f}", fill=(220, 60, 60), font=font)
-    draw.text((left + 470, bottom + 8), "blue=profile, red=threshold, orange=final lines", fill=(90, 90, 90), font=font)
+    draw.text((left + 470, bottom + 8), "blue=profile, red=threshold, green=peaks, orange=final lines", fill=(90, 90, 90), font=font)
 
     return np.array(img)
 
@@ -3330,6 +3341,46 @@ def _compute_line_projection_state(
     }
 
 
+def _line_runs_from_threshold_mask(
+    mask: np.ndarray,
+    min_line_height: int,
+    merge_gap_px: int,
+) -> List[Tuple[int, int]]:
+    if mask is None or mask.size == 0:
+        return []
+
+    h = int(mask.shape[0])
+    min_h = max(3, int(min_line_height))
+    runs: List[Tuple[int, int]] = []
+    y = 0
+    while y < h:
+        if not bool(mask[y]):
+            y += 1
+            continue
+        y1 = y
+        while y < h and bool(mask[y]):
+            y += 1
+        y2 = y
+        if y2 - y1 >= min_h:
+            runs.append((y1, y2))
+
+    if not runs:
+        return []
+
+    merged: List[Tuple[int, int]] = []
+    merge_gap = max(0, int(merge_gap_px))
+    for y1, y2 in runs:
+        if not merged:
+            merged.append((y1, y2))
+            continue
+        py1, py2 = merged[-1]
+        if y1 - py2 <= merge_gap:
+            merged[-1] = (py1, y2)
+        else:
+            merged.append((y1, y2))
+    return merged
+
+
 def _segment_lines_in_text_crop(
     crop_rgb: np.ndarray,
     min_line_height: int,
@@ -3351,22 +3402,75 @@ def _segment_lines_in_text_crop(
     bw = state["bw"]
     h = int(state["height"])
     w = int(state["width"])
+    projection = np.asarray(state["projection"], dtype=np.float32)
+    threshold = float(state["threshold"])
     mask = state["mask"]
 
     min_h = max(3, int(min_line_height))
-    line_candidates: List[Tuple[int, int, int, int]] = []
-    y = 0
-    while y < h:
-        if not bool(mask[y]):
-            y += 1
-            continue
-        y1 = y
-        while y < h and bool(mask[y]):
-            y += 1
-        y2 = y
-        if y2 - y1 < min_h:
-            continue
+    line_runs: List[Tuple[int, int]] = []
+    peaks_used: List[int] = []
 
+    if find_peaks is not None and projection.size >= 5:
+        maxv = float(np.max(projection))
+        distance = max(min_h, int(round(h * 0.06)))
+        prominence_rel = min(0.30, max(0.06, float(projection_threshold_rel) * 0.55))
+        prominence = max(2.0, maxv * prominence_rel)
+        peaks, _ = find_peaks(
+            projection,
+            distance=distance,
+            prominence=prominence,
+        )
+        if peaks.size > 0:
+            strong = projection[peaks] >= max(1.0, threshold * 1.05)
+            if bool(np.any(strong)):
+                peaks = peaks[strong]
+
+        if peaks.size > 0:
+            peaks = np.sort(peaks.astype(np.int32))
+            peaks_used = [int(p) for p in peaks.tolist()]
+
+            boundaries: List[int] = [0]
+            for i in range(len(peaks) - 1):
+                lo = int(peaks[i])
+                hi = int(peaks[i + 1])
+                if hi - lo < 2:
+                    continue
+                valley = lo + int(np.argmin(projection[lo : hi + 1]))
+                valley = max(boundaries[-1] + 1, min(h - 1, valley))
+                boundaries.append(valley)
+            boundaries.append(h)
+
+            if len(boundaries) >= 2:
+                for i in range(len(boundaries) - 1):
+                    y1 = int(boundaries[i])
+                    y2 = int(boundaries[i + 1])
+                    if y2 <= y1:
+                        continue
+                    if y2 - y1 < min_h:
+                        if line_runs:
+                            py1, py2 = line_runs[-1]
+                            line_runs[-1] = (py1, y2)
+                        continue
+                    line_runs.append((y1, y2))
+
+    if not line_runs:
+        line_runs = _line_runs_from_threshold_mask(
+            mask=mask,
+            min_line_height=min_h,
+            merge_gap_px=int(merge_gap_px),
+        )
+        peaks_used = []
+
+    if not line_runs:
+        state["peaks"] = []
+        state["line_runs"] = []
+        return []
+
+    state["peaks"] = peaks_used
+    state["line_runs"] = [[int(y1), int(y2)] for y1, y2 in line_runs]
+
+    candidates: List[Tuple[int, int, int, int]] = []
+    for y1, y2 in line_runs:
         sub = bw[y1:y2, :]
         if sub.size == 0:
             continue
@@ -3382,25 +3486,13 @@ def _segment_lines_in_text_crop(
         x2 = min(w, int(cols[-1]) + 3)
         if x2 - x1 < 4:
             continue
-        line_candidates.append((x1, y1, x2, y2))
+        candidates.append((x1, y1, x2, y2))
 
-    if not line_candidates:
+    if not candidates:
         return []
 
-    merged: List[Tuple[int, int, int, int]] = []
-    merge_gap = max(0, int(merge_gap_px))
-    for x1, y1, x2, y2 in line_candidates:
-        if not merged:
-            merged.append((x1, y1, x2, y2))
-            continue
-        px1, py1, px2, py2 = merged[-1]
-        if y1 - py2 <= merge_gap:
-            merged[-1] = (min(px1, x1), py1, max(px2, x2), y2)
-        else:
-            merged.append((x1, y1, x2, y2))
-
     tightened: List[Tuple[int, int, int, int]] = []
-    for x1, y1, x2, y2 in merged:
+    for x1, y1, x2, y2 in candidates:
         sub = bw[y1:y2, x1:x2]
         if sub.size == 0:
             continue
@@ -3669,6 +3761,7 @@ def run_tibetan_text_line_split_classical(
                     mask=np.asarray(line_state.get("mask"), dtype=bool),
                     line_boxes_local=line_boxes_local,
                     title=f"Line profile for tibetan_text box [{x1}, {y1}, {x2}, {y2}]",
+                    peaks=[int(p) for p in (line_state.get("peaks") or [])],
                 )
                 profile_selected_area = crop_area
                 profile_meta = {
@@ -3678,6 +3771,10 @@ def run_tibetan_text_line_split_classical(
                     "projection_smooth_rows": int(line_state.get("projection_smooth", 1)),
                     "projection_threshold_rel": float(line_state.get("projection_threshold_rel", 0.0)),
                     "line_count": len(line_boxes_local),
+                    "peak_count": int(len(line_state.get("peaks") or [])),
+                    "peaks": [int(p) for p in (line_state.get("peaks") or [])],
+                    "line_runs": line_state.get("line_runs"),
+                    "line_method": ("scipy_find_peaks" if line_state.get("peaks") else "threshold_mask_fallback"),
                 }
 
         line_boxes_global: List[List[int]] = []
