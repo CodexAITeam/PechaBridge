@@ -6,6 +6,8 @@ __pycache__/
 
 datasets/
 sbb_images/
+output/
+models/
 
 # C extensions
 *.so

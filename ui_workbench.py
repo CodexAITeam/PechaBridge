@@ -3499,52 +3499,74 @@ def _segment_horizontal_runs_in_line_crop(
         if peaks.size > 0:
             peaks = np.sort(peaks.astype(np.int32))
             peaks_used = [int(p) for p in peaks.tolist()]
+
+            # Boundaries follow your rule:
+            # start at line begin, then left valleys of subsequent peaks, then line end.
             boundaries: List[int] = [0]
-            for i in range(len(peaks) - 1):
-                lo = int(peaks[i])
-                hi = int(peaks[i + 1])
+            for i in range(1, len(peaks)):
+                lo = int(peaks[i - 1])
+                hi = int(peaks[i])
                 if hi - lo < 2:
                     continue
-                valley = lo + int(np.argmin(projection[lo : hi + 1]))
-                valley = max(boundaries[-1] + 1, min(w - 1, valley))
-                boundaries.append(valley)
+                left_valley_of_next_peak = lo + int(np.argmin(projection[lo : hi + 1]))
+                boundaries.append(left_valley_of_next_peak)
             boundaries.append(w)
-            for i in range(len(boundaries) - 1):
-                x1 = int(boundaries[i])
-                x2 = int(boundaries[i + 1])
-                if x2 - x1 < min_w:
-                    continue
-                if float(np.max(projection[x1:x2])) < max(1.0, threshold * 0.55):
-                    continue
-                runs.append((x1, x2))
+
+            norm_boundaries: List[int] = [0]
+            for b in boundaries[1:-1]:
+                bx = int(max(norm_boundaries[-1] + 1, min(w - 1, int(b))))
+                norm_boundaries.append(bx)
+            norm_boundaries.append(w)
+
+            for i in range(len(norm_boundaries) - 1):
+                x1 = int(norm_boundaries[i])
+                x2 = int(norm_boundaries[i + 1])
+                if x2 > x1:
+                    runs.append((x1, x2))
 
     if not runs:
-        soft = max(1.0, threshold * 0.75)
-        active = projection >= soft
-        x = 0
-        while x < w:
-            if not bool(active[x]):
-                x += 1
-                continue
-            x1 = x
-            while x < w and bool(active[x]):
-                x += 1
-            x2 = x
-            if x2 - x1 >= min_w:
-                runs.append((x1, x2))
+        runs = [(0, w)]
 
-    if runs:
-        merged: List[Tuple[int, int]] = []
-        for x1, x2 in runs:
-            if not merged:
-                merged.append((x1, x2))
+    # Keep full coverage while avoiding tiny fragments:
+    # tiny run is merged into a direct neighbor (prefer right).
+    if runs and len(runs) > 1:
+        i = 0
+        while i < len(runs):
+            x1, x2 = runs[i]
+            if (x2 - x1) >= min_w:
+                i += 1
                 continue
-            px1, px2 = merged[-1]
-            if x1 - px2 <= merge_gap:
-                merged[-1] = (px1, x2)
+            if i < len(runs) - 1:
+                nx1, nx2 = runs[i + 1]
+                if nx1 - x2 <= merge_gap:
+                    runs[i + 1] = (x1, nx2)
+                else:
+                    runs[i + 1] = (x1, nx2)
+                del runs[i]
             else:
-                merged.append((x1, x2))
-        runs = [(x1, x2) for x1, x2 in merged if (x2 - x1) >= min_w]
+                px1, px2 = runs[i - 1]
+                if x1 - px2 <= merge_gap:
+                    runs[i - 1] = (px1, x2)
+                else:
+                    runs[i - 1] = (px1, x2)
+                del runs[i]
+                i = max(0, i - 1)
+
+    # Re-normalize to guarantee contiguous full-width coverage.
+    if runs:
+        renorm: List[Tuple[int, int]] = []
+        cursor = 0
+        for i, (_, x2_raw) in enumerate(runs):
+            if i == len(runs) - 1:
+                x2 = w
+            else:
+                x2 = max(cursor + 1, min(w - 1, int(x2_raw)))
+            renorm.append((cursor, x2))
+            cursor = x2
+        if renorm:
+            lx1, _ = renorm[-1]
+            renorm[-1] = (lx1, w)
+        runs = [(x1, x2) for x1, x2 in renorm if x2 > x1]
 
     state["horizontal_peaks"] = peaks_used
     state["horizontal_runs"] = [[int(x1), int(x2)] for x1, x2 in runs]
@@ -3552,26 +3574,11 @@ def _segment_horizontal_runs_in_line_crop(
 
     boxes: List[Tuple[int, int, int, int]] = []
     for x1, x2 in runs:
-        sub = bw[:, x1:x2]
-        if sub.size == 0:
-            continue
-        rows = np.where((sub > 0).sum(axis=1) > 0)[0]
-        cols = np.where((sub > 0).sum(axis=0) > 0)[0]
-        if rows.size == 0 or cols.size == 0:
-            continue
-        bx1 = x1 + int(cols[0])
-        bx2 = x1 + int(cols[-1]) + 1
-        by1 = int(rows[0])
-        by2 = int(rows[-1]) + 1
-        if bx2 - bx1 < min_w or by2 - by1 < 2:
-            continue
-        pad = 1
-        bx1 = max(0, bx1 - pad)
-        by1 = max(0, by1 - pad)
-        bx2 = min(w, bx2 + pad)
-        by2 = min(h, by2 + pad)
-        if bx2 > bx1 and by2 > by1:
-            boxes.append((bx1, by1, bx2, by2))
+        # Full-height boxes, contiguous from line start to line end.
+        bx1 = max(0, min(w - 1, int(x1)))
+        bx2 = max(0, min(w, int(x2)))
+        if bx2 > bx1:
+            boxes.append((bx1, 0, bx2, h))
 
     return boxes, state
 
