@@ -3279,24 +3279,18 @@ def _segment_lines_in_text_crop(
         else:
             merged.append((x1, y1, x2, y2))
 
-    tightened: List[Tuple[int, int, int, int]] = []
-    for x1, y1, x2, y2 in merged:
-        sub = bw[y1:y2, x1:x2]
-        if sub.size == 0:
+    # Keep the detected line count, but enforce equal-height tiles that
+    # cover the full tibetan_text crop (no vertical gaps, full width).
+    line_count = max(1, len(merged))
+    uniform_lines: List[Tuple[int, int, int, int]] = []
+    for i in range(line_count):
+        y1 = (i * h) // line_count
+        y2 = ((i + 1) * h) // line_count
+        if y2 <= y1:
             continue
-        rows = np.where((sub > 0).sum(axis=1) > 0)[0]
-        if rows.size > 0:
-            y1 = y1 + int(rows[0])
-            y2 = y1 + int(rows[-1] - rows[0] + 1)
-        pad = 1
-        tx1 = max(0, x1 - pad)
-        ty1 = max(0, y1 - pad)
-        tx2 = min(w, x2 + pad)
-        ty2 = min(h, y2 + pad)
-        if tx2 > tx1 and ty2 > ty1:
-            tightened.append((tx1, ty1, tx2, ty2))
+        uniform_lines.append((0, y1, w, y2))
 
-    return tightened
+    return uniform_lines
 
 
 def _segment_red_runs_in_line_crop(
