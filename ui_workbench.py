@@ -3661,18 +3661,66 @@ def _build_wordbox_hierarchy_from_peaks(
 
     levels_out: List[Dict[str, Any]] = []
     for n in lvl:
-        box_len = max(1, int(np.ceil(float(w) / float(n))))
-        starts = _pick_distinct_starts(valley_pool, n, w)
+        requested_count = max(1, int(n))
+        box_count = max(1, min(requested_count, w))
+        interior_needed = max(0, box_count - 1)
+
+        # We build contiguous boundaries [0, b1, b2, ..., w].
+        interior = _pick_distinct_starts(
+            [v for v in valley_pool if 0 < int(v) < w],
+            interior_needed,
+            w,
+        )
+        interior = [int(v) for v in interior if 0 < int(v) < w]
+
+        if len(interior) > interior_needed:
+            interior = interior[:interior_needed]
+        if len(interior) < interior_needed:
+            targets = np.linspace(1.0, float(max(1, w - 1)), interior_needed + 2)[1:-1]
+            for t in targets:
+                c = int(round(float(t)))
+                c = max(1, min(w - 1, c))
+                if c not in interior:
+                    interior.append(c)
+                if len(interior) >= interior_needed:
+                    break
+        if len(interior) < interior_needed:
+            for c in range(1, w):
+                if c not in interior:
+                    interior.append(c)
+                if len(interior) >= interior_needed:
+                    break
+
+        interior = sorted(set(interior))
+        if len(interior) > interior_needed:
+            picks = np.linspace(0.0, float(len(interior) - 1), interior_needed)
+            interior = sorted({interior[int(round(p))] for p in picks})
+            while len(interior) < interior_needed:
+                for c in range(1, w):
+                    if c not in interior:
+                        interior.append(c)
+                    if len(interior) >= interior_needed:
+                        break
+            interior = sorted(interior)[:interior_needed]
+
+        boundaries = [0] + interior + [w]
         boxes: List[Tuple[int, int, int, int]] = []
-        for s in starts:
-            x1 = max(0, min(w - 1, int(s)))
-            x2 = min(w, x1 + box_len)
+        for i in range(len(boundaries) - 1):
+            x1 = int(boundaries[i])
+            x2 = int(boundaries[i + 1])
+            x1 = max(0, min(w - 1, x1))
+            x2 = max(0, min(w, x2))
             if x2 > x1:
                 boxes.append((x1, 0, x2, h))
+
+        starts = [int(b[0]) for b in boxes]
+        widths = [int(b[2] - b[0]) for b in boxes]
         levels_out.append(
             {
-                "count": int(n),
-                "box_length_px": int(box_len),
+                "count": int(box_count),
+                "target_count": int(requested_count),
+                "box_length_px": int(np.ceil(float(w) / float(requested_count))),
+                "box_lengths_px": widths,
                 "starts": [int(s) for s in starts],
                 "boxes": [[int(a), int(b), int(c), int(d)] for (a, b, c, d) in boxes],
             }
