@@ -3583,28 +3583,187 @@ def _segment_horizontal_runs_in_line_crop(
     return boxes, state
 
 
+def _left_valleys_for_peaks(projection: np.ndarray, peaks: List[int], width: int) -> List[int]:
+    w = max(1, int(width))
+    if projection is None or projection.size == 0 or w <= 0:
+        return [0]
+
+    sorted_peaks = sorted([int(p) for p in peaks if 0 <= int(p) < w])
+    valleys: List[int] = [0]
+    for i in range(1, len(sorted_peaks)):
+        lo = int(sorted_peaks[i - 1])
+        hi = int(sorted_peaks[i])
+        if hi - lo < 2:
+            continue
+        valley = lo + int(np.argmin(projection[lo : hi + 1]))
+        valleys.append(int(max(0, min(w - 1, valley))))
+    return sorted(set(valleys))
+
+
+def _pick_distinct_starts(values: List[int], needed: int, width: int) -> List[int]:
+    w = max(1, int(width))
+    n = max(1, int(needed))
+    uniq = sorted(set(int(v) for v in values if 0 <= int(v) < w))
+    if not uniq:
+        uniq = [0]
+    if n == 1:
+        return [uniq[0]]
+
+    targets = np.linspace(0.0, float(len(uniq) - 1), n)
+    picked_idx: List[int] = []
+    used = set()
+    for t in targets:
+        center = int(round(float(t)))
+        found = None
+        for off in range(0, len(uniq)):
+            left = center - off
+            right = center + off
+            if 0 <= left < len(uniq) and left not in used:
+                found = left
+                break
+            if 0 <= right < len(uniq) and right not in used:
+                found = right
+                break
+        if found is not None:
+            used.add(found)
+            picked_idx.append(found)
+
+    if len(picked_idx) < n:
+        for i in range(len(uniq)):
+            if i in used:
+                continue
+            picked_idx.append(i)
+            if len(picked_idx) >= n:
+                break
+
+    picked = sorted(uniq[i] for i in picked_idx[:n])
+    return picked
+
+
+def _build_wordbox_hierarchy_from_peaks(
+    projection: np.ndarray,
+    peaks: List[int],
+    width: int,
+    height: int,
+    levels: Optional[List[int]] = None,
+) -> Dict[str, Any]:
+    w = max(1, int(width))
+    h = max(1, int(height))
+    lvl = [2, 4, 8] if not levels else [max(1, int(v)) for v in levels]
+
+    valley_starts = _left_valleys_for_peaks(projection=projection, peaks=peaks, width=w)
+    valley_pool: List[int] = list(valley_starts)
+    if find_peaks is not None and projection is not None and projection.size >= 5:
+        minima, _ = find_peaks(-np.asarray(projection, dtype=np.float32), distance=max(2, int(round(w * 0.02))))
+        valley_pool.extend(int(v) for v in minima.tolist())
+    valley_pool.append(0)
+    valley_pool = sorted(set(int(v) for v in valley_pool if 0 <= int(v) < w))
+
+    levels_out: List[Dict[str, Any]] = []
+    for n in lvl:
+        box_len = max(1, int(np.ceil(float(w) / float(n))))
+        starts = _pick_distinct_starts(valley_pool, n, w)
+        boxes: List[Tuple[int, int, int, int]] = []
+        for s in starts:
+            x1 = max(0, min(w - 1, int(s)))
+            x2 = min(w, x1 + box_len)
+            if x2 > x1:
+                boxes.append((x1, 0, x2, h))
+        levels_out.append(
+            {
+                "count": int(n),
+                "box_length_px": int(box_len),
+                "starts": [int(s) for s in starts],
+                "boxes": [[int(a), int(b), int(c), int(d)] for (a, b, c, d) in boxes],
+            }
+        )
+
+    return {
+        "valley_starts": [int(v) for v in valley_starts],
+        "valley_pool": [int(v) for v in valley_pool],
+        "levels": levels_out,
+    }
+
+
+def _render_wordbox_hierarchy_view(
+    line_crop_rgb: np.ndarray,
+    hierarchy: Dict[str, Any],
+    peaks: Optional[List[int]] = None,
+) -> np.ndarray:
+    if line_crop_rgb is None or line_crop_rgb.size == 0:
+        return _line_profile_placeholder("No line crop available for hierarchy view.")
+
+    base = line_crop_rgb.astype(np.uint8)
+    h, w = base.shape[:2]
+    font = _load_overlay_font()
+    panels: List[np.ndarray] = []
+
+    ref = Image.fromarray(base).convert("RGB")
+    dref = ImageDraw.Draw(ref)
+    dref.text((6, 6), "Reference (clicked line)", fill=(20, 20, 20), font=font)
+    for p in (peaks or []):
+        px = int(max(0, min(w - 1, int(p))))
+        dref.line((px, 0, px, h - 1), fill=(46, 158, 78), width=1)
+    panels.append(np.array(ref))
+
+    palette = {
+        2: (245, 160, 66),
+        4: (80, 160, 255),
+        8: (220, 95, 95),
+    }
+    for lvl in (hierarchy.get("levels") or []):
+        n = int(lvl.get("count", 0))
+        boxes = lvl.get("boxes") or []
+        col = palette.get(n, (240, 180, 50))
+        panel = Image.fromarray(base).convert("RGB")
+        draw = ImageDraw.Draw(panel)
+        tag = f"{n} wordboxes (len ~= 1/{n} line width)"
+        draw.rectangle((2, 2, min(w - 2, 12 + 8 * len(tag)), 18), fill=(0, 0, 0))
+        draw.text((6, 5), tag, fill=col, font=font)
+        for i, box in enumerate(boxes, start=1):
+            if not isinstance(box, (tuple, list)) or len(box) != 4:
+                continue
+            x1, y1, x2, y2 = [int(v) for v in box]
+            draw.rectangle((x1, y1, x2, y2), outline=col, width=2)
+            label = f"{n}:{i}"
+            tx, ty = x1 + 2, max(0, y1 + 2)
+            draw.rectangle((tx, ty, tx + 7 * len(label), ty + 11), fill=(0, 0, 0))
+            draw.text((tx + 1, ty + 1), label, fill=col, font=font)
+        for p in (peaks or []):
+            px = int(max(0, min(w - 1, int(p))))
+            draw.line((px, 0, px, h - 1), fill=(46, 158, 78), width=1)
+        panels.append(np.array(panel))
+
+    sep = np.full((6, w, 3), 245, dtype=np.uint8)
+    out = panels[0]
+    for p in panels[1:]:
+        out = np.vstack([out, sep, p])
+    return out
+
+
 def preview_clicked_line_horizontal_profile(
     click_state: Dict[str, Any],
     evt: gr.SelectData,
 ):
     profile_placeholder = _line_profile_placeholder("Click a line box in the overlay to inspect its horizontal profile.")
     view_placeholder = _line_profile_placeholder("Click a line box in the overlay to open the extracted line view.")
+    hierarchy_placeholder = _line_profile_placeholder("Click a line box to generate the 2/4/8 wordbox hierarchy.")
     if not isinstance(click_state, dict):
-        return view_placeholder, profile_placeholder, "Run the line split first."
+        return view_placeholder, hierarchy_placeholder, profile_placeholder, "Run the line split first."
 
     image = click_state.get("image")
     line_boxes = click_state.get("line_boxes") or []
     if image is None or not line_boxes:
-        return view_placeholder, profile_placeholder, "No line boxes available. Run inference first."
+        return view_placeholder, hierarchy_placeholder, profile_placeholder, "No line boxes available. Run inference first."
 
     idx = getattr(evt, "index", None)
     if not isinstance(idx, (tuple, list)) or len(idx) < 2:
-        return view_placeholder, profile_placeholder, "Click position not available."
+        return view_placeholder, hierarchy_placeholder, profile_placeholder, "Click position not available."
     try:
         click_x = int(idx[0])
         click_y = int(idx[1])
     except Exception:
-        return view_placeholder, profile_placeholder, "Invalid click position."
+        return view_placeholder, hierarchy_placeholder, profile_placeholder, "Invalid click position."
 
     def _hits_for(px: int, py: int) -> List[Dict[str, Any]]:
         out: List[Dict[str, Any]] = []
@@ -3626,12 +3785,12 @@ def preview_clicked_line_horizontal_profile(
         hits = _hits_for(click_y, click_x)
 
     if not hits:
-        return view_placeholder, profile_placeholder, f"No line box at click ({click_x}, {click_y})."
+        return view_placeholder, hierarchy_placeholder, profile_placeholder, f"No line box at click ({click_x}, {click_y})."
 
     chosen = sorted(hits, key=lambda r: float(r.get("_area", 1.0)))[0]
     x1, y1, x2, y2 = [int(v) for v in (chosen.get("line_box") or [0, 0, 0, 0])]
     if x2 <= x1 or y2 <= y1:
-        return view_placeholder, profile_placeholder, "Selected line box is invalid."
+        return view_placeholder, hierarchy_placeholder, profile_placeholder, "Selected line box is invalid."
 
     src = np.asarray(image)
     h, w = src.shape[:2]
@@ -3640,7 +3799,7 @@ def preview_clicked_line_horizontal_profile(
     x2 = max(0, min(w, x2))
     y2 = max(0, min(h, y2))
     if x2 <= x1 or y2 <= y1:
-        return view_placeholder, profile_placeholder, "Selected line box is out of bounds."
+        return view_placeholder, hierarchy_placeholder, profile_placeholder, "Selected line box is out of bounds."
 
     line_crop = src[y1:y2, x1:x2]
     hstate = _compute_horizontal_projection_state(
@@ -3665,7 +3824,7 @@ def preview_clicked_line_horizontal_profile(
 
     if not bool(hstate.get("ok")):
         reason = str(hstate.get("reason", "unknown"))
-        return selected_view, profile_placeholder, f"Could not compute horizontal profile ({reason})."
+        return selected_view, hierarchy_placeholder, profile_placeholder, f"Could not compute horizontal profile ({reason})."
 
     projection = np.asarray(hstate["projection"], dtype=np.float32)
     profile = _render_horizontal_profile_plot(
@@ -3676,13 +3835,32 @@ def preview_clicked_line_horizontal_profile(
         peaks=[int(p) for p in (hstate.get("horizontal_peaks") or [])],
         runs=[list(r) for r in (hstate.get("horizontal_runs") or [])],
     )
+    hierarchy = _build_wordbox_hierarchy_from_peaks(
+        projection=projection,
+        peaks=[int(p) for p in (hstate.get("horizontal_peaks") or [])],
+        width=int(hstate.get("width", line_crop.shape[1])),
+        height=int(hstate.get("height", line_crop.shape[0])),
+        levels=[2, 4, 8],
+    )
+    hierarchy_view = _render_wordbox_hierarchy_view(
+        line_crop_rgb=line_crop,
+        hierarchy=hierarchy,
+        peaks=[int(p) for p in (hstate.get("horizontal_peaks") or [])],
+    )
     method = str(hstate.get("horizontal_method", "unknown"))
+    level_map: Dict[int, int] = {}
+    for rec in (hierarchy.get("levels") or []):
+        n = int(rec.get("count", 0))
+        level_map[n] = len(rec.get("boxes") or [])
+    l2 = int(level_map.get(2, 0))
+    l4 = int(level_map.get(4, 0))
+    l8 = int(level_map.get(8, 0))
     status = (
         f"Selected line {int(chosen.get('line_id', -1))} at ({click_x}, {click_y}) "
         f"box=[{x1}, {y1}, {x2}, {y2}] peaks={len(hstate.get('horizontal_peaks') or [])} "
-        f"boxes={len(local_boxes)} method={method}"
+        f"boxes={len(local_boxes)} hierarchy(2/4/8)=({l2}/{l4}/{l8}) method={method}"
     )
-    return selected_view, profile, status
+    return selected_view, hierarchy_view, profile, status
 
 
 def _compute_line_projection_state(
@@ -4047,6 +4225,7 @@ def run_tibetan_text_line_split_classical(
 ):
     empty_profile = _line_profile_placeholder("Run inference to see the projection profile used for line splitting.")
     empty_selected_view = _line_profile_placeholder("Click a line box in the overlay to open the extracted line view.")
+    empty_hierarchy_view = _line_profile_placeholder("Click a line box to generate the 2/4/8 wordbox hierarchy.")
     empty_selected_profile = _line_profile_placeholder("Click a line box in the overlay to inspect its horizontal profile.")
     empty_selected_status = "Click a line box in the overlay."
     empty_click_state = {
@@ -4062,13 +4241,13 @@ def run_tibetan_text_line_split_classical(
         "line_merge_gap_px": 5,
     }
     if image is None:
-        return None, "Please provide an image.", "{}", empty_profile, empty_selected_view, empty_selected_profile, empty_selected_status, empty_click_state
+        return None, "Please provide an image.", "{}", empty_profile, empty_selected_view, empty_hierarchy_view, empty_selected_profile, empty_selected_status, empty_click_state
     if cv2 is None:
-        return image, "opencv-python is required for classical line segmentation.", "{}", empty_profile, empty_selected_view, empty_selected_profile, empty_selected_status, empty_click_state
+        return image, "opencv-python is required for classical line segmentation.", "{}", empty_profile, empty_selected_view, empty_hierarchy_view, empty_selected_profile, empty_selected_status, empty_click_state
 
     model_file = Path(model_path).expanduser().resolve()
     if not model_file.exists():
-        return image, f"Model not found: {model_file}", "{}", empty_profile, empty_selected_view, empty_selected_profile, empty_selected_status, empty_click_state
+        return image, f"Model not found: {model_file}", "{}", empty_profile, empty_selected_view, empty_hierarchy_view, empty_selected_profile, empty_selected_status, empty_click_state
 
     try:
         model = _load_yolo_model(str(model_file))
@@ -4077,7 +4256,7 @@ def run_tibetan_text_line_split_classical(
             kwargs["device"] = (device or "").strip()
         results = model.predict(source=image, **kwargs)
     except Exception as exc:
-        return image, f"Inference failed: {type(exc).__name__}: {exc}", "{}", empty_profile, empty_selected_view, empty_selected_profile, empty_selected_status, empty_click_state
+        return image, f"Inference failed: {type(exc).__name__}: {exc}", "{}", empty_profile, empty_selected_view, empty_hierarchy_view, empty_selected_profile, empty_selected_status, empty_click_state
 
     h, w = image.shape[:2]
     overlay = Image.fromarray(image.astype(np.uint8)).convert("RGB")
@@ -4310,6 +4489,7 @@ def run_tibetan_text_line_split_classical(
         json.dumps(payload, ensure_ascii=False, indent=2),
         profile_image,
         empty_selected_view,
+        empty_hierarchy_view,
         empty_selected_profile,
         empty_selected_status,
         click_state,
@@ -5830,6 +6010,7 @@ def build_ui() -> gr.Blocks:
                     line_image_out = gr.Image(type="numpy", label="Overlay (Text + Line + Red Boxes)", interactive=True)
                     line_profile_out = gr.Image(type="numpy", label="Line Projection Profile (used for segmentation)")
                     line_selected_view = gr.Image(type="numpy", label="Selected Line Block + Peak-Boxes (same algorithm)")
+                    line_hierarchy_view = gr.Image(type="numpy", label="Selected Line Wordbox Hierarchy (2/4/8)")
                     line_selected_profile = gr.Image(type="numpy", label="Selected Line Horizontal Profile (click in overlay)")
                     line_click_status = gr.Textbox(label="Clicked Line", interactive=False)
                     line_status = gr.Textbox(label="Status", interactive=False)
@@ -5862,6 +6043,7 @@ def build_ui() -> gr.Blocks:
                     line_json,
                     line_profile_out,
                     line_selected_view,
+                    line_hierarchy_view,
                     line_selected_profile,
                     line_click_status,
                     line_click_state,
@@ -5870,7 +6052,7 @@ def build_ui() -> gr.Blocks:
             line_image_out.select(
                 fn=preview_clicked_line_horizontal_profile,
                 inputs=[line_click_state],
-                outputs=[line_selected_view, line_selected_profile, line_click_status],
+                outputs=[line_selected_view, line_hierarchy_view, line_selected_profile, line_click_status],
             )
             line_scan_models_btn.click(
                 fn=scan_ultralytics_inference_models,
