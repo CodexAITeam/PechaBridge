@@ -344,6 +344,9 @@ def _save_artifacts(
     num_groups: int,
     num_assets: int,
     width_buckets: Sequence[int],
+    steps_per_epoch: int,
+    effective_max_train_steps: int,
+    effective_num_train_epochs: int,
     prefix: str = "",
     global_step: int = 0,
 ) -> TrainingArtifacts:
@@ -386,8 +389,11 @@ def _save_artifacts(
                 "batch_size": int(args.batch_size),
                 "lr": float(args.lr),
                 "weight_decay": float(args.weight_decay),
-                "num_train_epochs": int(args.num_train_epochs),
-                "max_train_steps": int(args.max_train_steps),
+                "requested_num_train_epochs": int(args.num_train_epochs),
+                "requested_max_train_steps": int(args.max_train_steps),
+                "effective_num_train_epochs": int(effective_num_train_epochs),
+                "effective_max_train_steps": int(effective_max_train_steps),
+                "steps_per_epoch": int(steps_per_epoch),
                 "warmup_steps": int(args.warmup_steps),
                 "projection_dim": int(args.projection_dim),
                 "temperature": float(args.temperature),
@@ -492,9 +498,27 @@ def run(args) -> Dict[str, Any]:
 
     num_update_steps_per_epoch = len(dataloader)
     max_train_steps = int(args.max_train_steps)
+    requested_num_train_epochs = int(args.num_train_epochs)
+    requested_max_train_steps = int(args.max_train_steps)
     if max_train_steps <= 0:
-        max_train_steps = int(args.num_train_epochs) * num_update_steps_per_epoch
+        max_train_steps = requested_num_train_epochs * num_update_steps_per_epoch
     num_train_epochs = int(math.ceil(max_train_steps / num_update_steps_per_epoch))
+
+    if accelerator.is_main_process:
+        LOGGER.info(
+            "Training plan: steps_per_epoch=%d, requested_epochs=%d, requested_max_steps=%d, effective_epochs=%d, effective_max_steps=%d",
+            num_update_steps_per_epoch,
+            requested_num_train_epochs,
+            requested_max_train_steps,
+            num_train_epochs,
+            max_train_steps,
+        )
+        if requested_max_train_steps > 0 and requested_max_train_steps <= num_update_steps_per_epoch:
+            LOGGER.warning(
+                "max_train_steps=%d is <= steps_per_epoch=%d -> this runs at most one epoch.",
+                requested_max_train_steps,
+                num_update_steps_per_epoch,
+            )
 
     lr_scheduler = get_scheduler(
         name="cosine",
@@ -568,6 +592,9 @@ def run(args) -> Dict[str, Any]:
                     num_groups=len(groups),
                     num_assets=total_assets,
                     width_buckets=width_buckets,
+                    steps_per_epoch=num_update_steps_per_epoch,
+                    effective_max_train_steps=max_train_steps,
+                    effective_num_train_epochs=num_train_epochs,
                     prefix=prefix,
                     global_step=global_step,
                 )
@@ -588,6 +615,9 @@ def run(args) -> Dict[str, Any]:
             num_groups=len(groups),
             num_assets=total_assets,
             width_buckets=width_buckets,
+            steps_per_epoch=num_update_steps_per_epoch,
+            effective_max_train_steps=max_train_steps,
+            effective_num_train_epochs=num_train_epochs,
             prefix="",
             global_step=global_step,
         )
