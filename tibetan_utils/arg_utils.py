@@ -794,6 +794,80 @@ def create_eval_text_hierarchy_vit_parser(add_help: bool = True):
     return parser
 
 
+def add_faiss_text_hierarchy_search_arguments(parser):
+    """Arguments for FAISS-based TextHierarchy similarity search."""
+    parser.add_argument('--query_image', '--query-image', dest='query_image', type=str, required=True,
+                       help='Query image/crop path for similarity search')
+    parser.add_argument('--backbone_dir', '--backbone-dir', dest='backbone_dir', type=str, required=True,
+                       help='Path to trained backbone directory used for embedding')
+    parser.add_argument('--projection_head_path', '--projection-head-path', dest='projection_head_path', type=str, default='',
+                       help='Optional projection head checkpoint (.pt)')
+    parser.add_argument('--output_dir', '--output-dir', dest='output_dir', type=str, required=True,
+                       help='Directory where search report is written')
+
+    parser.add_argument('--index_path', '--index-path', dest='index_path', type=str, default='',
+                       help='Existing FAISS index path (.faiss). If set, loads DB instead of rebuilding.')
+    parser.add_argument('--meta_path', '--meta-path', dest='meta_path', type=str, default='',
+                       help='Optional explicit metadata sidecar path for existing FAISS DB')
+    parser.add_argument('--dataset_dir', '--dataset-dir', dest='dataset_dir', type=str, default='',
+                       help='Dataset root to build FAISS DB when --index-path is not given')
+    parser.add_argument('--save_index_path', '--save-index-path', dest='save_index_path', type=str, default='',
+                       help='Path where newly built FAISS DB is saved (default: <output_dir>/text_hierarchy.faiss)')
+
+    parser.add_argument('--metric', type=str, default='cosine', choices=['cosine', 'l2'],
+                       help='FAISS similarity metric')
+    parser.add_argument('--top_k', '--top-k', dest='top_k', type=int, default=10,
+                       help='Number of nearest neighbors to return')
+
+    parser.add_argument('--include_line_images', '--include-line-images', dest='include_line_images',
+                       action='store_true', help='Use line.png assets from TextHierarchy')
+    parser.add_argument('--no_include_line_images', '--no-include-line-images', dest='include_line_images',
+                       action='store_false', help='Disable line.png assets')
+    parser.set_defaults(include_line_images=True)
+    parser.add_argument('--include_word_crops', '--include-word-crops', dest='include_word_crops',
+                       action='store_true', help='Use hierarchy word crops (word_*.png)')
+    parser.add_argument('--no_include_word_crops', '--no-include-word-crops', dest='include_word_crops',
+                       action='store_false', help='Disable hierarchy word crops')
+    parser.set_defaults(include_word_crops=True)
+    parser.add_argument('--include_number_crops', '--include-number-crops', dest='include_number_crops',
+                       action='store_true', help='Include NumberCrops assets in FAISS DB')
+    parser.add_argument('--min_assets_per_group', '--min-assets-per-group', dest='min_assets_per_group', type=int, default=1,
+                       help='Minimum assets required to include a group while building DB')
+
+    parser.add_argument('--config_path', '--config-path', dest='config_path', type=str, default='',
+                       help='Optional training_config.json path for normalization defaults')
+    parser.add_argument('--target_height', '--target-height', dest='target_height', type=int, default=0,
+                       help='Override normalized input height (0 = from config/DB)')
+    parser.add_argument('--max_width', '--max-width', dest='max_width', type=int, default=0,
+                       help='Override maximum normalized width (0 = from config/DB)')
+    parser.add_argument('--patch_multiple', '--patch-multiple', dest='patch_multiple', type=int, default=0,
+                       help='Override width snap multiple (0 = from config/DB)')
+    parser.add_argument('--width_buckets', '--width-buckets', dest='width_buckets', type=str, default='',
+                       help='Override comma-separated width buckets (empty = from config/DB)')
+
+    parser.add_argument('--batch_size', '--batch-size', dest='batch_size', type=int, default=32,
+                       help='Per-device embedding batch size while building DB')
+    parser.add_argument('--num_workers', '--num-workers', dest='num_workers', type=int, default=4,
+                       help='DataLoader workers')
+    parser.add_argument('--device', type=str, default='auto',
+                       help='Embedding device (auto/cpu/cuda:0/mps)')
+    parser.add_argument('--l2_normalize_embeddings', '--l2-normalize-embeddings', dest='l2_normalize_embeddings',
+                       action='store_true', help='L2-normalize embeddings (default on)')
+    parser.add_argument('--no_l2_normalize_embeddings', '--no-l2-normalize-embeddings', dest='l2_normalize_embeddings',
+                       action='store_false', help='Disable embedding L2 normalization')
+    parser.set_defaults(l2_normalize_embeddings=True)
+
+
+def create_faiss_text_hierarchy_search_parser(add_help: bool = True):
+    """Create parser for FAISS-based TextHierarchy similarity search."""
+    parser = argparse.ArgumentParser(
+        description="FAISS similarity search on TextHierarchy embeddings",
+        add_help=add_help,
+    )
+    add_faiss_text_hierarchy_search_arguments(parser)
+    return parser
+
+
 def add_prepare_donut_ocr_dataset_arguments(parser):
     """Arguments for preparing label-filtered OCR manifests for Donut-style training."""
     parser.add_argument('--dataset_dir', type=str, required=True,

@@ -74,6 +74,9 @@ CLI_SCRIPTS = [
     "run_pseudo_label_workflow.py",
     "scripts/train_image_encoder.py",
     "scripts/train_text_encoder.py",
+    "scripts/train_text_hierarchy_vit.py",
+    "scripts/eval_text_hierarchy_vit.py",
+    "scripts/faiss_text_hierarchy_search.py",
     "cli.py",
 ]
 
@@ -2090,6 +2093,602 @@ def run_train_text_encoder_live(
         + _tail_lines_newest_first(log_lines, 3000)
     )
     yield final_msg, str(expected_backbone), str(expected_tokenizer), str(expected_head), str(expected_cfg)
+
+
+def _read_json_file_pretty(path: Path) -> str:
+    if not path.exists() or not path.is_file():
+        return "{}"
+    try:
+        payload = json.loads(path.read_text(encoding="utf-8"))
+    except Exception:
+        try:
+            return path.read_text(encoding="utf-8", errors="replace")
+        except Exception:
+            return "{}"
+    try:
+        return json.dumps(payload, ensure_ascii=False, indent=2)
+    except Exception:
+        return "{}"
+
+
+def run_eval_text_hierarchy_vit_live(
+    dataset_dir: str,
+    backbone_dir: str,
+    projection_head_path: str,
+    output_dir: str,
+    config_path: str,
+    include_line_images: bool,
+    include_word_crops: bool,
+    include_number_crops: bool,
+    min_assets_per_group: int,
+    min_positives_per_query: int,
+    target_height: int,
+    max_width: int,
+    patch_multiple: int,
+    width_buckets: str,
+    batch_size: int,
+    num_workers: int,
+    device: str,
+    l2_normalize_embeddings: bool,
+    recall_ks: str,
+    max_queries: int,
+    seed: int,
+    write_per_query_csv: bool,
+):
+    dataset_path = Path(dataset_dir).expanduser().resolve()
+    backbone_path = Path(backbone_dir).expanduser().resolve()
+    output_path = Path(output_dir).expanduser().resolve()
+    script_path = ROOT / "scripts" / "eval_text_hierarchy_vit.py"
+
+    expected_report = output_path / "eval_text_hierarchy_vit_report.json"
+    expected_csv = output_path / "eval_text_hierarchy_vit_per_query.csv"
+
+    if not script_path.exists():
+        msg = f"Failed: script not found: {script_path}"
+        yield msg, str(expected_report), str(expected_csv), "{}"
+        return
+    if not dataset_path.exists() or not dataset_path.is_dir():
+        msg = f"Failed: dataset_dir does not exist: {dataset_path}"
+        yield msg, str(expected_report), str(expected_csv), "{}"
+        return
+    if not backbone_path.exists() or not backbone_path.is_dir():
+        msg = f"Failed: backbone_dir does not exist: {backbone_path}"
+        yield msg, str(expected_report), str(expected_csv), "{}"
+        return
+
+    output_path.mkdir(parents=True, exist_ok=True)
+
+    cmd = [
+        sys.executable,
+        "-u",
+        str(script_path),
+        "--dataset_dir",
+        str(dataset_path),
+        "--backbone_dir",
+        str(backbone_path),
+        "--output_dir",
+        str(output_path),
+        "--min_assets_per_group",
+        str(int(min_assets_per_group)),
+        "--min_positives_per_query",
+        str(int(min_positives_per_query)),
+        "--target_height",
+        str(int(target_height)),
+        "--max_width",
+        str(int(max_width)),
+        "--patch_multiple",
+        str(int(patch_multiple)),
+        "--batch_size",
+        str(int(batch_size)),
+        "--num_workers",
+        str(int(num_workers)),
+        "--device",
+        (device or "auto").strip(),
+        "--recall_ks",
+        (recall_ks or "1,5,10").strip(),
+        "--max_queries",
+        str(int(max_queries)),
+        "--seed",
+        str(int(seed)),
+    ]
+    proj = (projection_head_path or "").strip()
+    if proj:
+        cmd.extend(["--projection_head_path", str(Path(proj).expanduser().resolve())])
+    cfg = (config_path or "").strip()
+    if cfg:
+        cmd.extend(["--config_path", str(Path(cfg).expanduser().resolve())])
+    wb = (width_buckets or "").strip()
+    if wb:
+        cmd.extend(["--width_buckets", wb])
+
+    cmd.append("--include_line_images" if bool(include_line_images) else "--no_include_line_images")
+    cmd.append("--include_word_crops" if bool(include_word_crops) else "--no_include_word_crops")
+    if bool(include_number_crops):
+        cmd.append("--include_number_crops")
+    cmd.append("--l2_normalize_embeddings" if bool(l2_normalize_embeddings) else "--no_l2_normalize_embeddings")
+    cmd.append("--write_per_query_csv" if bool(write_per_query_csv) else "--no_write_per_query_csv")
+
+    try:
+        env = os.environ.copy()
+        env["PYTHONUNBUFFERED"] = "1"
+        proc = subprocess.Popen(
+            cmd,
+            cwd=str(ROOT),
+            env=env,
+            stdout=subprocess.PIPE,
+            stderr=subprocess.STDOUT,
+            text=False,
+            bufsize=0,
+        )
+    except Exception as exc:
+        msg = f"Failed\nOutput dir: {output_path}\n\n{type(exc).__name__}: {exc}"
+        yield msg, str(expected_report), str(expected_csv), "{}"
+        return
+
+    if proc.stdout is not None:
+        try:
+            os.set_blocking(proc.stdout.fileno(), False)
+        except Exception:
+            pass
+
+    log_lines: List[str] = []
+    partial = ""
+    last_emit_ts = 0.0
+    stream_failed = False
+    stream_fail_msg = ""
+
+    yield (
+        "Evaluating TextHierarchy ViT ...\n"
+        f"Dataset dir: {dataset_path}\n"
+        f"Backbone dir: {backbone_path}\n"
+        f"Output dir: {output_path}\n"
+        f"Expected report: {expected_report}\n"
+        f"Command: {shlex.join(cmd)}\n",
+        str(expected_report),
+        str(expected_csv),
+        "{}",
+    )
+
+    while True:
+        got_output = False
+        if (not stream_failed) and proc.stdout is not None:
+            try:
+                chunk = proc.stdout.read()
+            except BlockingIOError:
+                chunk = b""
+            except Exception as exc:
+                stream_failed = True
+                stream_fail_msg = f"stdout stream disabled ({type(exc).__name__}: {exc})"
+                chunk = b""
+            if chunk:
+                got_output = True
+                chunk_text = chunk.decode("utf-8", errors="replace") if isinstance(chunk, bytes) else str(chunk)
+                partial += chunk_text.replace("\r", "\n")
+                parts = partial.splitlines(keepends=True)
+                keep = ""
+                for piece in parts:
+                    if piece.endswith("\n"):
+                        log_lines.append(piece.rstrip("\n"))
+                    else:
+                        keep = piece
+                partial = keep
+
+        now = time.time()
+        if now - last_emit_ts >= 1.0:
+            tail = _tail_lines_newest_first(log_lines, 800)
+            if stream_failed and stream_fail_msg:
+                tail = f"{tail}\n[warning] {stream_fail_msg}" if tail else f"[warning] {stream_fail_msg}"
+            running_msg = (
+                "Evaluating TextHierarchy ViT ...\n"
+                f"Dataset dir: {dataset_path}\n"
+                f"Backbone dir: {backbone_path}\n"
+                f"Output dir: {output_path}\n"
+                f"Expected report: {expected_report}\n\n{tail}"
+            )
+            yield running_msg, str(expected_report), str(expected_csv), _read_json_file_pretty(expected_report)
+            last_emit_ts = now
+
+        if proc.poll() is not None:
+            break
+        if not got_output:
+            time.sleep(0.15)
+
+    if proc.stdout is not None:
+        try:
+            rest = proc.stdout.read()
+        except Exception:
+            rest = b""
+        if rest:
+            partial += rest.decode("utf-8", errors="replace").replace("\r", "\n") if isinstance(rest, bytes) else str(rest).replace("\r", "\n")
+        if partial:
+            log_lines.extend(partial.splitlines())
+
+    ok = proc.returncode == 0
+    status = "Success" if ok else "Failed"
+    final_msg = (
+        f"{status}\nDataset dir: {dataset_path}\nBackbone dir: {backbone_path}\n"
+        f"Output dir: {output_path}\nReport path: {expected_report}\n\n"
+        + _tail_lines_newest_first(log_lines, 3000)
+    )
+    yield final_msg, str(expected_report), str(expected_csv), _read_json_file_pretty(expected_report)
+
+
+def run_faiss_text_hierarchy_search_live(
+    query_image: str,
+    backbone_dir: str,
+    projection_head_path: str,
+    output_dir: str,
+    index_path: str,
+    meta_path: str,
+    dataset_dir: str,
+    save_index_path: str,
+    metric: str,
+    top_k: int,
+    include_line_images: bool,
+    include_word_crops: bool,
+    include_number_crops: bool,
+    min_assets_per_group: int,
+    config_path: str,
+    target_height: int,
+    max_width: int,
+    patch_multiple: int,
+    width_buckets: str,
+    batch_size: int,
+    num_workers: int,
+    device: str,
+    l2_normalize_embeddings: bool,
+):
+    query_path = Path(query_image).expanduser().resolve()
+    backbone_path = Path(backbone_dir).expanduser().resolve()
+    output_path = Path(output_dir).expanduser().resolve()
+    script_path = ROOT / "scripts" / "faiss_text_hierarchy_search.py"
+
+    idx_input = (index_path or "").strip()
+    save_idx_input = (save_index_path or "").strip()
+    if idx_input:
+        expected_index = Path(idx_input).expanduser().resolve()
+    elif save_idx_input:
+        expected_index = Path(save_idx_input).expanduser().resolve()
+    else:
+        expected_index = (output_path / "text_hierarchy.faiss").resolve()
+    expected_meta = (
+        Path(meta_path).expanduser().resolve()
+        if (meta_path or "").strip()
+        else Path(str(expected_index) + ".meta.json")
+    )
+    expected_report = (output_path / "faiss_search_results.json").resolve()
+
+    if not script_path.exists():
+        msg = f"Failed: script not found: {script_path}"
+        yield msg, str(expected_report), str(expected_index), str(expected_meta), "{}"
+        return
+    if not query_path.exists() or not query_path.is_file():
+        msg = f"Failed: query_image does not exist: {query_path}"
+        yield msg, str(expected_report), str(expected_index), str(expected_meta), "{}"
+        return
+    if not backbone_path.exists() or not backbone_path.is_dir():
+        msg = f"Failed: backbone_dir does not exist: {backbone_path}"
+        yield msg, str(expected_report), str(expected_index), str(expected_meta), "{}"
+        return
+    if not idx_input:
+        dataset_path = Path(dataset_dir).expanduser().resolve()
+        if not dataset_path.exists() or not dataset_path.is_dir():
+            msg = f"Failed: dataset_dir does not exist (required when no index_path): {dataset_path}"
+            yield msg, str(expected_report), str(expected_index), str(expected_meta), "{}"
+            return
+
+    output_path.mkdir(parents=True, exist_ok=True)
+
+    cmd = [
+        sys.executable,
+        "-u",
+        str(script_path),
+        "--query_image",
+        str(query_path),
+        "--backbone_dir",
+        str(backbone_path),
+        "--output_dir",
+        str(output_path),
+        "--metric",
+        (metric or "cosine").strip().lower(),
+        "--top_k",
+        str(int(top_k)),
+        "--min_assets_per_group",
+        str(int(min_assets_per_group)),
+        "--target_height",
+        str(int(target_height)),
+        "--max_width",
+        str(int(max_width)),
+        "--patch_multiple",
+        str(int(patch_multiple)),
+        "--batch_size",
+        str(int(batch_size)),
+        "--num_workers",
+        str(int(num_workers)),
+        "--device",
+        (device or "auto").strip(),
+    ]
+    proj = (projection_head_path or "").strip()
+    if proj:
+        cmd.extend(["--projection_head_path", str(Path(proj).expanduser().resolve())])
+    cfg = (config_path or "").strip()
+    if cfg:
+        cmd.extend(["--config_path", str(Path(cfg).expanduser().resolve())])
+    wb = (width_buckets or "").strip()
+    if wb:
+        cmd.extend(["--width_buckets", wb])
+    if idx_input:
+        cmd.extend(["--index_path", str(Path(idx_input).expanduser().resolve())])
+        if (meta_path or "").strip():
+            cmd.extend(["--meta_path", str(Path(meta_path).expanduser().resolve())])
+    else:
+        cmd.extend(["--dataset_dir", str(Path(dataset_dir).expanduser().resolve())])
+        if save_idx_input:
+            cmd.extend(["--save_index_path", str(Path(save_idx_input).expanduser().resolve())])
+
+    cmd.append("--include_line_images" if bool(include_line_images) else "--no_include_line_images")
+    cmd.append("--include_word_crops" if bool(include_word_crops) else "--no_include_word_crops")
+    if bool(include_number_crops):
+        cmd.append("--include_number_crops")
+    cmd.append("--l2_normalize_embeddings" if bool(l2_normalize_embeddings) else "--no_l2_normalize_embeddings")
+
+    try:
+        env = os.environ.copy()
+        env["PYTHONUNBUFFERED"] = "1"
+        proc = subprocess.Popen(
+            cmd,
+            cwd=str(ROOT),
+            env=env,
+            stdout=subprocess.PIPE,
+            stderr=subprocess.STDOUT,
+            text=False,
+            bufsize=0,
+        )
+    except Exception as exc:
+        msg = f"Failed\nOutput dir: {output_path}\n\n{type(exc).__name__}: {exc}"
+        yield msg, str(expected_report), str(expected_index), str(expected_meta), "{}"
+        return
+
+    if proc.stdout is not None:
+        try:
+            os.set_blocking(proc.stdout.fileno(), False)
+        except Exception:
+            pass
+
+    log_lines: List[str] = []
+    partial = ""
+    last_emit_ts = 0.0
+    stream_failed = False
+    stream_fail_msg = ""
+
+    yield (
+        "Running FAISS similarity search ...\n"
+        f"Query image: {query_path}\n"
+        f"Backbone dir: {backbone_path}\n"
+        f"Output dir: {output_path}\n"
+        f"Expected report: {expected_report}\n"
+        f"Expected index: {expected_index}\n"
+        f"Command: {shlex.join(cmd)}\n",
+        str(expected_report),
+        str(expected_index),
+        str(expected_meta),
+        "{}",
+    )
+
+    while True:
+        got_output = False
+        if (not stream_failed) and proc.stdout is not None:
+            try:
+                chunk = proc.stdout.read()
+            except BlockingIOError:
+                chunk = b""
+            except Exception as exc:
+                stream_failed = True
+                stream_fail_msg = f"stdout stream disabled ({type(exc).__name__}: {exc})"
+                chunk = b""
+            if chunk:
+                got_output = True
+                chunk_text = chunk.decode("utf-8", errors="replace") if isinstance(chunk, bytes) else str(chunk)
+                partial += chunk_text.replace("\r", "\n")
+                parts = partial.splitlines(keepends=True)
+                keep = ""
+                for piece in parts:
+                    if piece.endswith("\n"):
+                        log_lines.append(piece.rstrip("\n"))
+                    else:
+                        keep = piece
+                partial = keep
+
+        now = time.time()
+        if now - last_emit_ts >= 1.0:
+            tail = _tail_lines_newest_first(log_lines, 800)
+            if stream_failed and stream_fail_msg:
+                tail = f"{tail}\n[warning] {stream_fail_msg}" if tail else f"[warning] {stream_fail_msg}"
+            running_msg = (
+                "Running FAISS similarity search ...\n"
+                f"Query image: {query_path}\n"
+                f"Backbone dir: {backbone_path}\n"
+                f"Output dir: {output_path}\n"
+                f"Expected report: {expected_report}\n\n{tail}"
+            )
+            yield running_msg, str(expected_report), str(expected_index), str(expected_meta), _read_json_file_pretty(expected_report)
+            last_emit_ts = now
+
+        if proc.poll() is not None:
+            break
+        if not got_output:
+            time.sleep(0.15)
+
+    if proc.stdout is not None:
+        try:
+            rest = proc.stdout.read()
+        except Exception:
+            rest = b""
+        if rest:
+            partial += rest.decode("utf-8", errors="replace").replace("\r", "\n") if isinstance(rest, bytes) else str(rest).replace("\r", "\n")
+        if partial:
+            log_lines.extend(partial.splitlines())
+
+    ok = proc.returncode == 0
+    status = "Success" if ok else "Failed"
+    final_msg = (
+        f"{status}\nQuery image: {query_path}\nBackbone dir: {backbone_path}\n"
+        f"Output dir: {output_path}\nReport path: {expected_report}\n"
+        f"Index path: {expected_index}\nMetadata path: {expected_meta}\n\n"
+        + _tail_lines_newest_first(log_lines, 3000)
+    )
+    yield final_msg, str(expected_report), str(expected_index), str(expected_meta), _read_json_file_pretty(expected_report)
+
+
+def run_faiss_text_hierarchy_search_live_with_mode(
+    index_mode: str,
+    query_image: str,
+    backbone_dir: str,
+    projection_head_path: str,
+    output_dir: str,
+    index_path: str,
+    meta_path: str,
+    dataset_dir: str,
+    save_index_path: str,
+    metric: str,
+    top_k: int,
+    include_line_images: bool,
+    include_word_crops: bool,
+    include_number_crops: bool,
+    min_assets_per_group: int,
+    config_path: str,
+    target_height: int,
+    max_width: int,
+    patch_multiple: int,
+    width_buckets: str,
+    batch_size: int,
+    num_workers: int,
+    device: str,
+    l2_normalize_embeddings: bool,
+):
+    mode = (index_mode or "").strip().lower()
+    use_existing = "existing" in mode
+    eff_index = (index_path or "").strip() if use_existing else ""
+    eff_meta = (meta_path or "").strip() if use_existing else ""
+    eff_dataset = "" if use_existing else (dataset_dir or "").strip()
+    yield from run_faiss_text_hierarchy_search_live(
+        query_image=query_image,
+        backbone_dir=backbone_dir,
+        projection_head_path=projection_head_path,
+        output_dir=output_dir,
+        index_path=eff_index,
+        meta_path=eff_meta,
+        dataset_dir=eff_dataset,
+        save_index_path=save_index_path,
+        metric=metric,
+        top_k=top_k,
+        include_line_images=include_line_images,
+        include_word_crops=include_word_crops,
+        include_number_crops=include_number_crops,
+        min_assets_per_group=min_assets_per_group,
+        config_path=config_path,
+        target_height=target_height,
+        max_width=max_width,
+        patch_multiple=patch_multiple,
+        width_buckets=width_buckets,
+        batch_size=batch_size,
+        num_workers=num_workers,
+        device=device,
+        l2_normalize_embeddings=l2_normalize_embeddings,
+    )
+
+
+def scan_text_hierarchy_retrieval_artifacts(models_dir: str):
+    base = Path(models_dir).expanduser().resolve()
+    if not base.exists() or not base.is_dir():
+        empty = gr.update(choices=[], value=None)
+        return empty, empty, empty, "", "", "", "", f"Models directory not found: {base}"
+
+    backbones: List[str] = []
+    heads: List[str] = []
+    indices: List[str] = []
+    for p in sorted(base.rglob("*")):
+        if p.is_file():
+            low = p.name.lower()
+            sfx = p.suffix.lower()
+            if sfx == ".faiss":
+                indices.append(str(p.resolve()))
+                continue
+            if sfx == ".pt" and "projection_head" in low:
+                heads.append(str(p.resolve()))
+                continue
+            continue
+
+        if not p.is_dir():
+            continue
+        if not (p / "config.json").exists():
+            continue
+        has_weights = (p / "pytorch_model.bin").exists() or (p / "model.safetensors").exists() or (p / "model.safetensors.index.json").exists()
+        if has_weights:
+            backbones.append(str(p.resolve()))
+
+    backbones = sorted(set(backbones))
+    heads = sorted(set(heads))
+    indices = sorted(set(indices))
+
+    backbone_default = backbones[0] if backbones else ""
+    head_default = _suggest_projection_head_for_backbone(backbone_default) if backbone_default else ""
+    if not head_default and heads:
+        head_default = heads[0]
+    index_default = indices[0] if indices else ""
+    meta_default = str(Path(index_default + ".meta.json")) if index_default else ""
+
+    msg = (
+        f"Found {len(backbones)} backbone(s), {len(heads)} projection head(s), "
+        f"{len(indices)} FAISS index file(s) in {base}"
+    )
+    return (
+        gr.update(choices=backbones, value=(backbone_default if backbone_default else None)),
+        gr.update(choices=heads, value=(head_default if head_default else None)),
+        gr.update(choices=indices, value=(index_default if index_default else None)),
+        backbone_default,
+        head_default,
+        index_default,
+        meta_default,
+        msg,
+    )
+
+
+def scan_text_hierarchy_retrieval_artifacts_for_ui(models_dir: str):
+    (
+        backbone_update,
+        head_update,
+        index_update,
+        backbone_default,
+        head_default,
+        index_default,
+        meta_default,
+        msg,
+    ) = scan_text_hierarchy_retrieval_artifacts(models_dir)
+    return (
+        backbone_update,
+        head_update,
+        index_update,
+        backbone_default,
+        head_default,
+        index_default,
+        meta_default,
+        msg,
+        index_default,
+        meta_default,
+    )
+
+
+def on_faiss_index_change_ui(index_path: str):
+    idx_raw = (index_path or "").strip()
+    if not idx_raw:
+        return "", ""
+    idx = Path(idx_raw).expanduser().resolve()
+    return str(idx), str(Path(str(idx) + ".meta.json"))
+
+
+def _file_to_path_text(file_path: Optional[str]):
+    return (file_path or "").strip()
 
 
 def run_donut_ocr_workflow_live(
@@ -6491,6 +7090,11 @@ def build_ui() -> gr.Blocks:
     default_image_encoder_output_dir = str((workspace_root / "models" / "image-encoder").resolve())
     default_text_encoder_input_dir = str((workspace_root / "data" / "corpora").resolve())
     default_text_encoder_output_dir = str((workspace_root / "models" / "text-encoder").resolve())
+    default_text_hierarchy_backbone_dir = str((workspace_root / "models" / "text_hierarchy_vit" / "text_hierarchy_vit_backbone").resolve())
+    default_text_hierarchy_projection_head = str((workspace_root / "models" / "text_hierarchy_vit" / "text_hierarchy_projection_head.pt").resolve())
+    default_text_hierarchy_eval_dir = str((workspace_root / "models" / "text_hierarchy_vit" / "eval").resolve())
+    default_text_hierarchy_faiss_dir = str((workspace_root / "models" / "text_hierarchy_vit" / "faiss_search").resolve())
+    default_text_hierarchy_faiss_index = str((workspace_root / "models" / "text_hierarchy_vit" / "faiss_search" / "text_hierarchy.faiss").resolve())
     default_prompt = (
         "Extract page layout blocks and OCR text. "
         "Return strict JSON with key 'detections' containing a list of objects with: "
@@ -6537,7 +7141,7 @@ def build_ui() -> gr.Blocks:
                 "10. SBB Grid Review: Browse sbb_images in 9x9 pages and move selected pages to quarantine.\n"
                 "11. Diffusion + LoRA: Prepare texture crops, train LoRA, and run SDXL/SD2.1 + ControlNet inference.\n"
                 "12. Donut OCR Workflow: Run synthetic generation + manifest prep + Donut-style OCR training on label 1.\n"
-                "13. Retrieval Encoders: Train image and text encoders for future n-gram retrieval.\n"
+                "13. Retrieval Encoders: Train + evaluate hierarchy encoders and run FAISS similarity search.\n"
                 "14. CLI Audit: Show all CLI options from project scripts."
             )
 
@@ -8092,13 +8696,32 @@ def build_ui() -> gr.Blocks:
                 ],
             )
 
-        # 13) Retrieval encoder training
+        # 13) Retrieval encoders + evaluation + FAISS search
         with gr.Tab("13. Retrieval Encoders"):
             gr.Markdown(
-                "Train unpaired encoders for future Tibetan n-gram retrieval: "
-                "A) self-supervised image encoder on page images, "
-                "B) unsupervised text encoder on Tibetan text files."
+                "Train and evaluate retrieval components for Tibetan n-gram search: "
+                "A) image encoder training, B) text encoder training, "
+                "C) TextHierarchy ViT evaluation, D) FAISS similarity search."
             )
+
+            gr.Markdown("### Shared Artifact Scan (Backbone / Projection / FAISS)")
+            with gr.Row():
+                retr_models_dir = gr.Textbox(label="models_dir", value=str((workspace_root / "models").resolve()))
+                retr_scan_btn = gr.Button("Scan Retrieval Artifacts")
+            with gr.Row():
+                retr_backbone_select = gr.Dropdown(label="Detected Backbone Dirs", choices=[], allow_custom_value=True)
+                retr_head_select = gr.Dropdown(label="Detected Projection Heads", choices=[], allow_custom_value=True)
+                retr_faiss_select = gr.Dropdown(label="Detected FAISS Indices", choices=[], allow_custom_value=True)
+            retr_scan_status = gr.Textbox(label="Artifact Scan Status", interactive=False)
+            with gr.Row():
+                retr_backbone_path = gr.Textbox(label="shared_backbone_dir", value=default_text_hierarchy_backbone_dir)
+                retr_head_path = gr.Textbox(label="shared_projection_head_path", value=default_text_hierarchy_projection_head)
+            with gr.Row():
+                retr_faiss_index_path = gr.Textbox(label="shared_faiss_index_path", value=default_text_hierarchy_faiss_index)
+                retr_faiss_meta_path = gr.Textbox(
+                    label="shared_faiss_meta_path",
+                    value=f"{default_text_hierarchy_faiss_index}.meta.json",
+                )
 
             gr.Markdown("### A) Train Image Encoder (SimCLR-style)")
             with gr.Row():
@@ -8188,6 +8811,89 @@ def build_ui() -> gr.Blocks:
                     text_enc_head_path = gr.Textbox(label="Projection Head Path", interactive=False)
                     text_enc_cfg_path = gr.Textbox(label="Training Config Path", interactive=False)
 
+            gr.Markdown("### C) Evaluate TextHierarchy ViT (Recall@K / MRR)")
+            with gr.Row():
+                with gr.Column(scale=1):
+                    eval_th_dataset_dir = gr.Textbox(label="dataset_dir", value=default_text_hierarchy_dir)
+                    eval_th_output_dir = gr.Textbox(label="output_dir", value=default_text_hierarchy_eval_dir)
+                    eval_th_config_path = gr.Textbox(label="config_path (optional)", value="")
+                    with gr.Row():
+                        eval_th_include_lines = gr.Checkbox(label="include_line_images", value=True)
+                        eval_th_include_words = gr.Checkbox(label="include_word_crops", value=True)
+                        eval_th_include_numbers = gr.Checkbox(label="include_number_crops", value=False)
+                    with gr.Row():
+                        eval_th_min_assets = gr.Number(label="min_assets_per_group", value=1, precision=0)
+                        eval_th_min_pos = gr.Number(label="min_positives_per_query", value=1, precision=0)
+                    with gr.Row():
+                        eval_th_target_h = gr.Number(label="target_height (0=auto)", value=0, precision=0)
+                        eval_th_max_w = gr.Number(label="max_width (0=auto)", value=0, precision=0)
+                    with gr.Row():
+                        eval_th_patch_mult = gr.Number(label="patch_multiple (0=auto)", value=0, precision=0)
+                        eval_th_width_buckets = gr.Textbox(label="width_buckets (optional)", value="")
+                    with gr.Row():
+                        eval_th_batch = gr.Number(label="batch_size", value=32, precision=0)
+                        eval_th_workers = gr.Number(label="num_workers", value=4, precision=0)
+                    with gr.Row():
+                        eval_th_device = gr.Dropdown(choices=["auto", "cpu", "cuda", "mps"], value="auto", label="device")
+                        eval_th_l2 = gr.Checkbox(label="l2_normalize_embeddings", value=True)
+                    with gr.Row():
+                        eval_th_recall_ks = gr.Textbox(label="recall_ks", value="1,5,10")
+                        eval_th_max_queries = gr.Number(label="max_queries (0=all)", value=0, precision=0)
+                    with gr.Row():
+                        eval_th_seed = gr.Number(label="seed", value=42, precision=0)
+                        eval_th_write_csv = gr.Checkbox(label="write_per_query_csv", value=True)
+                    eval_th_run_btn = gr.Button("Run Hierarchy Eval", variant="primary")
+                with gr.Column(scale=1):
+                    eval_th_log = gr.Textbox(label="Hierarchy Eval Log", lines=14, interactive=False)
+                    eval_th_report_path = gr.Textbox(label="Eval Report Path", interactive=False)
+                    eval_th_csv_path = gr.Textbox(label="Per-Query CSV Path", interactive=False)
+                    eval_th_report_json = gr.Code(label="Eval Report JSON", language="json")
+
+            gr.Markdown("### D) FAISS Similarity Search")
+            with gr.Row():
+                with gr.Column(scale=1):
+                    faiss_mode = gr.Radio(
+                        choices=["Use Existing FAISS Index", "Build FAISS Index From Dataset"],
+                        value="Use Existing FAISS Index",
+                        label="Index Mode",
+                    )
+                    faiss_query_file = gr.File(label="query_image file (optional)", type="filepath")
+                    faiss_query_path = gr.Textbox(label="query_image path", value="")
+                    faiss_output_dir = gr.Textbox(label="output_dir", value=default_text_hierarchy_faiss_dir)
+                    faiss_index_path = gr.Textbox(label="index_path", value=default_text_hierarchy_faiss_index)
+                    faiss_meta_path = gr.Textbox(label="meta_path (optional)", value=f"{default_text_hierarchy_faiss_index}.meta.json")
+                    faiss_dataset_dir = gr.Textbox(label="dataset_dir (for build mode)", value=default_text_hierarchy_dir)
+                    faiss_save_index_path = gr.Textbox(label="save_index_path (for build mode)", value=default_text_hierarchy_faiss_index)
+                    with gr.Row():
+                        faiss_metric = gr.Dropdown(choices=["cosine", "l2"], value="cosine", label="metric")
+                        faiss_top_k = gr.Number(label="top_k", value=10, precision=0)
+                    with gr.Row():
+                        faiss_include_lines = gr.Checkbox(label="include_line_images", value=True)
+                        faiss_include_words = gr.Checkbox(label="include_word_crops", value=True)
+                        faiss_include_numbers = gr.Checkbox(label="include_number_crops", value=False)
+                    with gr.Row():
+                        faiss_min_assets = gr.Number(label="min_assets_per_group", value=1, precision=0)
+                        faiss_l2 = gr.Checkbox(label="l2_normalize_embeddings", value=True)
+                    with gr.Row():
+                        faiss_config_path = gr.Textbox(label="config_path (optional)", value="")
+                        faiss_device = gr.Dropdown(choices=["auto", "cpu", "cuda", "mps"], value="auto", label="device")
+                    with gr.Row():
+                        faiss_target_h = gr.Number(label="target_height (0=auto)", value=0, precision=0)
+                        faiss_max_w = gr.Number(label="max_width (0=auto)", value=0, precision=0)
+                    with gr.Row():
+                        faiss_patch_mult = gr.Number(label="patch_multiple (0=auto)", value=0, precision=0)
+                        faiss_width_buckets = gr.Textbox(label="width_buckets (optional)", value="")
+                    with gr.Row():
+                        faiss_batch = gr.Number(label="batch_size", value=32, precision=0)
+                        faiss_workers = gr.Number(label="num_workers", value=4, precision=0)
+                    faiss_run_btn = gr.Button("Run FAISS Search", variant="primary")
+                with gr.Column(scale=1):
+                    faiss_log = gr.Textbox(label="FAISS Search Log", lines=14, interactive=False)
+                    faiss_report_path = gr.Textbox(label="Search Report Path", interactive=False)
+                    faiss_index_out = gr.Textbox(label="Resolved Index Path", interactive=False)
+                    faiss_meta_out = gr.Textbox(label="Resolved Metadata Path", interactive=False)
+                    faiss_results_json = gr.Code(label="Search Results JSON", language="json")
+
             image_enc_run_btn.click(
                 fn=run_train_image_encoder_live,
                 inputs=[
@@ -8250,6 +8956,114 @@ def build_ui() -> gr.Blocks:
                     text_enc_head_path,
                     text_enc_cfg_path,
                 ],
+            )
+
+            retr_scan_btn.click(
+                fn=scan_text_hierarchy_retrieval_artifacts_for_ui,
+                inputs=[retr_models_dir],
+                outputs=[
+                    retr_backbone_select,
+                    retr_head_select,
+                    retr_faiss_select,
+                    retr_backbone_path,
+                    retr_head_path,
+                    retr_faiss_index_path,
+                    retr_faiss_meta_path,
+                    retr_scan_status,
+                    faiss_index_path,
+                    faiss_meta_path,
+                ],
+            )
+            retr_backbone_select.change(
+                fn=on_encoder_backbone_change_ui,
+                inputs=[retr_backbone_select],
+                outputs=[retr_backbone_path, retr_head_path],
+            )
+            retr_head_select.change(
+                fn=lambda x: x or "",
+                inputs=[retr_head_select],
+                outputs=[retr_head_path],
+            )
+            retr_faiss_select.change(
+                fn=on_faiss_index_change_ui,
+                inputs=[retr_faiss_select],
+                outputs=[retr_faiss_index_path, retr_faiss_meta_path],
+            )
+
+            eval_th_run_btn.click(
+                fn=run_eval_text_hierarchy_vit_live,
+                inputs=[
+                    eval_th_dataset_dir,
+                    retr_backbone_path,
+                    retr_head_path,
+                    eval_th_output_dir,
+                    eval_th_config_path,
+                    eval_th_include_lines,
+                    eval_th_include_words,
+                    eval_th_include_numbers,
+                    eval_th_min_assets,
+                    eval_th_min_pos,
+                    eval_th_target_h,
+                    eval_th_max_w,
+                    eval_th_patch_mult,
+                    eval_th_width_buckets,
+                    eval_th_batch,
+                    eval_th_workers,
+                    eval_th_device,
+                    eval_th_l2,
+                    eval_th_recall_ks,
+                    eval_th_max_queries,
+                    eval_th_seed,
+                    eval_th_write_csv,
+                ],
+                outputs=[eval_th_log, eval_th_report_path, eval_th_csv_path, eval_th_report_json],
+            )
+
+            faiss_query_file.change(
+                fn=_file_to_path_text,
+                inputs=[faiss_query_file],
+                outputs=[faiss_query_path],
+            )
+            retr_faiss_index_path.change(
+                fn=lambda x: x or "",
+                inputs=[retr_faiss_index_path],
+                outputs=[faiss_index_path],
+            )
+            retr_faiss_meta_path.change(
+                fn=lambda x: x or "",
+                inputs=[retr_faiss_meta_path],
+                outputs=[faiss_meta_path],
+            )
+
+            faiss_run_btn.click(
+                fn=run_faiss_text_hierarchy_search_live_with_mode,
+                inputs=[
+                    faiss_mode,
+                    faiss_query_path,
+                    retr_backbone_path,
+                    retr_head_path,
+                    faiss_output_dir,
+                    faiss_index_path,
+                    faiss_meta_path,
+                    faiss_dataset_dir,
+                    faiss_save_index_path,
+                    faiss_metric,
+                    faiss_top_k,
+                    faiss_include_lines,
+                    faiss_include_words,
+                    faiss_include_numbers,
+                    faiss_min_assets,
+                    faiss_config_path,
+                    faiss_target_h,
+                    faiss_max_w,
+                    faiss_patch_mult,
+                    faiss_width_buckets,
+                    faiss_batch,
+                    faiss_workers,
+                    faiss_device,
+                    faiss_l2,
+                ],
+                outputs=[faiss_log, faiss_report_path, faiss_index_out, faiss_meta_out, faiss_results_json],
             )
 
         # 14) CLI reference

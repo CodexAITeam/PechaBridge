@@ -41,6 +41,7 @@ Available subcommands:
 - `export-text-hierarchy`
 - `train-text-hierarchy-vit`
 - `eval-text-hierarchy-vit`
+- `faiss-text-hierarchy-search`
 - `prepare-donut-ocr-dataset`
 - `train-donut-ocr`
 - `run-donut-ocr-workflow`
@@ -207,6 +208,31 @@ python cli.py eval-text-hierarchy-vit \
   --projection-head-path ./models/text_hierarchy_vit/text_hierarchy_projection_head.pt \
   --output-dir ./models/text_hierarchy_vit/eval \
   --recall-ks 1,5,10
+```
+
+FAISS similarity search (build DB from dataset + search):
+
+```bash
+python cli.py faiss-text-hierarchy-search \
+  --query-image ./datasets/text_hierarchy/TextHierarchy/PPN337138764X__bg_PPN337138764X_00000005/text_block_001/line_001/line.png \
+  --dataset-dir ./datasets/text_hierarchy \
+  --backbone-dir ./models/text_hierarchy_vit/text_hierarchy_vit_backbone \
+  --projection-head-path ./models/text_hierarchy_vit/text_hierarchy_projection_head.pt \
+  --output-dir ./models/text_hierarchy_vit/faiss_search \
+  --save-index-path ./models/text_hierarchy_vit/faiss_search/text_hierarchy.faiss \
+  --top-k 10
+```
+
+FAISS similarity search (reuse existing DB):
+
+```bash
+python cli.py faiss-text-hierarchy-search \
+  --query-image ./some_query.png \
+  --index-path ./models/text_hierarchy_vit/faiss_search/text_hierarchy.faiss \
+  --backbone-dir ./models/text_hierarchy_vit/text_hierarchy_vit_backbone \
+  --projection-head-path ./models/text_hierarchy_vit/text_hierarchy_projection_head.pt \
+  --output-dir ./models/text_hierarchy_vit/faiss_search \
+  --top-k 10
 ```
 
 ## Label Studio (CLI)
