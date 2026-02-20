@@ -339,6 +339,7 @@ def _save_artifacts(
     output_dir: Path,
     backbone: nn.Module,
     projection_head: ProjectionHead,
+    image_processor: Any,
     args,
     *,
     num_groups: int,
@@ -359,6 +360,22 @@ def _save_artifacts(
     unwrapped_backbone = accelerator.unwrap_model(backbone)
     unwrapped_head = accelerator.unwrap_model(projection_head)
     unwrapped_backbone.save_pretrained(str(backbone_dir))
+    if image_processor is not None and hasattr(image_processor, "save_pretrained"):
+        try:
+            image_processor.save_pretrained(str(backbone_dir))
+        except Exception as exc:
+            LOGGER.warning("Could not save image processor to %s: %s", backbone_dir, exc)
+
+    if image_processor is not None:
+        image_mean = list(getattr(image_processor, "image_mean", [0.5, 0.5, 0.5]))
+        image_std = list(getattr(image_processor, "image_std", [0.5, 0.5, 0.5]))
+    else:
+        image_mean = [0.5, 0.5, 0.5]
+        image_std = [0.5, 0.5, 0.5]
+    if len(image_mean) == 1:
+        image_mean = image_mean * 3
+    if len(image_std) == 1:
+        image_std = image_std * 3
 
     torch.save(
         {
@@ -400,6 +417,8 @@ def _save_artifacts(
                 "mixed_precision": args.mixed_precision,
                 "gradient_checkpointing": bool(args.gradient_checkpointing),
                 "freeze_backbone": bool(args.freeze_backbone),
+                "image_mean": [float(v) for v in image_mean[:3]],
+                "image_std": [float(v) for v in image_std[:3]],
                 "global_step": int(global_step),
                 "backbone_dir": str(backbone_dir),
                 "projection_head_path": str(projection_head_path),
@@ -445,13 +464,26 @@ def run(args) -> Dict[str, Any]:
     if accelerator.is_main_process:
         LOGGER.info("Found %d groups / %d assets for training", len(groups), total_assets)
 
-    image_processor = AutoImageProcessor.from_pretrained(args.model_name_or_path)
+    image_processor = None
+    image_stats_source = "default(0.5)"
+    try:
+        image_processor = AutoImageProcessor.from_pretrained(args.model_name_or_path)
+        image_stats_source = f"AutoImageProcessor({args.model_name_or_path})"
+    except Exception as exc:
+        LOGGER.warning(
+            "Could not load image processor from %s: %s. Falling back to default mean/std.",
+            args.model_name_or_path,
+            exc,
+        )
+
     image_mean = list(getattr(image_processor, "image_mean", [0.5, 0.5, 0.5]))
     image_std = list(getattr(image_processor, "image_std", [0.5, 0.5, 0.5]))
     if len(image_mean) == 1:
         image_mean = image_mean * 3
     if len(image_std) == 1:
         image_std = image_std * 3
+    if accelerator.is_main_process:
+        LOGGER.info("Image normalization stats source: %s (mean=%s std=%s)", image_stats_source, image_mean[:3], image_std[:3])
 
     transform = HierarchyTwoViewTransform(
         target_height=int(args.target_height),
@@ -588,6 +620,7 @@ def run(args) -> Dict[str, Any]:
                     output_dir=output_dir,
                     backbone=backbone,
                     projection_head=projection_head,
+                    image_processor=image_processor,
                     args=args,
                     num_groups=len(groups),
                     num_assets=total_assets,
@@ -611,6 +644,7 @@ def run(args) -> Dict[str, Any]:
             output_dir=output_dir,
             backbone=backbone,
             projection_head=projection_head,
+            image_processor=image_processor,
             args=args,
             num_groups=len(groups),
             num_assets=total_assets,

@@ -159,6 +159,49 @@ def _load_training_config(config_path: str, backbone_dir: Path) -> Dict[str, Any
     return {}
 
 
+def _normalize_stat_values(raw: Any, default: Sequence[float]) -> List[float]:
+    if isinstance(raw, (list, tuple)) and raw:
+        out: List[float] = []
+        for val in raw[:3]:
+            try:
+                out.append(float(val))
+            except Exception:
+                continue
+        if len(out) == 1:
+            out = out * 3
+        if len(out) >= 3:
+            return out[:3]
+    return [float(v) for v in default[:3]]
+
+
+def _load_image_stats(backbone_dir: Path, config: Dict[str, Any]) -> Tuple[List[float], List[float], str]:
+    default = [0.5, 0.5, 0.5]
+    model_name = str(config.get("model_name_or_path", "") or "").strip()
+    candidates = [str(backbone_dir)]
+    if model_name:
+        candidates.append(model_name)
+
+    seen: set[str] = set()
+    for source in candidates:
+        if source in seen:
+            continue
+        seen.add(source)
+        try:
+            image_processor = AutoImageProcessor.from_pretrained(source)
+            mean = _normalize_stat_values(getattr(image_processor, "image_mean", None), default)
+            std = _normalize_stat_values(getattr(image_processor, "image_std", None), default)
+            return mean, std, f"AutoImageProcessor({source})"
+        except Exception as exc:
+            LOGGER.warning("Could not load image processor from %s: %s", source, exc)
+
+    if "image_mean" in config or "image_std" in config:
+        mean = _normalize_stat_values(config.get("image_mean"), default)
+        std = _normalize_stat_values(config.get("image_std"), default)
+        return mean, std, "training_config"
+
+    return list(default), list(default), "default(0.5)"
+
+
 def _resolve_normalization(args, config: Dict[str, Any], meta_norm: Optional[Dict[str, Any]] = None) -> Dict[str, Any]:
     source = meta_norm if isinstance(meta_norm, dict) and meta_norm else config
     target_height = _to_int(source.get("target_height", 64), 64)
@@ -518,13 +561,13 @@ def run(args) -> Dict[str, Any]:
             raise RuntimeError(f"No assets produced from {dataset_dir}")
         LOGGER.info("Building FAISS DB from dataset: groups=%d assets=%d", len(groups), len(items))
 
-        image_processor = AutoImageProcessor.from_pretrained(str(backbone_dir))
-        image_mean = list(getattr(image_processor, "image_mean", [0.5, 0.5, 0.5]))
-        image_std = list(getattr(image_processor, "image_std", [0.5, 0.5, 0.5]))
-        if len(image_mean) == 1:
-            image_mean = image_mean * 3
-        if len(image_std) == 1:
-            image_std = image_std * 3
+        image_mean, image_std, image_stats_source = _load_image_stats(backbone_dir=backbone_dir, config=config)
+        LOGGER.info(
+            "Image normalization stats source (db build): %s (mean=%s std=%s)",
+            image_stats_source,
+            image_mean,
+            image_std,
+        )
 
         norm = _resolve_normalization(args, config, None)
         dataset = AssetDataset(
@@ -630,13 +673,13 @@ def run(args) -> Dict[str, Any]:
         raise RuntimeError("FAISS index not initialized.")
 
     # Query model load (same backbone/projection for consistent embedding space).
-    image_processor = AutoImageProcessor.from_pretrained(str(backbone_dir))
-    image_mean = list(getattr(image_processor, "image_mean", [0.5, 0.5, 0.5]))
-    image_std = list(getattr(image_processor, "image_std", [0.5, 0.5, 0.5]))
-    if len(image_mean) == 1:
-        image_mean = image_mean * 3
-    if len(image_std) == 1:
-        image_std = image_std * 3
+    image_mean, image_std, image_stats_source = _load_image_stats(backbone_dir=backbone_dir, config=config)
+    LOGGER.info(
+        "Image normalization stats source (query): %s (mean=%s std=%s)",
+        image_stats_source,
+        image_mean,
+        image_std,
+    )
 
     meta_norm = metadata.get("normalization") if isinstance(metadata, dict) else None
     norm = _resolve_normalization(args, config, meta_norm if isinstance(meta_norm, dict) else None)
