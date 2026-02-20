@@ -5,6 +5,7 @@ from __future__ import annotations
 
 import json
 import logging
+import random
 import sys
 from pathlib import Path
 from typing import Any, Dict, List, Optional, Tuple
@@ -555,6 +556,11 @@ def run(args) -> Dict[str, int]:
     image_paths = _list_images(input_dir)
     if not image_paths:
         raise RuntimeError(f"No images found in {input_dir}")
+    found_images = len(image_paths)
+    no_samples = max(0, int(getattr(args, "no_samples", 0)))
+    if 0 < no_samples < found_images:
+        image_paths = random.sample(image_paths, k=no_samples)
+        LOGGER.info("Random sampling enabled: using %d of %d images", len(image_paths), found_images)
 
     model = ModelManager.load_model(str(model_path))
     predict_kwargs: Dict[str, Any] = {"conf": float(args.conf), "imgsz": int(args.imgsz)}
@@ -563,6 +569,7 @@ def run(args) -> Dict[str, int]:
 
     hierarchy_levels = _parse_hierarchy_levels(args.hierarchy_levels)
     summary = {
+        "images_found": found_images,
         "images_total": len(image_paths),
         "images_processed": 0,
         "detections_total": 0,
@@ -737,4 +744,3 @@ def run(args) -> Dict[str, int]:
         summary["chinese_number_crops_saved"],
     )
     return summary
-

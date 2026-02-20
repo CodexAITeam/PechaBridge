@@ -104,6 +104,14 @@ def _build_root_parser() -> argparse.ArgumentParser:
     hierarchy_parser.add_argument("--model", type=str, required=True, help="Path to YOLO model (.pt)")
     hierarchy_parser.add_argument("--input-dir", type=str, required=True, help="Input image directory (recursive scan)")
     hierarchy_parser.add_argument("--output-dir", type=str, required=True, help="Output directory")
+    hierarchy_parser.add_argument(
+        "--no-samples",
+        "--no_samples",
+        dest="no_samples",
+        type=int,
+        default=0,
+        help="Randomly sample at most N images from input_dir (0 = use all images)",
+    )
     hierarchy_parser.add_argument("--conf", type=float, default=0.25, help="YOLO confidence threshold")
     hierarchy_parser.add_argument("--imgsz", type=int, default=1024, help="YOLO inference image size")
     hierarchy_parser.add_argument("--device", type=str, default="", help="Inference device (e.g. cpu, cuda:0)")
