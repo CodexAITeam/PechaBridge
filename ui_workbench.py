@@ -96,6 +96,13 @@ DEFAULT_LAYOUT_CLASS_NAMES: Dict[int, str] = {
     2: "chinese_number_word",
 }
 LABEL_FONT_SIZE = 12
+TEXT_HIERARCHY_SUBSET_CHOICES = [
+    "TextHierarchy (line.png)",
+    "TextHierarchy (word crops)",
+    "NumberCrops (tibetan_number_word)",
+    "NumberCrops (chinese_number_word)",
+    "All Images",
+]
 
 
 def _load_overlay_font() -> ImageFont.ImageFont:
@@ -2395,6 +2402,183 @@ def preview_adjacent_sample(dataset_dir: str, split: str, current_image: str, st
     next_image = images[next_idx]
     rendered, summary = preview_sample(dataset_dir, split, next_image)
     return gr.update(choices=images, value=next_image), rendered, summary
+
+
+def _list_text_hierarchy_assets(root: Path, subset: str) -> List[Path]:
+    subset_name = (subset or "").strip()
+    if not root.exists():
+        return []
+    if subset_name == "TextHierarchy (line.png)":
+        return sorted((root / "TextHierarchy").rglob("line_*/line.png"))
+    if subset_name == "TextHierarchy (word crops)":
+        return sorted((root / "TextHierarchy").rglob("line_*/level_*/word_*.png"))
+    if subset_name == "NumberCrops (tibetan_number_word)":
+        return sorted((root / "NumberCrops" / "tibetan_number_word").rglob("*"))
+    if subset_name == "NumberCrops (chinese_number_word)":
+        return sorted((root / "NumberCrops" / "chinese_number_word").rglob("*"))
+    return _list_images_recursive(root)
+
+
+def scan_text_hierarchy_assets(root_dir: str, subset: str):
+    root = Path(root_dir).expanduser().resolve()
+    if not root.exists() or not root.is_dir():
+        return gr.update(choices=[], value=None), f"Directory not found: {root}"
+
+    assets = [p for p in _list_text_hierarchy_assets(root, subset) if p.is_file()]
+    rels: List[str] = []
+    for p in assets:
+        try:
+            rels.append(str(p.relative_to(root)))
+        except Exception:
+            rels.append(str(p))
+
+    msg = f"Found {len(rels)} asset(s) in {root} for subset '{subset}'."
+    return gr.update(choices=rels, value=(rels[0] if rels else None)), msg
+
+
+def _extract_first_int_suffix(name: str, prefix: str) -> Optional[int]:
+    if not name.startswith(prefix):
+        return None
+    tail = name[len(prefix) :]
+    digits = "".join(ch for ch in tail if ch.isdigit())
+    if not digits:
+        return None
+    try:
+        return int(digits)
+    except Exception:
+        return None
+
+
+def _find_text_hierarchy_meta_path(root: Path, asset_path: Path) -> Optional[Path]:
+    current = asset_path.parent
+    while True:
+        candidate = current / "meta.json"
+        if candidate.exists() and candidate.is_file():
+            return candidate
+        if current == root or current.parent == current:
+            break
+        current = current.parent
+    return None
+
+
+def preview_text_hierarchy_asset(root_dir: str, asset_rel_path: str):
+    if not root_dir or not asset_rel_path:
+        return None, "Select a root directory and an asset.", "{}"
+
+    root = Path(root_dir).expanduser().resolve()
+    if not root.exists():
+        return None, f"Directory not found: {root}", "{}"
+
+    asset_path = (root / asset_rel_path).expanduser().resolve()
+    try:
+        asset_path.relative_to(root)
+    except Exception:
+        return None, f"Asset is outside root: {asset_path}", "{}"
+    if not asset_path.exists() or not asset_path.is_file():
+        return None, f"Asset not found: {asset_path}", "{}"
+
+    try:
+        with Image.open(asset_path) as im:
+            image_np = np.array(im.convert("RGB"))
+    except Exception as exc:
+        return None, f"Failed to load image: {type(exc).__name__}: {exc}", "{}"
+
+    h, w = image_np.shape[:2]
+    info_lines: List[str] = [
+        f"asset: {asset_rel_path}",
+        f"size: {w}x{h}",
+    ]
+    payload: Dict[str, Any] = {
+        "asset": asset_rel_path,
+        "size": {"width": int(w), "height": int(h)},
+    }
+
+    line_idx: Optional[int] = None
+    level_target: Optional[int] = None
+    word_idx: Optional[int] = None
+    for part in asset_path.parts:
+        if line_idx is None:
+            line_idx = _extract_first_int_suffix(part, "line_")
+        if level_target is None:
+            level_target = _extract_first_int_suffix(part, "level_")
+    if asset_path.stem.startswith("word_"):
+        word_idx = _extract_first_int_suffix(asset_path.stem, "word_")
+
+    if line_idx is not None:
+        info_lines.append(f"line_index: {line_idx}")
+        payload["line_index"] = int(line_idx)
+    if level_target is not None:
+        info_lines.append(f"level_target: {level_target}")
+        payload["level_target"] = int(level_target)
+    if word_idx is not None:
+        info_lines.append(f"word_index: {word_idx}")
+        payload["word_index"] = int(word_idx)
+
+    meta_path = _find_text_hierarchy_meta_path(root, asset_path)
+    if meta_path is not None:
+        try:
+            meta_data = json.loads(meta_path.read_text(encoding="utf-8"))
+            try:
+                payload["meta_path"] = str(meta_path.relative_to(root))
+            except Exception:
+                payload["meta_path"] = str(meta_path)
+            payload["meta"] = meta_data
+            lines = meta_data.get("lines") if isinstance(meta_data, dict) else None
+            if isinstance(lines, list) and line_idx is not None:
+                line_record = next(
+                    (x for x in lines if int(x.get("line_index", -1)) == int(line_idx) and isinstance(x, dict)),
+                    None,
+                )
+                if line_record is not None:
+                    payload["line_record"] = line_record
+                    info_lines.append("line_record: found")
+                    if level_target is not None:
+                        levels = ((line_record.get("hierarchy") or {}).get("levels") or [])
+                        level_record = next(
+                            (
+                                lv
+                                for lv in levels
+                                if isinstance(lv, dict)
+                                and int(lv.get("target_count", lv.get("count", -1))) == int(level_target)
+                            ),
+                            None,
+                        )
+                        if level_record is not None:
+                            payload["level_record"] = level_record
+                            info_lines.append("level_record: found")
+        except Exception as exc:
+            info_lines.append(f"meta parse failed: {type(exc).__name__}")
+            payload["meta_error"] = f"{type(exc).__name__}: {exc}"
+    else:
+        info_lines.append("meta.json: not found (ok for NumberCrops)")
+
+    return image_np, "\n".join(info_lines), json.dumps(payload, ensure_ascii=False, indent=2)
+
+
+def preview_adjacent_text_hierarchy_asset(root_dir: str, subset: str, current_asset: str, step: int):
+    root = Path(root_dir).expanduser().resolve()
+    if not root.exists() or not root.is_dir():
+        return gr.update(choices=[], value=None), None, f"Directory not found: {root}", "{}"
+
+    assets = [p for p in _list_text_hierarchy_assets(root, subset) if p.is_file()]
+    if not assets:
+        return gr.update(choices=[], value=None), None, "No assets found.", "{}"
+
+    rels: List[str] = []
+    for p in assets:
+        try:
+            rels.append(str(p.relative_to(root)))
+        except Exception:
+            rels.append(str(p))
+
+    if current_asset in rels:
+        idx = rels.index(current_asset)
+    else:
+        idx = 0
+    next_idx = (idx + int(step)) % len(rels)
+    next_asset = rels[next_idx]
+    img, info, payload = preview_text_hierarchy_asset(root_dir, next_asset)
+    return gr.update(choices=rels, value=next_asset), img, info, payload
 
 
 def export_to_label_studio(
@@ -5468,6 +5652,12 @@ def build_ui() -> gr.Blocks:
     default_texture_output_dir = str((workspace_root / "datasets" / "tibetan-yolo-ui-textured").resolve())
     default_texture_real_pages_dir = str((workspace_root / "sbb_images").resolve())
     default_sbb_grid_dir = str((workspace_root / "sbb_images").resolve())
+    text_hierarchy_candidate = (workspace_root / "datasets" / "text_hierarchy").resolve()
+    if not text_hierarchy_candidate.exists():
+        typo_candidate = (workspace_root / "datasets" / "text_hiarchy").resolve()
+        if typo_candidate.exists():
+            text_hierarchy_candidate = typo_candidate
+    default_text_hierarchy_dir = str(text_hierarchy_candidate)
     default_texture_lora_dataset_dir = str((workspace_root / "datasets" / "texture-lora-dataset").resolve())
     default_texture_lora_output_dir = str((workspace_root / "models" / "texture-lora-sdxl").resolve())
     default_image_encoder_input_dir = str((workspace_root / "sbb_images").resolve())
@@ -5501,7 +5691,7 @@ def build_ui() -> gr.Blocks:
             gr.Markdown(
                 "Use the tabs left-to-right. A practical flow is: Synthetic Data -> Diffusion + LoRA (texture) -> "
                 "Donut OCR Workflow -> Retrieval Encoders -> Batch VLM Layout (SBB) -> Dataset Preview -> Ultralytics Training -> Model Inference -> "
-                "Tibetan Line Split (CV) -> VLM Layout (single image) -> Label Studio Export."
+                "Tibetan Line Split (CV) -> Text Hierarchy Preview -> VLM Layout (single image) -> Label Studio Export."
             )
             gr.Markdown("### Tabs")
             gr.Markdown(
@@ -5512,6 +5702,7 @@ def build_ui() -> gr.Blocks:
                 "5. Ultralytics Training: Train YOLO models.\n"
                 "6. Model Inference: Run inference with trained models.\n"
                 "6b. Tibetan Line Split (CV): Detect `tibetan_text` boxes, split into lines, and optionally detect red text boxes per line.\n"
+                "6c. Text Hierarchy Preview: Browse exported `TextHierarchy` and `NumberCrops` assets.\n"
                 "7. VLM Layout: Run transformer-based layout parsing on a single image.\n"
                 "8. Label Studio Export: Convert YOLO split folders to Label Studio tasks and launch Label Studio.\n"
                 "9. PPN Downloader: Download and analyze SBB images.\n"
@@ -6058,6 +6249,64 @@ def build_ui() -> gr.Blocks:
                 fn=lambda x: x or "",
                 inputs=[line_model_select],
                 outputs=[line_model],
+            )
+
+        # 6c) Preview exported text hierarchy dataset
+        with gr.Tab("6c. Text Hierarchy Preview"):
+            gr.Markdown(
+                "Browse assets produced by `cli.py export-text-hierarchy`: "
+                "`TextHierarchy` lines/word crops and `NumberCrops` snippets."
+            )
+            with gr.Row():
+                th_root_dir = gr.Textbox(label="text_hierarchy_root_dir", value=default_text_hierarchy_dir)
+                th_subset = gr.Dropdown(
+                    label="Subset",
+                    choices=TEXT_HIERARCHY_SUBSET_CHOICES,
+                    value=TEXT_HIERARCHY_SUBSET_CHOICES[0],
+                )
+                th_scan_btn = gr.Button("Scan Assets")
+            with gr.Row():
+                with gr.Column(scale=1):
+                    th_asset_select = gr.Dropdown(label="Asset", choices=[], allow_custom_value=True)
+                    with gr.Row():
+                        th_prev_btn = gr.Button("Zurueck")
+                        th_next_btn = gr.Button("Vor")
+                    th_render_btn = gr.Button("Render Asset", variant="primary")
+                    th_scan_status = gr.Textbox(label="Scan Status", interactive=False)
+                    th_info = gr.Textbox(label="Asset Info", lines=8, interactive=False)
+                with gr.Column(scale=1):
+                    th_image = gr.Image(type="numpy", label="Asset Preview")
+                    th_json = gr.Code(label="Asset Metadata JSON", language="json")
+
+            th_scan_btn.click(
+                fn=scan_text_hierarchy_assets,
+                inputs=[th_root_dir, th_subset],
+                outputs=[th_asset_select, th_scan_status],
+            )
+            th_subset.change(
+                fn=scan_text_hierarchy_assets,
+                inputs=[th_root_dir, th_subset],
+                outputs=[th_asset_select, th_scan_status],
+            )
+            th_render_btn.click(
+                fn=preview_text_hierarchy_asset,
+                inputs=[th_root_dir, th_asset_select],
+                outputs=[th_image, th_info, th_json],
+            )
+            th_asset_select.change(
+                fn=preview_text_hierarchy_asset,
+                inputs=[th_root_dir, th_asset_select],
+                outputs=[th_image, th_info, th_json],
+            )
+            th_prev_btn.click(
+                fn=lambda root, subset, cur: preview_adjacent_text_hierarchy_asset(root, subset, cur, -1),
+                inputs=[th_root_dir, th_subset, th_asset_select],
+                outputs=[th_asset_select, th_image, th_info, th_json],
+            )
+            th_next_btn.click(
+                fn=lambda root, subset, cur: preview_adjacent_text_hierarchy_asset(root, subset, cur, 1),
+                inputs=[th_root_dir, th_subset, th_asset_select],
+                outputs=[th_asset_select, th_image, th_info, th_json],
             )
 
         # 7) VLM parsing
