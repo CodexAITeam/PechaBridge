@@ -96,6 +96,33 @@ def _build_root_parser() -> argparse.ArgumentParser:
     )
     workflow_parser.set_defaults(handler=_run_donut_ocr_workflow)
 
+    hierarchy_parser = subparsers.add_parser(
+        "export-text-hierarchy",
+        help="Run YOLO on an input folder and export line + word-block hierarchy crops",
+        description="Detect text regions and export Tibetan line hierarchy plus number crops.",
+    )
+    hierarchy_parser.add_argument("--model", type=str, required=True, help="Path to YOLO model (.pt)")
+    hierarchy_parser.add_argument("--input-dir", type=str, required=True, help="Input image directory (recursive scan)")
+    hierarchy_parser.add_argument("--output-dir", type=str, required=True, help="Output directory")
+    hierarchy_parser.add_argument("--conf", type=float, default=0.25, help="YOLO confidence threshold")
+    hierarchy_parser.add_argument("--imgsz", type=int, default=1024, help="YOLO inference image size")
+    hierarchy_parser.add_argument("--device", type=str, default="", help="Inference device (e.g. cpu, cuda:0)")
+    hierarchy_parser.add_argument("--min-line-height", type=int, default=10, help="Minimum detected line height in pixels")
+    hierarchy_parser.add_argument("--line-projection-smooth", type=int, default=9, help="Smoothing window for vertical line profile")
+    hierarchy_parser.add_argument("--line-projection-threshold-rel", type=float, default=0.20, help="Relative threshold for vertical line profile")
+    hierarchy_parser.add_argument("--line-merge-gap-px", type=int, default=5, help="Merge gap for neighboring line segments")
+    hierarchy_parser.add_argument("--horizontal-profile-smooth-cols", type=int, default=21, help="Smoothing window for horizontal profile")
+    hierarchy_parser.add_argument("--horizontal-profile-threshold-rel", type=float, default=0.20, help="Relative threshold for horizontal profile")
+    hierarchy_parser.add_argument("--horizontal-seg-min-width-px", type=int, default=14, help="Minimum horizontal segment width")
+    hierarchy_parser.add_argument("--horizontal-seg-merge-gap-px", type=int, default=6, help="Merge gap for horizontal segments")
+    hierarchy_parser.add_argument(
+        "--hierarchy-levels",
+        type=str,
+        default="2,4,8",
+        help="Comma-separated hierarchy levels (e.g. 2,4,8)",
+    )
+    hierarchy_parser.set_defaults(handler=_run_export_text_hierarchy)
+
     return parser
 
 
@@ -150,6 +177,13 @@ def _run_train_donut_ocr(args: argparse.Namespace) -> int:
 
 def _run_donut_ocr_workflow(args: argparse.Namespace) -> int:
     from scripts.run_donut_ocr_workflow import run
+
+    run(args)
+    return 0
+
+
+def _run_export_text_hierarchy(args: argparse.Namespace) -> int:
+    from scripts.export_text_hierarchy import run
 
     run(args)
     return 0
