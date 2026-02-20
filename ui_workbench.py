@@ -12,6 +12,7 @@ Provides:
 from __future__ import annotations
 
 import json
+import math
 import os
 import re
 import shlex
@@ -40,6 +41,21 @@ try:
     import cv2
 except Exception:
     cv2 = None
+
+try:
+    import torch
+    import torch.nn as nn
+    import torch.nn.functional as torch_f
+except Exception:
+    torch = None
+    nn = None
+    torch_f = None
+
+try:
+    from transformers import AutoImageProcessor, AutoModel
+except Exception:
+    AutoImageProcessor = None
+    AutoModel = None
 
 
 ROOT = Path(__file__).resolve().parent
@@ -4042,6 +4058,817 @@ def preview_clicked_line_horizontal_profile(
     return selected_view, hierarchy_view, profile, status
 
 
+def _to_int(value: Any, default: int) -> int:
+    try:
+        return int(value)
+    except Exception:
+        return int(default)
+
+
+def _to_float(value: Any, default: float) -> float:
+    try:
+        return float(value)
+    except Exception:
+        return float(default)
+
+
+def _parse_width_buckets_for_encoding(raw: Any, patch_multiple: int, max_width: int) -> List[int]:
+    vals: List[int] = []
+    if isinstance(raw, str):
+        tokens = [tok.strip() for tok in raw.split(",")]
+    elif isinstance(raw, (tuple, list)):
+        tokens = [str(tok).strip() for tok in raw]
+    else:
+        tokens = []
+    for tok in tokens:
+        if not tok:
+            continue
+        try:
+            v = int(tok)
+        except Exception:
+            continue
+        if v > 0:
+            vals.append(v)
+    if not vals:
+        vals = [int(max_width)]
+
+    pm = max(1, int(patch_multiple))
+    mw = max(pm, int(max_width))
+    out: List[int] = []
+    for v in vals:
+        vv = max(pm, min(mw, int(v)))
+        vv = int(math.ceil(float(vv) / float(pm)) * pm)
+        vv = max(pm, min(mw, vv))
+        out.append(vv)
+    unique = sorted(set(out))
+    return unique if unique else [mw]
+
+
+def _normalize_for_vit_encoding(
+    image: Image.Image,
+    target_height: int,
+    width_buckets: List[int],
+    patch_multiple: int,
+    max_width: int,
+) -> Image.Image:
+    rgb = image.convert("RGB")
+    orig_w, orig_h = rgb.size
+    if orig_w <= 0 or orig_h <= 0:
+        return Image.new("RGB", (max(16, int(max_width)), max(8, int(target_height))), (255, 255, 255))
+
+    t_h = max(8, int(target_height))
+    pm = max(1, int(patch_multiple))
+    mw = max(pm, int(max_width))
+
+    scale_h = float(t_h) / float(orig_h)
+    scaled_w = max(1, int(round(float(orig_w) * scale_h)))
+    scaled_h = int(t_h)
+    if scaled_w > mw:
+        shrink = float(mw) / float(scaled_w)
+        scaled_w = int(mw)
+        scaled_h = max(1, int(round(float(t_h) * shrink)))
+
+    resample = Image.Resampling.BICUBIC if hasattr(Image, "Resampling") else Image.BICUBIC
+    resized = rgb.resize((scaled_w, scaled_h), resample=resample)
+
+    buckets = sorted(int(v) for v in width_buckets if int(v) > 0)
+    if not buckets:
+        buckets = [mw]
+    target_w = next((b for b in buckets if b >= scaled_w), buckets[-1])
+    target_w = max(scaled_w, min(mw, int(target_w)))
+    target_w = int(math.ceil(float(target_w) / float(pm)) * pm)
+    target_w = min(mw, max(scaled_w, target_w))
+
+    canvas = Image.new("RGB", (target_w, t_h), (255, 255, 255))
+    canvas.paste(resized, (0, 0))
+    return canvas
+
+
+def _pooled_image_embedding_for_ui(backbone: Any, pixel_values: Any):
+    kwargs = {"pixel_values": pixel_values, "return_dict": True}
+    try:
+        outputs = backbone(interpolate_pos_encoding=True, **kwargs)
+    except TypeError:
+        outputs = backbone(**kwargs)
+
+    pooler = getattr(outputs, "pooler_output", None)
+    if pooler is not None:
+        return pooler
+    hidden = getattr(outputs, "last_hidden_state", None)
+    if hidden is None:
+        raise RuntimeError("Encoder output has no pooler_output/last_hidden_state")
+    if hidden.ndim == 3:
+        return hidden[:, 0]
+    return hidden
+
+
+if nn is not None:
+    class _UIProjectionHead(nn.Module):
+        def __init__(self, in_dim: int, out_dim: int):
+            super().__init__()
+            hidden_dim = max(out_dim * 2, in_dim // 2, 32)
+            self.net = nn.Sequential(
+                nn.Linear(in_dim, hidden_dim),
+                nn.GELU(),
+                nn.Linear(hidden_dim, out_dim),
+            )
+
+        def forward(self, x):
+            return self.net(x)
+else:
+    class _UIProjectionHead:
+        pass
+
+
+def _resolve_torch_device_for_encoding(preferred: str) -> Tuple[str, str]:
+    if torch is None:
+        return "cpu", "PyTorch not available; using CPU placeholder."
+    pref = (preferred or "").strip().lower()
+    if pref in {"", "auto"}:
+        if bool(getattr(torch.cuda, "is_available", lambda: False)()):
+            return "cuda", ""
+        mps_ok = False
+        try:
+            mps_ok = bool(torch.backends.mps.is_available())  # type: ignore[attr-defined]
+        except Exception:
+            mps_ok = False
+        if mps_ok:
+            return "mps", ""
+        return "cpu", ""
+    if pref.startswith("cuda") and not bool(getattr(torch.cuda, "is_available", lambda: False)()):
+        return "cpu", f"Requested device `{preferred}` not available. Falling back to CPU."
+    if pref == "mps":
+        try:
+            if bool(torch.backends.mps.is_available()):  # type: ignore[attr-defined]
+                return "mps", ""
+        except Exception:
+            pass
+        return "cpu", "Requested device `mps` not available. Falling back to CPU."
+    return pref, ""
+
+
+@lru_cache(maxsize=24)
+def _load_hierarchy_encoder_runtime_config(backbone_path: str, projection_head_path: str) -> Dict[str, Any]:
+    defaults = {
+        "target_height": 64,
+        "max_width": 1024,
+        "patch_multiple": 16,
+        "width_buckets": [256, 384, 512, 768],
+        "source": "defaults",
+    }
+    bpath = Path(backbone_path).expanduser().resolve() if (backbone_path or "").strip() else None
+    hpath = Path(projection_head_path).expanduser().resolve() if (projection_head_path or "").strip() else None
+    candidates: List[Path] = []
+    if bpath is not None:
+        candidates.append(bpath.parent / "training_config.json")
+        for p in sorted(bpath.parent.glob("*training_config.json")):
+            candidates.append(p)
+    if hpath is not None:
+        candidates.append(hpath.parent / "training_config.json")
+        for p in sorted(hpath.parent.glob("*training_config.json")):
+            candidates.append(p)
+
+    seen: set[str] = set()
+    uniq: List[Path] = []
+    for p in candidates:
+        key = str(p)
+        if key in seen:
+            continue
+        seen.add(key)
+        uniq.append(p)
+
+    for cfg_path in uniq:
+        if not cfg_path.exists() or not cfg_path.is_file():
+            continue
+        try:
+            data = json.loads(cfg_path.read_text(encoding="utf-8"))
+        except Exception:
+            continue
+        if not isinstance(data, dict):
+            continue
+        out = dict(defaults)
+        out["target_height"] = max(8, _to_int(data.get("target_height", out["target_height"]), out["target_height"]))
+        out["max_width"] = max(16, _to_int(data.get("max_width", out["max_width"]), out["max_width"]))
+        out["patch_multiple"] = max(1, _to_int(data.get("patch_multiple", out["patch_multiple"]), out["patch_multiple"]))
+        raw_buckets = data.get("width_buckets", out["width_buckets"])
+        out["width_buckets"] = _parse_width_buckets_for_encoding(
+            raw=raw_buckets,
+            patch_multiple=out["patch_multiple"],
+            max_width=out["max_width"],
+        )
+        out["source"] = str(cfg_path)
+        return out
+    return defaults
+
+
+def _suggest_projection_head_for_backbone(backbone_path: str) -> str:
+    if not (backbone_path or "").strip():
+        return ""
+    bpath = Path(backbone_path).expanduser().resolve()
+    if not bpath.exists():
+        return ""
+    cfg = _load_hierarchy_encoder_runtime_config(str(bpath), "")
+    cfg_source = str(cfg.get("source", "") or "")
+    if cfg_source and cfg_source != "defaults":
+        try:
+            cfg_data = json.loads(Path(cfg_source).read_text(encoding="utf-8"))
+            proj = str(cfg_data.get("projection_head_path", "") or "").strip()
+            if proj:
+                p = Path(proj).expanduser().resolve()
+                if p.exists():
+                    return str(p)
+        except Exception:
+            pass
+
+    local = sorted(bpath.parent.glob("*projection_head*.pt"))
+    if local:
+        return str(local[0].resolve())
+    return ""
+
+
+def scan_models_for_line_and_encoder_ui(models_dir: str):
+    base = Path(models_dir).expanduser().resolve()
+    if not base.exists() or not base.is_dir():
+        empty = gr.update(choices=[], value=None)
+        return empty, empty, empty, "", "", "", f"Directory not found: {base}"
+
+    yolo_models: List[str] = []
+    encoder_backbones: List[str] = []
+    projection_heads: List[str] = []
+    model_exts = {".pt", ".onnx", ".torchscript"}
+
+    for p in sorted(base.rglob("*")):
+        if p.is_file():
+            sfx = p.suffix.lower()
+            if sfx not in model_exts:
+                continue
+            lname = p.name.lower()
+            if "lora" in lname:
+                continue
+            if "projection_head" in lname:
+                projection_heads.append(str(p.resolve()))
+                continue
+            yolo_models.append(str(p.resolve()))
+            continue
+
+        if not p.is_dir():
+            continue
+        if not (p / "config.json").exists():
+            continue
+        has_weights = (
+            (p / "pytorch_model.bin").exists()
+            or (p / "model.safetensors").exists()
+            or (p / "model.safetensors.index.json").exists()
+        )
+        if not has_weights:
+            continue
+        pname = p.name.lower()
+        if any(k in pname for k in ("backbone", "vit", "dino", "swin", "beit")):
+            encoder_backbones.append(str(p.resolve()))
+
+    yolo_models = sorted(set(yolo_models))
+    encoder_backbones = sorted(set(encoder_backbones))
+    projection_heads = sorted(set(projection_heads))
+
+    yolo_default = yolo_models[0] if yolo_models else ""
+    enc_default = encoder_backbones[0] if encoder_backbones else ""
+    head_default = _suggest_projection_head_for_backbone(enc_default) if enc_default else ""
+    if not head_default and projection_heads:
+        head_default = projection_heads[0]
+
+    status = (
+        f"Found {len(yolo_models)} YOLO model(s), "
+        f"{len(encoder_backbones)} encoder backbone(s), "
+        f"{len(projection_heads)} projection head(s) in {base}"
+    )
+    return (
+        gr.update(choices=yolo_models, value=(yolo_default if yolo_default else None)),
+        gr.update(choices=encoder_backbones, value=(enc_default if enc_default else None)),
+        gr.update(choices=projection_heads, value=(head_default if head_default else None)),
+        yolo_default,
+        enc_default,
+        head_default,
+        status,
+    )
+
+
+def on_encoder_backbone_change_ui(backbone_path: str):
+    value = (backbone_path or "").strip()
+    suggested = _suggest_projection_head_for_backbone(value)
+    return value, suggested
+
+
+def _hierarchy_boxes_for_level(hierarchy: Dict[str, Any], level_count: int) -> List[List[int]]:
+    lvl = max(1, int(level_count))
+    levels = hierarchy.get("levels") or []
+    for rec in levels:
+        if int(rec.get("count", -1)) == lvl:
+            boxes = rec.get("boxes") or []
+            return [[int(v) for v in box] for box in boxes if isinstance(box, (tuple, list)) and len(box) == 4]
+    if levels:
+        boxes = levels[0].get("boxes") or []
+        return [[int(v) for v in box] for box in boxes if isinstance(box, (tuple, list)) and len(box) == 4]
+    return []
+
+
+def _render_hierarchy_level_overlay(
+    line_crop_rgb: np.ndarray,
+    boxes: List[List[int]],
+    level_count: int,
+    selected_idx: int = -1,
+) -> np.ndarray:
+    if line_crop_rgb is None or line_crop_rgb.size == 0:
+        return _line_profile_placeholder("No selected line available.")
+
+    palette = {2: (245, 160, 66), 4: (80, 160, 255), 8: (220, 95, 95)}
+    color = palette.get(int(level_count), (255, 180, 80))
+
+    panel = Image.fromarray(line_crop_rgb.astype(np.uint8)).convert("RGB")
+    draw = ImageDraw.Draw(panel)
+    font = _load_overlay_font()
+    tag = f"Click block to encode (level={int(level_count)}, boxes={len(boxes)})"
+    draw.rectangle((2, 2, min(panel.width - 2, 14 + 8 * len(tag)), 18), fill=(0, 0, 0))
+    draw.text((6, 5), tag, fill=color, font=font)
+    for i, box in enumerate(boxes, start=0):
+        x1, y1, x2, y2 = [int(v) for v in box]
+        stroke = 3 if i == int(selected_idx) else 2
+        line_col = (40, 220, 120) if i == int(selected_idx) else color
+        draw.rectangle((x1, y1, x2, y2), outline=line_col, width=stroke)
+        label = f"{int(level_count)}:{i + 1}"
+        tx, ty = x1 + 2, max(0, y1 + 2)
+        draw.rectangle((tx, ty, tx + 7 * len(label), ty + 11), fill=(0, 0, 0))
+        draw.text((tx + 1, ty + 1), label, fill=line_col, font=font)
+    return np.array(panel)
+
+
+def _find_clicked_box_index(boxes: List[List[int]], click_x: int, click_y: int) -> int:
+    hits: List[Tuple[int, int]] = []
+    for i, box in enumerate(boxes):
+        if not isinstance(box, (tuple, list)) or len(box) != 4:
+            continue
+        x1, y1, x2, y2 = [int(v) for v in box]
+        if x1 <= click_x <= x2 and y1 <= click_y <= y2:
+            area = max(1, (x2 - x1) * (y2 - y1))
+            hits.append((area, i))
+    if not hits:
+        return -1
+    hits = sorted(hits, key=lambda x: x[0])
+    return int(hits[0][1])
+
+
+def _compute_clicked_line_hierarchy_bundle(click_state: Dict[str, Any], evt: gr.SelectData) -> Dict[str, Any]:
+    profile_placeholder = _line_profile_placeholder("Click a line box in the overlay to inspect its horizontal profile.")
+    view_placeholder = _line_profile_placeholder("Click a line box in the overlay to open the extracted line view.")
+    if not isinstance(click_state, dict):
+        return {"ok": False, "reason": "Run line split first.", "selected_view": view_placeholder, "profile": profile_placeholder}
+
+    image = click_state.get("image")
+    line_boxes = click_state.get("line_boxes") or []
+    if image is None or not line_boxes:
+        return {"ok": False, "reason": "No line boxes available.", "selected_view": view_placeholder, "profile": profile_placeholder}
+
+    idx = getattr(evt, "index", None)
+    if not isinstance(idx, (tuple, list)) or len(idx) < 2:
+        return {"ok": False, "reason": "Click position not available.", "selected_view": view_placeholder, "profile": profile_placeholder}
+    try:
+        click_x = int(idx[0])
+        click_y = int(idx[1])
+    except Exception:
+        return {"ok": False, "reason": "Invalid click position.", "selected_view": view_placeholder, "profile": profile_placeholder}
+
+    def _hits_for(px: int, py: int) -> List[Dict[str, Any]]:
+        out: List[Dict[str, Any]] = []
+        for rec in line_boxes:
+            box = rec.get("line_box") or []
+            if len(box) != 4:
+                continue
+            x1, y1, x2, y2 = [int(v) for v in box]
+            if x1 <= px <= x2 and y1 <= py <= y2:
+                area = max(1, (x2 - x1) * (y2 - y1))
+                hit = dict(rec)
+                hit["_area"] = float(area)
+                out.append(hit)
+        return out
+
+    hits = _hits_for(click_x, click_y)
+    if not hits:
+        hits = _hits_for(click_y, click_x)
+    if not hits:
+        return {
+            "ok": False,
+            "reason": f"No line box at click ({click_x}, {click_y}).",
+            "selected_view": view_placeholder,
+            "profile": profile_placeholder,
+        }
+
+    chosen = sorted(hits, key=lambda r: float(r.get("_area", 1.0)))[0]
+    x1, y1, x2, y2 = [int(v) for v in (chosen.get("line_box") or [0, 0, 0, 0])]
+    if x2 <= x1 or y2 <= y1:
+        return {"ok": False, "reason": "Selected line box is invalid.", "selected_view": view_placeholder, "profile": profile_placeholder}
+
+    src = np.asarray(image)
+    h, w = src.shape[:2]
+    x1 = max(0, min(w - 1, x1))
+    y1 = max(0, min(h - 1, y1))
+    x2 = max(0, min(w, x2))
+    y2 = max(0, min(h, y2))
+    if x2 <= x1 or y2 <= y1:
+        return {"ok": False, "reason": "Selected line box is out of bounds.", "selected_view": view_placeholder, "profile": profile_placeholder}
+
+    line_crop = src[y1:y2, x1:x2]
+    hstate = _compute_horizontal_projection_state(
+        crop_rgb=line_crop,
+        smooth_cols=int(click_state.get("horizontal_profile_smooth_cols", 21)),
+        threshold_rel=float(click_state.get("horizontal_profile_threshold_rel", 0.20)),
+    )
+    local_boxes, hstate = _segment_horizontal_runs_in_line_crop(
+        line_crop_rgb=line_crop,
+        smooth_cols=int(click_state.get("horizontal_profile_smooth_cols", 21)),
+        threshold_rel=float(click_state.get("horizontal_profile_threshold_rel", 0.20)),
+        min_width_px=int(click_state.get("horizontal_seg_min_width_px", 14)),
+        merge_gap_px=int(click_state.get("horizontal_seg_merge_gap_px", 6)),
+        horizontal_state=hstate,
+    )
+    selected_view = _render_clicked_line_overlay(
+        line_crop_rgb=line_crop,
+        boxes_local=local_boxes,
+        peaks=[int(p) for p in (hstate.get("horizontal_peaks") or [])] if bool(hstate.get("ok")) else [],
+        peak_axis="x",
+    )
+    if not bool(hstate.get("ok")):
+        return {
+            "ok": False,
+            "reason": f"Could not compute horizontal profile ({str(hstate.get('reason', 'unknown'))}).",
+            "selected_view": selected_view,
+            "profile": profile_placeholder,
+        }
+
+    projection = np.asarray(hstate.get("projection"), dtype=np.float32)
+    profile = _render_horizontal_profile_plot(
+        projection=projection,
+        threshold=float(hstate.get("threshold", 0.0)),
+        mask=np.asarray(hstate.get("mask"), dtype=bool),
+        title=f"Horizontal profile for line {int(chosen.get('line_id', -1))} [{x1}, {y1}, {x2}, {y2}]",
+        peaks=[int(p) for p in (hstate.get("horizontal_peaks") or [])],
+        runs=[list(r) for r in (hstate.get("horizontal_runs") or [])],
+    )
+    hierarchy = _build_wordbox_hierarchy_from_peaks(
+        projection=projection,
+        peaks=[int(p) for p in (hstate.get("horizontal_peaks") or [])],
+        width=int(hstate.get("width", line_crop.shape[1])),
+        height=int(hstate.get("height", line_crop.shape[0])),
+        levels=[2, 4, 8],
+    )
+    return {
+        "ok": True,
+        "selected_view": selected_view,
+        "profile": profile,
+        "line_crop": line_crop,
+        "line_id": int(chosen.get("line_id", -1)),
+        "line_box": [x1, y1, x2, y2],
+        "hierarchy": hierarchy,
+        "horizontal_state": hstate,
+        "local_boxes": local_boxes,
+        "click_xy": [int(click_x), int(click_y)],
+    }
+
+
+def run_tibetan_text_line_split_for_embedding_ui(
+    image: np.ndarray,
+    model_path: str,
+    conf: float,
+    imgsz: int,
+    device: str,
+    min_line_height: int,
+    projection_smooth: int,
+    projection_threshold_rel: float,
+    merge_gap_px: int,
+):
+    out = run_tibetan_text_line_split_classical(
+        image=image,
+        model_path=model_path,
+        conf=conf,
+        imgsz=imgsz,
+        device=device,
+        min_line_height=min_line_height,
+        projection_smooth=projection_smooth,
+        projection_threshold_rel=projection_threshold_rel,
+        merge_gap_px=merge_gap_px,
+        draw_parent_boxes=True,
+        detect_red_text=False,
+        red_min_redness=26,
+        red_min_saturation=35,
+        red_column_fill_rel=0.07,
+        red_merge_gap_px=14,
+        red_min_width_px=18,
+        draw_red_boxes=False,
+    )
+    (
+        overlay,
+        status,
+        out_json,
+        line_profile,
+        selected_line_view,
+        _unused_hierarchy_view,
+        selected_line_profile,
+        click_status,
+        click_state,
+    ) = out
+    word_overlay = _line_profile_placeholder("Click a line in the overlay, choose level 2/4/8, then click a block.")
+    word_crop = _line_profile_placeholder("Selected text block crop appears here.")
+    vector_text = ""
+    encode_status = "Click a line box in the overlay."
+    selected_state: Dict[str, Any] = {}
+    return (
+        overlay,
+        status,
+        out_json,
+        line_profile,
+        selected_line_view,
+        selected_line_profile,
+        click_status,
+        click_state,
+        word_overlay,
+        word_crop,
+        vector_text,
+        encode_status,
+        selected_state,
+    )
+
+
+def prepare_clicked_line_for_embedding_ui(
+    click_state: Dict[str, Any],
+    hierarchy_level: str,
+    evt: gr.SelectData,
+):
+    word_overlay_placeholder = _line_profile_placeholder("Click a line in the overlay first.")
+    word_crop_placeholder = _line_profile_placeholder("Selected text block crop appears here.")
+    level_count = max(1, _to_int(hierarchy_level, 2))
+
+    bundle = _compute_clicked_line_hierarchy_bundle(click_state=click_state, evt=evt)
+    if not bool(bundle.get("ok")):
+        reason = str(bundle.get("reason", "Line selection failed."))
+        return (
+            bundle.get("selected_view") if isinstance(bundle.get("selected_view"), np.ndarray) else _line_profile_placeholder(reason),
+            bundle.get("profile") if isinstance(bundle.get("profile"), np.ndarray) else _line_profile_placeholder(reason),
+            word_overlay_placeholder,
+            reason,
+            {},
+            word_crop_placeholder,
+            "",
+            reason,
+        )
+
+    hierarchy = bundle.get("hierarchy") or {}
+    boxes_level = _hierarchy_boxes_for_level(hierarchy=hierarchy, level_count=level_count)
+    word_overlay = _render_hierarchy_level_overlay(
+        line_crop_rgb=np.asarray(bundle["line_crop"]),
+        boxes=boxes_level,
+        level_count=level_count,
+        selected_idx=-1,
+    )
+    selected_state = {
+        "line_crop": np.asarray(bundle["line_crop"]),
+        "line_id": int(bundle.get("line_id", -1)),
+        "line_box": [int(v) for v in (bundle.get("line_box") or [0, 0, 0, 0])],
+        "hierarchy": hierarchy,
+        "active_level": int(level_count),
+        "active_boxes": boxes_level,
+        "selected_box_index": -1,
+        "click_xy": bundle.get("click_xy") or None,
+    }
+    line_status = (
+        f"Selected line {int(bundle.get('line_id', -1))} "
+        f"box={selected_state['line_box']} | level={int(level_count)} | blocks={len(boxes_level)}"
+    )
+    return (
+        np.asarray(bundle["selected_view"]),
+        np.asarray(bundle["profile"]),
+        word_overlay,
+        line_status,
+        selected_state,
+        word_crop_placeholder,
+        "",
+        "Click a block in the hierarchy overlay to encode it.",
+    )
+
+
+def update_hierarchy_level_for_embedding_ui(
+    selected_state: Dict[str, Any],
+    hierarchy_level: str,
+):
+    level_count = max(1, _to_int(hierarchy_level, 2))
+    if not isinstance(selected_state, dict) or selected_state.get("line_crop") is None:
+        placeholder = _line_profile_placeholder("Click a line in the overlay first.")
+        return placeholder, "No selected line available.", {}, _line_profile_placeholder("Selected text block crop appears here."), "", "Click a line first."
+
+    line_crop = np.asarray(selected_state.get("line_crop"))
+    hierarchy = selected_state.get("hierarchy") or {}
+    boxes_level = _hierarchy_boxes_for_level(hierarchy=hierarchy, level_count=level_count)
+    overlay = _render_hierarchy_level_overlay(
+        line_crop_rgb=line_crop,
+        boxes=boxes_level,
+        level_count=level_count,
+        selected_idx=-1,
+    )
+    selected_state["active_level"] = int(level_count)
+    selected_state["active_boxes"] = boxes_level
+    selected_state["selected_box_index"] = -1
+    status = (
+        f"Line {int(selected_state.get('line_id', -1))}: level={int(level_count)} blocks={len(boxes_level)}"
+    )
+    return overlay, status, selected_state, _line_profile_placeholder("Selected text block crop appears here."), "", "Click a block in the hierarchy overlay to encode it."
+
+
+@lru_cache(maxsize=6)
+def _load_hierarchy_vit_encoder_bundle(backbone_path: str, projection_head_path: str):
+    if torch is None or AutoModel is None or AutoImageProcessor is None or nn is None:
+        raise RuntimeError("Encoding requires torch + transformers. Please install requirements.")
+
+    bpath = Path(backbone_path).expanduser().resolve()
+    if not bpath.exists() or not bpath.is_dir():
+        raise FileNotFoundError(f"Encoder backbone not found: {bpath}")
+
+    image_processor = AutoImageProcessor.from_pretrained(str(bpath))
+    backbone = AutoModel.from_pretrained(str(bpath))
+    backbone.eval()
+
+    projection_head = None
+    ppath_raw = (projection_head_path or "").strip()
+    if ppath_raw:
+        ppath = Path(ppath_raw).expanduser().resolve()
+        if ppath.exists() and ppath.is_file():
+            payload = torch.load(str(ppath), map_location="cpu")
+            if isinstance(payload, dict) and "state_dict" in payload:
+                state_dict = payload.get("state_dict", {})
+                in_dim = _to_int(payload.get("input_dim", 0), 0)
+                out_dim = _to_int(payload.get("output_dim", 0), 0)
+            else:
+                state_dict = payload
+                in_dim = 0
+                out_dim = 0
+            hidden_size = _to_int(getattr(backbone.config, "hidden_size", 0), 0)
+            if in_dim <= 0:
+                in_dim = hidden_size
+            if out_dim <= 0:
+                out_dim = in_dim
+            if in_dim > 0 and out_dim > 0:
+                head = _UIProjectionHead(in_dim=int(in_dim), out_dim=int(out_dim))
+                head.load_state_dict(state_dict, strict=False)
+                head.eval()
+                projection_head = head
+
+    return image_processor, backbone, projection_head
+
+
+def encode_clicked_hierarchy_block_ui(
+    selected_state: Dict[str, Any],
+    encoder_backbone_path: str,
+    projection_head_path: str,
+    encoder_device: str,
+    l2_normalize: bool,
+    vector_decimals: int,
+    evt: gr.SelectData,
+):
+    if not isinstance(selected_state, dict) or selected_state.get("line_crop") is None:
+        placeholder = _line_profile_placeholder("Click a line and choose a hierarchy level first.")
+        return placeholder, _line_profile_placeholder("Selected text block crop appears here."), "", "No selected line hierarchy available.", {}
+
+    boxes = selected_state.get("active_boxes") or []
+    level_count = _to_int(selected_state.get("active_level", 2), 2)
+    line_crop = np.asarray(selected_state.get("line_crop"))
+    if line_crop.size == 0 or not boxes:
+        overlay = _render_hierarchy_level_overlay(line_crop, boxes, level_count, selected_idx=-1)
+        return overlay, _line_profile_placeholder("No block available for encoding."), "", "No active hierarchy blocks to encode.", selected_state
+
+    idx = getattr(evt, "index", None)
+    if not isinstance(idx, (tuple, list)) or len(idx) < 2:
+        overlay = _render_hierarchy_level_overlay(line_crop, boxes, level_count, selected_idx=-1)
+        return overlay, _line_profile_placeholder("Click position not available."), "", "Click position not available.", selected_state
+    try:
+        click_x = int(idx[0])
+        click_y = int(idx[1])
+    except Exception:
+        overlay = _render_hierarchy_level_overlay(line_crop, boxes, level_count, selected_idx=-1)
+        return overlay, _line_profile_placeholder("Invalid click position."), "", "Invalid click position.", selected_state
+
+    box_idx = _find_clicked_box_index(boxes, click_x, click_y)
+    if box_idx < 0:
+        box_idx = _find_clicked_box_index(boxes, click_y, click_x)
+    if box_idx < 0:
+        overlay = _render_hierarchy_level_overlay(line_crop, boxes, level_count, selected_idx=-1)
+        return overlay, _line_profile_placeholder("No hierarchy block at clicked position."), "", "No hierarchy block at clicked position.", selected_state
+
+    x1, y1, x2, y2 = [int(v) for v in boxes[box_idx]]
+    h, w = line_crop.shape[:2]
+    x1 = max(0, min(w - 1, x1))
+    y1 = max(0, min(h - 1, y1))
+    x2 = max(0, min(w, x2))
+    y2 = max(0, min(h, y2))
+    if x2 <= x1 or y2 <= y1:
+        overlay = _render_hierarchy_level_overlay(line_crop, boxes, level_count, selected_idx=-1)
+        return overlay, _line_profile_placeholder("Selected block is invalid."), "", "Selected block is invalid.", selected_state
+
+    crop = line_crop[y1:y2, x1:x2]
+    overlay = _render_hierarchy_level_overlay(line_crop, boxes, level_count, selected_idx=box_idx)
+    selected_state["selected_box_index"] = int(box_idx)
+
+    backbone_raw = (encoder_backbone_path or "").strip()
+    if not backbone_raw:
+        return (
+            overlay,
+            crop,
+            "",
+            "Please select an encoder backbone model.",
+            selected_state,
+        )
+
+    try:
+        runtime_cfg = _load_hierarchy_encoder_runtime_config(backbone_raw, projection_head_path or "")
+        width_buckets = _parse_width_buckets_for_encoding(
+            raw=runtime_cfg.get("width_buckets", "256,384,512,768"),
+            patch_multiple=_to_int(runtime_cfg.get("patch_multiple", 16), 16),
+            max_width=_to_int(runtime_cfg.get("max_width", 1024), 1024),
+        )
+        image_processor, backbone, projection_head = _load_hierarchy_vit_encoder_bundle(
+            backbone_raw,
+            (projection_head_path or "").strip(),
+        )
+
+        mean = list(getattr(image_processor, "image_mean", [0.5, 0.5, 0.5]))
+        std = list(getattr(image_processor, "image_std", [0.5, 0.5, 0.5]))
+        if len(mean) == 1:
+            mean = mean * 3
+        if len(std) == 1:
+            std = std * 3
+        mean = [float(v) for v in mean[:3]]
+        std = [max(1e-6, float(v)) for v in std[:3]]
+
+        norm_img = _normalize_for_vit_encoding(
+            image=Image.fromarray(crop.astype(np.uint8)).convert("RGB"),
+            target_height=_to_int(runtime_cfg.get("target_height", 64), 64),
+            width_buckets=width_buckets,
+            patch_multiple=_to_int(runtime_cfg.get("patch_multiple", 16), 16),
+            max_width=_to_int(runtime_cfg.get("max_width", 1024), 1024),
+        )
+        arr = np.asarray(norm_img).astype(np.float32) / 255.0
+        ten = torch.from_numpy(arr).permute(2, 0, 1).contiguous().float()
+        mean_t = torch.tensor(mean, dtype=torch.float32).view(3, 1, 1)
+        std_t = torch.tensor(std, dtype=torch.float32).view(3, 1, 1)
+        pixel_values = ((ten - mean_t) / std_t).unsqueeze(0)
+
+        resolved_device, device_note = _resolve_torch_device_for_encoding(encoder_device)
+        backbone = backbone.to(resolved_device)
+        backbone.eval()
+        if projection_head is not None:
+            projection_head = projection_head.to(resolved_device)
+            projection_head.eval()
+
+        with torch.no_grad():
+            emb = _pooled_image_embedding_for_ui(backbone, pixel_values.to(resolved_device))
+            if projection_head is not None:
+                emb = projection_head(emb)
+            if bool(l2_normalize) and torch_f is not None:
+                emb = torch_f.normalize(emb, dim=-1)
+        vec = emb[0].detach().cpu().float().tolist()
+        decimals = max(2, min(9, _to_int(vector_decimals, 6)))
+        vec_round = [round(float(v), decimals) for v in vec]
+        vec_norm = float(np.linalg.norm(np.asarray(vec, dtype=np.float32)))
+
+        vector_payload = {
+            "line_id": int(selected_state.get("line_id", -1)),
+            "line_box": [int(v) for v in (selected_state.get("line_box") or [0, 0, 0, 0])],
+            "hierarchy_level": int(level_count),
+            "block_index_1based": int(box_idx + 1),
+            "block_box_local": [int(x1), int(y1), int(x2), int(y2)],
+            "crop_size": {"width": int(x2 - x1), "height": int(y2 - y1)},
+            "encoder_backbone": str(Path(backbone_raw).expanduser().resolve()),
+            "projection_head": str(Path(projection_head_path).expanduser().resolve()) if (projection_head_path or "").strip() else "",
+            "device_used": resolved_device,
+            "embedding_dim": int(len(vec_round)),
+            "embedding_norm_l2": round(vec_norm, 6),
+            "l2_normalized": bool(l2_normalize),
+            "normalization": {
+                "target_height": int(runtime_cfg.get("target_height", 64)),
+                "max_width": int(runtime_cfg.get("max_width", 1024)),
+                "patch_multiple": int(runtime_cfg.get("patch_multiple", 16)),
+                "width_buckets": [int(v) for v in width_buckets],
+                "config_source": str(runtime_cfg.get("source", "defaults")),
+            },
+            "vector": vec_round,
+        }
+        vector_text = json.dumps(vector_payload, ensure_ascii=False, indent=2)
+        msg = (
+            f"Encoded block {int(box_idx + 1)}/{len(boxes)} (level {int(level_count)}), "
+            f"dim={len(vec_round)}, device={resolved_device}"
+        )
+        if device_note:
+            msg = f"{msg}. {device_note}"
+        return overlay, crop, vector_text, msg, selected_state
+    except Exception as exc:
+        return overlay, crop, "", f"Encoding failed: {type(exc).__name__}: {exc}", selected_state
+
+
 def _compute_line_projection_state(
     crop_rgb: np.ndarray,
     projection_smooth: int,
@@ -5691,7 +6518,7 @@ def build_ui() -> gr.Blocks:
             gr.Markdown(
                 "Use the tabs left-to-right. A practical flow is: Synthetic Data -> Diffusion + LoRA (texture) -> "
                 "Donut OCR Workflow -> Retrieval Encoders -> Batch VLM Layout (SBB) -> Dataset Preview -> Ultralytics Training -> Model Inference -> "
-                "Tibetan Line Split (CV) -> Text Hierarchy Preview -> VLM Layout (single image) -> Label Studio Export."
+                "Tibetan Line Split (CV) -> Text Hierarchy Preview -> Hierarchy Encode Preview -> VLM Layout (single image) -> Label Studio Export."
             )
             gr.Markdown("### Tabs")
             gr.Markdown(
@@ -5703,6 +6530,7 @@ def build_ui() -> gr.Blocks:
                 "6. Model Inference: Run inference with trained models.\n"
                 "6b. Tibetan Line Split (CV): Detect `tibetan_text` boxes, split into lines, and optionally detect red text boxes per line.\n"
                 "6c. Text Hierarchy Preview: Browse exported `TextHierarchy` and `NumberCrops` assets.\n"
+                "6d. Hierarchy Encode Preview: Detect lines, build 2/4/8 hierarchy, click a block, and output latent vector.\n"
                 "7. VLM Layout: Run transformer-based layout parsing on a single image.\n"
                 "8. Label Studio Export: Convert YOLO split folders to Label Studio tasks and launch Label Studio.\n"
                 "9. PPN Downloader: Download and analyze SBB images.\n"
@@ -6307,6 +7135,167 @@ def build_ui() -> gr.Blocks:
                 fn=lambda root, subset, cur: preview_adjacent_text_hierarchy_asset(root, subset, cur, 1),
                 inputs=[th_root_dir, th_subset, th_asset_select],
                 outputs=[th_asset_select, th_image, th_info, th_json],
+            )
+
+        # 6d) Interactive hierarchy + embedding preview on uploaded image
+        with gr.Tab("6d. Hierarchy Encode Preview"):
+            gr.Markdown(
+                "Scan `models/` for passende Modelle, run line detection on an uploaded image, "
+                "split lines into 2/4/8 hierarchy blocks, click one block, and output its latent vector."
+            )
+            he_line_click_state = gr.State({})
+            he_selected_state = gr.State({})
+            with gr.Row():
+                with gr.Column(scale=1):
+                    he_models_dir = gr.Textbox(label="models_dir", value=str((workspace_root / "models").resolve()))
+                    he_scan_models_btn = gr.Button("Scan Models")
+                    he_yolo_model_select = gr.Dropdown(
+                        label="Detected YOLO Model (line detection)",
+                        choices=[],
+                        allow_custom_value=True,
+                    )
+                    he_encoder_backbone_select = gr.Dropdown(
+                        label="Detected Encoder Backbone (ViT/DINO)",
+                        choices=[],
+                        allow_custom_value=True,
+                    )
+                    he_projection_head_select = gr.Dropdown(
+                        label="Detected Projection Head (.pt)",
+                        choices=[],
+                        allow_custom_value=True,
+                    )
+                    he_scan_status = gr.Textbox(label="Model Scan Status", interactive=False)
+
+                    he_line_model = gr.Textbox(label="line_model_path", value="")
+                    he_encoder_backbone = gr.Textbox(label="encoder_backbone_path", value="")
+                    he_projection_head = gr.Textbox(label="projection_head_path (optional)", value="")
+
+                    with gr.Accordion("Line Segmentation Parameters", open=False):
+                        he_conf = gr.Slider(0.01, 0.99, value=0.25, step=0.01, label="conf")
+                        he_imgsz = gr.Number(label="imgsz", value=1024, precision=0)
+                        he_device = gr.Textbox(label="line_detection_device", value="")
+                        he_min_height = gr.Number(label="min_line_height_px", value=10, precision=0)
+                        he_proj_smooth = gr.Number(label="projection_smooth_rows", value=9, precision=0)
+                        he_proj_thresh = gr.Slider(0.05, 0.80, value=0.20, step=0.01, label="projection_threshold_rel")
+                        he_merge_gap = gr.Number(label="merge_gap_px", value=5, precision=0)
+
+                    with gr.Accordion("Hierarchy + Encoding Options", open=True):
+                        he_hierarchy_level = gr.Dropdown(label="Hierarchy Level", choices=["2", "4", "8"], value="2")
+                        he_encoder_device = gr.Textbox(label="encoder_device", value="auto")
+                        he_l2_norm = gr.Checkbox(label="l2_normalize_embedding", value=True)
+                        he_vector_decimals = gr.Number(label="vector_decimals", value=6, precision=0)
+
+                    he_run_btn = gr.Button("Detect + Split + Prepare Hierarchy", variant="primary")
+
+                with gr.Column(scale=1):
+                    he_image_in = gr.Image(type="numpy", label="Input Image", sources=["upload", "clipboard"])
+                    he_overlay = gr.Image(type="numpy", label="Overlay (Detected tibetan_text + Line Boxes)", interactive=True)
+                    he_line_profile = gr.Image(type="numpy", label="Line Projection Profile")
+                    he_selected_line_view = gr.Image(type="numpy", label="Selected Line (Peak-based Split)")
+                    he_selected_line_profile = gr.Image(type="numpy", label="Selected Line Horizontal Profile")
+                    he_word_overlay = gr.Image(type="numpy", label="Hierarchy Blocks (click to encode)", interactive=True)
+                    he_word_crop = gr.Image(type="numpy", label="Selected Text Block Crop")
+                    he_run_status = gr.Textbox(label="Run Status", interactive=False)
+                    he_line_status = gr.Textbox(label="Line Selection Status", interactive=False)
+                    he_encode_status = gr.Textbox(label="Encoding Status", interactive=False)
+                    he_json = gr.Code(label="Line Segmentation JSON", language="json")
+                    he_vector = gr.Code(label="Latent Vector JSON", language="json")
+
+            he_scan_models_btn.click(
+                fn=scan_models_for_line_and_encoder_ui,
+                inputs=[he_models_dir],
+                outputs=[
+                    he_yolo_model_select,
+                    he_encoder_backbone_select,
+                    he_projection_head_select,
+                    he_line_model,
+                    he_encoder_backbone,
+                    he_projection_head,
+                    he_scan_status,
+                ],
+            )
+            he_yolo_model_select.change(
+                fn=lambda x: x or "",
+                inputs=[he_yolo_model_select],
+                outputs=[he_line_model],
+            )
+            he_encoder_backbone_select.change(
+                fn=on_encoder_backbone_change_ui,
+                inputs=[he_encoder_backbone_select],
+                outputs=[he_encoder_backbone, he_projection_head],
+            )
+            he_projection_head_select.change(
+                fn=lambda x: x or "",
+                inputs=[he_projection_head_select],
+                outputs=[he_projection_head],
+            )
+
+            he_run_btn.click(
+                fn=run_tibetan_text_line_split_for_embedding_ui,
+                inputs=[
+                    he_image_in,
+                    he_line_model,
+                    he_conf,
+                    he_imgsz,
+                    he_device,
+                    he_min_height,
+                    he_proj_smooth,
+                    he_proj_thresh,
+                    he_merge_gap,
+                ],
+                outputs=[
+                    he_overlay,
+                    he_run_status,
+                    he_json,
+                    he_line_profile,
+                    he_selected_line_view,
+                    he_selected_line_profile,
+                    he_line_status,
+                    he_line_click_state,
+                    he_word_overlay,
+                    he_word_crop,
+                    he_vector,
+                    he_encode_status,
+                    he_selected_state,
+                ],
+            )
+            he_overlay.select(
+                fn=prepare_clicked_line_for_embedding_ui,
+                inputs=[he_line_click_state, he_hierarchy_level],
+                outputs=[
+                    he_selected_line_view,
+                    he_selected_line_profile,
+                    he_word_overlay,
+                    he_line_status,
+                    he_selected_state,
+                    he_word_crop,
+                    he_vector,
+                    he_encode_status,
+                ],
+            )
+            he_hierarchy_level.change(
+                fn=update_hierarchy_level_for_embedding_ui,
+                inputs=[he_selected_state, he_hierarchy_level],
+                outputs=[
+                    he_word_overlay,
+                    he_line_status,
+                    he_selected_state,
+                    he_word_crop,
+                    he_vector,
+                    he_encode_status,
+                ],
+            )
+            he_word_overlay.select(
+                fn=encode_clicked_hierarchy_block_ui,
+                inputs=[
+                    he_selected_state,
+                    he_encoder_backbone,
+                    he_projection_head,
+                    he_encoder_device,
+                    he_l2_norm,
+                    he_vector_decimals,
+                ],
+                outputs=[he_word_overlay, he_word_crop, he_vector, he_encode_status, he_selected_state],
             )
 
         # 7) VLM parsing

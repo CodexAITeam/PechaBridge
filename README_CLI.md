@@ -40,6 +40,7 @@ Available subcommands:
 - `train-text-encoder`
 - `export-text-hierarchy`
 - `train-text-hierarchy-vit`
+- `eval-text-hierarchy-vit`
 - `prepare-donut-ocr-dataset`
 - `train-donut-ocr`
 - `run-donut-ocr-workflow`
@@ -195,6 +196,17 @@ python cli.py train-text-hierarchy-vit \
   --target-height 64 \
   --width-buckets 256,384,512,768 \
   --max-width 1024
+```
+
+Evaluate retrieval quality (Recall@K + MRR):
+
+```bash
+python cli.py eval-text-hierarchy-vit \
+  --dataset-dir ./datasets/text_hierarchy \
+  --backbone-dir ./models/text_hierarchy_vit/text_hierarchy_vit_backbone \
+  --projection-head-path ./models/text_hierarchy_vit/text_hierarchy_projection_head.pt \
+  --output-dir ./models/text_hierarchy_vit/eval \
+  --recall-ks 1,5,10
 ```
 
 ## Label Studio (CLI)

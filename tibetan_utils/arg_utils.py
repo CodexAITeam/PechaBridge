@@ -720,6 +720,80 @@ def create_train_text_hierarchy_vit_parser(add_help: bool = True):
     return parser
 
 
+def add_eval_text_hierarchy_vit_arguments(parser):
+    """Arguments for retrieval evaluation of a trained TextHierarchy ViT encoder."""
+    parser.add_argument('--dataset_dir', '--dataset-dir', dest='dataset_dir', type=str, required=True,
+                       help='Root containing TextHierarchy/ and optional NumberCrops/')
+    parser.add_argument('--backbone_dir', '--backbone-dir', dest='backbone_dir', type=str, required=True,
+                       help='Path to trained backbone directory (e.g. text_hierarchy_vit_backbone)')
+    parser.add_argument('--projection_head_path', '--projection-head-path', dest='projection_head_path', type=str, default='',
+                       help='Optional projection head checkpoint (.pt)')
+    parser.add_argument('--output_dir', '--output-dir', dest='output_dir', type=str, required=True,
+                       help='Directory where eval report/CSV are written')
+    parser.add_argument('--config_path', '--config-path', dest='config_path', type=str, default='',
+                       help='Optional explicit training_config.json path')
+
+    parser.add_argument('--include_line_images', '--include-line-images', dest='include_line_images',
+                       action='store_true', help='Use line.png assets from TextHierarchy')
+    parser.add_argument('--no_include_line_images', '--no-include-line-images', dest='include_line_images',
+                       action='store_false', help='Disable line.png assets')
+    parser.set_defaults(include_line_images=True)
+    parser.add_argument('--include_word_crops', '--include-word-crops', dest='include_word_crops',
+                       action='store_true', help='Use hierarchy word crops (word_*.png)')
+    parser.add_argument('--no_include_word_crops', '--no-include-word-crops', dest='include_word_crops',
+                       action='store_false', help='Disable hierarchy word crops')
+    parser.set_defaults(include_word_crops=True)
+    parser.add_argument('--include_number_crops', '--include-number-crops', dest='include_number_crops',
+                       action='store_true', help='Include NumberCrops in retrieval gallery')
+    parser.add_argument('--min_assets_per_group', '--min-assets-per-group', dest='min_assets_per_group', type=int, default=1,
+                       help='Minimum assets required to include a group in gallery')
+    parser.add_argument('--min_positives_per_query', '--min-positives-per-query', dest='min_positives_per_query', type=int, default=1,
+                       help='Required positives per query (1 => group size at least 2)')
+
+    parser.add_argument('--target_height', '--target-height', dest='target_height', type=int, default=0,
+                       help='Override normalized input height (0 = from training config/default)')
+    parser.add_argument('--max_width', '--max-width', dest='max_width', type=int, default=0,
+                       help='Override maximum normalized width (0 = from training config/default)')
+    parser.add_argument('--patch_multiple', '--patch-multiple', dest='patch_multiple', type=int, default=0,
+                       help='Override width snap multiple (0 = from training config/default)')
+    parser.add_argument('--width_buckets', '--width-buckets', dest='width_buckets', type=str, default='',
+                       help='Override comma-separated width buckets (empty = from training config/default)')
+
+    parser.add_argument('--batch_size', '--batch-size', dest='batch_size', type=int, default=32,
+                       help='Per-device eval batch size')
+    parser.add_argument('--num_workers', '--num-workers', dest='num_workers', type=int, default=4,
+                       help='DataLoader workers')
+    parser.add_argument('--device', type=str, default='auto',
+                       help='Embedding device (auto/cpu/cuda:0/mps)')
+    parser.add_argument('--l2_normalize_embeddings', '--l2-normalize-embeddings', dest='l2_normalize_embeddings',
+                       action='store_true', help='L2-normalize embeddings before retrieval (default on)')
+    parser.add_argument('--no_l2_normalize_embeddings', '--no-l2-normalize-embeddings', dest='l2_normalize_embeddings',
+                       action='store_false', help='Disable embedding L2 normalization')
+    parser.set_defaults(l2_normalize_embeddings=True)
+    parser.add_argument('--recall_ks', '--recall-ks', dest='recall_ks', type=str, default='1,5,10',
+                       help='Comma-separated Recall@K values (e.g. 1,5,10)')
+    parser.add_argument('--max_queries', '--max-queries', dest='max_queries', type=int, default=0,
+                       help='Randomly sample at most N evaluable queries (0 = all)')
+    parser.add_argument('--seed', type=int, default=42,
+                       help='Random seed (sampling and reproducibility)')
+
+    parser.add_argument('--write_per_query_csv', '--write-per-query-csv', dest='write_per_query_csv',
+                       action='store_true', help='Write per-query CSV report (default on)')
+    parser.add_argument('--no_write_per_query_csv', '--no-write-per-query-csv', dest='write_per_query_csv',
+                       action='store_false', help='Disable per-query CSV output')
+    parser.set_defaults(write_per_query_csv=True)
+
+
+def create_eval_text_hierarchy_vit_parser(add_help: bool = True):
+    """Create parser for evaluating a TextHierarchy ViT retrieval encoder."""
+    parser = argparse.ArgumentParser(
+        description="Evaluate ViT retrieval encoder on exported TextHierarchy dataset",
+        add_help=add_help,
+    )
+    add_eval_text_hierarchy_vit_arguments(parser)
+    return parser
+
+
 def add_prepare_donut_ocr_dataset_arguments(parser):
     """Arguments for preparing label-filtered OCR manifests for Donut-style training."""
     parser.add_argument('--dataset_dir', type=str, required=True,

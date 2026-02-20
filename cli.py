@@ -7,6 +7,7 @@ import argparse
 import logging
 
 from tibetan_utils.arg_utils import (
+    create_eval_text_hierarchy_vit_parser,
     create_prepare_texture_lora_dataset_parser,
     create_prepare_donut_ocr_dataset_parser,
     create_run_donut_ocr_workflow_parser,
@@ -78,6 +79,15 @@ def _build_root_parser() -> argparse.ArgumentParser:
         description=train_hierarchy_parent.description,
     )
     train_hierarchy_parser.set_defaults(handler=_run_train_text_hierarchy_vit)
+
+    eval_hierarchy_parent = create_eval_text_hierarchy_vit_parser(add_help=False)
+    eval_hierarchy_parser = subparsers.add_parser(
+        "eval-text-hierarchy-vit",
+        parents=[eval_hierarchy_parent],
+        help="Evaluate ViT retrieval encoder on TextHierarchy crops",
+        description=eval_hierarchy_parent.description,
+    )
+    eval_hierarchy_parser.set_defaults(handler=_run_eval_text_hierarchy_vit)
 
     prepare_donut_parent = create_prepare_donut_ocr_dataset_parser(add_help=False)
     prepare_donut_parser = subparsers.add_parser(
@@ -181,6 +191,13 @@ def _run_train_text_encoder(args: argparse.Namespace) -> int:
 
 def _run_train_text_hierarchy_vit(args: argparse.Namespace) -> int:
     from scripts.train_text_hierarchy_vit import run
+
+    run(args)
+    return 0
+
+
+def _run_eval_text_hierarchy_vit(args: argparse.Namespace) -> int:
+    from scripts.eval_text_hierarchy_vit import run
 
     run(args)
     return 0
