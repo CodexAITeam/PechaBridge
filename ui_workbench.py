@@ -3600,46 +3600,6 @@ def _left_valleys_for_peaks(projection: np.ndarray, peaks: List[int], width: int
     return sorted(set(valleys))
 
 
-def _pick_distinct_starts(values: List[int], needed: int, width: int) -> List[int]:
-    w = max(1, int(width))
-    n = max(1, int(needed))
-    uniq = sorted(set(int(v) for v in values if 0 <= int(v) < w))
-    if not uniq:
-        uniq = [0]
-    if n == 1:
-        return [uniq[0]]
-
-    targets = np.linspace(0.0, float(len(uniq) - 1), n)
-    picked_idx: List[int] = []
-    used = set()
-    for t in targets:
-        center = int(round(float(t)))
-        found = None
-        for off in range(0, len(uniq)):
-            left = center - off
-            right = center + off
-            if 0 <= left < len(uniq) and left not in used:
-                found = left
-                break
-            if 0 <= right < len(uniq) and right not in used:
-                found = right
-                break
-        if found is not None:
-            used.add(found)
-            picked_idx.append(found)
-
-    if len(picked_idx) < n:
-        for i in range(len(uniq)):
-            if i in used:
-                continue
-            picked_idx.append(i)
-            if len(picked_idx) >= n:
-                break
-
-    picked = sorted(uniq[i] for i in picked_idx[:n])
-    return picked
-
-
 def _build_wordbox_hierarchy_from_peaks(
     projection: np.ndarray,
     peaks: List[int],
@@ -3663,47 +3623,32 @@ def _build_wordbox_hierarchy_from_peaks(
     for n in lvl:
         requested_count = max(1, int(n))
         box_count = max(1, min(requested_count, w))
-        interior_needed = max(0, box_count - 1)
+        desired_len = float(w) / float(requested_count)
+        interior_valleys = sorted(int(v) for v in valley_pool if 0 < int(v) < w)
 
-        # We build contiguous boundaries [0, b1, b2, ..., w].
-        interior = _pick_distinct_starts(
-            [v for v in valley_pool if 0 < int(v) < w],
-            interior_needed,
-            w,
-        )
-        interior = [int(v) for v in interior if 0 < int(v) < w]
+        boundaries: List[int] = [0]
+        boundary_sources: List[str] = []
+        for i in range(1, box_count):
+            remaining_after = box_count - i
+            min_x = boundaries[-1] + 1
+            max_x = max(min_x, w - remaining_after)
 
-        if len(interior) > interior_needed:
-            interior = interior[:interior_needed]
-        if len(interior) < interior_needed:
-            targets = np.linspace(1.0, float(max(1, w - 1)), interior_needed + 2)[1:-1]
-            for t in targets:
-                c = int(round(float(t)))
-                c = max(1, min(w - 1, c))
-                if c not in interior:
-                    interior.append(c)
-                if len(interior) >= interior_needed:
-                    break
-        if len(interior) < interior_needed:
-            for c in range(1, w):
-                if c not in interior:
-                    interior.append(c)
-                if len(interior) >= interior_needed:
-                    break
+            target = int(round(i * desired_len))
+            target = max(min_x, min(max_x, target))
 
-        interior = sorted(set(interior))
-        if len(interior) > interior_needed:
-            picks = np.linspace(0.0, float(len(interior) - 1), interior_needed)
-            interior = sorted({interior[int(round(p))] for p in picks})
-            while len(interior) < interior_needed:
-                for c in range(1, w):
-                    if c not in interior:
-                        interior.append(c)
-                    if len(interior) >= interior_needed:
-                        break
-            interior = sorted(interior)[:interior_needed]
+            candidates = [v for v in interior_valleys if min_x <= v <= max_x]
+            if candidates:
+                chosen = min(candidates, key=lambda v: (abs(int(v) - target), int(v)))
+                source = "valley"
+            else:
+                chosen = target
+                source = "fallback"
 
-        boundaries = [0] + interior + [w]
+            chosen = int(max(min_x, min(max_x, chosen)))
+            boundaries.append(chosen)
+            boundary_sources.append(source)
+        boundaries.append(w)
+
         boxes: List[Tuple[int, int, int, int]] = []
         for i in range(len(boundaries) - 1):
             x1 = int(boundaries[i])
@@ -3719,8 +3664,10 @@ def _build_wordbox_hierarchy_from_peaks(
             {
                 "count": int(box_count),
                 "target_count": int(requested_count),
-                "box_length_px": int(np.ceil(float(w) / float(requested_count))),
+                "box_length_px": int(round(desired_len)),
                 "box_lengths_px": widths,
+                "boundaries": [int(v) for v in boundaries],
+                "boundary_sources": boundary_sources,
                 "starts": [int(s) for s in starts],
                 "boxes": [[int(a), int(b), int(c), int(d)] for (a, b, c, d) in boxes],
             }
