@@ -12,6 +12,7 @@ from tibetan_utils.arg_utils import (
     create_run_donut_ocr_workflow_parser,
     create_train_donut_ocr_parser,
     create_train_image_encoder_parser,
+    create_train_text_hierarchy_vit_parser,
     create_train_text_encoder_parser,
     create_texture_augment_parser,
     create_train_texture_lora_parser,
@@ -68,6 +69,15 @@ def _build_root_parser() -> argparse.ArgumentParser:
         description=train_text_parent.description,
     )
     train_text_parser.set_defaults(handler=_run_train_text_encoder)
+
+    train_hierarchy_parent = create_train_text_hierarchy_vit_parser(add_help=False)
+    train_hierarchy_parser = subparsers.add_parser(
+        "train-text-hierarchy-vit",
+        parents=[train_hierarchy_parent],
+        help="Train ViT retrieval encoder on TextHierarchy crops",
+        description=train_hierarchy_parent.description,
+    )
+    train_hierarchy_parser.set_defaults(handler=_run_train_text_hierarchy_vit)
 
     prepare_donut_parent = create_prepare_donut_ocr_dataset_parser(add_help=False)
     prepare_donut_parser = subparsers.add_parser(
@@ -164,6 +174,13 @@ def _run_train_image_encoder(args: argparse.Namespace) -> int:
 
 def _run_train_text_encoder(args: argparse.Namespace) -> int:
     from scripts.train_text_encoder import run
+
+    run(args)
+    return 0
+
+
+def _run_train_text_hierarchy_vit(args: argparse.Namespace) -> int:
+    from scripts.train_text_hierarchy_vit import run
 
     run(args)
     return 0

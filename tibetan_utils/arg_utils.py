@@ -625,6 +625,71 @@ def add_train_text_encoder_arguments(parser):
     parser.set_defaults(checkpoint_overwrite=True)
 
 
+def add_train_text_hierarchy_vit_arguments(parser):
+    """Arguments for ViT retrieval training on exported TextHierarchy crops."""
+    parser.add_argument('--dataset_dir', '--dataset-dir', dest='dataset_dir', type=str, required=True,
+                       help='Root containing TextHierarchy/ and optional NumberCrops/')
+    parser.add_argument('--output_dir', '--output-dir', dest='output_dir', type=str, required=True,
+                       help='Directory where trained ViT artifacts are saved')
+    parser.add_argument('--model_name_or_path', '--model-name-or-path', dest='model_name_or_path', type=str,
+                       default='google/vit-base-patch16-224-in21k',
+                       help='HF vision backbone ID/path (e.g. DINOv2, ViT, BEiT, Swin)')
+
+    parser.add_argument('--include_line_images', '--include-line-images', dest='include_line_images',
+                       action='store_true', help='Use line.png assets from TextHierarchy')
+    parser.add_argument('--no_include_line_images', '--no-include-line-images', dest='include_line_images',
+                       action='store_false', help='Disable line.png assets')
+    parser.set_defaults(include_line_images=True)
+    parser.add_argument('--include_word_crops', '--include-word-crops', dest='include_word_crops',
+                       action='store_true', help='Use hierarchy word crops (word_*.png)')
+    parser.add_argument('--no_include_word_crops', '--no-include-word-crops', dest='include_word_crops',
+                       action='store_false', help='Disable hierarchy word crops')
+    parser.set_defaults(include_word_crops=True)
+    parser.add_argument('--include_number_crops', '--include-number-crops', dest='include_number_crops',
+                       action='store_true', help='Include NumberCrops as singleton groups')
+    parser.add_argument('--min_assets_per_group', '--min-assets-per-group', dest='min_assets_per_group', type=int, default=1,
+                       help='Minimum assets required per positive group')
+
+    parser.add_argument('--target_height', '--target-height', dest='target_height', type=int, default=64,
+                       help='Fixed normalized input height in pixels')
+    parser.add_argument('--width_buckets', '--width-buckets', dest='width_buckets', type=str, default='256,384,512,768',
+                       help='Comma-separated target width buckets for right-padding')
+    parser.add_argument('--max_width', '--max-width', dest='max_width', type=int, default=1024,
+                       help='Maximum normalized width before clipping')
+    parser.add_argument('--patch_multiple', '--patch-multiple', dest='patch_multiple', type=int, default=16,
+                       help='Snap widths to a multiple of this value')
+
+    parser.add_argument('--batch_size', '--batch-size', dest='batch_size', type=int, default=16,
+                       help='Per-device batch size')
+    parser.add_argument('--lr', type=float, default=1e-4,
+                       help='Learning rate')
+    parser.add_argument('--weight_decay', '--weight-decay', dest='weight_decay', type=float, default=0.01,
+                       help='Weight decay')
+    parser.add_argument('--num_train_epochs', '--num-train-epochs', dest='num_train_epochs', type=int, default=8,
+                       help='Training epochs (used when max_train_steps=0)')
+    parser.add_argument('--max_train_steps', '--max-train-steps', dest='max_train_steps', type=int, default=0,
+                       help='Override total train steps (0 = derive from epochs)')
+    parser.add_argument('--warmup_steps', '--warmup-steps', dest='warmup_steps', type=int, default=200,
+                       help='Warmup steps for lr scheduler')
+    parser.add_argument('--projection_dim', '--projection-dim', dest='projection_dim', type=int, default=256,
+                       help='Projection head output dimension')
+    parser.add_argument('--temperature', type=float, default=0.1,
+                       help='NT-Xent temperature')
+    parser.add_argument('--mixed_precision', '--mixed-precision', dest='mixed_precision', type=str, default='fp16',
+                       choices=['no', 'fp16', 'bf16'],
+                       help='Accelerate mixed precision mode')
+    parser.add_argument('--gradient_checkpointing', '--gradient-checkpointing', dest='gradient_checkpointing',
+                       action='store_true', help='Enable backbone gradient checkpointing when supported')
+    parser.add_argument('--freeze_backbone', '--freeze-backbone', dest='freeze_backbone',
+                       action='store_true', help='Freeze backbone and train projection head only')
+    parser.add_argument('--num_workers', '--num-workers', dest='num_workers', type=int, default=4,
+                       help='Dataloader workers')
+    parser.add_argument('--seed', type=int, default=42,
+                       help='Random seed')
+    parser.add_argument('--checkpoint_every_steps', '--checkpoint-every-steps', dest='checkpoint_every_steps',
+                       type=int, default=0, help='Save checkpoint every N optimizer steps (0 disables)')
+
+
 def create_train_image_encoder_parser(add_help: bool = True):
     """Create parser for image encoder training."""
     parser = argparse.ArgumentParser(
@@ -642,6 +707,16 @@ def create_train_text_encoder_parser(add_help: bool = True):
         add_help=add_help,
     )
     add_train_text_encoder_arguments(parser)
+    return parser
+
+
+def create_train_text_hierarchy_vit_parser(add_help: bool = True):
+    """Create parser for ViT training on TextHierarchy crops."""
+    parser = argparse.ArgumentParser(
+        description="Train ViT retrieval encoder on exported TextHierarchy dataset",
+        add_help=add_help,
+    )
+    add_train_text_hierarchy_vit_arguments(parser)
     return parser
 
 

@@ -38,6 +38,8 @@ Available subcommands:
 - `texture-augment`
 - `train-image-encoder`
 - `train-text-encoder`
+- `export-text-hierarchy`
+- `train-text-hierarchy-vit`
 - `prepare-donut-ocr-dataset`
 - `train-donut-ocr`
 - `run-donut-ocr-workflow`
@@ -169,6 +171,30 @@ python cli.py train-donut-ocr \
   --output_dir ./models/donut-ocr-label1 \
   --model_name_or_path microsoft/trocr-base-stage1 \
   --train_tokenizer
+```
+
+### 6) TextHierarchy export + ViT retrieval training
+
+Export line/word hierarchy crops from page images:
+
+```bash
+python cli.py export-text-hierarchy \
+  --model ./models/layoutModels/layout_model.pt \
+  --input-dir ./sbb_images \
+  --output-dir ./datasets/text_hierarchy \
+  --no_samples 100
+```
+
+Train a pretrained ViT backbone with hierarchy-aware positive pairs:
+
+```bash
+python cli.py train-text-hierarchy-vit \
+  --dataset-dir ./datasets/text_hierarchy \
+  --output-dir ./models/text_hierarchy_vit \
+  --model-name-or-path facebook/dinov2-base \
+  --target-height 64 \
+  --width-buckets 256,384,512,768 \
+  --max-width 1024
 ```
 
 ## Label Studio (CLI)
