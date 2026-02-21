@@ -12,6 +12,8 @@ models/
 # C extensions
 *.so
 *.yaml
+!configs/
+!configs/patch_gen.yaml
 
 ls-tasks.json
 ls-tasks.label_config.xml

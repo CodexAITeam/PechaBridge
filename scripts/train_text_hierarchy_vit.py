@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""Train a ViT-based retrieval encoder on TextHierarchy crops."""
+"""Train a ViT-based retrieval encoder on TextHierarchy or patch-parquet datasets."""
 
 from __future__ import annotations
 
@@ -29,6 +29,11 @@ if str(REPO_ROOT) not in sys.path:
     sys.path.insert(0, str(REPO_ROOT))
 
 from tibetan_utils.arg_utils import create_train_text_hierarchy_vit_parser
+
+try:
+    import pandas as pd
+except Exception:  # pragma: no cover
+    pd = None
 
 LOGGER = logging.getLogger("train_text_hierarchy_vit")
 IMAGE_EXTENSIONS = {".png", ".jpg", ".jpeg", ".bmp", ".tif", ".tiff", ".webp"}
@@ -83,6 +88,113 @@ class HierarchyGroup:
     assets: List[Path]
 
 
+def _sanitize_id(value: Any) -> str:
+    txt = str(value or "").strip()
+    if not txt:
+        return "unknown"
+    out: List[str] = []
+    for ch in txt:
+        if ch.isalnum() or ch in {"-", "_", "."}:
+            out.append(ch)
+        else:
+            out.append("_")
+    return "".join(out).strip("_") or "unknown"
+
+
+def _resolve_patch_asset_path(dataset_dir: Path, row: Dict[str, Any]) -> Path:
+    raw_patch_path = str(row.get("patch_path", "") or "").strip()
+    if raw_patch_path:
+        try:
+            raw = Path(raw_patch_path).expanduser()
+            if raw.is_absolute():
+                if raw.exists():
+                    return raw.resolve()
+            else:
+                candidate = (dataset_dir / raw).resolve()
+                if candidate.exists():
+                    return candidate
+        except Exception:
+            pass
+
+    doc_id = _sanitize_id(row.get("doc_id", ""))
+    page_id = _sanitize_id(row.get("page_id", ""))
+    line_id = int(row.get("line_id", -1))
+    scale_w = int(row.get("scale_w", -1))
+    patch_id = int(row.get("patch_id", -1))
+    return (
+        dataset_dir
+        / "patches"
+        / f"doc={doc_id}"
+        / f"page={page_id}"
+        / f"line={line_id}"
+        / f"scale={scale_w}"
+        / f"patch_{patch_id}.png"
+    ).resolve()
+
+
+def _discover_patch_parquet_groups(
+    dataset_dir: Path,
+    include_line_images: bool,
+    include_word_crops: bool,
+    min_assets_per_group: int,
+) -> List[HierarchyGroup]:
+    meta_path = dataset_dir / "meta" / "patches.parquet"
+    if not meta_path.exists() or not meta_path.is_file():
+        return []
+    if pd is None:  # pragma: no cover
+        raise RuntimeError("pandas is required to read patch parquet metadata.")
+
+    use_patch_assets = bool(include_word_crops or include_line_images)
+    if not use_patch_assets:
+        LOGGER.warning(
+            "Patch parquet dataset found at %s, but both include flags are disabled.",
+            meta_path,
+        )
+        return []
+
+    cols = [
+        "patch_id",
+        "doc_id",
+        "page_id",
+        "line_id",
+        "scale_w",
+        "patch_path",
+    ]
+    df = pd.read_parquet(meta_path, columns=cols)
+    if df.empty:
+        return []
+
+    grouped: Dict[str, List[Path]] = {}
+    for row in df.to_dict(orient="records"):
+        try:
+            line_id = int(row.get("line_id", -1))
+            scale_w = int(row.get("scale_w", -1))
+        except Exception:
+            continue
+        if line_id < 0 or scale_w <= 0:
+            continue
+        path = _resolve_patch_asset_path(dataset_dir, row)
+        if not path.exists() or not path.is_file():
+            continue
+        doc_id = str(row.get("doc_id", "") or "")
+        page_id = str(row.get("page_id", "") or "")
+        key = (
+            f"patches/doc={_sanitize_id(doc_id)}"
+            f"/page={_sanitize_id(page_id)}"
+            f"/line={line_id}"
+            f"/scale={scale_w}"
+        )
+        grouped.setdefault(key, []).append(path)
+
+    groups: List[HierarchyGroup] = []
+    required = max(1, int(min_assets_per_group))
+    for key in sorted(grouped.keys()):
+        uniq = sorted({str(p.resolve()): p.resolve() for p in grouped[key]}.values(), key=lambda p: str(p))
+        if len(uniq) >= required:
+            groups.append(HierarchyGroup(key=key, assets=uniq))
+    return groups
+
+
 def _discover_hierarchy_groups(
     dataset_dir: Path,
     include_line_images: bool,
@@ -90,6 +202,32 @@ def _discover_hierarchy_groups(
     include_number_crops: bool,
     min_assets_per_group: int,
 ) -> List[HierarchyGroup]:
+    patch_groups = _discover_patch_parquet_groups(
+        dataset_dir=dataset_dir,
+        include_line_images=include_line_images,
+        include_word_crops=include_word_crops,
+        min_assets_per_group=min_assets_per_group,
+    )
+    if patch_groups:
+        groups: List[HierarchyGroup] = list(patch_groups)
+        if include_number_crops:
+            number_root = dataset_dir / "NumberCrops"
+            if number_root.exists() and number_root.is_dir():
+                for img_path in sorted(
+                    p for p in number_root.rglob("*") if p.is_file() and p.suffix.lower() in IMAGE_EXTENSIONS
+                ):
+                    try:
+                        key = str(img_path.relative_to(dataset_dir))
+                    except Exception:
+                        key = str(img_path)
+                    groups.append(HierarchyGroup(key=f"number::{key}", assets=[img_path]))
+        LOGGER.info(
+            "Using patch parquet dataset: groups=%d source=%s",
+            len(groups),
+            str((dataset_dir / "meta" / "patches.parquet").resolve()),
+        )
+        return groups
+
     groups: List[HierarchyGroup] = []
     text_root = dataset_dir / "TextHierarchy"
     if text_root.exists() and text_root.is_dir():

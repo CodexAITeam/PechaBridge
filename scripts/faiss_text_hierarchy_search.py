@@ -284,6 +284,16 @@ def _extract_source_key(rel_path: Path) -> str:
     parts = list(rel_path.parts)
     if not parts:
         return rel_path.stem
+    if parts[0] == "patches":
+        doc = ""
+        page = ""
+        for tok in parts:
+            if tok.startswith("doc="):
+                doc = tok.split("=", 1)[1]
+            elif tok.startswith("page="):
+                page = tok.split("=", 1)[1]
+        if doc or page:
+            return f"{doc}__{page}".strip("_")
     if parts[0] == "TextHierarchy" and len(parts) >= 2:
         return str(parts[1])
     if parts[0] == "NumberCrops" and len(parts) >= 3:

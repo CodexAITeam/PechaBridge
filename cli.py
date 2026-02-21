@@ -19,6 +19,7 @@ from tibetan_utils.arg_utils import (
     create_texture_augment_parser,
     create_train_texture_lora_parser,
 )
+from pechabridge.cli.gen_patches import create_parser as create_gen_patches_parser, run as run_gen_patches
 
 LOGGER = logging.getLogger("pechabridge_cli")
 
@@ -76,7 +77,7 @@ def _build_root_parser() -> argparse.ArgumentParser:
     train_hierarchy_parser = subparsers.add_parser(
         "train-text-hierarchy-vit",
         parents=[train_hierarchy_parent],
-        help="Train ViT retrieval encoder on TextHierarchy crops",
+        help="Train ViT retrieval encoder on TextHierarchy or patch-parquet dataset",
         description=train_hierarchy_parent.description,
     )
     train_hierarchy_parser.set_defaults(handler=_run_train_text_hierarchy_vit)
@@ -85,7 +86,7 @@ def _build_root_parser() -> argparse.ArgumentParser:
     eval_hierarchy_parser = subparsers.add_parser(
         "eval-text-hierarchy-vit",
         parents=[eval_hierarchy_parent],
-        help="Evaluate ViT retrieval encoder on TextHierarchy crops",
+        help="Evaluate ViT retrieval encoder on TextHierarchy or patch-parquet dataset",
         description=eval_hierarchy_parent.description,
     )
     eval_hierarchy_parser.set_defaults(handler=_run_eval_text_hierarchy_vit)
@@ -94,7 +95,7 @@ def _build_root_parser() -> argparse.ArgumentParser:
     faiss_hierarchy_parser = subparsers.add_parser(
         "faiss-text-hierarchy-search",
         parents=[faiss_hierarchy_parent],
-        help="FAISS similarity search on TextHierarchy embeddings",
+        help="FAISS similarity search on TextHierarchy/patch-parquet embeddings",
         description=faiss_hierarchy_parent.description,
     )
     faiss_hierarchy_parser.set_defaults(handler=_run_faiss_text_hierarchy_search)
@@ -160,6 +161,15 @@ def _build_root_parser() -> argparse.ArgumentParser:
         help="Comma-separated hierarchy levels (e.g. 2,4,8)",
     )
     hierarchy_parser.set_defaults(handler=_run_export_text_hierarchy)
+
+    gen_patches_parent = create_gen_patches_parser(add_help=False)
+    gen_patches_parser = subparsers.add_parser(
+        "gen-patches",
+        parents=[gen_patches_parent],
+        help="Generate line sub-patch dataset with Option-A neighborhood metadata",
+        description=gen_patches_parent.description,
+    )
+    gen_patches_parser.set_defaults(handler=_run_gen_patches)
 
     return parser
 
@@ -245,6 +255,11 @@ def _run_export_text_hierarchy(args: argparse.Namespace) -> int:
     from scripts.export_text_hierarchy import run
 
     run(args)
+    return 0
+
+
+def _run_gen_patches(args: argparse.Namespace) -> int:
+    run_gen_patches(args)
     return 0
 
 

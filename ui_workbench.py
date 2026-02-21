@@ -33,6 +33,11 @@ from PIL import Image, ImageDraw, ImageFont
 import yaml
 
 try:
+    import pandas as pd
+except Exception:
+    pd = None
+
+try:
     from scipy.signal import find_peaks
 except Exception:
     find_peaks = None
@@ -116,10 +121,15 @@ DEFAULT_LAYOUT_CLASS_NAMES: Dict[int, str] = {
 }
 LABEL_FONT_SIZE = 12
 TEXT_HIERARCHY_SUBSET_CHOICES = [
-    "TextHierarchy (line.png)",
-    "TextHierarchy (word crops)",
-    "NumberCrops (tibetan_number_word)",
-    "NumberCrops (chinese_number_word)",
+    "PatchDataset (all)",
+    "PatchDataset (scale=256)",
+    "PatchDataset (scale=384)",
+    "PatchDataset (scale=512)",
+    "PatchDataset (debug)",
+    "Legacy TextHierarchy (line.png)",
+    "Legacy TextHierarchy (word crops)",
+    "Legacy NumberCrops (tibetan_number_word)",
+    "Legacy NumberCrops (chinese_number_word)",
     "All Images",
 ]
 
@@ -2111,6 +2121,197 @@ def _read_json_file_pretty(path: Path) -> str:
         return "{}"
 
 
+def run_gen_patches_live(
+    config_path: str,
+    model_path: str,
+    input_dir: str,
+    output_dir: str,
+    conf: float,
+    imgsz: int,
+    device: str,
+    no_samples: int,
+    seed: int,
+    target_height: int,
+    widths: str,
+    overlap: float,
+    rmin: float,
+    prominence: float,
+    n_per_line_per_scale: int,
+    p_aligned: float,
+    debug_dump: int,
+):
+    cli_path = ROOT / "cli.py"
+    cfg = (config_path or "").strip()
+    model = Path(model_path).expanduser().resolve()
+    in_dir = Path(input_dir).expanduser().resolve()
+    out_dir = Path(output_dir).expanduser().resolve()
+    expected_meta = (out_dir / "meta" / "patches.parquet").resolve()
+
+    if not cli_path.exists():
+        msg = f"Failed: script not found: {cli_path}"
+        yield msg, str(out_dir), str(expected_meta)
+        return
+    if not model.exists() or not model.is_file():
+        msg = f"Failed: model path not found: {model}"
+        yield msg, str(out_dir), str(expected_meta)
+        return
+    if not in_dir.exists() or not in_dir.is_dir():
+        msg = f"Failed: input_dir does not exist: {in_dir}"
+        yield msg, str(out_dir), str(expected_meta)
+        return
+
+    out_dir.mkdir(parents=True, exist_ok=True)
+
+    cmd = [
+        sys.executable,
+        "-u",
+        str(cli_path),
+        "gen-patches",
+    ]
+    if cfg:
+        cmd.extend(["--config", str(Path(cfg).expanduser().resolve())])
+    cmd.extend(
+        [
+            "--model",
+            str(model),
+            "--input-dir",
+            str(in_dir),
+            "--output-dir",
+            str(out_dir),
+            "--conf",
+            str(float(conf)),
+            "--imgsz",
+            str(int(imgsz)),
+            "--device",
+            str((device or "").strip()),
+            "--no-samples",
+            str(int(no_samples)),
+            "--seed",
+            str(int(seed)),
+            "--target-height",
+            str(int(target_height)),
+            "--widths",
+            str((widths or "").strip()),
+            "--overlap",
+            str(float(overlap)),
+            "--rmin",
+            str(float(rmin)),
+            "--prominence",
+            str(float(prominence)),
+            "--n-per-line-per-scale",
+            str(int(n_per_line_per_scale)),
+            "--p-aligned",
+            str(float(p_aligned)),
+            "--debug-dump",
+            str(int(debug_dump)),
+        ]
+    )
+
+    try:
+        env = os.environ.copy()
+        env["PYTHONUNBUFFERED"] = "1"
+        proc = subprocess.Popen(
+            cmd,
+            cwd=str(ROOT),
+            env=env,
+            stdout=subprocess.PIPE,
+            stderr=subprocess.STDOUT,
+            text=False,
+            bufsize=0,
+        )
+    except Exception as exc:
+        msg = f"Failed\nOutput dir: {out_dir}\n\n{type(exc).__name__}: {exc}"
+        yield msg, str(out_dir), str(expected_meta)
+        return
+
+    if proc.stdout is not None:
+        try:
+            os.set_blocking(proc.stdout.fileno(), False)
+        except Exception:
+            pass
+
+    log_lines: List[str] = []
+    partial = ""
+    last_emit_ts = 0.0
+    stream_failed = False
+    stream_fail_msg = ""
+
+    yield (
+        "Generating patch dataset ...\n"
+        f"Model: {model}\n"
+        f"Input dir: {in_dir}\n"
+        f"Output dir: {out_dir}\n"
+        f"Expected metadata: {expected_meta}\n"
+        f"Command: {shlex.join(cmd)}\n",
+        str(out_dir),
+        str(expected_meta),
+    )
+
+    while True:
+        got_output = False
+        if (not stream_failed) and proc.stdout is not None:
+            try:
+                chunk = proc.stdout.read()
+            except BlockingIOError:
+                chunk = b""
+            except Exception as exc:
+                stream_failed = True
+                stream_fail_msg = f"stdout stream disabled ({type(exc).__name__}: {exc})"
+                chunk = b""
+
+            if chunk:
+                got_output = True
+                chunk_text = chunk.decode("utf-8", errors="replace") if isinstance(chunk, bytes) else str(chunk)
+                partial += chunk_text.replace("\r", "\n")
+                parts = partial.splitlines(keepends=True)
+                keep = ""
+                for piece in parts:
+                    if piece.endswith("\n"):
+                        log_lines.append(piece.rstrip("\n"))
+                    else:
+                        keep = piece
+                partial = keep
+
+        now = time.time()
+        if now - last_emit_ts >= 1.0:
+            tail = _tail_lines_newest_first(log_lines, 800)
+            if stream_failed and stream_fail_msg:
+                tail = f"{tail}\n[warning] {stream_fail_msg}" if tail else f"[warning] {stream_fail_msg}"
+            running_msg = (
+                "Generating patch dataset ...\n"
+                f"Model: {model}\n"
+                f"Input dir: {in_dir}\n"
+                f"Output dir: {out_dir}\n"
+                f"Expected metadata: {expected_meta}\n\n{tail}"
+            )
+            yield running_msg, str(out_dir), str(expected_meta)
+            last_emit_ts = now
+
+        if proc.poll() is not None:
+            break
+        if not got_output:
+            time.sleep(0.15)
+
+    if proc.stdout is not None:
+        try:
+            rest = proc.stdout.read()
+        except Exception:
+            rest = b""
+        if rest:
+            partial += rest.decode("utf-8", errors="replace").replace("\r", "\n") if isinstance(rest, bytes) else str(rest).replace("\r", "\n")
+        if partial:
+            log_lines.extend(partial.splitlines())
+
+    ok = proc.returncode == 0
+    status = "Success" if ok else "Failed"
+    final_msg = (
+        f"{status}\nModel: {model}\nInput dir: {in_dir}\nOutput dir: {out_dir}\n"
+        f"Metadata path: {expected_meta}\n\n"
+        + _tail_lines_newest_first(log_lines, 3000)
+    )
+    yield final_msg, str(out_dir), str(expected_meta)
+
+
 def run_eval_text_hierarchy_vit_live(
     dataset_dir: str,
     backbone_dir: str,
@@ -3023,13 +3224,21 @@ def _list_text_hierarchy_assets(root: Path, subset: str) -> List[Path]:
     subset_name = (subset or "").strip()
     if not root.exists():
         return []
-    if subset_name == "TextHierarchy (line.png)":
+    if subset_name == "PatchDataset (all)":
+        return sorted((root / "patches").rglob("patch_*.png"))
+    if subset_name.startswith("PatchDataset (scale=") and subset_name.endswith(")"):
+        wanted = subset_name[len("PatchDataset (scale=") : -1].strip()
+        if wanted:
+            return sorted((root / "patches").rglob(f"scale={wanted}/patch_*.png"))
+    if subset_name == "PatchDataset (debug)":
+        return sorted((root / "debug").rglob("*.png"))
+    if subset_name == "Legacy TextHierarchy (line.png)":
         return sorted((root / "TextHierarchy").rglob("line_*/line.png"))
-    if subset_name == "TextHierarchy (word crops)":
+    if subset_name == "Legacy TextHierarchy (word crops)":
         return sorted((root / "TextHierarchy").rglob("line_*/level_*/word_*.png"))
-    if subset_name == "NumberCrops (tibetan_number_word)":
+    if subset_name == "Legacy NumberCrops (tibetan_number_word)":
         return sorted((root / "NumberCrops" / "tibetan_number_word").rglob("*"))
-    if subset_name == "NumberCrops (chinese_number_word)":
+    if subset_name == "Legacy NumberCrops (chinese_number_word)":
         return sorted((root / "NumberCrops" / "chinese_number_word").rglob("*"))
     return _list_images_recursive(root)
 
@@ -3049,6 +3258,132 @@ def scan_text_hierarchy_assets(root_dir: str, subset: str):
 
     msg = f"Found {len(rels)} asset(s) in {root} for subset '{subset}'."
     return gr.update(choices=rels, value=(rels[0] if rels else None)), msg
+
+
+def _sanitize_patch_id(value: Any) -> str:
+    txt = str(value or "").strip()
+    if not txt:
+        return "unknown"
+    out: List[str] = []
+    for ch in txt:
+        if ch.isalnum() or ch in {"-", "_", "."}:
+            out.append(ch)
+        else:
+            out.append("_")
+    return "".join(out).strip("_") or "unknown"
+
+
+def _resolve_patch_meta_path(root: Path) -> Optional[Path]:
+    meta = root / "meta" / "patches.parquet"
+    if meta.exists() and meta.is_file():
+        return meta
+    return None
+
+
+def _resolve_patch_path_from_meta(root: Path, row: Dict[str, Any]) -> Optional[Path]:
+    raw = str(row.get("patch_path", "") or "").strip()
+    if raw:
+        p = Path(raw).expanduser()
+        if p.is_absolute():
+            resolved_abs = p.resolve()
+            if resolved_abs.exists():
+                return resolved_abs
+        else:
+            resolved_rel = (root / p).resolve()
+            if resolved_rel.exists():
+                return resolved_rel
+    try:
+        patch_id = int(row.get("patch_id", -1))
+        line_id = int(row.get("line_id", -1))
+        scale_w = int(row.get("scale_w", -1))
+        doc = _sanitize_patch_id(row.get("doc_id", ""))
+        page = _sanitize_patch_id(row.get("page_id", ""))
+    except Exception:
+        return None
+    if patch_id < 0 or line_id < 0 or scale_w <= 0:
+        return None
+    return (
+        root
+        / "patches"
+        / f"doc={doc}"
+        / f"page={page}"
+        / f"line={line_id}"
+        / f"scale={scale_w}"
+        / f"patch_{patch_id}.png"
+    ).resolve()
+
+
+@lru_cache(maxsize=6)
+def _load_patch_meta_lookup_cached(meta_path: str, root_dir: str, mtime_ns: int) -> Dict[str, Dict[str, Any]]:
+    _ = mtime_ns
+    if pd is None:
+        return {}
+    root = Path(root_dir).expanduser().resolve()
+    mp = Path(meta_path).expanduser().resolve()
+    if not mp.exists() or not mp.is_file():
+        return {}
+    try:
+        df = pd.read_parquet(mp)
+    except Exception:
+        return {}
+    if df is None or getattr(df, "empty", True):
+        return {}
+
+    keep_cols = [
+        "patch_id",
+        "doc_id",
+        "page_id",
+        "line_id",
+        "scale_w",
+        "k",
+        "x0_norm",
+        "x1_norm",
+        "line_h_px",
+        "line_w_px",
+        "boundary_score",
+        "ink_ratio",
+        "source_img_path",
+        "line_x0",
+        "line_y0",
+        "line_x1",
+        "line_y1",
+        "x0_px",
+        "x1_px",
+        "tag",
+        "patch_path",
+    ]
+    cols = [c for c in keep_cols if c in df.columns]
+    if cols:
+        df = df[cols]
+
+    lookup: Dict[str, Dict[str, Any]] = {}
+    for row in df.to_dict(orient="records"):
+        resolved = _resolve_patch_path_from_meta(root, row)
+        if resolved is None:
+            continue
+        rec: Dict[str, Any] = {}
+        for k, v in row.items():
+            if pd.isna(v):
+                rec[k] = None
+            elif isinstance(v, (np.generic,)):
+                rec[k] = v.item()
+            else:
+                rec[k] = v
+        rec["resolved_patch_path"] = str(resolved)
+        lookup[str(resolved)] = rec
+    return lookup
+
+
+def _lookup_patch_meta_record(root: Path, asset_path: Path) -> Optional[Dict[str, Any]]:
+    meta_path = _resolve_patch_meta_path(root)
+    if meta_path is None:
+        return None
+    try:
+        mtime_ns = int(meta_path.stat().st_mtime_ns)
+    except Exception:
+        mtime_ns = 0
+    lookup = _load_patch_meta_lookup_cached(str(meta_path), str(root), int(mtime_ns))
+    return lookup.get(str(asset_path.resolve()))
 
 
 def _extract_first_int_suffix(name: str, prefix: str) -> Optional[int]:
@@ -3129,43 +3464,60 @@ def preview_text_hierarchy_asset(root_dir: str, asset_rel_path: str):
         info_lines.append(f"word_index: {word_idx}")
         payload["word_index"] = int(word_idx)
 
-    meta_path = _find_text_hierarchy_meta_path(root, asset_path)
-    if meta_path is not None:
-        try:
-            meta_data = json.loads(meta_path.read_text(encoding="utf-8"))
-            try:
-                payload["meta_path"] = str(meta_path.relative_to(root))
-            except Exception:
-                payload["meta_path"] = str(meta_path)
-            payload["meta"] = meta_data
-            lines = meta_data.get("lines") if isinstance(meta_data, dict) else None
-            if isinstance(lines, list) and line_idx is not None:
-                line_record = next(
-                    (x for x in lines if int(x.get("line_index", -1)) == int(line_idx) and isinstance(x, dict)),
-                    None,
-                )
-                if line_record is not None:
-                    payload["line_record"] = line_record
-                    info_lines.append("line_record: found")
-                    if level_target is not None:
-                        levels = ((line_record.get("hierarchy") or {}).get("levels") or [])
-                        level_record = next(
-                            (
-                                lv
-                                for lv in levels
-                                if isinstance(lv, dict)
-                                and int(lv.get("target_count", lv.get("count", -1))) == int(level_target)
-                            ),
-                            None,
-                        )
-                        if level_record is not None:
-                            payload["level_record"] = level_record
-                            info_lines.append("level_record: found")
-        except Exception as exc:
-            info_lines.append(f"meta parse failed: {type(exc).__name__}")
-            payload["meta_error"] = f"{type(exc).__name__}: {exc}"
+    patch_record = _lookup_patch_meta_record(root=root, asset_path=asset_path)
+    if patch_record is not None:
+        payload["patch_meta"] = patch_record
+        info_lines.extend(
+            [
+                f"doc_id: {patch_record.get('doc_id', '')}",
+                f"page_id: {patch_record.get('page_id', '')}",
+                f"line_id: {patch_record.get('line_id', '')}",
+                f"scale_w: {patch_record.get('scale_w', '')}",
+                f"k: {patch_record.get('k', '')}",
+                f"tag: {patch_record.get('tag', '')}",
+                f"ink_ratio: {patch_record.get('ink_ratio', '')}",
+                f"boundary_score: {patch_record.get('boundary_score', '')}",
+            ]
+        )
+        payload["meta_source"] = "meta/patches.parquet"
     else:
-        info_lines.append("meta.json: not found (ok for NumberCrops)")
+        meta_path = _find_text_hierarchy_meta_path(root, asset_path)
+        if meta_path is not None:
+            try:
+                meta_data = json.loads(meta_path.read_text(encoding="utf-8"))
+                try:
+                    payload["meta_path"] = str(meta_path.relative_to(root))
+                except Exception:
+                    payload["meta_path"] = str(meta_path)
+                payload["meta"] = meta_data
+                lines = meta_data.get("lines") if isinstance(meta_data, dict) else None
+                if isinstance(lines, list) and line_idx is not None:
+                    line_record = next(
+                        (x for x in lines if int(x.get("line_index", -1)) == int(line_idx) and isinstance(x, dict)),
+                        None,
+                    )
+                    if line_record is not None:
+                        payload["line_record"] = line_record
+                        info_lines.append("line_record: found")
+                        if level_target is not None:
+                            levels = ((line_record.get("hierarchy") or {}).get("levels") or [])
+                            level_record = next(
+                                (
+                                    lv
+                                    for lv in levels
+                                    if isinstance(lv, dict)
+                                    and int(lv.get("target_count", lv.get("count", -1))) == int(level_target)
+                                ),
+                                None,
+                            )
+                            if level_record is not None:
+                                payload["level_record"] = level_record
+                                info_lines.append("level_record: found")
+            except Exception as exc:
+                info_lines.append(f"meta parse failed: {type(exc).__name__}")
+                payload["meta_error"] = f"{type(exc).__name__}: {exc}"
+        else:
+            info_lines.append("metadata: not found (ok for loose image folders)")
 
     return image_np, "\n".join(info_lines), json.dumps(payload, ensure_ascii=False, indent=2)
 
@@ -7387,10 +7739,13 @@ def build_ui() -> gr.Blocks:
     default_texture_output_dir = str((workspace_root / "datasets" / "tibetan-yolo-ui-textured").resolve())
     default_texture_real_pages_dir = str((workspace_root / "sbb_images").resolve())
     default_sbb_grid_dir = str((workspace_root / "sbb_images").resolve())
-    text_hierarchy_candidate = (workspace_root / "datasets" / "text_hierarchy").resolve()
+    text_hierarchy_candidate = (workspace_root / "datasets" / "text_patches").resolve()
     if not text_hierarchy_candidate.exists():
+        legacy_candidate = (workspace_root / "datasets" / "text_hierarchy").resolve()
         typo_candidate = (workspace_root / "datasets" / "text_hiarchy").resolve()
-        if typo_candidate.exists():
+        if legacy_candidate.exists():
+            text_hierarchy_candidate = legacy_candidate
+        elif typo_candidate.exists():
             text_hierarchy_candidate = typo_candidate
     default_text_hierarchy_dir = str(text_hierarchy_candidate)
     default_texture_lora_dataset_dir = str((workspace_root / "datasets" / "texture-lora-dataset").resolve())
@@ -7401,7 +7756,7 @@ def build_ui() -> gr.Blocks:
     default_text_hierarchy_projection_head = str((workspace_root / "models" / "text_hierarchy_vit" / "text_hierarchy_projection_head.pt").resolve())
     default_text_hierarchy_eval_dir = str((workspace_root / "models" / "text_hierarchy_vit" / "eval").resolve())
     default_text_hierarchy_faiss_dir = str((workspace_root / "models" / "text_hierarchy_vit" / "faiss_search").resolve())
-    default_text_hierarchy_faiss_index = str((workspace_root / "models" / "text_hierarchy_vit" / "faiss_search" / "text_hierarchy.faiss").resolve())
+    default_text_hierarchy_faiss_index = str((workspace_root / "models" / "text_hierarchy_vit" / "faiss_search" / "text_patches.faiss").resolve())
     default_prompt = (
         "Extract page layout blocks and OCR text. "
         "Return strict JSON with key 'detections' containing a list of objects with: "
@@ -7429,7 +7784,7 @@ def build_ui() -> gr.Blocks:
             gr.Markdown(
                 "Use the tabs left-to-right. A practical flow is: Synthetic Data -> Diffusion + LoRA (texture) -> "
                 "Donut OCR Workflow -> Retrieval Encoders -> Batch VLM Layout (SBB) -> Dataset Preview -> Ultralytics Training -> Model Inference -> "
-                "Tibetan Line Split (CV) -> Text Hierarchy Preview -> Hierarchy Encode Preview -> VLM Layout (single image) -> Label Studio Export."
+                "Tibetan Line Split (CV) -> Patch Dataset (gen-patches) -> Hierarchy Encode Preview -> VLM Layout (single image) -> Label Studio Export."
             )
             gr.Markdown("### Tabs")
             gr.Markdown(
@@ -7440,7 +7795,7 @@ def build_ui() -> gr.Blocks:
                 "5. Ultralytics Training: Train YOLO models.\n"
                 "6. Model Inference: Run inference with trained models.\n"
                 "6b. Tibetan Line Split (CV): Detect `tibetan_text` boxes, split into lines, and optionally detect red text boxes per line.\n"
-                "6c. Text Hierarchy Preview: Browse exported `TextHierarchy` and `NumberCrops` assets.\n"
+                "6c. Patch Dataset (gen-patches): Generate and browse `patches/` + `meta/patches.parquet`.\n"
                 "6d. Hierarchy Encode Preview: Detect lines, build 2/4/8 hierarchy, click a block, and output latent vector.\n"
                 "7. VLM Layout: Run transformer-based layout parsing on a single image.\n"
                 "8. Label Studio Export: Convert YOLO split folders to Label Studio tasks and launch Label Studio.\n"
@@ -7990,14 +8345,49 @@ def build_ui() -> gr.Blocks:
                 outputs=[line_model],
             )
 
-        # 6c) Preview exported text hierarchy dataset
-        with gr.Tab("6c. Text Hierarchy Preview"):
+        # 6c) Generate + preview patch dataset
+        with gr.Tab("6c. Patch Dataset (gen-patches)"):
             gr.Markdown(
-                "Browse assets produced by `cli.py export-text-hierarchy`: "
-                "`TextHierarchy` lines/word crops and `NumberCrops` snippets."
+                "Generate and inspect the new patch dataset from `cli.py gen-patches` "
+                "(layout model -> line split -> multi-scale patches + parquet metadata)."
             )
+            with gr.Accordion("Generate Patch Dataset", open=False):
+                with gr.Row():
+                    with gr.Column(scale=1):
+                        th_gen_config = gr.Textbox(label="config (optional)", value=str((ROOT / "configs" / "patch_gen.yaml").resolve()))
+                        th_gen_model = gr.Textbox(
+                            label="model_path",
+                            value=str((ROOT / "runs" / "detect" / "train" / "weights" / "best.pt").resolve()),
+                        )
+                        th_gen_input_dir = gr.Textbox(label="input_dir", value=str((workspace_root / "sbb_images").resolve()))
+                        th_gen_output_dir = gr.Textbox(label="output_dir", value=default_text_hierarchy_dir)
+                    with gr.Column(scale=1):
+                        with gr.Row():
+                            th_gen_conf = gr.Slider(0.01, 0.99, value=0.25, step=0.01, label="conf")
+                            th_gen_imgsz = gr.Number(label="imgsz", value=1024, precision=0)
+                        with gr.Row():
+                            th_gen_device = gr.Textbox(label="device", value="")
+                            th_gen_samples = gr.Number(label="no_samples (0=all)", value=0, precision=0)
+                        with gr.Row():
+                            th_gen_seed = gr.Number(label="seed", value=42, precision=0)
+                            th_gen_target_h = gr.Number(label="target_height", value=112, precision=0)
+                        with gr.Row():
+                            th_gen_widths = gr.Textbox(label="widths", value="256,384,512")
+                            th_gen_overlap = gr.Slider(0.0, 0.9, value=0.5, step=0.05, label="overlap")
+                        with gr.Row():
+                            th_gen_rmin = gr.Number(label="rmin", value=0.01, precision=3)
+                            th_gen_prominence = gr.Number(label="prominence", value=0.08, precision=3)
+                        with gr.Row():
+                            th_gen_n = gr.Number(label="n_per_line_per_scale", value=12, precision=0)
+                            th_gen_p_aligned = gr.Slider(0.0, 1.0, value=0.6, step=0.05, label="p_aligned")
+                        with gr.Row():
+                            th_gen_debug = gr.Number(label="debug_dump", value=0, precision=0)
+                            th_gen_btn = gr.Button("Run gen-patches", variant="primary")
+                th_gen_log = gr.Textbox(label="Generation Log", lines=10, interactive=False)
+                th_meta_path = gr.Textbox(label="metadata_path", interactive=False)
+
             with gr.Row():
-                th_root_dir = gr.Textbox(label="text_hierarchy_root_dir", value=default_text_hierarchy_dir)
+                th_root_dir = gr.Textbox(label="patch_dataset_root_dir", value=default_text_hierarchy_dir)
                 th_subset = gr.Dropdown(
                     label="Subset",
                     choices=TEXT_HIERARCHY_SUBSET_CHOICES,
@@ -8017,6 +8407,34 @@ def build_ui() -> gr.Blocks:
                     th_image = gr.Image(type="numpy", label="Asset Preview")
                     th_json = gr.Code(label="Asset Metadata JSON", language="json")
 
+            th_gen_btn.click(
+                fn=run_gen_patches_live,
+                inputs=[
+                    th_gen_config,
+                    th_gen_model,
+                    th_gen_input_dir,
+                    th_gen_output_dir,
+                    th_gen_conf,
+                    th_gen_imgsz,
+                    th_gen_device,
+                    th_gen_samples,
+                    th_gen_seed,
+                    th_gen_target_h,
+                    th_gen_widths,
+                    th_gen_overlap,
+                    th_gen_rmin,
+                    th_gen_prominence,
+                    th_gen_n,
+                    th_gen_p_aligned,
+                    th_gen_debug,
+                ],
+                outputs=[th_gen_log, th_root_dir, th_meta_path],
+            )
+            th_root_dir.change(
+                fn=lambda x: x or "",
+                inputs=[th_root_dir],
+                outputs=[th_gen_output_dir],
+            )
             th_scan_btn.click(
                 fn=scan_text_hierarchy_assets,
                 inputs=[th_root_dir, th_subset],
@@ -9008,7 +9426,7 @@ def build_ui() -> gr.Blocks:
             gr.Markdown(
                 "Train and evaluate retrieval components for Tibetan n-gram search: "
                 "A) image encoder training, "
-                "B) TextHierarchy ViT evaluation, C) FAISS similarity search."
+                "B) Patch-Hierarchy ViT evaluation, C) FAISS similarity search."
             )
 
             gr.Markdown("### Shared Artifact Scan (Backbone / Projection / FAISS)")
@@ -9069,10 +9487,10 @@ def build_ui() -> gr.Blocks:
                     image_enc_head_path = gr.Textbox(label="Projection Head Path", interactive=False)
                     image_enc_cfg_path = gr.Textbox(label="Training Config Path", interactive=False)
 
-            gr.Markdown("### B) Evaluate TextHierarchy ViT (Recall@K / MRR)")
+            gr.Markdown("### B) Evaluate Patch/Hierarchy ViT (Recall@K / MRR)")
             with gr.Row():
                 with gr.Column(scale=1):
-                    eval_th_dataset_dir = gr.Textbox(label="dataset_dir", value=default_text_hierarchy_dir)
+                    eval_th_dataset_dir = gr.Textbox(label="dataset_dir (patch dataset root)", value=default_text_hierarchy_dir)
                     eval_th_output_dir = gr.Textbox(label="output_dir", value=default_text_hierarchy_eval_dir)
                     eval_th_config_path = gr.Textbox(label="config_path (optional)", value="")
                     with gr.Row():
@@ -9157,7 +9575,7 @@ def build_ui() -> gr.Blocks:
                     faiss_output_dir = gr.Textbox(label="output_dir", value=default_text_hierarchy_faiss_dir)
                     faiss_index_path = gr.Textbox(label="index_path", value=default_text_hierarchy_faiss_index)
                     faiss_meta_path = gr.Textbox(label="meta_path (optional)", value=f"{default_text_hierarchy_faiss_index}.meta.json")
-                    faiss_dataset_dir = gr.Textbox(label="dataset_dir (for build mode)", value=default_text_hierarchy_dir)
+                    faiss_dataset_dir = gr.Textbox(label="dataset_dir (patch dataset, build mode)", value=default_text_hierarchy_dir)
                     faiss_save_index_path = gr.Textbox(label="save_index_path (for build mode)", value=default_text_hierarchy_faiss_index)
                     with gr.Row():
                         faiss_metric = gr.Dropdown(choices=["cosine", "l2"], value="cosine", label="metric")

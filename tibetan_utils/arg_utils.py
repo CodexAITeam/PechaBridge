@@ -628,7 +628,7 @@ def add_train_text_encoder_arguments(parser):
 def add_train_text_hierarchy_vit_arguments(parser):
     """Arguments for ViT retrieval training on exported TextHierarchy crops."""
     parser.add_argument('--dataset_dir', '--dataset-dir', dest='dataset_dir', type=str, required=True,
-                       help='Root containing TextHierarchy/ and optional NumberCrops/')
+                       help='Dataset root (legacy TextHierarchy/ or new patches/ + meta/patches.parquet)')
     parser.add_argument('--output_dir', '--output-dir', dest='output_dir', type=str, required=True,
                        help='Directory where trained ViT artifacts are saved')
     parser.add_argument('--model_name_or_path', '--model-name-or-path', dest='model_name_or_path', type=str,
@@ -713,7 +713,7 @@ def create_train_text_encoder_parser(add_help: bool = True):
 def create_train_text_hierarchy_vit_parser(add_help: bool = True):
     """Create parser for ViT training on TextHierarchy crops."""
     parser = argparse.ArgumentParser(
-        description="Train ViT retrieval encoder on exported TextHierarchy dataset",
+        description="Train ViT retrieval encoder on legacy TextHierarchy or new patch-parquet dataset",
         add_help=add_help,
     )
     add_train_text_hierarchy_vit_arguments(parser)
@@ -723,7 +723,7 @@ def create_train_text_hierarchy_vit_parser(add_help: bool = True):
 def add_eval_text_hierarchy_vit_arguments(parser):
     """Arguments for retrieval evaluation of a trained TextHierarchy ViT encoder."""
     parser.add_argument('--dataset_dir', '--dataset-dir', dest='dataset_dir', type=str, required=True,
-                       help='Root containing TextHierarchy/ and optional NumberCrops/')
+                       help='Dataset root (legacy TextHierarchy/ or new patches/ + meta/patches.parquet)')
     parser.add_argument('--backbone_dir', '--backbone-dir', dest='backbone_dir', type=str, required=True,
                        help='Path to trained backbone directory (e.g. text_hierarchy_vit_backbone)')
     parser.add_argument('--projection_head_path', '--projection-head-path', dest='projection_head_path', type=str, default='',
@@ -787,7 +787,7 @@ def add_eval_text_hierarchy_vit_arguments(parser):
 def create_eval_text_hierarchy_vit_parser(add_help: bool = True):
     """Create parser for evaluating a TextHierarchy ViT retrieval encoder."""
     parser = argparse.ArgumentParser(
-        description="Evaluate ViT retrieval encoder on exported TextHierarchy dataset",
+        description="Evaluate ViT retrieval encoder on legacy TextHierarchy or new patch-parquet dataset",
         add_help=add_help,
     )
     add_eval_text_hierarchy_vit_arguments(parser)
@@ -810,7 +810,7 @@ def add_faiss_text_hierarchy_search_arguments(parser):
     parser.add_argument('--meta_path', '--meta-path', dest='meta_path', type=str, default='',
                        help='Optional explicit metadata sidecar path for existing FAISS DB')
     parser.add_argument('--dataset_dir', '--dataset-dir', dest='dataset_dir', type=str, default='',
-                       help='Dataset root to build FAISS DB when --index-path is not given')
+                       help='Dataset root to build FAISS DB (legacy TextHierarchy or new patch-parquet)')
     parser.add_argument('--save_index_path', '--save-index-path', dest='save_index_path', type=str, default='',
                        help='Path where newly built FAISS DB is saved (default: <output_dir>/text_hierarchy.faiss)')
 
@@ -861,7 +861,7 @@ def add_faiss_text_hierarchy_search_arguments(parser):
 def create_faiss_text_hierarchy_search_parser(add_help: bool = True):
     """Create parser for FAISS-based TextHierarchy similarity search."""
     parser = argparse.ArgumentParser(
-        description="FAISS similarity search on TextHierarchy embeddings",
+        description="FAISS similarity search on TextHierarchy/patch-parquet embeddings",
         add_help=add_help,
     )
     add_faiss_text_hierarchy_search_arguments(parser)
