@@ -15,7 +15,9 @@ from tqdm.auto import tqdm
 
 from diffusers import (
     ControlNetModel,
+    StableDiffusionImg2ImgPipeline,
     StableDiffusionControlNetImg2ImgPipeline,
+    StableDiffusionXLImg2ImgPipeline,
     StableDiffusionXLControlNetImg2ImgPipeline,
 )
 
@@ -81,24 +83,38 @@ def _compute_canny_condition(image: Image.Image, canny_low: int, canny_high: int
 
 
 def _load_pipeline(args, base_model_id: str, controlnet_model_id: str, device: torch.device, dtype: torch.dtype):
-    LOGGER.info("Loading ControlNet model: %s", controlnet_model_id)
-    controlnet = ControlNetModel.from_pretrained(controlnet_model_id, torch_dtype=dtype, use_safetensors=True)
-
     LOGGER.info("Loading base model (%s): %s", args.model_family, base_model_id)
-    if args.model_family == "sd21":
-        pipe = StableDiffusionControlNetImg2ImgPipeline.from_pretrained(
-            base_model_id,
-            controlnet=controlnet,
-            torch_dtype=dtype,
-            use_safetensors=True,
-        )
+    if bool(getattr(args, "disable_controlnet", False)):
+        LOGGER.info("ControlNet disabled: using plain img2img pipeline.")
+        if args.model_family == "sd21":
+            pipe = StableDiffusionImg2ImgPipeline.from_pretrained(
+                base_model_id,
+                torch_dtype=dtype,
+                use_safetensors=True,
+            )
+        else:
+            pipe = StableDiffusionXLImg2ImgPipeline.from_pretrained(
+                base_model_id,
+                torch_dtype=dtype,
+                use_safetensors=True,
+            )
     else:
-        pipe = StableDiffusionXLControlNetImg2ImgPipeline.from_pretrained(
-            base_model_id,
-            controlnet=controlnet,
-            torch_dtype=dtype,
-            use_safetensors=True,
-        )
+        LOGGER.info("Loading ControlNet model: %s", controlnet_model_id)
+        controlnet = ControlNetModel.from_pretrained(controlnet_model_id, torch_dtype=dtype, use_safetensors=True)
+        if args.model_family == "sd21":
+            pipe = StableDiffusionControlNetImg2ImgPipeline.from_pretrained(
+                base_model_id,
+                controlnet=controlnet,
+                torch_dtype=dtype,
+                use_safetensors=True,
+            )
+        else:
+            pipe = StableDiffusionXLControlNetImg2ImgPipeline.from_pretrained(
+                base_model_id,
+                controlnet=controlnet,
+                torch_dtype=dtype,
+                use_safetensors=True,
+            )
 
     if args.lora_path:
         lora_path = Path(args.lora_path).expanduser().resolve()
@@ -180,7 +196,9 @@ def run(args) -> dict:
 
         with Image.open(input_path) as image:
             image = image.convert("RGB")
-            control_image = _compute_canny_condition(image=image, canny_low=args.canny_low, canny_high=args.canny_high)
+            control_image = None
+            if not bool(getattr(args, "disable_controlnet", False)):
+                control_image = _compute_canny_condition(image=image, canny_low=args.canny_low, canny_high=args.canny_high)
 
             generator = None
             if args.seed is not None:
@@ -191,13 +209,14 @@ def run(args) -> dict:
             call_kwargs = {
                 "prompt": args.prompt,
                 "image": image,
-                "control_image": control_image,
                 "strength": strength,
                 "num_inference_steps": int(args.steps),
                 "guidance_scale": float(args.guidance_scale),
-                "controlnet_conditioning_scale": float(args.controlnet_scale),
                 "generator": generator,
             }
+            if control_image is not None:
+                call_kwargs["control_image"] = control_image
+                call_kwargs["controlnet_conditioning_scale"] = float(args.controlnet_scale)
             if cross_attention_kwargs:
                 call_kwargs["cross_attention_kwargs"] = cross_attention_kwargs
 
@@ -213,7 +232,8 @@ def run(args) -> dict:
         "output_dir": str(output_dir),
         "model_family": args.model_family,
         "base_model_id": base_model_id,
-        "controlnet_model_id": controlnet_model_id,
+        "controlnet_model_id": "" if bool(getattr(args, "disable_controlnet", False)) else controlnet_model_id,
+        "disable_controlnet": bool(getattr(args, "disable_controlnet", False)),
     }
 
 

@@ -476,6 +476,8 @@ def add_texture_augment_arguments(parser):
                        help='Base random seed; if set, outputs are deterministic')
     parser.add_argument('--controlnet_scale', type=float, default=2.0,
                        help='ControlNet conditioning scale (high to preserve structure)')
+    parser.add_argument('--disable_controlnet', action='store_true',
+                       help='Disable ControlNet completely and run plain img2img inference.')
     parser.add_argument('--lora_path', type=str, default='',
                        help='Optional path to LoRA directory or .safetensors file')
     parser.add_argument('--lora_scale', type=float, default=0.8,
@@ -623,6 +625,71 @@ def add_train_text_encoder_arguments(parser):
     parser.set_defaults(checkpoint_overwrite=True)
 
 
+def add_train_text_hierarchy_vit_arguments(parser):
+    """Arguments for ViT retrieval training on exported TextHierarchy crops."""
+    parser.add_argument('--dataset_dir', '--dataset-dir', dest='dataset_dir', type=str, required=True,
+                       help='Root containing TextHierarchy/ and optional NumberCrops/')
+    parser.add_argument('--output_dir', '--output-dir', dest='output_dir', type=str, required=True,
+                       help='Directory where trained ViT artifacts are saved')
+    parser.add_argument('--model_name_or_path', '--model-name-or-path', dest='model_name_or_path', type=str,
+                       default='google/vit-base-patch16-224-in21k',
+                       help='HF vision backbone ID/path (e.g. DINOv2, ViT, BEiT, Swin)')
+
+    parser.add_argument('--include_line_images', '--include-line-images', dest='include_line_images',
+                       action='store_true', help='Use line.png assets from TextHierarchy')
+    parser.add_argument('--no_include_line_images', '--no-include-line-images', dest='include_line_images',
+                       action='store_false', help='Disable line.png assets')
+    parser.set_defaults(include_line_images=True)
+    parser.add_argument('--include_word_crops', '--include-word-crops', dest='include_word_crops',
+                       action='store_true', help='Use hierarchy word crops (word_*.png)')
+    parser.add_argument('--no_include_word_crops', '--no-include-word-crops', dest='include_word_crops',
+                       action='store_false', help='Disable hierarchy word crops')
+    parser.set_defaults(include_word_crops=True)
+    parser.add_argument('--include_number_crops', '--include-number-crops', dest='include_number_crops',
+                       action='store_true', help='Include NumberCrops as singleton groups')
+    parser.add_argument('--min_assets_per_group', '--min-assets-per-group', dest='min_assets_per_group', type=int, default=1,
+                       help='Minimum assets required per positive group')
+
+    parser.add_argument('--target_height', '--target-height', dest='target_height', type=int, default=64,
+                       help='Fixed normalized input height in pixels')
+    parser.add_argument('--width_buckets', '--width-buckets', dest='width_buckets', type=str, default='256,384,512,768',
+                       help='Comma-separated target width buckets for right-padding')
+    parser.add_argument('--max_width', '--max-width', dest='max_width', type=int, default=1024,
+                       help='Maximum normalized width before clipping')
+    parser.add_argument('--patch_multiple', '--patch-multiple', dest='patch_multiple', type=int, default=16,
+                       help='Snap widths to a multiple of this value')
+
+    parser.add_argument('--batch_size', '--batch-size', dest='batch_size', type=int, default=16,
+                       help='Per-device batch size')
+    parser.add_argument('--lr', type=float, default=1e-4,
+                       help='Learning rate')
+    parser.add_argument('--weight_decay', '--weight-decay', dest='weight_decay', type=float, default=0.01,
+                       help='Weight decay')
+    parser.add_argument('--num_train_epochs', '--num-train-epochs', dest='num_train_epochs', type=int, default=8,
+                       help='Training epochs (used when max_train_steps=0)')
+    parser.add_argument('--max_train_steps', '--max-train-steps', dest='max_train_steps', type=int, default=0,
+                       help='Override total train steps (0 = derive from epochs)')
+    parser.add_argument('--warmup_steps', '--warmup-steps', dest='warmup_steps', type=int, default=200,
+                       help='Warmup steps for lr scheduler')
+    parser.add_argument('--projection_dim', '--projection-dim', dest='projection_dim', type=int, default=256,
+                       help='Projection head output dimension')
+    parser.add_argument('--temperature', type=float, default=0.1,
+                       help='NT-Xent temperature')
+    parser.add_argument('--mixed_precision', '--mixed-precision', dest='mixed_precision', type=str, default='fp16',
+                       choices=['no', 'fp16', 'bf16'],
+                       help='Accelerate mixed precision mode')
+    parser.add_argument('--gradient_checkpointing', '--gradient-checkpointing', dest='gradient_checkpointing',
+                       action='store_true', help='Enable backbone gradient checkpointing when supported')
+    parser.add_argument('--freeze_backbone', '--freeze-backbone', dest='freeze_backbone',
+                       action='store_true', help='Freeze backbone and train projection head only')
+    parser.add_argument('--num_workers', '--num-workers', dest='num_workers', type=int, default=4,
+                       help='Dataloader workers')
+    parser.add_argument('--seed', type=int, default=42,
+                       help='Random seed')
+    parser.add_argument('--checkpoint_every_steps', '--checkpoint-every-steps', dest='checkpoint_every_steps',
+                       type=int, default=0, help='Save checkpoint every N optimizer steps (0 disables)')
+
+
 def create_train_image_encoder_parser(add_help: bool = True):
     """Create parser for image encoder training."""
     parser = argparse.ArgumentParser(
@@ -640,6 +707,164 @@ def create_train_text_encoder_parser(add_help: bool = True):
         add_help=add_help,
     )
     add_train_text_encoder_arguments(parser)
+    return parser
+
+
+def create_train_text_hierarchy_vit_parser(add_help: bool = True):
+    """Create parser for ViT training on TextHierarchy crops."""
+    parser = argparse.ArgumentParser(
+        description="Train ViT retrieval encoder on exported TextHierarchy dataset",
+        add_help=add_help,
+    )
+    add_train_text_hierarchy_vit_arguments(parser)
+    return parser
+
+
+def add_eval_text_hierarchy_vit_arguments(parser):
+    """Arguments for retrieval evaluation of a trained TextHierarchy ViT encoder."""
+    parser.add_argument('--dataset_dir', '--dataset-dir', dest='dataset_dir', type=str, required=True,
+                       help='Root containing TextHierarchy/ and optional NumberCrops/')
+    parser.add_argument('--backbone_dir', '--backbone-dir', dest='backbone_dir', type=str, required=True,
+                       help='Path to trained backbone directory (e.g. text_hierarchy_vit_backbone)')
+    parser.add_argument('--projection_head_path', '--projection-head-path', dest='projection_head_path', type=str, default='',
+                       help='Optional projection head checkpoint (.pt)')
+    parser.add_argument('--output_dir', '--output-dir', dest='output_dir', type=str, required=True,
+                       help='Directory where eval report/CSV are written')
+    parser.add_argument('--config_path', '--config-path', dest='config_path', type=str, default='',
+                       help='Optional explicit training_config.json path')
+
+    parser.add_argument('--include_line_images', '--include-line-images', dest='include_line_images',
+                       action='store_true', help='Use line.png assets from TextHierarchy')
+    parser.add_argument('--no_include_line_images', '--no-include-line-images', dest='include_line_images',
+                       action='store_false', help='Disable line.png assets')
+    parser.set_defaults(include_line_images=True)
+    parser.add_argument('--include_word_crops', '--include-word-crops', dest='include_word_crops',
+                       action='store_true', help='Use hierarchy word crops (word_*.png)')
+    parser.add_argument('--no_include_word_crops', '--no-include-word-crops', dest='include_word_crops',
+                       action='store_false', help='Disable hierarchy word crops')
+    parser.set_defaults(include_word_crops=True)
+    parser.add_argument('--include_number_crops', '--include-number-crops', dest='include_number_crops',
+                       action='store_true', help='Include NumberCrops in retrieval gallery')
+    parser.add_argument('--min_assets_per_group', '--min-assets-per-group', dest='min_assets_per_group', type=int, default=1,
+                       help='Minimum assets required to include a group in gallery')
+    parser.add_argument('--min_positives_per_query', '--min-positives-per-query', dest='min_positives_per_query', type=int, default=1,
+                       help='Required positives per query (1 => group size at least 2)')
+
+    parser.add_argument('--target_height', '--target-height', dest='target_height', type=int, default=0,
+                       help='Override normalized input height (0 = from training config/default)')
+    parser.add_argument('--max_width', '--max-width', dest='max_width', type=int, default=0,
+                       help='Override maximum normalized width (0 = from training config/default)')
+    parser.add_argument('--patch_multiple', '--patch-multiple', dest='patch_multiple', type=int, default=0,
+                       help='Override width snap multiple (0 = from training config/default)')
+    parser.add_argument('--width_buckets', '--width-buckets', dest='width_buckets', type=str, default='',
+                       help='Override comma-separated width buckets (empty = from training config/default)')
+
+    parser.add_argument('--batch_size', '--batch-size', dest='batch_size', type=int, default=32,
+                       help='Per-device eval batch size')
+    parser.add_argument('--num_workers', '--num-workers', dest='num_workers', type=int, default=4,
+                       help='DataLoader workers')
+    parser.add_argument('--device', type=str, default='auto',
+                       help='Embedding device (auto/cpu/cuda:0/mps)')
+    parser.add_argument('--l2_normalize_embeddings', '--l2-normalize-embeddings', dest='l2_normalize_embeddings',
+                       action='store_true', help='L2-normalize embeddings before retrieval (default on)')
+    parser.add_argument('--no_l2_normalize_embeddings', '--no-l2-normalize-embeddings', dest='l2_normalize_embeddings',
+                       action='store_false', help='Disable embedding L2 normalization')
+    parser.set_defaults(l2_normalize_embeddings=True)
+    parser.add_argument('--recall_ks', '--recall-ks', dest='recall_ks', type=str, default='1,5,10',
+                       help='Comma-separated Recall@K values (e.g. 1,5,10)')
+    parser.add_argument('--max_queries', '--max-queries', dest='max_queries', type=int, default=0,
+                       help='Randomly sample at most N evaluable queries (0 = all)')
+    parser.add_argument('--seed', type=int, default=42,
+                       help='Random seed (sampling and reproducibility)')
+
+    parser.add_argument('--write_per_query_csv', '--write-per-query-csv', dest='write_per_query_csv',
+                       action='store_true', help='Write per-query CSV report (default on)')
+    parser.add_argument('--no_write_per_query_csv', '--no-write-per-query-csv', dest='write_per_query_csv',
+                       action='store_false', help='Disable per-query CSV output')
+    parser.set_defaults(write_per_query_csv=True)
+
+
+def create_eval_text_hierarchy_vit_parser(add_help: bool = True):
+    """Create parser for evaluating a TextHierarchy ViT retrieval encoder."""
+    parser = argparse.ArgumentParser(
+        description="Evaluate ViT retrieval encoder on exported TextHierarchy dataset",
+        add_help=add_help,
+    )
+    add_eval_text_hierarchy_vit_arguments(parser)
+    return parser
+
+
+def add_faiss_text_hierarchy_search_arguments(parser):
+    """Arguments for FAISS-based TextHierarchy similarity search."""
+    parser.add_argument('--query_image', '--query-image', dest='query_image', type=str, required=True,
+                       help='Query image/crop path for similarity search')
+    parser.add_argument('--backbone_dir', '--backbone-dir', dest='backbone_dir', type=str, required=True,
+                       help='Path to trained backbone directory used for embedding')
+    parser.add_argument('--projection_head_path', '--projection-head-path', dest='projection_head_path', type=str, default='',
+                       help='Optional projection head checkpoint (.pt)')
+    parser.add_argument('--output_dir', '--output-dir', dest='output_dir', type=str, required=True,
+                       help='Directory where search report is written')
+
+    parser.add_argument('--index_path', '--index-path', dest='index_path', type=str, default='',
+                       help='Existing FAISS index path (.faiss). If set, loads DB instead of rebuilding.')
+    parser.add_argument('--meta_path', '--meta-path', dest='meta_path', type=str, default='',
+                       help='Optional explicit metadata sidecar path for existing FAISS DB')
+    parser.add_argument('--dataset_dir', '--dataset-dir', dest='dataset_dir', type=str, default='',
+                       help='Dataset root to build FAISS DB when --index-path is not given')
+    parser.add_argument('--save_index_path', '--save-index-path', dest='save_index_path', type=str, default='',
+                       help='Path where newly built FAISS DB is saved (default: <output_dir>/text_hierarchy.faiss)')
+
+    parser.add_argument('--metric', type=str, default='cosine', choices=['cosine', 'l2'],
+                       help='FAISS similarity metric')
+    parser.add_argument('--top_k', '--top-k', dest='top_k', type=int, default=10,
+                       help='Number of nearest neighbors to return')
+
+    parser.add_argument('--include_line_images', '--include-line-images', dest='include_line_images',
+                       action='store_true', help='Use line.png assets from TextHierarchy')
+    parser.add_argument('--no_include_line_images', '--no-include-line-images', dest='include_line_images',
+                       action='store_false', help='Disable line.png assets')
+    parser.set_defaults(include_line_images=True)
+    parser.add_argument('--include_word_crops', '--include-word-crops', dest='include_word_crops',
+                       action='store_true', help='Use hierarchy word crops (word_*.png)')
+    parser.add_argument('--no_include_word_crops', '--no-include-word-crops', dest='include_word_crops',
+                       action='store_false', help='Disable hierarchy word crops')
+    parser.set_defaults(include_word_crops=True)
+    parser.add_argument('--include_number_crops', '--include-number-crops', dest='include_number_crops',
+                       action='store_true', help='Include NumberCrops assets in FAISS DB')
+    parser.add_argument('--min_assets_per_group', '--min-assets-per-group', dest='min_assets_per_group', type=int, default=1,
+                       help='Minimum assets required to include a group while building DB')
+
+    parser.add_argument('--config_path', '--config-path', dest='config_path', type=str, default='',
+                       help='Optional training_config.json path for normalization defaults')
+    parser.add_argument('--target_height', '--target-height', dest='target_height', type=int, default=0,
+                       help='Override normalized input height (0 = from config/DB)')
+    parser.add_argument('--max_width', '--max-width', dest='max_width', type=int, default=0,
+                       help='Override maximum normalized width (0 = from config/DB)')
+    parser.add_argument('--patch_multiple', '--patch-multiple', dest='patch_multiple', type=int, default=0,
+                       help='Override width snap multiple (0 = from config/DB)')
+    parser.add_argument('--width_buckets', '--width-buckets', dest='width_buckets', type=str, default='',
+                       help='Override comma-separated width buckets (empty = from config/DB)')
+
+    parser.add_argument('--batch_size', '--batch-size', dest='batch_size', type=int, default=32,
+                       help='Per-device embedding batch size while building DB')
+    parser.add_argument('--num_workers', '--num-workers', dest='num_workers', type=int, default=4,
+                       help='DataLoader workers')
+    parser.add_argument('--device', type=str, default='auto',
+                       help='Embedding device (auto/cpu/cuda:0/mps)')
+    parser.add_argument('--l2_normalize_embeddings', '--l2-normalize-embeddings', dest='l2_normalize_embeddings',
+                       action='store_true', help='L2-normalize embeddings (default on)')
+    parser.add_argument('--no_l2_normalize_embeddings', '--no-l2-normalize-embeddings', dest='l2_normalize_embeddings',
+                       action='store_false', help='Disable embedding L2 normalization')
+    parser.set_defaults(l2_normalize_embeddings=True)
+
+
+def create_faiss_text_hierarchy_search_parser(add_help: bool = True):
+    """Create parser for FAISS-based TextHierarchy similarity search."""
+    parser = argparse.ArgumentParser(
+        description="FAISS similarity search on TextHierarchy embeddings",
+        add_help=add_help,
+    )
+    add_faiss_text_hierarchy_search_arguments(parser)
     return parser
 
 
