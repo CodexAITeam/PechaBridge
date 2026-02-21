@@ -20,6 +20,7 @@ from tibetan_utils.arg_utils import (
     create_train_texture_lora_parser,
 )
 from pechabridge.cli.gen_patches import create_parser as create_gen_patches_parser, run as run_gen_patches
+from pechabridge.cli.mine_mnn_pairs import create_parser as create_mnn_pairs_parser, run as run_mnn_pairs
 
 LOGGER = logging.getLogger("pechabridge_cli")
 
@@ -171,6 +172,15 @@ def _build_root_parser() -> argparse.ArgumentParser:
     )
     gen_patches_parser.set_defaults(handler=_run_gen_patches)
 
+    mnn_parent = create_mnn_pairs_parser(add_help=False)
+    mnn_parser = subparsers.add_parser(
+        "mine-mnn-pairs",
+        parents=[mnn_parent],
+        help="Mine robust cross-page MNN positives from patch dataset",
+        description=mnn_parent.description,
+    )
+    mnn_parser.set_defaults(handler=_run_mine_mnn_pairs)
+
     return parser
 
 
@@ -260,6 +270,11 @@ def _run_export_text_hierarchy(args: argparse.Namespace) -> int:
 
 def _run_gen_patches(args: argparse.Namespace) -> int:
     run_gen_patches(args)
+    return 0
+
+
+def _run_mine_mnn_pairs(args: argparse.Namespace) -> int:
+    run_mnn_pairs(args)
     return 0
 
 
