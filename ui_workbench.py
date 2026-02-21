@@ -121,11 +121,11 @@ DEFAULT_LAYOUT_CLASS_NAMES: Dict[int, str] = {
 }
 LABEL_FONT_SIZE = 12
 TEXT_HIERARCHY_SUBSET_CHOICES = [
+    "PatchDataset (debug)",
     "PatchDataset (all)",
     "PatchDataset (scale=256)",
     "PatchDataset (scale=384)",
     "PatchDataset (scale=512)",
-    "PatchDataset (debug)",
     "Legacy TextHierarchy (line.png)",
     "Legacy TextHierarchy (word crops)",
     "Legacy NumberCrops (tibetan_number_word)",
@@ -3224,6 +3224,12 @@ def _list_text_hierarchy_assets(root: Path, subset: str) -> List[Path]:
     subset_name = (subset or "").strip()
     if not root.exists():
         return []
+    def _sorted_by_mtime_desc(paths: List[Path]) -> List[Path]:
+        return sorted(
+            paths,
+            key=lambda p: float(p.stat().st_mtime) if p.exists() else 0.0,
+            reverse=True,
+        )
     if subset_name == "PatchDataset (all)":
         return sorted((root / "patches").rglob("patch_*.png"))
     if subset_name.startswith("PatchDataset (scale=") and subset_name.endswith(")"):
@@ -3231,7 +3237,7 @@ def _list_text_hierarchy_assets(root: Path, subset: str) -> List[Path]:
         if wanted:
             return sorted((root / "patches").rglob(f"scale={wanted}/patch_*.png"))
     if subset_name == "PatchDataset (debug)":
-        return sorted((root / "debug").rglob("*.png"))
+        return _sorted_by_mtime_desc(list((root / "debug").rglob("*.png")))
     if subset_name == "Legacy TextHierarchy (line.png)":
         return sorted((root / "TextHierarchy").rglob("line_*/line.png"))
     if subset_name == "Legacy TextHierarchy (word crops)":
@@ -7739,15 +7745,7 @@ def build_ui() -> gr.Blocks:
     default_texture_output_dir = str((workspace_root / "datasets" / "tibetan-yolo-ui-textured").resolve())
     default_texture_real_pages_dir = str((workspace_root / "sbb_images").resolve())
     default_sbb_grid_dir = str((workspace_root / "sbb_images").resolve())
-    text_hierarchy_candidate = (workspace_root / "datasets" / "text_patches").resolve()
-    if not text_hierarchy_candidate.exists():
-        legacy_candidate = (workspace_root / "datasets" / "text_hierarchy").resolve()
-        typo_candidate = (workspace_root / "datasets" / "text_hiarchy").resolve()
-        if legacy_candidate.exists():
-            text_hierarchy_candidate = legacy_candidate
-        elif typo_candidate.exists():
-            text_hierarchy_candidate = typo_candidate
-    default_text_hierarchy_dir = str(text_hierarchy_candidate)
+    default_text_hierarchy_dir = str((workspace_root / "datasets" / "text_patches").resolve())
     default_texture_lora_dataset_dir = str((workspace_root / "datasets" / "texture-lora-dataset").resolve())
     default_texture_lora_output_dir = str((workspace_root / "models" / "texture-lora-sdxl").resolve())
     default_image_encoder_input_dir = str((workspace_root / "sbb_images").resolve())
@@ -7795,7 +7793,7 @@ def build_ui() -> gr.Blocks:
                 "5. Ultralytics Training: Train YOLO models.\n"
                 "6. Model Inference: Run inference with trained models.\n"
                 "6b. Tibetan Line Split (CV): Detect `tibetan_text` boxes, split into lines, and optionally detect red text boxes per line.\n"
-                "6c. Patch Dataset (gen-patches): Generate and browse `patches/` + `meta/patches.parquet`.\n"
+                "6c. Patch Dataset Debug View: Generate and browse `datasets/text_patches` (`patches/`, `meta/patches.parquet`, `debug/`).\n"
                 "6d. Hierarchy Encode Preview: Detect lines, build 2/4/8 hierarchy, click a block, and output latent vector.\n"
                 "7. VLM Layout: Run transformer-based layout parsing on a single image.\n"
                 "8. Label Studio Export: Convert YOLO split folders to Label Studio tasks and launch Label Studio.\n"
@@ -8346,10 +8344,10 @@ def build_ui() -> gr.Blocks:
             )
 
         # 6c) Generate + preview patch dataset
-        with gr.Tab("6c. Patch Dataset (gen-patches)"):
+        with gr.Tab("6c. Patch Dataset Debug View"):
             gr.Markdown(
                 "Generate and inspect the new patch dataset from `cli.py gen-patches` "
-                "(layout model -> line split -> multi-scale patches + parquet metadata)."
+                "(`datasets/text_patches`: line patches + `meta/patches.parquet` + `debug/` overlays)."
             )
             with gr.Accordion("Generate Patch Dataset", open=False):
                 with gr.Row():
@@ -8391,7 +8389,7 @@ def build_ui() -> gr.Blocks:
                 th_subset = gr.Dropdown(
                     label="Subset",
                     choices=TEXT_HIERARCHY_SUBSET_CHOICES,
-                    value=TEXT_HIERARCHY_SUBSET_CHOICES[0],
+                    value="PatchDataset (debug)",
                 )
                 th_scan_btn = gr.Button("Scan Assets")
             with gr.Row():
