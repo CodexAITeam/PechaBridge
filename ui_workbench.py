@@ -5195,6 +5195,315 @@ def run_tibetan_text_line_split_for_embedding_ui(
     )
 
 
+def _persist_faiss_ui_query_crop(query_crop_rgb: np.ndarray) -> str:
+    if query_crop_rgb is None:
+        return ""
+    arr = np.asarray(query_crop_rgb)
+    if arr.size == 0:
+        return ""
+    if arr.ndim == 2:
+        arr = np.stack([arr, arr, arr], axis=-1)
+    arr = arr.astype(np.uint8, copy=False)
+    out_dir = (Path(tempfile.gettempdir()) / "pechabridge_ui" / "faiss_query_crops").resolve()
+    try:
+        out_dir.mkdir(parents=True, exist_ok=True)
+        stamp = f"{int(time.time() * 1000)}_{int(time.time_ns() % 1000000)}"
+        out_path = out_dir / f"query_{stamp}.png"
+        Image.fromarray(arr).save(out_path)
+        return str(out_path)
+    except Exception:
+        return ""
+
+
+def _render_faiss_query_selection_overlay(
+    line_crop_rgb: np.ndarray,
+    selection_x: Optional[List[int]],
+    anchor_x: Optional[int],
+) -> np.ndarray:
+    if line_crop_rgb is None or np.asarray(line_crop_rgb).size == 0:
+        return _line_profile_placeholder("Click a line in the overlay first.")
+
+    base = np.asarray(line_crop_rgb).astype(np.uint8, copy=False)
+    panel = Image.fromarray(base).convert("RGB")
+    draw = ImageDraw.Draw(panel)
+    font = _load_overlay_font()
+    w, h = panel.width, panel.height
+
+    tag = "Click twice in this line to define query range (x-start, x-end)."
+    draw.rectangle((2, 2, min(w - 2, 14 + 8 * len(tag)), 18), fill=(0, 0, 0))
+    draw.text((6, 5), tag, fill=(245, 180, 72), font=font)
+
+    if isinstance(selection_x, (list, tuple)) and len(selection_x) >= 2:
+        sx1 = max(0, min(w - 1, int(selection_x[0])))
+        sx2 = max(sx1 + 1, min(w, int(selection_x[1])))
+        draw.rectangle((sx1, 0, sx2 - 1, h - 1), outline=(80, 200, 255), width=3)
+        label = f"query [{sx1},{sx2})"
+        draw.rectangle((sx1 + 2, 20, min(w - 2, sx1 + 12 + 8 * len(label)), 34), fill=(0, 0, 0))
+        draw.text((sx1 + 4, 22), label, fill=(80, 200, 255), font=font)
+
+    if anchor_x is not None:
+        ax = max(0, min(w - 1, int(anchor_x)))
+        draw.line((ax, 0, ax, h - 1), fill=(255, 90, 90), width=2)
+        draw.rectangle((max(0, ax - 3), 0, min(w - 1, ax + 3), min(h - 1, 7)), fill=(255, 90, 90))
+
+    return np.asarray(panel)
+
+
+def _extract_click_x_for_line(evt: gr.SelectData, line_width: int) -> Optional[int]:
+    idx = getattr(evt, "index", None)
+    if not isinstance(idx, (tuple, list)) or len(idx) < 2:
+        return None
+    try:
+        a = int(idx[0])
+        b = int(idx[1])
+    except Exception:
+        return None
+    if line_width <= 0:
+        return None
+    if 0 <= a < line_width:
+        return int(a)
+    if 0 <= b < line_width:
+        return int(b)
+    return int(max(0, min(line_width - 1, a)))
+
+
+def run_tibetan_text_line_split_for_faiss_ui(
+    image: np.ndarray,
+    model_path: str,
+    conf: float,
+    imgsz: int,
+    device: str,
+    min_line_height: int,
+    projection_smooth: int,
+    projection_threshold_rel: float,
+    merge_gap_px: int,
+):
+    out = run_tibetan_text_line_split_classical(
+        image=image,
+        model_path=model_path,
+        conf=conf,
+        imgsz=imgsz,
+        device=device,
+        min_line_height=min_line_height,
+        projection_smooth=projection_smooth,
+        projection_threshold_rel=projection_threshold_rel,
+        merge_gap_px=merge_gap_px,
+        draw_parent_boxes=True,
+        detect_red_text=False,
+        red_min_redness=26,
+        red_min_saturation=35,
+        red_column_fill_rel=0.07,
+        red_merge_gap_px=14,
+        red_min_width_px=18,
+        draw_red_boxes=False,
+    )
+    (
+        overlay,
+        status,
+        out_json,
+        line_profile,
+        selected_line_view,
+        _unused_hierarchy_view,
+        selected_line_profile,
+        click_status,
+        click_state,
+    ) = out
+    query_crop = _line_profile_placeholder("Select a line first, then choose a query range.")
+    query_status = "Click a line box in the overlay, then click twice inside the selected line."
+    query_state: Dict[str, Any] = {}
+    return (
+        overlay,
+        status,
+        out_json,
+        line_profile,
+        selected_line_view,
+        selected_line_profile,
+        click_status,
+        click_state,
+        query_crop,
+        "",
+        query_status,
+        query_state,
+    )
+
+
+def prepare_clicked_line_for_faiss_query_ui(
+    click_state: Dict[str, Any],
+    evt: gr.SelectData,
+):
+    line_view_placeholder = _line_profile_placeholder("Click a line box in the overlay first.")
+    line_profile_placeholder = _line_profile_placeholder("Selected line horizontal profile appears here.")
+    query_crop_placeholder = _line_profile_placeholder("Selected FAISS query crop appears here.")
+
+    bundle = _compute_clicked_line_hierarchy_bundle(click_state=click_state, evt=evt)
+    if not bool(bundle.get("ok")):
+        reason = str(bundle.get("reason", "Line selection failed."))
+        return (
+            line_view_placeholder,
+            line_profile_placeholder,
+            reason,
+            query_crop_placeholder,
+            "",
+            reason,
+            {},
+        )
+
+    line_crop = np.asarray(bundle.get("line_crop"))
+    if line_crop.size == 0:
+        reason = "Selected line crop is empty."
+        return (
+            line_view_placeholder,
+            line_profile_placeholder,
+            reason,
+            query_crop_placeholder,
+            "",
+            reason,
+            {},
+        )
+
+    h, w = line_crop.shape[:2]
+    if h < 2 or w < 2:
+        reason = "Selected line crop is too small."
+        return (
+            line_view_placeholder,
+            line_profile_placeholder,
+            reason,
+            query_crop_placeholder,
+            "",
+            reason,
+            {},
+        )
+
+    selection_x = [0, int(w)]
+    query_crop = line_crop[:, int(selection_x[0]) : int(selection_x[1])]
+    query_path = _persist_faiss_ui_query_crop(query_crop)
+    overlay = _render_faiss_query_selection_overlay(line_crop_rgb=line_crop, selection_x=selection_x, anchor_x=None)
+    line_profile = (
+        np.asarray(bundle.get("profile"))
+        if isinstance(bundle.get("profile"), np.ndarray)
+        else line_profile_placeholder
+    )
+    line_status = (
+        f"Selected line {int(bundle.get('line_id', -1))} "
+        f"box={bundle.get('line_box') or [0, 0, 0, 0]} size={w}x{h}"
+    )
+    query_status = (
+        f"Using full line as query ({w}px width). "
+        "Click twice in Selected Line View to refine."
+    )
+    query_state = {
+        "line_crop": line_crop.astype(np.uint8, copy=False),
+        "line_id": int(bundle.get("line_id", -1)),
+        "line_box": [int(v) for v in (bundle.get("line_box") or [0, 0, 0, 0])],
+        "selection_x": [int(selection_x[0]), int(selection_x[1])],
+        "anchor_x": None,
+        "query_path": str(query_path),
+    }
+    return (
+        overlay,
+        line_profile,
+        line_status,
+        query_crop.astype(np.uint8, copy=False),
+        str(query_path),
+        query_status,
+        query_state,
+    )
+
+
+def select_faiss_query_range_in_line_ui(
+    query_state: Dict[str, Any],
+    evt: gr.SelectData,
+):
+    query_crop_placeholder = _line_profile_placeholder("Select a line first.")
+    line_view_placeholder = _line_profile_placeholder("Click a line box in the overlay first.")
+
+    if not isinstance(query_state, dict) or query_state.get("line_crop") is None:
+        return line_view_placeholder, query_crop_placeholder, "", "No selected line available.", {}
+
+    line_crop = np.asarray(query_state.get("line_crop"))
+    if line_crop.size == 0:
+        return line_view_placeholder, query_crop_placeholder, "", "No selected line available.", {}
+
+    h, w = line_crop.shape[:2]
+    selection_x_raw = query_state.get("selection_x") or [0, int(w)]
+    sx1 = max(0, min(w - 1, _to_int(selection_x_raw[0], 0)))
+    sx2 = max(sx1 + 1, min(w, _to_int(selection_x_raw[1], w)))
+    current_crop = line_crop[:, sx1:sx2]
+    current_path = str(query_state.get("query_path", "") or "")
+    if not current_path:
+        current_path = _persist_faiss_ui_query_crop(current_crop)
+        query_state["query_path"] = str(current_path)
+
+    click_x = _extract_click_x_for_line(evt=evt, line_width=w)
+    if click_x is None:
+        overlay = _render_faiss_query_selection_overlay(
+            line_crop_rgb=line_crop,
+            selection_x=[sx1, sx2],
+            anchor_x=query_state.get("anchor_x"),
+        )
+        return overlay, current_crop, current_path, "Click position not available.", query_state
+
+    anchor = query_state.get("anchor_x")
+    if anchor is None:
+        query_state["anchor_x"] = int(click_x)
+        overlay = _render_faiss_query_selection_overlay(
+            line_crop_rgb=line_crop,
+            selection_x=[sx1, sx2],
+            anchor_x=int(click_x),
+        )
+        status = f"Start point set at x={int(click_x)}. Click end point now."
+        return overlay, current_crop, current_path, status, query_state
+
+    ax = max(0, min(w - 1, _to_int(anchor, 0)))
+    nx1 = int(min(ax, int(click_x)))
+    nx2 = int(max(ax, int(click_x)) + 1)
+    if nx2 - nx1 < 2:
+        nx2 = min(w, nx1 + 2)
+    if nx2 <= nx1:
+        nx1, nx2 = 0, int(w)
+
+    query_state["selection_x"] = [int(nx1), int(nx2)]
+    query_state["anchor_x"] = None
+    query_crop = line_crop[:, int(nx1) : int(nx2)]
+    query_path = _persist_faiss_ui_query_crop(query_crop)
+    query_state["query_path"] = str(query_path)
+    overlay = _render_faiss_query_selection_overlay(
+        line_crop_rgb=line_crop,
+        selection_x=[int(nx1), int(nx2)],
+        anchor_x=None,
+    )
+    status = f"Query range selected: x=[{int(nx1)},{int(nx2)}) width={int(nx2 - nx1)} px."
+    return overlay, query_crop.astype(np.uint8, copy=False), str(query_path), status, query_state
+
+
+def reset_faiss_query_to_full_line_ui(query_state: Dict[str, Any]):
+    query_crop_placeholder = _line_profile_placeholder("Select a line first.")
+    line_view_placeholder = _line_profile_placeholder("Click a line box in the overlay first.")
+    if not isinstance(query_state, dict) or query_state.get("line_crop") is None:
+        return line_view_placeholder, query_crop_placeholder, "", "No selected line available.", {}
+
+    line_crop = np.asarray(query_state.get("line_crop"))
+    if line_crop.size == 0:
+        return line_view_placeholder, query_crop_placeholder, "", "No selected line available.", {}
+
+    h, w = line_crop.shape[:2]
+    if h < 2 or w < 2:
+        return line_view_placeholder, query_crop_placeholder, "", "Selected line is too small.", query_state
+
+    query_state["selection_x"] = [0, int(w)]
+    query_state["anchor_x"] = None
+    query_crop = line_crop[:, : int(w)]
+    query_path = _persist_faiss_ui_query_crop(query_crop)
+    query_state["query_path"] = str(query_path)
+    overlay = _render_faiss_query_selection_overlay(
+        line_crop_rgb=line_crop,
+        selection_x=[0, int(w)],
+        anchor_x=None,
+    )
+    status = f"Reset query range to full line width ({int(w)} px)."
+    return overlay, query_crop.astype(np.uint8, copy=False), str(query_path), status, query_state
+
+
 def prepare_clicked_line_for_embedding_ui(
     click_state: Dict[str, Any],
     hierarchy_level: str,
@@ -7088,8 +7397,6 @@ def build_ui() -> gr.Blocks:
     default_texture_lora_output_dir = str((workspace_root / "models" / "texture-lora-sdxl").resolve())
     default_image_encoder_input_dir = str((workspace_root / "sbb_images").resolve())
     default_image_encoder_output_dir = str((workspace_root / "models" / "image-encoder").resolve())
-    default_text_encoder_input_dir = str((workspace_root / "data" / "corpora").resolve())
-    default_text_encoder_output_dir = str((workspace_root / "models" / "text-encoder").resolve())
     default_text_hierarchy_backbone_dir = str((workspace_root / "models" / "text_hierarchy_vit" / "text_hierarchy_vit_backbone").resolve())
     default_text_hierarchy_projection_head = str((workspace_root / "models" / "text_hierarchy_vit" / "text_hierarchy_projection_head.pt").resolve())
     default_text_hierarchy_eval_dir = str((workspace_root / "models" / "text_hierarchy_vit" / "eval").resolve())
@@ -8700,8 +9007,8 @@ def build_ui() -> gr.Blocks:
         with gr.Tab("13. Retrieval Encoders"):
             gr.Markdown(
                 "Train and evaluate retrieval components for Tibetan n-gram search: "
-                "A) image encoder training, B) text encoder training, "
-                "C) TextHierarchy ViT evaluation, D) FAISS similarity search."
+                "A) image encoder training, "
+                "B) TextHierarchy ViT evaluation, C) FAISS similarity search."
             )
 
             gr.Markdown("### Shared Artifact Scan (Backbone / Projection / FAISS)")
@@ -8762,56 +9069,7 @@ def build_ui() -> gr.Blocks:
                     image_enc_head_path = gr.Textbox(label="Projection Head Path", interactive=False)
                     image_enc_cfg_path = gr.Textbox(label="Training Config Path", interactive=False)
 
-            gr.Markdown("### B) Train Text Encoder (SimCSE-style)")
-            with gr.Row():
-                with gr.Column(scale=1):
-                    text_enc_input_dir = gr.Textbox(label="input_dir (text files)", value=default_text_encoder_input_dir)
-                    text_enc_output_dir = gr.Textbox(label="output_dir", value=default_text_encoder_output_dir)
-                    text_enc_model = gr.Textbox(label="model_name_or_path", value="google/byt5-small")
-                    with gr.Row():
-                        text_enc_normalization = gr.Dropdown(
-                            choices=["NFC", "NFKC", "NFD", "NFKD", "none"],
-                            value="NFC",
-                            label="normalization",
-                        )
-                        text_enc_max_length = gr.Number(label="max_length", value=256, precision=0)
-                    with gr.Row():
-                        text_enc_min_chars = gr.Number(label="min_chars", value=2, precision=0)
-                        text_enc_max_chars = gr.Number(label="max_chars", value=512, precision=0)
-                    with gr.Row():
-                        text_enc_batch_size = gr.Number(label="batch_size", value=16, precision=0)
-                        text_enc_lr = gr.Number(label="lr", value=5e-5, precision=6)
-                    with gr.Row():
-                        text_enc_weight_decay = gr.Number(label="weight_decay", value=0.01, precision=4)
-                        text_enc_epochs = gr.Number(label="num_train_epochs", value=5, precision=0)
-                    with gr.Row():
-                        text_enc_max_steps = gr.Number(label="max_train_steps (0=use epochs)", value=0, precision=0)
-                        text_enc_warmup = gr.Number(label="warmup_steps", value=200, precision=0)
-                    with gr.Row():
-                        text_enc_proj_dim = gr.Number(label="projection_dim", value=256, precision=0)
-                        text_enc_temperature = gr.Slider(0.01, 1.0, value=0.05, step=0.01, label="temperature")
-                    with gr.Row():
-                        text_enc_mixed_precision = gr.Dropdown(
-                            choices=["no", "fp16", "bf16"],
-                            value="fp16",
-                            label="mixed_precision",
-                        )
-                        text_enc_workers = gr.Number(label="num_workers", value=4, precision=0)
-                    with gr.Row():
-                        text_enc_seed = gr.Number(label="seed", value=42, precision=0)
-                        text_enc_checkpoint_every = gr.Number(label="checkpoint_every_steps (0=off)", value=0, precision=0)
-                    with gr.Row():
-                        text_enc_gc = gr.Checkbox(label="gradient_checkpointing", value=False)
-                        text_enc_freeze = gr.Checkbox(label="freeze_backbone", value=False)
-                    text_enc_run_btn = gr.Button("Train Text Encoder", variant="primary")
-                with gr.Column(scale=1):
-                    text_enc_log = gr.Textbox(label="Text Encoder Log", lines=16, interactive=False)
-                    text_enc_backbone_path = gr.Textbox(label="Backbone Path", interactive=False)
-                    text_enc_tokenizer_path = gr.Textbox(label="Tokenizer Path", interactive=False)
-                    text_enc_head_path = gr.Textbox(label="Projection Head Path", interactive=False)
-                    text_enc_cfg_path = gr.Textbox(label="Training Config Path", interactive=False)
-
-            gr.Markdown("### C) Evaluate TextHierarchy ViT (Recall@K / MRR)")
+            gr.Markdown("### B) Evaluate TextHierarchy ViT (Recall@K / MRR)")
             with gr.Row():
                 with gr.Column(scale=1):
                     eval_th_dataset_dir = gr.Textbox(label="dataset_dir", value=default_text_hierarchy_dir)
@@ -8849,16 +9107,53 @@ def build_ui() -> gr.Blocks:
                     eval_th_csv_path = gr.Textbox(label="Per-Query CSV Path", interactive=False)
                     eval_th_report_json = gr.Code(label="Eval Report JSON", language="json")
 
-            gr.Markdown("### D) FAISS Similarity Search")
+            gr.Markdown("### C) FAISS Similarity Search")
+            faiss_line_click_state = gr.State({})
+            faiss_query_state = gr.State({})
             with gr.Row():
                 with gr.Column(scale=1):
+                    with gr.Accordion("Interactive Query Builder (Image -> Text/Line Detection -> Query Range)", open=True):
+                        faiss_query_image_in = gr.Image(
+                            type="numpy",
+                            label="query source image",
+                            sources=["upload", "clipboard"],
+                        )
+                        with gr.Row():
+                            faiss_line_models_dir = gr.Textbox(label="line_models_dir", value=str((workspace_root / "models").resolve()))
+                            faiss_line_scan_btn = gr.Button("Scan Line Models")
+                        faiss_line_model_select = gr.Dropdown(
+                            label="Detected Ultralytics Line Model",
+                            choices=[],
+                            allow_custom_value=True,
+                        )
+                        faiss_line_model_scan_status = gr.Textbox(label="Line Model Scan Status", interactive=False)
+                        faiss_line_model = gr.Textbox(
+                            label="line_model_path",
+                            value=str((ROOT / "runs" / "detect" / "train" / "weights" / "best.pt").resolve()),
+                        )
+                        with gr.Row():
+                            faiss_line_conf = gr.Slider(0.01, 0.99, value=0.25, step=0.01, label="conf")
+                            faiss_line_imgsz = gr.Number(label="imgsz", value=1024, precision=0)
+                        with gr.Row():
+                            faiss_line_device = gr.Textbox(label="line_detection_device", value="")
+                            faiss_line_min_height = gr.Number(label="min_line_height_px", value=10, precision=0)
+                        with gr.Row():
+                            faiss_line_proj_smooth = gr.Number(label="projection_smooth_rows", value=9, precision=0)
+                            faiss_line_proj_thresh = gr.Slider(0.05, 0.80, value=0.20, step=0.01, label="projection_threshold_rel")
+                        faiss_line_merge_gap = gr.Number(label="merge_gap_px", value=5, precision=0)
+                        with gr.Row():
+                            faiss_detect_btn = gr.Button("Detect Text + Split Lines")
+                            faiss_query_reset_btn = gr.Button("Reset Query to Full Line")
+
+                    with gr.Accordion("Query Image Path (optional fallback)", open=False):
+                        faiss_query_file = gr.File(label="query_image file", type="filepath")
+                        faiss_query_path = gr.Textbox(label="query_image path", value="")
+
                     faiss_mode = gr.Radio(
                         choices=["Use Existing FAISS Index", "Build FAISS Index From Dataset"],
                         value="Use Existing FAISS Index",
                         label="Index Mode",
                     )
-                    faiss_query_file = gr.File(label="query_image file (optional)", type="filepath")
-                    faiss_query_path = gr.Textbox(label="query_image path", value="")
                     faiss_output_dir = gr.Textbox(label="output_dir", value=default_text_hierarchy_faiss_dir)
                     faiss_index_path = gr.Textbox(label="index_path", value=default_text_hierarchy_faiss_index)
                     faiss_meta_path = gr.Textbox(label="meta_path (optional)", value=f"{default_text_hierarchy_faiss_index}.meta.json")
@@ -8888,7 +9183,16 @@ def build_ui() -> gr.Blocks:
                         faiss_workers = gr.Number(label="num_workers", value=4, precision=0)
                     faiss_run_btn = gr.Button("Run FAISS Search", variant="primary")
                 with gr.Column(scale=1):
-                    faiss_log = gr.Textbox(label="FAISS Search Log", lines=14, interactive=False)
+                    faiss_overlay = gr.Image(type="numpy", label="Overlay (Detected tibetan_text + Line Boxes)", interactive=True)
+                    faiss_line_profile = gr.Image(type="numpy", label="Line Projection Profile")
+                    faiss_selected_line_view = gr.Image(type="numpy", label="Selected Line View (click twice for query range)", interactive=True)
+                    faiss_selected_line_profile = gr.Image(type="numpy", label="Selected Line Horizontal Profile")
+                    faiss_query_crop = gr.Image(type="numpy", label="Selected Query Crop")
+                    faiss_detect_status = gr.Textbox(label="Detection Status", interactive=False)
+                    faiss_line_select_status = gr.Textbox(label="Line Selection Status", interactive=False)
+                    faiss_query_select_status = gr.Textbox(label="Query Selection Status", interactive=False)
+                    faiss_detect_json = gr.Code(label="Line Detection JSON", language="json")
+                    faiss_log = gr.Textbox(label="FAISS Search Log", lines=12, interactive=False)
                     faiss_report_path = gr.Textbox(label="Search Report Path", interactive=False)
                     faiss_index_out = gr.Textbox(label="Resolved Index Path", interactive=False)
                     faiss_meta_out = gr.Textbox(label="Resolved Metadata Path", interactive=False)
@@ -8921,40 +9225,6 @@ def build_ui() -> gr.Blocks:
                     image_enc_backbone_path,
                     image_enc_head_path,
                     image_enc_cfg_path,
-                ],
-            )
-
-            text_enc_run_btn.click(
-                fn=run_train_text_encoder_live,
-                inputs=[
-                    text_enc_input_dir,
-                    text_enc_output_dir,
-                    text_enc_model,
-                    text_enc_normalization,
-                    text_enc_min_chars,
-                    text_enc_max_chars,
-                    text_enc_max_length,
-                    text_enc_batch_size,
-                    text_enc_lr,
-                    text_enc_weight_decay,
-                    text_enc_epochs,
-                    text_enc_max_steps,
-                    text_enc_warmup,
-                    text_enc_proj_dim,
-                    text_enc_temperature,
-                    text_enc_mixed_precision,
-                    text_enc_gc,
-                    text_enc_freeze,
-                    text_enc_workers,
-                    text_enc_seed,
-                    text_enc_checkpoint_every,
-                ],
-                outputs=[
-                    text_enc_log,
-                    text_enc_backbone_path,
-                    text_enc_tokenizer_path,
-                    text_enc_head_path,
-                    text_enc_cfg_path,
                 ],
             )
 
@@ -9017,6 +9287,80 @@ def build_ui() -> gr.Blocks:
                     eval_th_write_csv,
                 ],
                 outputs=[eval_th_log, eval_th_report_path, eval_th_csv_path, eval_th_report_json],
+            )
+
+            faiss_line_scan_btn.click(
+                fn=scan_ultralytics_inference_models,
+                inputs=[faiss_line_models_dir],
+                outputs=[faiss_line_model_select, faiss_line_model_scan_status],
+            )
+            faiss_line_model_select.change(
+                fn=lambda x: x or "",
+                inputs=[faiss_line_model_select],
+                outputs=[faiss_line_model],
+            )
+            faiss_detect_btn.click(
+                fn=run_tibetan_text_line_split_for_faiss_ui,
+                inputs=[
+                    faiss_query_image_in,
+                    faiss_line_model,
+                    faiss_line_conf,
+                    faiss_line_imgsz,
+                    faiss_line_device,
+                    faiss_line_min_height,
+                    faiss_line_proj_smooth,
+                    faiss_line_proj_thresh,
+                    faiss_line_merge_gap,
+                ],
+                outputs=[
+                    faiss_overlay,
+                    faiss_detect_status,
+                    faiss_detect_json,
+                    faiss_line_profile,
+                    faiss_selected_line_view,
+                    faiss_selected_line_profile,
+                    faiss_line_select_status,
+                    faiss_line_click_state,
+                    faiss_query_crop,
+                    faiss_query_path,
+                    faiss_query_select_status,
+                    faiss_query_state,
+                ],
+            )
+            faiss_overlay.select(
+                fn=prepare_clicked_line_for_faiss_query_ui,
+                inputs=[faiss_line_click_state],
+                outputs=[
+                    faiss_selected_line_view,
+                    faiss_selected_line_profile,
+                    faiss_line_select_status,
+                    faiss_query_crop,
+                    faiss_query_path,
+                    faiss_query_select_status,
+                    faiss_query_state,
+                ],
+            )
+            faiss_selected_line_view.select(
+                fn=select_faiss_query_range_in_line_ui,
+                inputs=[faiss_query_state],
+                outputs=[
+                    faiss_selected_line_view,
+                    faiss_query_crop,
+                    faiss_query_path,
+                    faiss_query_select_status,
+                    faiss_query_state,
+                ],
+            )
+            faiss_query_reset_btn.click(
+                fn=reset_faiss_query_to_full_line_ui,
+                inputs=[faiss_query_state],
+                outputs=[
+                    faiss_selected_line_view,
+                    faiss_query_crop,
+                    faiss_query_path,
+                    faiss_query_select_status,
+                    faiss_query_state,
+                ],
             )
 
             faiss_query_file.change(
