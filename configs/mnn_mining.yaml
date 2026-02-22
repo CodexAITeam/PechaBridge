@@ -51,4 +51,6 @@ performance:
   shard_by_doc: true
   max_patches: null
   num_workers: 8
-
+  two_stage_verify: true
+  stage1_overfetch_factor: 8
+  stage1_candidates_per_src: 0  # 0 => max_pairs_per_src * stage1_overfetch_factor

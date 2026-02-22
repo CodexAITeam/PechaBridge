@@ -116,6 +116,9 @@ class PerformanceConfig:
     shard_by_doc: bool = True
     max_patches: Optional[int] = None
     num_workers: int = 8
+    two_stage_verify: bool = True
+    stage1_overfetch_factor: int = 8
+    stage1_candidates_per_src: int = 0
 
 
 @dataclass
@@ -200,6 +203,9 @@ class MNNConfig:
                 shard_by_doc=bool(perf_p.get("shard_by_doc", True)),
                 max_patches=(int(perf_p.get("max_patches")) if perf_p.get("max_patches") is not None else None),
                 num_workers=int(perf_p.get("num_workers", 8)),
+                two_stage_verify=bool(perf_p.get("two_stage_verify", True)),
+                stage1_overfetch_factor=int(perf_p.get("stage1_overfetch_factor", 8)),
+                stage1_candidates_per_src=int(perf_p.get("stage1_candidates_per_src", 0)),
             ),
         )
 
@@ -225,6 +231,15 @@ class PairCandidate:
     stability_ratio: float
     multi_scale_ok: bool
     notes: str
+
+
+@dataclass(frozen=True)
+class MutualCandidate:
+    src: PatchRecord
+    dst: PatchRecord
+    sim: float
+    rank_src_to_dst: int
+    rank_dst_to_src: int
 
 
 class ProjectionHead(nn.Module):
@@ -750,6 +765,119 @@ class MNNMiner:
             return checks >= 1
         return checks > 0
 
+    def _mine_one_source_mutual(
+        self,
+        *,
+        scale_w: int,
+        src: PatchRecord,
+        max_candidates: int,
+    ) -> List[MutualCandidate]:
+        """Stage-1 mining: mutual-NN shortlist only (no expensive verification)."""
+        src_list = self._retrieve_filtered(
+            scale_w=int(scale_w),
+            src_patch_id=int(src.patch_id),
+            topk=int(self.cfg.mining.topK),
+        )
+        if not src_list:
+            return []
+
+        limit = max(1, int(max_candidates))
+        out: List[MutualCandidate] = []
+        used_dst: set[int] = set()
+        for dst_id, sim, rank_sd in src_list:
+            if int(dst_id) in used_dst:
+                continue
+            dst = self._records_by_id.get(int(dst_id))
+            if dst is None:
+                continue
+            dst_list = self._retrieve_filtered(
+                scale_w=int(scale_w),
+                src_patch_id=int(dst.patch_id),
+                topk=int(self.cfg.mining.mutual_topK),
+            )
+            ok_mut, _r_sd, rank_ds = find_mutual_ranks(
+                src_patch_id=int(src.patch_id),
+                dst_patch_id=int(dst.patch_id),
+                src_to_candidates=src_list,
+                dst_to_candidates=dst_list,
+                mutual_topk=int(self.cfg.mining.mutual_topK),
+            )
+            if not ok_mut:
+                continue
+            out.append(
+                MutualCandidate(
+                    src=src,
+                    dst=dst,
+                    sim=float(sim),
+                    rank_src_to_dst=int(rank_sd),
+                    rank_dst_to_src=int(rank_ds),
+                )
+            )
+            used_dst.add(int(dst.patch_id))
+            if len(out) >= limit:
+                break
+        return out[:limit]
+
+    def _verify_mutual_candidate(self, cand: MutualCandidate) -> Optional[PairCandidate]:
+        """Stage-2 verification: stability, multiscale consistency, optional signature."""
+        src = cand.src
+        dst = cand.dst
+
+        notes: List[str] = ["mutual"]
+        st_count = 0
+        st_ratio = 1.0
+        if bool(self.cfg.stability.enabled):
+            st_count, st_ratio = self._stability_for_pair(src, dst)
+            notes.append(f"stability={st_count}/{self.cfg.stability.n_trials}")
+            if st_ratio < float(self.cfg.stability.require_ratio):
+                return None
+
+        multi_ok = self._multiscale_ok(src, dst) if bool(self.cfg.multiscale.enabled) else True
+        notes.append(f"multiscale={int(bool(multi_ok))}")
+        if bool(self.cfg.multiscale.enabled) and bool(self.cfg.multiscale.require_two_scales) and (not multi_ok):
+            return None
+
+        if bool(self.cfg.filtering.signature.enabled):
+            sig_a = self._get_signature(src)
+            sig_b = self._get_signature(dst)
+            c = _corr(sig_a, sig_b)
+            notes.append(f"sigcorr={c:.3f}")
+            if c < float(self.cfg.filtering.signature.corr_min):
+                return None
+
+        return PairCandidate(
+            src=src,
+            dst=dst,
+            sim=float(cand.sim),
+            rank_src_to_dst=int(cand.rank_src_to_dst),
+            rank_dst_to_src=int(cand.rank_dst_to_src),
+            stability_count=int(st_count),
+            stability_ratio=float(st_ratio),
+            multi_scale_ok=bool(multi_ok),
+            notes=";".join(notes),
+        )
+
+    def _verify_one_source_candidates(
+        self,
+        cands: Sequence[MutualCandidate],
+        *,
+        max_pairs: int,
+    ) -> List[PairCandidate]:
+        out: List[PairCandidate] = []
+        for cand in cands:
+            verified = self._verify_mutual_candidate(cand)
+            if verified is not None:
+                out.append(verified)
+        out.sort(
+            key=lambda x: (
+                float(x.stability_ratio),
+                float(x.sim),
+                1 if x.multi_scale_ok else 0,
+            ),
+            reverse=True,
+        )
+        return out[: max(1, int(max_pairs))]
+
     def _mine_one_source(self, *, scale_w: int, src: PatchRecord) -> List[PairCandidate]:
         src_list = self._retrieve_filtered(
             scale_w=int(scale_w),
@@ -840,6 +968,161 @@ class MNNMiner:
             src_records.sort(key=lambda r: r.patch_id)
 
         max_workers = max(1, int(getattr(self.cfg.performance, "num_workers", 1)))
+        heavy_checks_enabled = bool(self.cfg.stability.enabled) or bool(self.cfg.multiscale.enabled) or bool(
+            self.cfg.filtering.signature.enabled
+        )
+        use_two_stage = bool(getattr(self.cfg.performance, "two_stage_verify", True)) and heavy_checks_enabled
+
+        if use_two_stage:
+            max_pairs_per_src = max(1, int(self.cfg.mining.max_pairs_per_src))
+            stage1_fixed = max(0, int(getattr(self.cfg.performance, "stage1_candidates_per_src", 0)))
+            stage1_factor = max(1, int(getattr(self.cfg.performance, "stage1_overfetch_factor", 8)))
+            stage1_limit = stage1_fixed if stage1_fixed > 0 else max_pairs_per_src * stage1_factor
+
+            LOGGER.info(
+                "Mining scale=%d with 2-stage verification: workers=%d sources=%d stage1_limit=%d",
+                int(scale_w),
+                int(max_workers),
+                len(src_records),
+                int(stage1_limit),
+            )
+
+            stage1_by_src: Dict[int, List[MutualCandidate]] = {}
+
+            # Stage 1: fast mutual shortlist.
+            if max_workers <= 1:
+                pbar1 = tqdm(total=len(src_records), desc=f"mine-mnn-stage1-{scale_w}", leave=False)
+                for src in src_records:
+                    stage1_by_src[int(src.patch_id)] = self._mine_one_source_mutual(
+                        scale_w=int(scale_w),
+                        src=src,
+                        max_candidates=int(stage1_limit),
+                    )
+                    pbar1.update(1)
+                pbar1.close()
+            else:
+                workers1 = min(max_workers, max(1, len(src_records)))
+                max_inflight1 = max(int(workers1) * 4, int(workers1))
+                pending1: Dict[Future[List[MutualCandidate]], PatchRecord] = {}
+                src_iter1 = iter(src_records)
+                pbar1 = tqdm(total=len(src_records), desc=f"mine-mnn-stage1-{scale_w}", leave=False)
+                with ThreadPoolExecutor(max_workers=int(workers1), thread_name_prefix=f"mnnS1_{int(scale_w)}") as ex:
+                    while len(pending1) < max_inflight1:
+                        try:
+                            src = next(src_iter1)
+                        except StopIteration:
+                            break
+                        fut = ex.submit(
+                            self._mine_one_source_mutual,
+                            scale_w=int(scale_w),
+                            src=src,
+                            max_candidates=int(stage1_limit),
+                        )
+                        pending1[fut] = src
+
+                    while pending1:
+                        done, _ = wait(set(pending1.keys()), return_when=FIRST_COMPLETED)
+                        for fut in done:
+                            src = pending1.pop(fut)
+                            try:
+                                stage1_by_src[int(src.patch_id)] = fut.result()
+                            except Exception:
+                                LOGGER.exception(
+                                    "Stage1 mutual mining failed for scale=%d src_patch_id=%d",
+                                    int(scale_w),
+                                    int(src.patch_id),
+                                )
+                                pbar1.close()
+                                raise
+                            pbar1.update(1)
+
+                            try:
+                                nxt = next(src_iter1)
+                            except StopIteration:
+                                continue
+                            nf = ex.submit(
+                                self._mine_one_source_mutual,
+                                scale_w=int(scale_w),
+                                src=nxt,
+                                max_candidates=int(stage1_limit),
+                            )
+                            pending1[nf] = nxt
+                pbar1.close()
+
+            stage1_total = int(sum(len(v) for v in stage1_by_src.values()))
+            LOGGER.info(
+                "Scale=%d stage1 shortlist complete: total_mutual_candidates=%d avg_per_src=%.3f",
+                int(scale_w),
+                stage1_total,
+                float(stage1_total / max(1, len(src_records))),
+            )
+
+            # Stage 2: expensive verification on shortlist only.
+            if max_workers <= 1:
+                pbar2 = tqdm(total=len(src_records), desc=f"mine-mnn-stage2-{scale_w}", leave=False)
+                for src in src_records:
+                    raws = stage1_by_src.get(int(src.patch_id), [])
+                    if raws:
+                        out.extend(self._verify_one_source_candidates(raws, max_pairs=int(max_pairs_per_src)))
+                    pbar2.update(1)
+                pbar2.close()
+                return out
+
+            workers2 = min(max_workers, max(1, len(src_records)))
+            max_inflight2 = max(int(workers2) * 4, int(workers2))
+            by_src_id2: Dict[int, List[PairCandidate]] = {}
+            pending2: Dict[Future[List[PairCandidate]], PatchRecord] = {}
+            src_iter2 = iter(src_records)
+            pbar2 = tqdm(total=len(src_records), desc=f"mine-mnn-stage2-{scale_w}", leave=False)
+            with ThreadPoolExecutor(max_workers=int(workers2), thread_name_prefix=f"mnnS2_{int(scale_w)}") as ex:
+                while len(pending2) < max_inflight2:
+                    try:
+                        src = next(src_iter2)
+                    except StopIteration:
+                        break
+                    raws = stage1_by_src.get(int(src.patch_id), [])
+                    if not raws:
+                        by_src_id2[int(src.patch_id)] = []
+                        pbar2.update(1)
+                        continue
+                    pending2[ex.submit(self._verify_one_source_candidates, raws, max_pairs=int(max_pairs_per_src))] = src
+
+                while pending2:
+                    done, _ = wait(set(pending2.keys()), return_when=FIRST_COMPLETED)
+                    for fut in done:
+                        src = pending2.pop(fut)
+                        try:
+                            by_src_id2[int(src.patch_id)] = fut.result()
+                        except Exception:
+                            LOGGER.exception(
+                                "Stage2 verification failed for scale=%d src_patch_id=%d",
+                                int(scale_w),
+                                int(src.patch_id),
+                            )
+                            pbar2.close()
+                            raise
+                        pbar2.update(1)
+
+                        while True:
+                            try:
+                                nxt = next(src_iter2)
+                            except StopIteration:
+                                break
+                            raws_nxt = stage1_by_src.get(int(nxt.patch_id), [])
+                            if not raws_nxt:
+                                by_src_id2[int(nxt.patch_id)] = []
+                                pbar2.update(1)
+                                continue
+                            pending2[
+                                ex.submit(self._verify_one_source_candidates, raws_nxt, max_pairs=int(max_pairs_per_src))
+                            ] = nxt
+                            break
+            pbar2.close()
+
+            for src in src_records:
+                out.extend(by_src_id2.get(int(src.patch_id), []))
+            return out
+
         if max_workers <= 1:
             pbar = tqdm(total=len(src_records), desc=f"mine-mnn-scale-{scale_w}", leave=False)
             for src in src_records:

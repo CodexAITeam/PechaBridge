@@ -15,8 +15,8 @@ This module mines robust cross-page positive patch pairs from real Pecha scans.
 3. Build FAISS inner-product index per scale.
 4. Retrieve filtered neighbors with exclusion rules (same page/line/nearby).
 5. Keep only mutual-nearest-neighbor candidates.
-6. Verify stability with deterministic test-time augmentations.
-7. Optionally verify multi-scale consistency (center-matched patches across scales).
+6. Stage 1 (fast): build a per-source shortlist of mutual candidates (no stability/multiscale/signature checks yet).
+7. Stage 2 (slow): verify only the shortlist with deterministic stability checks and optional multi-scale/signature checks.
 8. Keep top pairs per source patch.
 9. Save `mnn_pairs.parquet` and a JSON summary.
 
@@ -28,6 +28,7 @@ python -m pechabridge.cli.mine_mnn_pairs \
   --meta /path/to/out_dataset/meta/patches.parquet \
   --out /path/to/out_dataset/meta/mnn_pairs.parquet \
   --config /path/to/configs/mnn_mining.yaml \
+  --num-workers 8 \
   --debug_dump 50
 ```
 
@@ -53,3 +54,9 @@ Summary JSON:
 - same path as output parquet with suffix `.summary.json`
 - includes counts, sim/stability stats, and top doc/page match sources
 
+## Performance Notes
+
+- `performance.two_stage_verify: true` (default) is recommended for large scales.
+- For a quick first pass, disable `stability.enabled` and `multiscale.enabled`.
+- Reduce `mining.topK` / `mining.mutual_topK` for faster candidate generation.
+- `--num-workers` controls source-loop mining threads (and also embedding DataLoader / FAISS threads).
