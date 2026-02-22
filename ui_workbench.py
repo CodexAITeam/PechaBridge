@@ -3287,17 +3287,18 @@ def _resolve_patch_meta_path(root: Path) -> Optional[Path]:
 
 
 def _resolve_patch_path_from_meta(root: Path, row: Dict[str, Any]) -> Optional[Path]:
-    raw = str(row.get("patch_path", "") or "").strip()
-    if raw:
-        p = Path(raw).expanduser()
-        if p.is_absolute():
-            resolved_abs = p.resolve()
-            if resolved_abs.exists():
-                return resolved_abs
-        else:
-            resolved_rel = (root / p).resolve()
-            if resolved_rel.exists():
-                return resolved_rel
+    for path_col in ("patch_path", "patch_image_path"):
+        raw = str(row.get(path_col, "") or "").strip()
+        if raw:
+            p = Path(raw).expanduser()
+            if p.is_absolute():
+                resolved_abs = p.resolve()
+                if resolved_abs.exists():
+                    return resolved_abs
+            else:
+                resolved_rel = (root / p).resolve()
+                if resolved_rel.exists():
+                    return resolved_rel
     try:
         patch_id = int(row.get("patch_id", -1))
         line_id = int(row.get("line_id", -1))
@@ -3357,6 +3358,7 @@ def _load_patch_meta_lookup_cached(meta_path: str, root_dir: str, mtime_ns: int)
         "x1_px",
         "tag",
         "patch_path",
+        "patch_image_path",
     ]
     cols = [c for c in keep_cols if c in df.columns]
     if cols:
@@ -3390,6 +3392,436 @@ def _lookup_patch_meta_record(root: Path, asset_path: Path) -> Optional[Dict[str
         mtime_ns = 0
     lookup = _load_patch_meta_lookup_cached(str(meta_path), str(root), int(mtime_ns))
     return lookup.get(str(asset_path.resolve()))
+
+
+def _resolve_mnn_pairs_meta_path(root: Path) -> Optional[Path]:
+    p = (root / "meta" / "mnn_pairs.parquet").resolve()
+    if p.exists() and p.is_file():
+        return p
+    return None
+
+
+@lru_cache(maxsize=4)
+def _load_mnn_patch_match_index_cached(
+    root_dir: str,
+    patch_meta_path: str,
+    patch_meta_mtime_ns: int,
+    mnn_pairs_path: str,
+    mnn_pairs_mtime_ns: int,
+) -> Dict[str, Any]:
+    _ = patch_meta_mtime_ns, mnn_pairs_mtime_ns
+    if pd is None:
+        return {"patches": {}, "neighbors": {}, "rows": [], "error": "pandas not installed"}
+
+    root = Path(root_dir).expanduser().resolve()
+    patch_meta = Path(patch_meta_path).expanduser().resolve()
+    mnn_pairs = Path(mnn_pairs_path).expanduser().resolve()
+    if not patch_meta.exists() or not patch_meta.is_file():
+        return {"patches": {}, "neighbors": {}, "rows": [], "error": f"patches parquet not found: {patch_meta}"}
+    if not mnn_pairs.exists() or not mnn_pairs.is_file():
+        return {"patches": {}, "neighbors": {}, "rows": [], "error": f"mnn pairs parquet not found: {mnn_pairs}"}
+
+    try:
+        patch_df = pd.read_parquet(patch_meta)
+    except Exception as exc:
+        return {"patches": {}, "neighbors": {}, "rows": [], "error": f"Failed to read patches parquet: {type(exc).__name__}: {exc}"}
+    try:
+        pairs_df = pd.read_parquet(mnn_pairs)
+    except Exception as exc:
+        return {"patches": {}, "neighbors": {}, "rows": [], "error": f"Failed to read mnn pairs parquet: {type(exc).__name__}: {exc}"}
+
+    if patch_df is None or getattr(patch_df, "empty", True):
+        return {"patches": {}, "neighbors": {}, "rows": [], "error": "patches parquet is empty"}
+    if pairs_df is None or getattr(pairs_df, "empty", True):
+        return {"patches": {}, "neighbors": {}, "rows": [], "error": "mnn pairs parquet is empty"}
+
+    patch_cols_keep = [
+        "patch_id",
+        "doc_id",
+        "page_id",
+        "line_id",
+        "scale_w",
+        "k",
+        "x0_norm",
+        "x1_norm",
+        "ink_ratio",
+        "boundary_score",
+        "patch_path",
+        "patch_image_path",
+    ]
+    pair_cols_keep = [
+        "src_patch_id",
+        "dst_patch_id",
+        "sim",
+        "stability_ratio",
+        "multi_scale_ok",
+        "rank_src_to_dst",
+        "rank_dst_to_src",
+        "src_doc_id",
+        "src_page_id",
+        "src_line_id",
+        "src_scale_w",
+        "dst_doc_id",
+        "dst_page_id",
+        "dst_line_id",
+        "dst_scale_w",
+    ]
+    patch_cols = [c for c in patch_cols_keep if c in patch_df.columns]
+    if patch_cols:
+        patch_df = patch_df[patch_cols]
+    pair_cols = [c for c in pair_cols_keep if c in pairs_df.columns]
+    if pair_cols:
+        pairs_df = pairs_df[pair_cols]
+
+    patches: Dict[int, Dict[str, Any]] = {}
+    for row in patch_df.to_dict(orient="records"):
+        try:
+            pid = int(row.get("patch_id", -1))
+        except Exception:
+            continue
+        if pid < 0:
+            continue
+        resolved_path = _resolve_patch_path_from_meta(root, row)
+        rec: Dict[str, Any] = {}
+        for k, v in row.items():
+            try:
+                is_na = bool(pd.isna(v))
+            except Exception:
+                is_na = False
+            if is_na:
+                rec[k] = None
+            elif isinstance(v, np.generic):
+                rec[k] = v.item()
+            else:
+                rec[k] = v
+        rec["patch_id"] = int(pid)
+        rec["resolved_patch_path"] = str(resolved_path) if resolved_path is not None else ""
+        # Prefer a record with a resolvable patch image path.
+        prev = patches.get(pid)
+        if prev is None or (not str(prev.get("resolved_patch_path", "")).strip() and rec["resolved_patch_path"]):
+            patches[pid] = rec
+
+    neighbors_map: Dict[int, Dict[int, Dict[str, Any]]] = {}
+
+    def _safe_float(x: Any, default: float = 0.0) -> float:
+        try:
+            y = float(x)
+            return y if math.isfinite(y) else float(default)
+        except Exception:
+            return float(default)
+
+    def _safe_int_or_none(x: Any) -> Optional[int]:
+        try:
+            return int(x)
+        except Exception:
+            return None
+
+    def _coerce_scalar(v: Any) -> Any:
+        if isinstance(v, np.generic):
+            return v.item()
+        try:
+            if pd.isna(v):
+                return None
+        except Exception:
+            pass
+        if isinstance(v, (str, int, float, bool)) or v is None:
+            return v
+        return str(v)
+
+    for row in pairs_df.to_dict(orient="records"):
+        try:
+            src = int(row.get("src_patch_id", -1))
+            dst = int(row.get("dst_patch_id", -1))
+        except Exception:
+            continue
+        if src < 0 or dst < 0 or src == dst:
+            continue
+        sim = _safe_float(row.get("sim", 0.0), 0.0)
+        stability = _safe_float(row.get("stability_ratio", 0.0), 0.0)
+        rank_sd = _safe_int_or_none(row.get("rank_src_to_dst"))
+        rank_ds = _safe_int_or_none(row.get("rank_dst_to_src"))
+        multi_ok = bool(row.get("multi_scale_ok", False))
+
+        shared = {
+            "sim": float(sim),
+            "stability_ratio": float(stability),
+            "multi_scale_ok": bool(multi_ok),
+            "rank_src_to_dst": rank_sd,
+            "rank_dst_to_src": rank_ds,
+        }
+
+        rec_fwd = dict(shared)
+        rec_fwd.update(
+            {
+                "src_patch_id": int(src),
+                "dst_patch_id": int(dst),
+                "direction": "src_to_dst",
+                "src_doc_id": _coerce_scalar(row.get("src_doc_id")),
+                "src_page_id": _coerce_scalar(row.get("src_page_id")),
+                "src_line_id": _safe_int_or_none(row.get("src_line_id")),
+                "src_scale_w": _safe_int_or_none(row.get("src_scale_w")),
+                "dst_doc_id": _coerce_scalar(row.get("dst_doc_id")),
+                "dst_page_id": _coerce_scalar(row.get("dst_page_id")),
+                "dst_line_id": _safe_int_or_none(row.get("dst_line_id")),
+                "dst_scale_w": _safe_int_or_none(row.get("dst_scale_w")),
+            }
+        )
+        rec_rev = dict(shared)
+        rec_rev.update(
+            {
+                "src_patch_id": int(dst),
+                "dst_patch_id": int(src),
+                "direction": "dst_to_src",
+                "src_doc_id": _coerce_scalar(row.get("dst_doc_id")),
+                "src_page_id": _coerce_scalar(row.get("dst_page_id")),
+                "src_line_id": _safe_int_or_none(row.get("dst_line_id")),
+                "src_scale_w": _safe_int_or_none(row.get("dst_scale_w")),
+                "dst_doc_id": _coerce_scalar(row.get("src_doc_id")),
+                "dst_page_id": _coerce_scalar(row.get("src_page_id")),
+                "dst_line_id": _safe_int_or_none(row.get("src_line_id")),
+                "dst_scale_w": _safe_int_or_none(row.get("src_scale_w")),
+                "rank_src_to_dst": rank_ds,
+                "rank_dst_to_src": rank_sd,
+            }
+        )
+
+        for a, b, rec in ((src, dst, rec_fwd), (dst, src, rec_rev)):
+            bucket = neighbors_map.setdefault(int(a), {})
+            prev = bucket.get(int(b))
+            if prev is None:
+                bucket[int(b)] = rec
+                continue
+            prev_score = (_safe_float(prev.get("sim", 0.0)), _safe_float(prev.get("stability_ratio", 0.0)))
+            new_score = (_safe_float(rec.get("sim", 0.0)), _safe_float(rec.get("stability_ratio", 0.0)))
+            if new_score > prev_score:
+                bucket[int(b)] = rec
+
+    neighbors: Dict[int, List[Dict[str, Any]]] = {}
+    rows: List[Dict[str, Any]] = []
+    for src_pid in sorted(neighbors_map.keys()):
+        items = list(neighbors_map[src_pid].values())
+        items_sorted = sorted(
+            items,
+            key=lambda r: (
+                float(_safe_float(r.get("sim", 0.0))),
+                float(_safe_float(r.get("stability_ratio", 0.0))),
+                -int(_safe_int_or_none(r.get("rank_src_to_dst")) or 999999),
+            ),
+            reverse=True,
+        )
+        neighbors[src_pid] = items_sorted
+        patch_rec = patches.get(int(src_pid), {})
+        rows.append(
+            {
+                "patch_id": int(src_pid),
+                "match_count": int(len(items_sorted)),
+                "doc_id": patch_rec.get("doc_id", ""),
+                "page_id": patch_rec.get("page_id", ""),
+                "line_id": patch_rec.get("line_id", None),
+                "scale_w": patch_rec.get("scale_w", None),
+                "k": patch_rec.get("k", None),
+                "ink_ratio": patch_rec.get("ink_ratio", None),
+                "boundary_score": patch_rec.get("boundary_score", None),
+                "patch_path": patch_rec.get("resolved_patch_path", ""),
+            }
+        )
+
+    rows_sorted = sorted(
+        rows,
+        key=lambda r: (
+            int(r.get("match_count", 0)),
+            float(_safe_float(r.get("ink_ratio", 0.0))),
+            int(r.get("patch_id", -1)),
+        ),
+        reverse=True,
+    )
+    return {"patches": patches, "neighbors": neighbors, "rows": rows_sorted, "error": ""}
+
+
+def _load_mnn_patch_match_index(root_dir: str, patch_meta_path: str, mnn_pairs_path: str) -> Dict[str, Any]:
+    root = Path(root_dir).expanduser().resolve()
+    patch_meta = Path(patch_meta_path).expanduser().resolve()
+    mnn_pairs = Path(mnn_pairs_path).expanduser().resolve()
+    pm_mtime = int(patch_meta.stat().st_mtime_ns) if patch_meta.exists() else 0
+    mp_mtime = int(mnn_pairs.stat().st_mtime_ns) if mnn_pairs.exists() else 0
+    return _load_mnn_patch_match_index_cached(str(root), str(patch_meta), pm_mtime, str(mnn_pairs), mp_mtime)
+
+
+def scan_mnn_patch_matches_ui(root_dir: str, patch_meta_path: str, mnn_pairs_path: str, min_match_count: float, max_list_rows: float):
+    root = Path(root_dir or "").expanduser().resolve() if str(root_dir or "").strip() else None
+    if root is None or not root.exists() or not root.is_dir():
+        return (
+            gr.update(choices=[], value=None),
+            [],
+            f"Dataset root not found: {root}",
+            "{}",
+        )
+    if pd is None:
+        return gr.update(choices=[], value=None), [], "pandas is not installed.", "{}"
+
+    patch_meta = Path(patch_meta_path).expanduser().resolve() if str(patch_meta_path or "").strip() else (_resolve_patch_meta_path(root) or Path(""))
+    mnn_pairs = Path(mnn_pairs_path).expanduser().resolve() if str(mnn_pairs_path or "").strip() else (_resolve_mnn_pairs_meta_path(root) or Path(""))
+
+    if not patch_meta.exists():
+        return gr.update(choices=[], value=None), [], f"patches.parquet not found: {patch_meta}", "{}"
+    if not mnn_pairs.exists():
+        return gr.update(choices=[], value=None), [], f"mnn_pairs.parquet not found: {mnn_pairs}", "{}"
+
+    payload = _load_mnn_patch_match_index(str(root), str(patch_meta), str(mnn_pairs))
+    err = str(payload.get("error", "") or "").strip()
+    if err:
+        return gr.update(choices=[], value=None), [], err, "{}"
+
+    rows_all = list(payload.get("rows", []))
+    min_count = max(0, int(min_match_count or 0))
+    rows_filtered = [r for r in rows_all if int(r.get("match_count", 0)) >= min_count]
+    limit = max(1, int(max_list_rows or 200))
+    rows_show = rows_filtered[:limit]
+
+    choices: List[str] = []
+    for r in rows_show:
+        choices.append(
+            f"patch_id={int(r.get('patch_id', -1))} | matches={int(r.get('match_count', 0))} | "
+            f"doc={r.get('doc_id', '')} | page={r.get('page_id', '')} | line={r.get('line_id', '')} | "
+            f"scale={r.get('scale_w', '')} | k={r.get('k', '')}"
+        )
+
+    df_rows = []
+    for r in rows_show:
+        df_rows.append(
+            [
+                int(r.get("patch_id", -1)),
+                int(r.get("match_count", 0)),
+                str(r.get("doc_id", "")),
+                str(r.get("page_id", "")),
+                ("" if r.get("line_id", None) is None else int(r.get("line_id"))),
+                ("" if r.get("scale_w", None) is None else int(r.get("scale_w"))),
+                ("" if r.get("k", None) is None else int(r.get("k"))),
+                ("" if r.get("ink_ratio", None) is None else round(float(r.get("ink_ratio")), 4)),
+                ("" if r.get("boundary_score", None) is None else round(float(r.get("boundary_score")), 4)),
+            ]
+        )
+
+    summary = {
+        "dataset_root": str(root),
+        "patch_meta_path": str(patch_meta),
+        "mnn_pairs_path": str(mnn_pairs),
+        "rows_total_with_matches": int(len(rows_all)),
+        "rows_after_min_match_count": int(len(rows_filtered)),
+        "rows_shown": int(len(rows_show)),
+        "min_match_count": int(min_count),
+    }
+    status = (
+        f"Loaded MNN viewer index: {len(rows_all)} source patches with matches. "
+        f"Showing {len(rows_show)} (min_match_count={min_count}, max_list_rows={limit})."
+    )
+    return gr.update(choices=choices, value=(choices[0] if choices else None)), df_rows, status, json.dumps(summary, ensure_ascii=False, indent=2)
+
+
+def preview_mnn_patch_matches_ui(root_dir: str, patch_meta_path: str, mnn_pairs_path: str, patch_choice: str, max_matches: float):
+    if not root_dir or not patch_choice:
+        return [], "Select dataset root and patch first.", "{}"
+    m = re.search(r"patch_id=(\d+)", str(patch_choice))
+    if m is None:
+        return [], f"Could not parse patch_id from selection: {patch_choice}", "{}"
+    patch_id = int(m.group(1))
+
+    root = Path(root_dir).expanduser().resolve()
+    patch_meta = Path(patch_meta_path).expanduser().resolve() if str(patch_meta_path or "").strip() else (_resolve_patch_meta_path(root) or Path(""))
+    mnn_pairs = Path(mnn_pairs_path).expanduser().resolve() if str(mnn_pairs_path or "").strip() else (_resolve_mnn_pairs_meta_path(root) or Path(""))
+    payload = _load_mnn_patch_match_index(str(root), str(patch_meta), str(mnn_pairs))
+    err = str(payload.get("error", "") or "").strip()
+    if err:
+        return [], err, "{}"
+
+    patches = payload.get("patches", {}) or {}
+    neighbors = payload.get("neighbors", {}) or {}
+    src_rec = patches.get(int(patch_id))
+    if src_rec is None:
+        return [], f"Patch {patch_id} not found in patches.parquet.", "{}"
+
+    src_path = Path(str(src_rec.get("resolved_patch_path", "") or "")).expanduser()
+    if not src_path.exists() or not src_path.is_file():
+        return [], f"Source patch image not found for patch_id={patch_id}.", "{}"
+
+    try:
+        with Image.open(src_path) as im:
+            src_img = np.array(im.convert("RGB"))
+    except Exception as exc:
+        return [], f"Failed to load source patch image: {type(exc).__name__}: {exc}", "{}"
+
+    gallery_items: List[Tuple[np.ndarray, str]] = []
+    gallery_items.append((src_img, f"SRC patch_id={patch_id}"))
+
+    neigh_list = list(neighbors.get(int(patch_id), []))
+    limit = max(0, int(max_matches or 0))
+    if limit > 0:
+        neigh_list = neigh_list[:limit]
+
+    shown_neighbors: List[Dict[str, Any]] = []
+    missing_count = 0
+    for rec in neigh_list:
+        dst_pid = int(rec.get("dst_patch_id", -1))
+        dst_meta = patches.get(dst_pid)
+        if dst_meta is None:
+            missing_count += 1
+            continue
+        dst_path = Path(str(dst_meta.get("resolved_patch_path", "") or "")).expanduser()
+        if not dst_path.exists() or not dst_path.is_file():
+            missing_count += 1
+            continue
+        try:
+            with Image.open(dst_path) as im:
+                dst_img = np.array(im.convert("RGB"))
+        except Exception:
+            missing_count += 1
+            continue
+
+        sim = rec.get("sim", None)
+        stability = rec.get("stability_ratio", None)
+        caption = (
+            f"dst={dst_pid} | sim={float(sim):.3f} | stab={float(stability):.2f}"
+            if sim is not None and stability is not None
+            else f"dst={dst_pid}"
+        )
+        gallery_items.append((dst_img, caption))
+        shown_neighbors.append(
+            {
+                "dst_patch_id": int(dst_pid),
+                "sim": (None if sim is None else float(sim)),
+                "stability_ratio": (None if stability is None else float(stability)),
+                "multi_scale_ok": bool(rec.get("multi_scale_ok", False)),
+                "rank_src_to_dst": rec.get("rank_src_to_dst"),
+                "rank_dst_to_src": rec.get("rank_dst_to_src"),
+                "dst_doc_id": dst_meta.get("doc_id", rec.get("dst_doc_id")),
+                "dst_page_id": dst_meta.get("page_id", rec.get("dst_page_id")),
+                "dst_line_id": dst_meta.get("line_id", rec.get("dst_line_id")),
+                "dst_scale_w": dst_meta.get("scale_w", rec.get("dst_scale_w")),
+                "dst_k": dst_meta.get("k", None),
+                "dst_patch_path": str(dst_path),
+            }
+        )
+
+    status = (
+        f"patch_id={patch_id}: showing {len(shown_neighbors)} MNN matches"
+        f"{f' (requested limit={limit})' if limit > 0 else ''}"
+        f"{f', missing/unreadable={missing_count}' if missing_count > 0 else ''}."
+    )
+    meta_json = {
+        "source_patch": {
+            "patch_id": int(patch_id),
+            "doc_id": src_rec.get("doc_id"),
+            "page_id": src_rec.get("page_id"),
+            "line_id": src_rec.get("line_id"),
+            "scale_w": src_rec.get("scale_w"),
+            "k": src_rec.get("k"),
+            "patch_path": str(src_path),
+        },
+        "match_count_total": int(len(neighbors.get(int(patch_id), []))),
+        "match_count_shown": int(len(shown_neighbors)),
+        "matches": shown_neighbors,
+    }
+    return gallery_items, status, json.dumps(meta_json, ensure_ascii=False, indent=2)
 
 
 def _extract_first_int_suffix(name: str, prefix: str) -> Optional[int]:
@@ -8462,6 +8894,72 @@ def build_ui() -> gr.Blocks:
                 fn=lambda root, subset, cur: preview_adjacent_text_hierarchy_asset(root, subset, cur, 1),
                 inputs=[th_root_dir, th_subset, th_asset_select],
                 outputs=[th_asset_select, th_image, th_info, th_json],
+            )
+
+        # 6c2) Inspect MNN matches for individual patches in a patch dataset
+        with gr.Tab("6c2. MNN Patch Match Viewer"):
+            gr.Markdown(
+                "Browse `meta/mnn_pairs.parquet` for a patch dataset. "
+                "Scan patches with their MNN match counts, select a patch, then preview source + MNN matches side-by-side."
+            )
+            with gr.Row():
+                with gr.Column(scale=1):
+                    mnn_view_root_dir = gr.Textbox(label="patch_dataset_root_dir", value=default_text_hierarchy_dir)
+                    mnn_view_patch_meta = gr.Textbox(
+                        label="patches_parquet (optional)",
+                        value=str((Path(default_text_hierarchy_dir) / "meta" / "patches.parquet").resolve()),
+                    )
+                    mnn_view_pairs_meta = gr.Textbox(
+                        label="mnn_pairs_parquet (optional)",
+                        value=str((Path(default_text_hierarchy_dir) / "meta" / "mnn_pairs.parquet").resolve()),
+                    )
+                    with gr.Row():
+                        mnn_view_min_matches = gr.Number(label="min_match_count", value=1, precision=0)
+                        mnn_view_max_rows = gr.Number(label="max_list_rows", value=200, precision=0)
+                    with gr.Row():
+                        mnn_view_scan_btn = gr.Button("Scan MNN Patches", variant="primary")
+                        mnn_view_preview_btn = gr.Button("Preview Selected Patch")
+                    mnn_view_patch_select = gr.Dropdown(label="Patch (with MNN count)", choices=[], allow_custom_value=False)
+                    mnn_view_status = gr.Textbox(label="Status", interactive=False)
+                with gr.Column(scale=1):
+                    mnn_view_list = gr.Dataframe(
+                        headers=["patch_id", "match_count", "doc_id", "page_id", "line_id", "scale_w", "k", "ink_ratio", "boundary_score"],
+                        label="Patches with MNN match counts",
+                        interactive=False,
+                        wrap=True,
+                    )
+                    with gr.Row():
+                        mnn_view_max_matches = gr.Number(label="max_matches_to_render (0=all)", value=24, precision=0)
+                    mnn_view_gallery = gr.Gallery(
+                        label="Source Patch + MNN Matches (side-by-side)",
+                        columns=4,
+                        height="auto",
+                        object_fit="contain",
+                    )
+                    mnn_view_json = gr.Code(label="Selected Patch + MNN Match Metadata JSON", language="json")
+
+            mnn_view_scan_btn.click(
+                fn=scan_mnn_patch_matches_ui,
+                inputs=[mnn_view_root_dir, mnn_view_patch_meta, mnn_view_pairs_meta, mnn_view_min_matches, mnn_view_max_rows],
+                outputs=[mnn_view_patch_select, mnn_view_list, mnn_view_status, mnn_view_json],
+            )
+            mnn_view_root_dir.change(
+                fn=lambda x: (
+                    str((Path(x or "").expanduser().resolve() / "meta" / "patches.parquet").resolve()) if str(x or "").strip() else "",
+                    str((Path(x or "").expanduser().resolve() / "meta" / "mnn_pairs.parquet").resolve()) if str(x or "").strip() else "",
+                ),
+                inputs=[mnn_view_root_dir],
+                outputs=[mnn_view_patch_meta, mnn_view_pairs_meta],
+            )
+            mnn_view_preview_btn.click(
+                fn=preview_mnn_patch_matches_ui,
+                inputs=[mnn_view_root_dir, mnn_view_patch_meta, mnn_view_pairs_meta, mnn_view_patch_select, mnn_view_max_matches],
+                outputs=[mnn_view_gallery, mnn_view_status, mnn_view_json],
+            )
+            mnn_view_patch_select.change(
+                fn=preview_mnn_patch_matches_ui,
+                inputs=[mnn_view_root_dir, mnn_view_patch_meta, mnn_view_pairs_meta, mnn_view_patch_select, mnn_view_max_matches],
+                outputs=[mnn_view_gallery, mnn_view_status, mnn_view_json],
             )
 
         # 6d) Interactive hierarchy + embedding preview on uploaded image
