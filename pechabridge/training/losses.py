@@ -14,12 +14,15 @@ from pechabridge.training.mnn_pairs import PatchMeta, one_d_iou
 @dataclass(frozen=True)
 class MpNCEConfig:
     tau: float = 0.07
+    w_ocr: float = 0.5
     w_overlap: float = 0.3
     w_multiscale: float = 0.2
     t_iou: float = 0.6
     eps_center: float = 0.06
     min_positives_per_anchor: int = 1
     allow_self_fallback: bool = True
+    use_mnn: bool = True
+    use_ocr: bool = False
     exclude_same_page_in_denominator: bool = False
     lambda_smooth: float = 0.05
 
@@ -55,6 +58,7 @@ def multi_positive_infonce(
     patch_ids: Sequence[int],
     mnn_map: Mapping[int, Sequence[Tuple[int, float]]],
     cfg: MpNCEConfig,
+    ocr_map: Mapping[int, Sequence[Tuple[int, float]]] | None = None,
 ) -> Tuple[torch.Tensor, Dict[str, float]]:
     """
     Compute weighted multi-positive InfoNCE + optional overlap smoothness.
@@ -76,6 +80,7 @@ def multi_positive_infonce(
             "valid_anchors": 0.0,
             "avg_positives": 0.0,
             "mnn_pos": 0.0,
+            "ocr_pos": 0.0,
             "overlap_pos": 0.0,
             "multiscale_pos": 0.0,
             "fallback_pos": 0.0,
@@ -90,6 +95,7 @@ def multi_positive_infonce(
     valid_anchors = 0
     total_pos = 0
     count_mnn = 0
+    count_ocr = 0
     count_overlap = 0
     count_multiscale = 0
     count_fallback = 0
@@ -101,6 +107,7 @@ def multi_positive_infonce(
         pid_to_indices.setdefault(int(pid), []).append(int(i))
 
     neg_inf = torch.tensor(float("-inf"), device=z.device, dtype=logits.dtype)
+    ocr_map = ocr_map or {}
 
     for i in range(M):
         pid_i = int(patch_ids[i])
@@ -108,10 +115,28 @@ def multi_positive_infonce(
         pos_idx: List[int] = []
         pos_w: List[float] = []
         pos_kind: List[str] = []
+        pos_loc: Dict[int, int] = {}
+
+        def _add_pos(j: int, weight: float, kind: str) -> None:
+            jj = int(j)
+            if jj == i:
+                return
+            w = max(1e-8, float(weight))
+            loc = pos_loc.get(jj)
+            if loc is None:
+                pos_loc[jj] = len(pos_idx)
+                pos_idx.append(jj)
+                pos_w.append(w)
+                pos_kind.append(str(kind))
+            else:
+                # Merge duplicate positives from multiple weak sources.
+                pos_w[loc] = float(pos_w[loc] + w)
+                if kind not in str(pos_kind[loc]).split("+"):
+                    pos_kind[loc] = f"{pos_kind[loc]}+{kind}"
 
         # MNN positives.
-        neigh = mnn_map.get(pid_i, [])
-        if neigh:
+        neigh = mnn_map.get(pid_i, []) if bool(cfg.use_mnn) else []
+        if neigh and bool(cfg.use_mnn):
             neigh_map = {int(dst): float(w) for dst, w in neigh}
             for j in range(M):
                 if i == j:
@@ -119,37 +144,42 @@ def multi_positive_infonce(
                 w = neigh_map.get(int(patch_ids[j]))
                 if w is None:
                     continue
-                pos_idx.append(j)
-                pos_w.append(max(1e-8, float(w)))
-                pos_kind.append("mnn")
+                _add_pos(j, float(w), "mnn")
+
+        # OCR weak-label positives (same weak OCR text cluster, weighted by OCR confidence-derived edge weight).
+        if bool(cfg.use_ocr):
+            neigh_ocr = ocr_map.get(pid_i, [])
+            if neigh_ocr:
+                neigh_ocr_map = {int(dst): float(w) for dst, w in neigh_ocr}
+                for j in range(M):
+                    if i == j:
+                        continue
+                    w_raw = neigh_ocr_map.get(int(patch_ids[j]))
+                    if w_raw is None:
+                        continue
+                    _add_pos(j, float(cfg.w_ocr) * float(w_raw), "ocr")
 
         # Overlap and multiscale positives.
         for j in range(M):
             if i == j:
                 continue
-            if j in pos_idx:
+            if j in pos_loc:
                 continue
             meta_j = metas[j]
             if _is_overlap_pos(meta_i, meta_j, cfg.t_iou):
-                pos_idx.append(j)
-                pos_w.append(max(1e-8, float(cfg.w_overlap)))
-                pos_kind.append("overlap")
+                _add_pos(j, float(cfg.w_overlap), "overlap")
                 if i < j:
                     smooth_pairs.append((i, j))
                 continue
             if _is_multiscale_pos(meta_i, meta_j, cfg.eps_center):
-                pos_idx.append(j)
-                pos_w.append(max(1e-8, float(cfg.w_multiscale)))
-                pos_kind.append("multiscale")
+                _add_pos(j, float(cfg.w_multiscale), "multiscale")
 
         # Self fallback only when no other positives.
         if (not pos_idx) and bool(cfg.allow_self_fallback):
             for j in pid_to_indices.get(pid_i, []):
                 if j == i:
                     continue
-                pos_idx.append(int(j))
-                pos_w.append(1.0)
-                pos_kind.append("fallback")
+                _add_pos(int(j), 1.0, "fallback")
 
         if len(pos_idx) < max(1, int(cfg.min_positives_per_anchor)):
             continue
@@ -182,16 +212,18 @@ def multi_positive_infonce(
         losses.append(li)
         valid_anchors += 1
         total_pos += len(pos_idx)
-        count_mnn += sum(1 for k in pos_kind if k == "mnn")
-        count_overlap += sum(1 for k in pos_kind if k == "overlap")
-        count_multiscale += sum(1 for k in pos_kind if k == "multiscale")
-        count_fallback += sum(1 for k in pos_kind if k == "fallback")
+        count_mnn += sum(1 for k in pos_kind if "mnn" in k)
+        count_ocr += sum(1 for k in pos_kind if "ocr" in k)
+        count_overlap += sum(1 for k in pos_kind if "overlap" in k)
+        count_multiscale += sum(1 for k in pos_kind if "multiscale" in k)
+        count_fallback += sum(1 for k in pos_kind if "fallback" in k)
 
     if not losses:
         return z.sum() * 0.0, {
             "valid_anchors": 0.0,
             "avg_positives": 0.0,
             "mnn_pos": 0.0,
+            "ocr_pos": 0.0,
             "overlap_pos": 0.0,
             "multiscale_pos": 0.0,
             "fallback_pos": 0.0,
@@ -213,6 +245,7 @@ def multi_positive_infonce(
         "valid_anchors": float(valid_anchors),
         "avg_positives": float(total_pos / max(1, valid_anchors)),
         "mnn_pos": float(count_mnn),
+        "ocr_pos": float(count_ocr),
         "overlap_pos": float(count_overlap),
         "multiscale_pos": float(count_multiscale),
         "fallback_pos": float(count_fallback),
@@ -222,4 +255,3 @@ def multi_positive_infonce(
 
 
 __all__ = ["MpNCEConfig", "multi_positive_infonce"]
-

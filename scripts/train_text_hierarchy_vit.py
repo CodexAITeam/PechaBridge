@@ -32,6 +32,7 @@ from tibetan_utils.arg_utils import create_train_text_hierarchy_vit_parser
 from pechabridge.training.losses import MpNCEConfig, multi_positive_infonce
 from pechabridge.training.mnn_pairs import PatchMeta, load_mnn_map, load_patch_metadata, patch_id_to_index_map
 from pechabridge.training.samplers.pair_batch_sampler import PairBatchSampler, SamplerConfig
+from pechabridge.training.weak_ocr_pairs import load_ocr_weak_map, merge_positive_maps
 
 try:
     import pandas as pd
@@ -851,6 +852,20 @@ def _run_patch_mpnce_training(
     pairs_path = Path(pairs_path_raw).expanduser().resolve() if pairs_path_raw else (dataset_dir / "meta" / "mnn_pairs.parquet").resolve()
     if not pairs_path.exists() or not pairs_path.is_file():
         pairs_path = None
+    weak_ocr_path_raw = str(getattr(args, "weak_ocr_parquet", "") or "").strip()
+    weak_ocr_path = (
+        Path(weak_ocr_path_raw).expanduser().resolve()
+        if weak_ocr_path_raw
+        else (dataset_dir / "meta" / "weak_ocr.parquet").resolve()
+    )
+    if not weak_ocr_path.exists() or not weak_ocr_path.is_file():
+        # Fallback naming variants users may have used.
+        alt_candidates = [
+            (dataset_dir / "meta" / "weak_ocr_labels.parquet").resolve(),
+            (dataset_dir / "meta" / "ocr_weak_labels.parquet").resolve(),
+        ]
+        found_alt = next((p for p in alt_candidates if p.exists() and p.is_file()), None)
+        weak_ocr_path = found_alt if found_alt is not None else None
 
     records = load_patch_metadata(
         dataset_dir=dataset_dir,
@@ -861,27 +876,59 @@ def _run_patch_mpnce_training(
     if not records:
         raise RuntimeError(f"No patch records found after filtering in {meta_path}")
     pid_to_index = patch_id_to_index_map(records)
-    mnn_map = load_mnn_map(
-        pairs_parquet=pairs_path,
+    positive_sources = str(getattr(args, "positive_sources", "mnn") or "mnn").strip().lower()
+    if positive_sources not in {"mnn", "ocr", "both"}:
+        positive_sources = "mnn"
+    use_mnn = positive_sources in {"mnn", "both"}
+    use_ocr = positive_sources in {"ocr", "both"}
+
+    mnn_map_all = load_mnn_map(
+        pairs_parquet=pairs_path if use_mnn else None,
         pair_min_sim=float(getattr(args, "pair_min_sim", 0.25)),
         pair_min_stability_ratio=float(getattr(args, "pair_min_stability_ratio", 0.5)),
         require_multi_scale_ok=bool(getattr(args, "pair_require_multi_scale_ok", False)),
         weight_scale=float(getattr(args, "w_mnn_scale", 1.0)),
         max_neighbors_per_anchor=int(getattr(args, "max_neighbors_per_anchor", 0)),
-    )
+    ) if use_mnn else {}
+    ocr_map_all = load_ocr_weak_map(
+        weak_ocr_parquet=weak_ocr_path if use_ocr else None,
+        pair_min_confidence=float(getattr(args, "ocr_min_confidence", 0.2)),
+        min_chars=int(getattr(args, "ocr_min_chars", 2)),
+        max_group_size=int(getattr(args, "ocr_max_group_size", 128)),
+        max_neighbors_per_anchor=int(getattr(args, "ocr_max_neighbors_per_anchor", 0)),
+        weight_scale=float(getattr(args, "w_ocr_scale", 1.0)),
+        require_no_error=bool(getattr(args, "ocr_require_no_error", True)),
+        patch_id_allowlist=set(pid_to_index.keys()),
+    ) if use_ocr else {}
 
-    anchors_with_pairs = sum(1 for rec in records if int(rec.patch_id) in mnn_map and len(mnn_map[int(rec.patch_id)]) > 0)
+    mnn_map = mnn_map_all if use_mnn else {}
+    ocr_map = ocr_map_all if use_ocr else {}
+    sampler_positive_map = merge_positive_maps(mnn_map, ocr_map)
+
+    anchors_with_mnn = sum(1 for rec in records if int(rec.patch_id) in mnn_map and len(mnn_map[int(rec.patch_id)]) > 0)
+    anchors_with_ocr = sum(1 for rec in records if int(rec.patch_id) in ocr_map and len(ocr_map[int(rec.patch_id)]) > 0)
+    anchors_with_pairs = sum(
+        1 for rec in records if int(rec.patch_id) in sampler_positive_map and len(sampler_positive_map[int(rec.patch_id)]) > 0
+    )
     coverage = float(anchors_with_pairs) / float(max(1, len(records)))
     if accelerator.is_main_process:
         LOGGER.info(
-            "Patch mode: patches=%d mnn_pairs_file=%s anchors_with_pairs=%d coverage=%.4f",
+            "Patch mode: patches=%d positive_sources=%s mnn_pairs_file=%s weak_ocr_file=%s anchors_any=%d coverage=%.4f anchors_mnn=%d anchors_ocr=%d",
             len(records),
             str(pairs_path) if pairs_path else "none",
+            str(weak_ocr_path) if weak_ocr_path else "none",
             anchors_with_pairs,
             coverage,
+            anchors_with_mnn,
+            anchors_with_ocr,
         )
     if bool(getattr(args, "require_pairs", False)) and anchors_with_pairs <= 0:
-        raise RuntimeError("require_pairs=True but no anchors with MNN positives after filtering.")
+        raise RuntimeError("require_pairs=True but no anchors with selected positives (MNN/OCR) after filtering.")
+    if use_ocr and weak_ocr_path is None:
+        raise FileNotFoundError(
+            "positive_sources includes OCR but no weak OCR parquet was found. "
+            "Use --weak_ocr_parquet or generate dataset/meta/weak_ocr.parquet."
+        )
 
     transform = HierarchyTwoViewTransform(
         target_height=int(args.target_height),
@@ -895,7 +942,7 @@ def _run_patch_mpnce_training(
     pair_sampler = PairBatchSampler(
         records=records,
         patch_id_to_index=pid_to_index,
-        mnn_map=mnn_map,
+        mnn_map=sampler_positive_map,
         config=SamplerConfig(
             batch_size=int(args.batch_size),
             p_pair=float(getattr(args, "p_pair", 0.6)),
@@ -983,12 +1030,15 @@ def _run_patch_mpnce_training(
 
     mp_cfg = MpNCEConfig(
         tau=float(args.temperature),
+        w_ocr=float(getattr(args, "w_ocr", 0.5)),
         w_overlap=float(getattr(args, "w_overlap", 0.3)),
         w_multiscale=float(getattr(args, "w_multiscale", 0.2)),
         t_iou=float(getattr(args, "t_iou", 0.6)),
         eps_center=float(getattr(args, "eps_center", 0.06)),
         min_positives_per_anchor=max(1, int(getattr(args, "min_positives_per_anchor", 1))),
         allow_self_fallback=bool(getattr(args, "allow_self_fallback", True)),
+        use_mnn=bool(use_mnn),
+        use_ocr=bool(use_ocr),
         exclude_same_page_in_denominator=bool(getattr(args, "exclude_same_page_in_denominator", False)),
         lambda_smooth=float(getattr(args, "lambda_smooth", 0.05)),
     )
@@ -999,6 +1049,7 @@ def _run_patch_mpnce_training(
     skipped_batches = 0
     fallback_count_total = 0.0
     mnn_pos_total = 0.0
+    ocr_pos_total = 0.0
     overlap_pos_total = 0.0
     multiscale_pos_total = 0.0
     valid_anchor_total = 0.0
@@ -1060,6 +1111,7 @@ def _run_patch_mpnce_training(
                 patch_ids=patch_ids,
                 mnn_map=mnn_map,
                 cfg=mp_cfg,
+                ocr_map=ocr_map,
             )
 
             valid_anchors = int(round(float(stats.get("valid_anchors", 0.0))))
@@ -1082,6 +1134,7 @@ def _run_patch_mpnce_training(
             valid_anchor_total += float(stats.get("valid_anchors", 0.0))
             fallback_count_total += float(stats.get("fallback_pos", 0.0))
             mnn_pos_total += float(stats.get("mnn_pos", 0.0))
+            ocr_pos_total += float(stats.get("ocr_pos", 0.0))
             overlap_pos_total += float(stats.get("overlap_pos", 0.0))
             multiscale_pos_total += float(stats.get("multiscale_pos", 0.0))
             avg_pos_accum += float(stats.get("avg_positives", 0.0))
@@ -1091,6 +1144,7 @@ def _run_patch_mpnce_training(
                 loss=f"{loss.detach().item():.4f}",
                 valid=f"{valid_anchors}",
                 mnn=f"{int(stats.get('mnn_pos', 0.0))}",
+                ocr=f"{int(stats.get('ocr_pos', 0.0))}",
             )
 
             if (
@@ -1118,6 +1172,8 @@ def _run_patch_mpnce_training(
                         "task": "text_hierarchy_vit_mpnce_retrieval",
                         "patch_meta_parquet": str(meta_path),
                         "pairs_parquet": str(pairs_path) if pairs_path else "",
+                        "weak_ocr_parquet": str(weak_ocr_path) if weak_ocr_path else "",
+                        "positive_sources": positive_sources,
                     },
                 )
         if global_step >= max_train_steps:
@@ -1130,14 +1186,22 @@ def _run_patch_mpnce_training(
     if accelerator.is_main_process:
         extra_cfg = {
             "task": "text_hierarchy_vit_mpnce_retrieval",
+            "positive_sources": positive_sources,
             "patch_meta_parquet": str(meta_path),
             "pairs_parquet": str(pairs_path) if pairs_path else "",
+            "weak_ocr_parquet": str(weak_ocr_path) if weak_ocr_path else "",
             "pair_min_sim": float(getattr(args, "pair_min_sim", 0.25)),
             "pair_min_stability_ratio": float(getattr(args, "pair_min_stability_ratio", 0.5)),
             "pair_require_multi_scale_ok": bool(getattr(args, "pair_require_multi_scale_ok", False)),
             "require_pairs": bool(getattr(args, "require_pairs", False)),
             "allow_self_fallback": bool(getattr(args, "allow_self_fallback", True)),
             "w_mnn_scale": float(getattr(args, "w_mnn_scale", 1.0)),
+            "w_ocr_scale": float(getattr(args, "w_ocr_scale", 1.0)),
+            "w_ocr": float(getattr(args, "w_ocr", 0.5)),
+            "ocr_min_confidence": float(getattr(args, "ocr_min_confidence", 0.2)),
+            "ocr_min_chars": int(getattr(args, "ocr_min_chars", 2)),
+            "ocr_max_group_size": int(getattr(args, "ocr_max_group_size", 128)),
+            "ocr_max_neighbors_per_anchor": int(getattr(args, "ocr_max_neighbors_per_anchor", 0)),
             "w_overlap": float(getattr(args, "w_overlap", 0.3)),
             "w_multiscale": float(getattr(args, "w_multiscale", 0.2)),
             "t_iou": float(getattr(args, "t_iou", 0.6)),
@@ -1150,10 +1214,13 @@ def _run_patch_mpnce_training(
             "phase2_lr_scale": float(getattr(args, "phase2_lr_scale", 0.1)),
             "sampler_p_pair": float(getattr(args, "p_pair", 0.6)),
             "sampler_hard_negative_ratio": float(getattr(args, "hard_negative_ratio", 0.2)),
+            "anchors_with_mnn": int(anchors_with_mnn),
+            "anchors_with_ocr": int(anchors_with_ocr),
             "anchors_with_pairs": int(anchors_with_pairs),
             "coverage_ratio": float(coverage),
             "stats_valid_anchors_total": float(valid_anchor_total),
             "stats_mnn_pos_total": float(mnn_pos_total),
+            "stats_ocr_pos_total": float(ocr_pos_total),
             "stats_overlap_pos_total": float(overlap_pos_total),
             "stats_multiscale_pos_total": float(multiscale_pos_total),
             "stats_fallback_pos_total": float(fallback_count_total),
@@ -1199,7 +1266,14 @@ def _run_patch_mpnce_training(
         avg_loss = cumulative_loss / max(1, global_step - skipped_batches)
         LOGGER.info("mpNCE training finished: steps=%d skipped=%d avg_loss=%.6f", global_step, skipped_batches, avg_loss)
         LOGGER.info("Average positives/anchor (batch-mean): %.4f", float(avg_pos_accum / max(1, avg_pos_count)))
-        LOGGER.info("MNN vs overlap counts: mnn=%.0f overlap=%.0f multiscale=%.0f fallback=%.0f", mnn_pos_total, overlap_pos_total, multiscale_pos_total, fallback_count_total)
+        LOGGER.info(
+            "Positive counts by source: mnn=%.0f ocr=%.0f overlap=%.0f multiscale=%.0f fallback=%.0f",
+            mnn_pos_total,
+            ocr_pos_total,
+            overlap_pos_total,
+            multiscale_pos_total,
+            fallback_count_total,
+        )
         LOGGER.info("FAISS-ready embeddings: %s / %s", emb_path, emb_meta_path)
 
     return {
@@ -1214,6 +1288,8 @@ def _run_patch_mpnce_training(
         "faiss_embeddings_path": emb_path,
         "faiss_embeddings_meta_path": emb_meta_path,
         "anchors_with_pairs": int(anchors_with_pairs),
+        "anchors_with_mnn": int(anchors_with_mnn),
+        "anchors_with_ocr": int(anchors_with_ocr),
         "coverage_ratio": float(coverage),
         "skipped_batches": int(skipped_batches),
     }

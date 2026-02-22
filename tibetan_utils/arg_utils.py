@@ -699,8 +699,11 @@ def add_train_text_hierarchy_vit_arguments(parser):
                        help='Patch filter: minimum ink_ratio')
     parser.add_argument('--boundary_score_min', '--boundary-score-min', dest='boundary_score_min', type=float, default=0.0,
                        help='Patch filter: minimum boundary_score')
+    parser.add_argument('--positive_sources', '--positive-sources', dest='positive_sources', type=str, default='mnn',
+                       choices=['mnn', 'ocr', 'both'],
+                       help='Which weak positive sources to use in mp-InfoNCE')
     parser.add_argument('--require_pairs', '--require-pairs', dest='require_pairs', action='store_true',
-                       help='Fail if no MNN positives remain after filtering')
+                       help='Fail if no selected weak positives (MNN/OCR) remain after filtering')
     parser.add_argument('--pair_min_sim', '--pair-min-sim', dest='pair_min_sim', type=float, default=0.25,
                        help='Minimum pair similarity from mnn_pairs.parquet')
     parser.add_argument('--pair_min_stability_ratio', '--pair-min-stability-ratio', dest='pair_min_stability_ratio',
@@ -717,6 +720,25 @@ def add_train_text_hierarchy_vit_arguments(parser):
                        help='Random seed for pair-aware batch sampler')
     parser.add_argument('--w_mnn_scale', '--w-mnn-scale', dest='w_mnn_scale', type=float, default=1.0,
                        help='Global scale factor applied to MNN edge weights')
+    parser.add_argument('--weak_ocr_parquet', '--weak-ocr-parquet', dest='weak_ocr_parquet', type=str, default='',
+                       help='Optional weak OCR labels parquet (default: <dataset>/meta/weak_ocr.parquet)')
+    parser.add_argument('--ocr_min_confidence', '--ocr-min-confidence', dest='ocr_min_confidence', type=float, default=0.2,
+                       help='Weak OCR filter: minimum OCR confidence')
+    parser.add_argument('--ocr_min_chars', '--ocr-min-chars', dest='ocr_min_chars', type=int, default=2,
+                       help='Weak OCR filter: minimum character count')
+    parser.add_argument('--ocr_max_group_size', '--ocr-max-group-size', dest='ocr_max_group_size', type=int, default=128,
+                       help='Skip weak OCR text clusters larger than this size (0 disables)')
+    parser.add_argument('--ocr_max_neighbors_per_anchor', '--ocr-max-neighbors-per-anchor', dest='ocr_max_neighbors_per_anchor',
+                       type=int, default=0, help='Cap OCR-derived neighbors per anchor (0 = unlimited)')
+    parser.add_argument('--ocr_require_no_error', '--ocr-require-no-error', dest='ocr_require_no_error', action='store_true',
+                       help='Only use weak OCR rows without error_code')
+    parser.add_argument('--no_ocr_require_no_error', '--no-ocr-require-no-error', dest='ocr_require_no_error', action='store_false',
+                       help='Allow weak OCR rows with error_code')
+    parser.set_defaults(ocr_require_no_error=True)
+    parser.add_argument('--w_ocr_scale', '--w-ocr-scale', dest='w_ocr_scale', type=float, default=1.0,
+                       help='Global scale factor applied while building OCR weak edges')
+    parser.add_argument('--w_ocr', '--w-ocr', dest='w_ocr', type=float, default=0.5,
+                       help='Loss weight multiplier for OCR weak positives in mp-InfoNCE numerator')
     parser.add_argument('--w_overlap', '--w-overlap', dest='w_overlap', type=float, default=0.3,
                        help='Weight for overlap positives in mp-InfoNCE')
     parser.add_argument('--w_multiscale', '--w-multiscale', dest='w_multiscale', type=float, default=0.2,

@@ -59,3 +59,36 @@ def test_mpNCE_nonempty_pos():
     assert float(stats.get("valid_anchors", 0.0)) >= 2.0
     assert float(stats.get("mnn_pos", 0.0)) > 0.0
 
+
+def test_mpNCE_ocr_only_nonempty_pos():
+    torch.manual_seed(1)
+    z = torch.randn(4, 8, dtype=torch.float32)
+    metas = [
+        _meta(10, "d1", "p1", 1, 256, 0.1, 0.2),
+        _meta(20, "d2", "p9", 1, 256, 0.1, 0.2),
+        _meta(10, "d1", "p1", 1, 256, 0.1, 0.2),
+        _meta(20, "d2", "p9", 1, 256, 0.1, 0.2),
+    ]
+    patch_ids = [10, 20, 10, 20]
+    cfg = MpNCEConfig(
+        tau=0.1,
+        w_ocr=0.7,
+        w_overlap=0.0,
+        w_multiscale=0.0,
+        use_mnn=False,
+        use_ocr=True,
+        allow_self_fallback=False,
+        lambda_smooth=0.0,
+    )
+    loss, stats = multi_positive_infonce(
+        z=z,
+        metas=metas,
+        patch_ids=patch_ids,
+        mnn_map={},
+        cfg=cfg,
+        ocr_map={10: [(20, 0.8)], 20: [(10, 0.8)]},
+    )
+    assert torch.isfinite(loss)
+    assert float(stats.get("valid_anchors", 0.0)) >= 2.0
+    assert float(stats.get("ocr_pos", 0.0)) > 0.0
+    assert float(stats.get("mnn_pos", 0.0)) == 0.0
