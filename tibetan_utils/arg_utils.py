@@ -688,6 +688,65 @@ def add_train_text_hierarchy_vit_arguments(parser):
                        help='Random seed')
     parser.add_argument('--checkpoint_every_steps', '--checkpoint-every-steps', dest='checkpoint_every_steps',
                        type=int, default=0, help='Save checkpoint every N optimizer steps (0 disables)')
+    parser.add_argument('--train_mode', '--train-mode', dest='train_mode', type=str, default='auto',
+                       choices=['auto', 'legacy', 'patch_mpnce'],
+                       help='Training mode selection (auto prefers patch_mpnce when patch parquet exists)')
+    parser.add_argument('--patch_meta_parquet', '--patch-meta-parquet', dest='patch_meta_parquet', type=str, default='',
+                       help='Optional explicit path to patch metadata parquet (default: <dataset>/meta/patches.parquet)')
+    parser.add_argument('--pairs_parquet', '--pairs-parquet', dest='pairs_parquet', type=str, default='',
+                       help='Optional explicit path to MNN pairs parquet (default: <dataset>/meta/mnn_pairs.parquet)')
+    parser.add_argument('--ink_ratio_min', '--ink-ratio-min', dest='ink_ratio_min', type=float, default=0.0,
+                       help='Patch filter: minimum ink_ratio')
+    parser.add_argument('--boundary_score_min', '--boundary-score-min', dest='boundary_score_min', type=float, default=0.0,
+                       help='Patch filter: minimum boundary_score')
+    parser.add_argument('--require_pairs', '--require-pairs', dest='require_pairs', action='store_true',
+                       help='Fail if no MNN positives remain after filtering')
+    parser.add_argument('--pair_min_sim', '--pair-min-sim', dest='pair_min_sim', type=float, default=0.25,
+                       help='Minimum pair similarity from mnn_pairs.parquet')
+    parser.add_argument('--pair_min_stability_ratio', '--pair-min-stability-ratio', dest='pair_min_stability_ratio',
+                       type=float, default=0.5, help='Minimum stability_ratio from mnn_pairs.parquet')
+    parser.add_argument('--pair_require_multi_scale_ok', '--pair-require-multi-scale-ok', dest='pair_require_multi_scale_ok',
+                       action='store_true', help='Require multi_scale_ok=true in mnn_pairs parquet')
+    parser.add_argument('--max_neighbors_per_anchor', '--max-neighbors-per-anchor', dest='max_neighbors_per_anchor',
+                       type=int, default=0, help='Cap loaded MNN neighbors per anchor (0 = unlimited)')
+    parser.add_argument('--p_pair', '--p-pair', dest='p_pair', type=float, default=0.6,
+                       help='Pair-aware sampler probability of adding an in-batch MNN partner')
+    parser.add_argument('--hard_negative_ratio', '--hard-negative-ratio', dest='hard_negative_ratio', type=float, default=0.2,
+                       help='Sampler fraction of same-page different-line hard negatives in each batch')
+    parser.add_argument('--pair_sampling_seed', '--pair-sampling-seed', dest='pair_sampling_seed', type=int, default=42,
+                       help='Random seed for pair-aware batch sampler')
+    parser.add_argument('--w_mnn_scale', '--w-mnn-scale', dest='w_mnn_scale', type=float, default=1.0,
+                       help='Global scale factor applied to MNN edge weights')
+    parser.add_argument('--w_overlap', '--w-overlap', dest='w_overlap', type=float, default=0.3,
+                       help='Weight for overlap positives in mp-InfoNCE')
+    parser.add_argument('--w_multiscale', '--w-multiscale', dest='w_multiscale', type=float, default=0.2,
+                       help='Weight for multiscale positives in mp-InfoNCE')
+    parser.add_argument('--t_iou', '--t-iou', dest='t_iou', type=float, default=0.6,
+                       help='1D IoU threshold for overlap positives')
+    parser.add_argument('--eps_center', '--eps-center', dest='eps_center', type=float, default=0.06,
+                       help='Normalized center distance for multiscale positives')
+    parser.add_argument('--min_positives_per_anchor', '--min-positives-per-anchor', dest='min_positives_per_anchor',
+                       type=int, default=1, help='Minimum positives required per anchor for mp-InfoNCE')
+    parser.add_argument('--min_valid_anchors_per_batch', '--min-valid-anchors-per-batch', dest='min_valid_anchors_per_batch',
+                       type=int, default=1, help='Skip optimizer step if batch has fewer valid anchors')
+    parser.add_argument('--allow_self_fallback', '--allow-self-fallback', dest='allow_self_fallback', action='store_true',
+                       help='Allow same patch_id second-view fallback positives when no other positives exist')
+    parser.add_argument('--no_allow_self_fallback', '--no-allow-self-fallback', dest='allow_self_fallback', action='store_false',
+                       help='Disable same patch_id fallback positives')
+    parser.set_defaults(allow_self_fallback=True)
+    parser.add_argument('--exclude_same_page_in_denominator', '--exclude-same-page-in-denominator',
+                       dest='exclude_same_page_in_denominator', action='store_true',
+                       help='Exclude same-page non-positive samples from InfoNCE denominator')
+    parser.add_argument('--lambda_smooth', '--lambda-smooth', dest='lambda_smooth', type=float, default=0.05,
+                       help='Overlap-only smoothness regularizer weight')
+    parser.add_argument('--phase1_epochs', '--phase1-epochs', dest='phase1_epochs', type=int, default=0,
+                       help='Phase-1 epochs (backbone frozen, head training). 0 => auto split')
+    parser.add_argument('--phase2_epochs', '--phase2-epochs', dest='phase2_epochs', type=int, default=0,
+                       help='Phase-2 epochs (unfreeze last transformer blocks). 0 => auto split')
+    parser.add_argument('--unfreeze_last_n_blocks', '--unfreeze-last-n-blocks', dest='unfreeze_last_n_blocks',
+                       type=int, default=2, help='Number of final transformer blocks to unfreeze in phase 2')
+    parser.add_argument('--phase2_lr_scale', '--phase2-lr-scale', dest='phase2_lr_scale', type=float, default=0.1,
+                       help='Learning-rate scale factor applied at phase-2 transition')
 
 
 def create_train_image_encoder_parser(add_help: bool = True):

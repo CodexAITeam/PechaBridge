@@ -21,6 +21,8 @@ from tibetan_utils.arg_utils import (
 )
 from pechabridge.cli.gen_patches import create_parser as create_gen_patches_parser, run as run_gen_patches
 from pechabridge.cli.mine_mnn_pairs import create_parser as create_mnn_pairs_parser, run as run_mnn_pairs
+from pechabridge.eval.eval_faiss_crosspage import create_parser as create_eval_faiss_crosspage_parser
+from pechabridge.eval.eval_faiss_crosspage import run as run_eval_faiss_crosspage
 
 LOGGER = logging.getLogger("pechabridge_cli")
 
@@ -181,6 +183,15 @@ def _build_root_parser() -> argparse.ArgumentParser:
     )
     mnn_parser.set_defaults(handler=_run_mine_mnn_pairs)
 
+    eval_cross_parent = create_eval_faiss_crosspage_parser(add_help=False)
+    eval_cross_parser = subparsers.add_parser(
+        "eval-faiss-crosspage",
+        parents=[eval_cross_parent],
+        help="Evaluate cross-page retrieval with FAISS from exported embeddings",
+        description=eval_cross_parent.description,
+    )
+    eval_cross_parser.set_defaults(handler=_run_eval_faiss_crosspage)
+
     return parser
 
 
@@ -275,6 +286,11 @@ def _run_gen_patches(args: argparse.Namespace) -> int:
 
 def _run_mine_mnn_pairs(args: argparse.Namespace) -> int:
     run_mnn_pairs(args)
+    return 0
+
+
+def _run_eval_faiss_crosspage(args: argparse.Namespace) -> int:
+    run_eval_faiss_crosspage(args)
     return 0
 
 

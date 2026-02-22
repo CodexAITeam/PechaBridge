@@ -3,7 +3,7 @@
 from __future__ import annotations
 
 from pathlib import Path
-from typing import Any, Tuple
+from typing import Any, Optional, Tuple
 
 import numpy as np
 
@@ -15,6 +15,28 @@ def import_faiss():
     except Exception as exc:  # pragma: no cover
         raise RuntimeError("faiss is required. Install `faiss-cpu` or `faiss-gpu`.") from exc
     return faiss
+
+
+def set_faiss_num_threads(num_threads: Optional[int]) -> bool:
+    """
+    Configure FAISS/OpenMP threads if supported.
+
+    Returns True when a thread setting was applied.
+    """
+    if num_threads is None:
+        return False
+    n = int(num_threads)
+    if n <= 0:
+        return False
+    faiss = import_faiss()
+    setter = getattr(faiss, "omp_set_num_threads", None)
+    if setter is None:
+        return False
+    try:
+        setter(int(n))
+        return True
+    except Exception:
+        return False
 
 
 def l2_normalize_rows(x: np.ndarray, eps: float = 1e-12) -> np.ndarray:
@@ -106,10 +128,10 @@ def load_index(index_path: Path, *, use_gpu: bool = False) -> Any:
 
 __all__ = [
     "import_faiss",
+    "set_faiss_num_threads",
     "l2_normalize_rows",
     "build_faiss_index",
     "search_index",
     "save_index",
     "load_index",
 ]
-

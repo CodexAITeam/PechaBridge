@@ -21,7 +21,7 @@ from tqdm.auto import tqdm
 from transformers import AutoImageProcessor, AutoModel
 
 from .augment import JitterConfig, generate_augmented_views
-from .faiss_utils import build_faiss_index, l2_normalize_rows, search_index
+from .faiss_utils import build_faiss_index, l2_normalize_rows, search_index, set_faiss_num_threads
 
 LOGGER = logging.getLogger("mnn_miner")
 
@@ -460,6 +460,12 @@ class MNNMiner:
     def __init__(self, config: MNNConfig):
         self.cfg = config
         self.device = _resolve_device(config.model.device)
+        faiss_threads = max(0, int(getattr(config.performance, "num_workers", 0)))
+        faiss_thread_applied = set_faiss_num_threads(faiss_threads if faiss_threads > 0 else None)
+        if faiss_thread_applied:
+            LOGGER.info("Configured FAISS/OpenMP threads: %d", faiss_threads)
+        else:
+            LOGGER.info("FAISS/OpenMP thread config unchanged (requested=%s)", str(faiss_threads))
         self.image_processor = AutoImageProcessor.from_pretrained(str(config.model.backbone))
         self.backbone = AutoModel.from_pretrained(str(config.model.backbone)).to(self.device).eval()
         self.projection_head: Optional[ProjectionHead] = None
@@ -1134,4 +1140,3 @@ __all__ = [
     "find_mutual_ranks",
     "select_center_match",
 ]
-
