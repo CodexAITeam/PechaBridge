@@ -8928,15 +8928,15 @@ def build_ui() -> gr.Blocks:
                         interactive=False,
                         wrap=True,
                     )
-                    with gr.Row():
-                        mnn_view_max_matches = gr.Number(label="max_matches_to_render (0=all)", value=24, precision=0)
-                    mnn_view_gallery = gr.Gallery(
-                        label="Source Patch + MNN Matches (side-by-side)",
-                        columns=4,
-                        height="auto",
-                        object_fit="contain",
-                    )
-                    mnn_view_json = gr.Code(label="Selected Patch + MNN Match Metadata JSON", language="json")
+            with gr.Row():
+                mnn_view_max_matches = gr.Number(label="max_matches_to_render (0=all)", value=24, precision=0)
+            mnn_view_gallery = gr.Gallery(
+                label="",
+                columns=4,
+                height="auto",
+                object_fit="contain",
+            )
+            mnn_view_json = gr.Code(label="Selected Patch + MNN Match Metadata JSON", language="json")
 
             mnn_view_scan_btn.click(
                 fn=scan_mnn_patch_matches_ui,
