@@ -21,6 +21,7 @@ from tibetan_utils.arg_utils import (
 )
 from pechabridge.cli.gen_patches import create_parser as create_gen_patches_parser, run as run_gen_patches
 from pechabridge.cli.mine_mnn_pairs import create_parser as create_mnn_pairs_parser, run as run_mnn_pairs
+from pechabridge.cli.weak_ocr_label import create_parser as create_weak_ocr_label_parser, run as run_weak_ocr_label
 from pechabridge.eval.eval_faiss_crosspage import create_parser as create_eval_faiss_crosspage_parser
 from pechabridge.eval.eval_faiss_crosspage import run as run_eval_faiss_crosspage
 
@@ -174,6 +175,15 @@ def _build_root_parser() -> argparse.ArgumentParser:
     )
     gen_patches_parser.set_defaults(handler=_run_gen_patches)
 
+    weak_ocr_parent = create_weak_ocr_label_parser(add_help=False)
+    weak_ocr_parser = subparsers.add_parser(
+        "weak-ocr-label",
+        parents=[weak_ocr_parent],
+        help="Generate weak OCR labels for patch datasets",
+        description=weak_ocr_parent.description,
+    )
+    weak_ocr_parser.set_defaults(handler=_run_weak_ocr_label)
+
     mnn_parent = create_mnn_pairs_parser(add_help=False)
     mnn_parser = subparsers.add_parser(
         "mine-mnn-pairs",
@@ -281,6 +291,11 @@ def _run_export_text_hierarchy(args: argparse.Namespace) -> int:
 
 def _run_gen_patches(args: argparse.Namespace) -> int:
     run_gen_patches(args)
+    return 0
+
+
+def _run_weak_ocr_label(args: argparse.Namespace) -> int:
+    run_weak_ocr_label(args)
     return 0
 
 

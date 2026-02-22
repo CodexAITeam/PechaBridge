@@ -119,7 +119,7 @@ Then open `http://127.0.0.1:7860` on your laptop.
 3. `Workbench Preview Tabs`: inspect detected text blocks, line segmentation, and hierarchy overlays on real pecha pages.
 4. `Label Studio Export` / pseudo-label workflow: generate reviewable labels when needed.
 5. `gen-patches` (CLI): build `datasets/text_patches` from page images using YOLO textbox detection + classical line segmentation.
-6. `weak_ocr_label` (CLI module, optional): create weak OCR labels on patch crops.
+6. `weak-ocr-label` (CLI, optional): create weak OCR labels on patch crops.
 7. `mine-mnn-pairs` (CLI): mine robust cross-page positives for retrieval training.
 8. `train-text-hierarchy-vit` (CLI): train patch retrieval encoder with mp-InfoNCE using `MNN`, `OCR`, or `both`.
 9. `eval-faiss-crosspage` and `faiss-text-hierarchy-search` (CLI): evaluate and inspect retrieval behavior.
@@ -158,6 +158,12 @@ python cli.py gen-patches \
   --no-samples 20 \
   --debug-dump 5
 
+# Generate weak OCR labels for patch crops (optional retrieval weak positives)
+python cli.py weak-ocr-label \
+  --dataset ./datasets/text_patches \
+  --meta ./datasets/text_patches/meta/patches.parquet \
+  --out ./datasets/text_patches/meta/weak_ocr.parquet
+
 # Mine cross-page MNN positives for retrieval training
 python cli.py mine-mnn-pairs \
   --dataset ./datasets/text_patches \
@@ -192,10 +198,10 @@ python cli.py run-donut-ocr-workflow \
   --model_output_dir ./models/donut-ocr-label1
 ```
 
-Weak OCR label generation for patch datasets is currently exposed as a module CLI:
+Weak OCR label generation for patch datasets is available as a root CLI subcommand:
 
 ```bash
-python -m pechabridge.cli.weak_ocr_label \
+python cli.py weak-ocr-label \
   --dataset ./datasets/text_patches \
   --meta ./datasets/text_patches/meta/patches.parquet \
   --out ./datasets/text_patches/meta/weak_ocr.parquet

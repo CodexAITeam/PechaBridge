@@ -40,6 +40,7 @@ Available subcommands:
 - `train-text-encoder`
 - `export-text-hierarchy`
 - `gen-patches`
+- `weak-ocr-label`
 - `mine-mnn-pairs`
 - `train-text-hierarchy-vit`
 - `eval-text-hierarchy-vit`
@@ -194,10 +195,10 @@ python cli.py gen-patches \
   --debug-dump 10
 ```
 
-Optional: generate weak OCR labels (standalone module CLI, not yet a `cli.py` subcommand):
+Optional: generate weak OCR labels:
 
 ```bash
-python -m pechabridge.cli.weak_ocr_label \
+python cli.py weak-ocr-label \
   --dataset ./datasets/text_patches \
   --meta ./datasets/text_patches/meta/patches.parquet \
   --out ./datasets/text_patches/meta/weak_ocr.parquet \
