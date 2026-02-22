@@ -915,6 +915,7 @@ def _run_patch_mpnce_training(
         LOGGER.info(
             "Patch mode: patches=%d positive_sources=%s mnn_pairs_file=%s weak_ocr_file=%s anchors_any=%d coverage=%.4f anchors_mnn=%d anchors_ocr=%d",
             len(records),
+            str(positive_sources),
             str(pairs_path) if pairs_path else "none",
             str(weak_ocr_path) if weak_ocr_path else "none",
             anchors_with_pairs,
