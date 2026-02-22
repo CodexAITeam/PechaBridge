@@ -44,7 +44,7 @@ def create_parser(add_help: bool = True) -> argparse.ArgumentParser:
         dest="num_workers",
         type=int,
         default=None,
-        help="Override config.performance.num_workers (used for embedding DataLoader and FAISS/OpenMP threads).",
+        help="Override config.performance.num_workers (used for source-loop mining threads, embedding DataLoader, and FAISS/OpenMP threads).",
     )
     return parser
 

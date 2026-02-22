@@ -5,7 +5,9 @@ from __future__ import annotations
 import json
 import logging
 import math
+import threading
 from collections import Counter, OrderedDict, defaultdict
+from concurrent.futures import FIRST_COMPLETED, Future, ThreadPoolExecutor, wait
 from dataclasses import dataclass, field
 from pathlib import Path
 from typing import Any, Dict, Iterable, List, Mapping, Optional, Sequence, Tuple
@@ -477,6 +479,9 @@ class MNNMiner:
         self._retrieval_cache: "OrderedDict[Tuple[int, int, int], List[Tuple[int, float, int]]]" = OrderedDict()
         self._retrieval_cache_size = 200000
         self._signature_cache: Dict[int, np.ndarray] = {}
+        self._retrieval_cache_lock = threading.Lock()
+        self._signature_cache_lock = threading.Lock()
+        self._embed_model_lock = threading.Lock()
 
     def _load_projection_head_if_available(self) -> None:
         ckpt = str(self.cfg.model.checkpoint or "").strip()
@@ -559,32 +564,36 @@ class MNNMiner:
     def _embed_images(self, images: Sequence[Image.Image]) -> np.ndarray:
         if not images:
             return np.zeros((0, 1), dtype=np.float32)
-        enc = self.image_processor(images=[im.convert("RGB") for im in images], return_tensors="pt")
-        pix = enc["pixel_values"].to(self.device)
-        with torch.no_grad():
-            emb = _pooled_embedding(self.backbone, pix)
-            if self.projection_head is not None:
-                emb = self.projection_head(emb)
-            emb = emb.detach().float()
-            if bool(self.cfg.index.normalize):
-                emb = F.normalize(emb, dim=-1)
+        # Keep threaded mining safe when stability checks call model forward.
+        with self._embed_model_lock:
+            enc = self.image_processor(images=[im.convert("RGB") for im in images], return_tensors="pt")
+            pix = enc["pixel_values"].to(self.device)
+            with torch.no_grad():
+                emb = _pooled_embedding(self.backbone, pix)
+                if self.projection_head is not None:
+                    emb = self.projection_head(emb)
+                emb = emb.detach().float()
+                if bool(self.cfg.index.normalize):
+                    emb = F.normalize(emb, dim=-1)
         arr = emb.cpu().numpy().astype(np.float32, copy=False)
         if bool(self.cfg.index.normalize):
             arr = l2_normalize_rows(arr)
         return arr
 
     def _cache_get(self, key: Tuple[int, int, int]) -> Optional[List[Tuple[int, float, int]]]:
-        val = self._retrieval_cache.get(key)
-        if val is None:
-            return None
-        self._retrieval_cache.move_to_end(key, last=True)
-        return val
+        with self._retrieval_cache_lock:
+            val = self._retrieval_cache.get(key)
+            if val is None:
+                return None
+            self._retrieval_cache.move_to_end(key, last=True)
+            return val
 
     def _cache_put(self, key: Tuple[int, int, int], value: List[Tuple[int, float, int]]) -> None:
-        self._retrieval_cache[key] = value
-        self._retrieval_cache.move_to_end(key, last=True)
-        while len(self._retrieval_cache) > self._retrieval_cache_size:
-            self._retrieval_cache.popitem(last=False)
+        with self._retrieval_cache_lock:
+            self._retrieval_cache[key] = value
+            self._retrieval_cache.move_to_end(key, last=True)
+            while len(self._retrieval_cache) > self._retrieval_cache_size:
+                self._retrieval_cache.popitem(last=False)
 
     def _filtered_from_search(
         self,
@@ -665,12 +674,14 @@ class MNNMiner:
 
     def _get_signature(self, rec: PatchRecord) -> np.ndarray:
         key = int(rec.patch_id)
-        sig = self._signature_cache.get(key)
-        if sig is not None:
-            return sig
+        with self._signature_cache_lock:
+            sig = self._signature_cache.get(key)
+            if sig is not None:
+                return sig
         with Image.open(rec.image_path) as im:
             sig = _signature_hproj(im.convert("RGB"))
-        self._signature_cache[key] = sig
+        with self._signature_cache_lock:
+            self._signature_cache[key] = sig
         return sig
 
     def _stability_for_pair(self, src: PatchRecord, dst: PatchRecord) -> Tuple[int, float]:
@@ -739,6 +750,85 @@ class MNNMiner:
             return checks >= 1
         return checks > 0
 
+    def _mine_one_source(self, *, scale_w: int, src: PatchRecord) -> List[PairCandidate]:
+        src_list = self._retrieve_filtered(
+            scale_w=int(scale_w),
+            src_patch_id=int(src.patch_id),
+            topk=int(self.cfg.mining.topK),
+        )
+        if not src_list:
+            return []
+
+        cand_src: List[PairCandidate] = []
+        used_dst: set[int] = set()
+        for dst_id, sim, rank_sd in src_list:
+            if int(dst_id) in used_dst:
+                continue
+            dst = self._records_by_id.get(int(dst_id))
+            if dst is None:
+                continue
+            dst_list = self._retrieve_filtered(
+                scale_w=int(scale_w),
+                src_patch_id=int(dst.patch_id),
+                topk=int(self.cfg.mining.mutual_topK),
+            )
+            ok_mut, _r_sd, rank_ds = find_mutual_ranks(
+                src_patch_id=int(src.patch_id),
+                dst_patch_id=int(dst.patch_id),
+                src_to_candidates=src_list,
+                dst_to_candidates=dst_list,
+                mutual_topk=int(self.cfg.mining.mutual_topK),
+            )
+            if not ok_mut:
+                continue
+
+            notes: List[str] = ["mutual"]
+            st_count = 0
+            st_ratio = 1.0
+            if bool(self.cfg.stability.enabled):
+                st_count, st_ratio = self._stability_for_pair(src, dst)
+                notes.append(f"stability={st_count}/{self.cfg.stability.n_trials}")
+                if st_ratio < float(self.cfg.stability.require_ratio):
+                    continue
+
+            multi_ok = self._multiscale_ok(src, dst) if bool(self.cfg.multiscale.enabled) else True
+            notes.append(f"multiscale={int(bool(multi_ok))}")
+            if bool(self.cfg.multiscale.enabled) and bool(self.cfg.multiscale.require_two_scales) and (not multi_ok):
+                continue
+
+            if bool(self.cfg.filtering.signature.enabled):
+                sig_a = self._get_signature(src)
+                sig_b = self._get_signature(dst)
+                c = _corr(sig_a, sig_b)
+                notes.append(f"sigcorr={c:.3f}")
+                if c < float(self.cfg.filtering.signature.corr_min):
+                    continue
+
+            cand_src.append(
+                PairCandidate(
+                    src=src,
+                    dst=dst,
+                    sim=float(sim),
+                    rank_src_to_dst=int(rank_sd),
+                    rank_dst_to_src=int(rank_ds),
+                    stability_count=int(st_count),
+                    stability_ratio=float(st_ratio),
+                    multi_scale_ok=bool(multi_ok),
+                    notes=";".join(notes),
+                )
+            )
+            used_dst.add(int(dst.patch_id))
+
+        cand_src.sort(
+            key=lambda x: (
+                float(x.stability_ratio),
+                float(x.sim),
+                1 if x.multi_scale_ok else 0,
+            ),
+            reverse=True,
+        )
+        return cand_src[: max(1, int(self.cfg.mining.max_pairs_per_src))]
+
     def _mine_scale(self, scale_w: int) -> List[PairCandidate]:
         st = self._scale_states[int(scale_w)]
         out: List[PairCandidate] = []
@@ -749,84 +839,59 @@ class MNNMiner:
         else:
             src_records.sort(key=lambda r: r.patch_id)
 
-        pbar = tqdm(total=len(src_records), desc=f"mine-mnn-scale-{scale_w}", leave=False)
-        for src in src_records:
-            src_list = self._retrieve_filtered(scale_w=int(scale_w), src_patch_id=int(src.patch_id), topk=int(self.cfg.mining.topK))
-            if not src_list:
+        max_workers = max(1, int(getattr(self.cfg.performance, "num_workers", 1)))
+        if max_workers <= 1:
+            pbar = tqdm(total=len(src_records), desc=f"mine-mnn-scale-{scale_w}", leave=False)
+            for src in src_records:
+                out.extend(self._mine_one_source(scale_w=int(scale_w), src=src))
                 pbar.update(1)
-                continue
+            pbar.close()
+            return out
 
-            cand_src: List[PairCandidate] = []
-            used_dst: set[int] = set()
-            for dst_id, sim, rank_sd in src_list:
-                if int(dst_id) in used_dst:
-                    continue
-                dst = self._records_by_id.get(int(dst_id))
-                if dst is None:
-                    continue
-                dst_list = self._retrieve_filtered(
-                    scale_w=int(scale_w),
-                    src_patch_id=int(dst.patch_id),
-                    topk=int(self.cfg.mining.mutual_topK),
-                )
-                ok_mut, _r_sd, rank_ds = find_mutual_ranks(
-                    src_patch_id=int(src.patch_id),
-                    dst_patch_id=int(dst.patch_id),
-                    src_to_candidates=src_list,
-                    dst_to_candidates=dst_list,
-                    mutual_topk=int(self.cfg.mining.mutual_topK),
-                )
-                if not ok_mut:
-                    continue
+        workers = min(max_workers, max(1, len(src_records)))
+        max_inflight = max(int(workers) * 4, int(workers))
+        LOGGER.info(
+            "Mining scale=%d with parallel source loop: workers=%d inflight=%d sources=%d",
+            int(scale_w),
+            int(workers),
+            int(max_inflight),
+            len(src_records),
+        )
 
-                notes: List[str] = ["mutual"]
-                st_count = 0
-                st_ratio = 1.0
-                if bool(self.cfg.stability.enabled):
-                    st_count, st_ratio = self._stability_for_pair(src, dst)
-                    notes.append(f"stability={st_count}/{self.cfg.stability.n_trials}")
-                    if st_ratio < float(self.cfg.stability.require_ratio):
+        by_src_id: Dict[int, List[PairCandidate]] = {}
+        pending: Dict[Future[List[PairCandidate]], PatchRecord] = {}
+        src_iter = iter(src_records)
+        pbar = tqdm(total=len(src_records), desc=f"mine-mnn-scale-{scale_w}", leave=False)
+        with ThreadPoolExecutor(max_workers=int(workers), thread_name_prefix=f"mnn{int(scale_w)}") as ex:
+            while len(pending) < max_inflight:
+                try:
+                    src = next(src_iter)
+                except StopIteration:
+                    break
+                pending[ex.submit(self._mine_one_source, scale_w=int(scale_w), src=src)] = src
+
+            while pending:
+                done, _ = wait(set(pending.keys()), return_when=FIRST_COMPLETED)
+                for fut in done:
+                    src = pending.pop(fut)
+                    try:
+                        by_src_id[int(src.patch_id)] = fut.result()
+                    except Exception:
+                        LOGGER.exception("Mining failed for scale=%d src_patch_id=%d", int(scale_w), int(src.patch_id))
+                        pbar.close()
+                        raise
+                    pbar.update(1)
+
+                    try:
+                        nxt = next(src_iter)
+                    except StopIteration:
                         continue
-
-                multi_ok = self._multiscale_ok(src, dst) if bool(self.cfg.multiscale.enabled) else True
-                notes.append(f"multiscale={int(bool(multi_ok))}")
-                if bool(self.cfg.multiscale.enabled) and bool(self.cfg.multiscale.require_two_scales) and (not multi_ok):
-                    continue
-
-                if bool(self.cfg.filtering.signature.enabled):
-                    sig_a = self._get_signature(src)
-                    sig_b = self._get_signature(dst)
-                    c = _corr(sig_a, sig_b)
-                    notes.append(f"sigcorr={c:.3f}")
-                    if c < float(self.cfg.filtering.signature.corr_min):
-                        continue
-
-                cand_src.append(
-                    PairCandidate(
-                        src=src,
-                        dst=dst,
-                        sim=float(sim),
-                        rank_src_to_dst=int(rank_sd),
-                        rank_dst_to_src=int(rank_ds),
-                        stability_count=int(st_count),
-                        stability_ratio=float(st_ratio),
-                        multi_scale_ok=bool(multi_ok),
-                        notes=";".join(notes),
-                    )
-                )
-                used_dst.add(int(dst.patch_id))
-
-            cand_src.sort(
-                key=lambda x: (
-                    float(x.stability_ratio),
-                    float(x.sim),
-                    1 if x.multi_scale_ok else 0,
-                ),
-                reverse=True,
-            )
-            out.extend(cand_src[: max(1, int(self.cfg.mining.max_pairs_per_src))])
-            pbar.update(1)
+                    pending[ex.submit(self._mine_one_source, scale_w=int(scale_w), src=nxt)] = nxt
         pbar.close()
+
+        # Restore stable source order independent of task completion order.
+        for src in src_records:
+            out.extend(by_src_id.get(int(src.patch_id), []))
         return out
 
     def _build_debug_grid(
