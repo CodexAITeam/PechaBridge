@@ -18,7 +18,19 @@ from PIL import Image
 from .backends import OCRBackend, OCRResult, TesseractBackend, VLMBackendStub
 from .preprocess import PreprocessConfig, preprocess_patch_image
 
+try:
+    from tqdm.auto import tqdm
+except Exception:  # pragma: no cover
+    tqdm = None
+
 LOGGER = logging.getLogger("weak_ocr_labeler")
+
+
+def _progress(iterable: Iterable[Any], *, total: int, desc: str) -> Iterable[Any]:
+    """Wrap iterator with tqdm when available."""
+    if tqdm is None:
+        return iterable
+    return tqdm(iterable, total=max(0, int(total)), desc=str(desc), leave=False)
 
 
 def _jsonable(value: Any) -> Any:
@@ -625,7 +637,7 @@ def run_weak_ocr_labeler(
                 bool(config.output.store_raw),
                 rate_limit_qps,
             )
-            for task in tasks:
+            for task in _progress(tasks, total=len(tasks), desc="weak-ocr"):
                 produced_rows.append(_process_task(task))
         else:
             ctx = mp.get_context("spawn")
@@ -640,7 +652,8 @@ def run_weak_ocr_labeler(
                     rate_limit_qps,
                 ),
             ) as pool:
-                for out_row in pool.imap_unordered(_process_task, tasks, chunksize=batch):
+                iterator = pool.imap_unordered(_process_task, tasks, chunksize=batch)
+                for out_row in _progress(iterator, total=len(tasks), desc="weak-ocr"):
                     produced_rows.append(out_row)
 
     include_raw = bool(config.output.store_raw)
