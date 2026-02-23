@@ -2181,9 +2181,23 @@ def _run_line_clip_training(
         num_training_steps=max_train_steps,
     )
 
-    backbone, text_encoder, image_projection_head, text_projection_head, optimizer, dataloader, lr_scheduler = accelerator.prepare(
-        backbone, text_encoder, image_projection_head, text_projection_head, optimizer, dataloader, lr_scheduler
-    )
+    if val_dataloader is not None:
+        (
+            backbone,
+            text_encoder,
+            image_projection_head,
+            text_projection_head,
+            optimizer,
+            dataloader,
+            val_dataloader,
+            lr_scheduler,
+        ) = accelerator.prepare(
+            backbone, text_encoder, image_projection_head, text_projection_head, optimizer, dataloader, val_dataloader, lr_scheduler
+        )
+    else:
+        backbone, text_encoder, image_projection_head, text_projection_head, optimizer, dataloader, lr_scheduler = accelerator.prepare(
+            backbone, text_encoder, image_projection_head, text_projection_head, optimizer, dataloader, lr_scheduler
+        )
 
     progress_bar = tqdm(total=max_train_steps, disable=not accelerator.is_local_main_process, desc="train-line-clip")
     global_step = 0
@@ -2191,6 +2205,8 @@ def _run_line_clip_training(
     acc_i2t_total = 0.0
     acc_t2i_total = 0.0
     stat_steps = 0
+    last_val_metrics: Dict[str, float] = {}
+    val_interval_steps = max(0, int(getattr(args, "checkpoint_every_steps", 0)))
     for epoch in range(num_train_epochs):
         if not bool(getattr(args, "freeze_backbone", False)):
             backbone.train()
@@ -2231,12 +2247,41 @@ def _run_line_clip_training(
             acc_t2i_total += float(clip_stats.get("acc_t2i", 0.0))
             stat_steps += 1
             progress_bar.update(1)
-            progress_bar.set_postfix(
-                loss=f"{loss.detach().item():.4f}",
-                i2t=f"{float(clip_stats.get('acc_i2t', 0.0)):.2f}",
-                t2i=f"{float(clip_stats.get('acc_t2i', 0.0)):.2f}",
-                lr=f"{lr_scheduler.get_last_lr()[0]:.2e}",
-            )
+            postfix = {
+                "loss": f"{loss.detach().item():.4f}",
+                "i2t": f"{float(clip_stats.get('acc_i2t', 0.0)):.2f}",
+                "t2i": f"{float(clip_stats.get('acc_t2i', 0.0)):.2f}",
+                "lr": f"{lr_scheduler.get_last_lr()[0]:.2e}",
+            }
+            if last_val_metrics:
+                postfix["vi2t@1"] = f"{float(last_val_metrics.get('val_i2t_r1', 0.0)):.2f}"
+                postfix["vt2i@1"] = f"{float(last_val_metrics.get('val_t2i_r1', 0.0)):.2f}"
+            progress_bar.set_postfix(**postfix)
+
+            if val_dataloader is not None and val_interval_steps > 0 and global_step % val_interval_steps == 0:
+                val_metrics = _evaluate_line_clip_retrieval(
+                    accelerator=accelerator,
+                    backbone=backbone,
+                    text_encoder=text_encoder,
+                    image_projection_head=image_projection_head,
+                    text_projection_head=text_projection_head,
+                    val_dataloader=val_dataloader,
+                    freeze_backbone=bool(getattr(args, "freeze_backbone", False)),
+                    freeze_text_encoder=bool(getattr(args, "freeze_text_encoder", False)),
+                    temperature=float(args.temperature),
+                )
+                if accelerator.is_main_process and val_metrics:
+                    last_val_metrics = dict(val_metrics)
+                    LOGGER.info(
+                        "Line CLIP val @ step %d: n=%d i2t@1=%.4f t2i@1=%.4f i2t@5=%.4f t2i@5=%.4f",
+                        global_step,
+                        int(val_metrics.get("val_count", 0.0)),
+                        float(val_metrics.get("val_i2t_r1", 0.0)),
+                        float(val_metrics.get("val_t2i_r1", 0.0)),
+                        float(val_metrics.get("val_i2t_r5", 0.0)),
+                        float(val_metrics.get("val_t2i_r5", 0.0)),
+                    )
+                accelerator.wait_for_everyone()
 
             if (
                 int(args.checkpoint_every_steps) > 0
@@ -2297,6 +2342,7 @@ def _run_line_clip_training(
             "image_preprocess_bdrc": (bdrc_pre_cfg.to_dict() if bdrc_pre_cfg is not None else None),
             "avg_clip_i2t_top1": float(acc_i2t_total / max(1, stat_steps)),
             "avg_clip_t2i_top1": float(acc_t2i_total / max(1, stat_steps)),
+            "last_val_metrics": last_val_metrics,
         }
         final_artifacts = _save_artifacts(
             accelerator=accelerator,

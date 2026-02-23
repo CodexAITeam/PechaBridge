@@ -15,7 +15,9 @@ The project combines:
 - SDXL/SD2.1 + ControlNet + LoRA texture adaptation,
 - line sub-patch dataset generation with Option-A neighborhood metadata,
 - weak OCR labeling + robust MNN mining for cross-page positives,
-- ViT/DINOv2 retrieval training (mp-InfoNCE) and FAISS-based evaluation/search.
+- ViT/DINOv2 retrieval training (mp-InfoNCE) and FAISS-based evaluation/search,
+- line-level dual vision-text encoder training (CLIP-style) on OCR manifests,
+- Donut/TroCR OCR training on OpenPecha/BDRC-style line manifests with optional BDRC preprocessing.
 
 The primary entrypoint for end-to-end usage is the **Workbench UI** (`ui_workbench.py`).
 
@@ -26,10 +28,12 @@ The primary entrypoint for end-to-end usage is the **Workbench UI** (`ui_workben
 - **Detection training and inference**: Provides Ultralytics YOLO training, validation, and inference workflows for local data and SBB pages.
 - **Pseudo-labeling and rule-based filtering**: Supports VLM-assisted layout extraction plus post-filtering before annotation review.
 - **Donut-style OCR workflow (Label 1)**: Runs generation, manifest preparation, tokenizer handling, and Vision Transformer encoder + autoregressive decoder training.
+- **Standalone DONUT/TroCR OCR training**: Trains OCR directly on OpenPecha/BDRC line manifests (`train-donut-ocr`) with `none|pb|bdrc` image preprocessing and CER evaluation.
 - **Diffusion texture adaptation**: Includes SDXL/SD2.1 + ControlNet augmentation and optional LoRA integration for more realistic page textures.
 - **Patch retrieval dataset generation**: Generates line sub-patches (`datasets/text_patches`) with parquet metadata for retrieval training.
 - **Weak supervision for retrieval**: Supports weak OCR labels and robust MNN mining for cross-page positives.
 - **Retrieval encoder training + eval**: Trains ViT/DINOv2 patch encoders with mp-InfoNCE and exports FAISS-ready embeddings plus cross-page evaluation.
+- **Dual vision-text encoder (CLIP-style) training**: Trains DINOv2 + text encoder (e.g. ByT5) on line image/text manifests (`line_clip`) for text-to-line and line-to-text retrieval.
 - **Retrieval encoder preparation (legacy/base)**: Includes unpaired image/text encoder training as a base for broader Tibetan retrieval experiments.
 
 ## Example: SBB Layout Analysis
@@ -82,6 +86,8 @@ Legacy files `requirements-ui.txt`, `requirements-vlm.txt`, and `requirements-lo
 - Patch dataset generation (YOLO textbox -> lines -> sub-patches): [docs/dataset_generation.md](docs/dataset_generation.md)
 - Robust MNN mining for cross-page positives: [docs/mnn_mining.md](docs/mnn_mining.md)
 - Retrieval training with mp-InfoNCE (MNN/OCR weak positives): [docs/retrieval_mpnce_training.md](docs/retrieval_mpnce_training.md)
+- DONUT/TroCR OCR training (OpenPecha/BDRC manifests, CER, checkpoints): [README_DONUT_OCR.md](README_DONUT_OCR.md)
+- Line-CLIP dual vision-text encoder training (DINOv2 + text encoder): [README_LINE_CLIP_DUAL_ENCODER.md](README_LINE_CLIP_DUAL_ENCODER.md)
 - Weak OCR labeling for patch datasets: [docs/weak_ocr.md](docs/weak_ocr.md)
 - Diffusion + LoRA details: [docs/texture_augmentation.md](docs/texture_augmentation.md)
 - Retrieval roadmap: [docs/tibetan_ngram_retrieval_plan.md](docs/tibetan_ngram_retrieval_plan.md)
@@ -122,7 +128,9 @@ Then open `http://127.0.0.1:7860` on your laptop.
 6. `weak-ocr-label` (CLI, optional): create weak OCR labels on patch crops.
 7. `mine-mnn-pairs` (CLI): mine robust cross-page positives for retrieval training.
 8. `train-text-hierarchy-vit` (CLI): train patch retrieval encoder with mp-InfoNCE using `MNN`, `OCR`, or `both`.
-9. `eval-faiss-crosspage` and `faiss-text-hierarchy-search` (CLI): evaluate and inspect retrieval behavior.
+9. `train-text-hierarchy-vit --train-mode line_clip` (CLI): train line-level dual vision-text encoder on OCR manifests.
+10. `train-donut-ocr` (CLI): train generative OCR model (TroCR/Donut-style VisionEncoderDecoder) on line manifests.
+11. `eval-faiss-crosspage` and `faiss-text-hierarchy-search` (CLI): evaluate and inspect retrieval behavior.
 
 ## Unified CLI
 
@@ -182,6 +190,26 @@ python cli.py train-text-hierarchy-vit \
   --pairs-parquet ./datasets/text_patches/meta/mnn_pairs.parquet \
   --weak-ocr-parquet ./datasets/text_patches/meta/weak_ocr.parquet
 
+# Train line-level dual vision-text encoder (CLIP-style) on OCR manifests
+python cli.py train-text-hierarchy-vit \
+  --dataset-dir ./datasets/openpecha_ocr_lines \
+  --output-dir ./models/line_clip_openpecha_bdrc_dinov2_byt5 \
+  --train-mode line_clip \
+  --train-manifest ./datasets/openpecha_ocr_lines/train/meta/lines.jsonl \
+  --val-manifest ./datasets/openpecha_ocr_lines/eval/meta/lines.jsonl \
+  --model-name-or-path facebook/dinov2-base \
+  --text-encoder-name-or-path google/byt5-small \
+  --image-preprocess-pipeline bdrc
+
+# Train Donut/TroCR OCR directly on line manifests (with CER on eval split)
+python cli.py train-donut-ocr \
+  --train_manifest ./datasets/openpecha_ocr_lines/train/meta/lines.jsonl \
+  --val_manifest ./datasets/openpecha_ocr_lines/eval/meta/lines.jsonl \
+  --output_dir ./models/donut_openpecha_bdrc \
+  --model_name_or_path microsoft/trocr-base-stage1 \
+  --tokenizer_path openpecha/BoSentencePiece \
+  --image_preprocess_pipeline bdrc
+
 # Cross-page FAISS evaluation from exported embeddings
 python cli.py eval-faiss-crosspage \
   --embeddings-npy ./models/text_hierarchy_vit_mpnce/faiss_embeddings.npy \
@@ -206,6 +234,43 @@ python cli.py weak-ocr-label \
   --meta ./datasets/text_patches/meta/patches.parquet \
   --out ./datasets/text_patches/meta/weak_ocr.parquet
 ```
+
+## Model Outputs And Workbench Compatibility
+
+### DONUT/TroCR OCR (`train-donut-ocr`)
+
+Typical outputs in `--output_dir`:
+
+- `checkpoint-*` (step-based HF checkpoints)
+- `checkpoint-epoch-<N>-cer-<X>` symlink aliases (if eval happened before save)
+- `model/` (final `VisionEncoderDecoderModel`)
+- `tokenizer/`
+- `image_processor/`
+- `train_summary.json`
+
+Current Workbench support:
+
+- The Workbench supports the **DONUT OCR workflow runner** (`run-donut-ocr-workflow`) and monitors training logs/output dirs.
+- There is currently **no dedicated standalone DONUT inference tab** that loads a trained `model/ + tokenizer/ + image_processor/` triplet for ad-hoc OCR inference in the UI.
+- Training and evaluation are fully supported via CLI (`cli.py train-donut-ocr`).
+
+### Dual Vision-Text Encoder (`train-text-hierarchy-vit --train-mode line_clip`)
+
+Typical outputs in `--output_dir`:
+
+- `text_hierarchy_vit_backbone/` (image backbone + image processor)
+- `text_hierarchy_projection_head.pt` (image projection head)
+- `text_hierarchy_clip_text_encoder/` (HF text encoder + tokenizer)
+- `text_hierarchy_clip_text_projection_head.pt` (text projection head)
+- `faiss_embeddings.npy`, `faiss_embeddings_meta.parquet`
+- `training_config.json`
+- optional `checkpoint_step_*` snapshots (image backbone/head checkpoints)
+
+Current Workbench support:
+
+- The Workbench can scan and use the **image backbone + image projection head** for line/block encoding previews and FAISS-related UI flows.
+- The **text encoder part** of `line_clip` is currently **not yet consumed by the Workbench UI** (text query encoding remains a CLI / future UI extension topic).
+- Training artifacts are therefore usable in the UI for image-side encoding, while full dual-encoder evaluation is primarily CLI-driven.
 
 ## Label Studio Notes
 

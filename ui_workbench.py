@@ -5669,7 +5669,10 @@ def _suggest_projection_head_for_backbone(backbone_path: str) -> str:
         except Exception:
             pass
 
-    local = sorted(bpath.parent.glob("*projection_head*.pt"))
+    local = [
+        p for p in sorted(bpath.parent.glob("*projection_head*.pt"))
+        if "clip_text_projection_head" not in p.name.lower()
+    ]
     if local:
         return str(local[0].resolve())
     return ""
@@ -5695,6 +5698,12 @@ def scan_models_for_line_and_encoder_ui(models_dir: str):
             if "lora" in lname:
                 continue
             if "projection_head" in lname:
+                # Keep only image-side projection heads in this dropdown.
+                # `line_clip` training additionally saves a text projection head
+                # (`...clip_text_projection_head.pt`) which is not compatible
+                # with the image encoder UI flows.
+                if "clip_text_projection_head" in lname:
+                    continue
                 projection_heads.append(str(p.resolve()))
                 continue
             yolo_models.append(str(p.resolve()))
