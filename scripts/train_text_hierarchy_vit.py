@@ -17,7 +17,7 @@ import torch
 import torch.nn as nn
 import torch.nn.functional as F
 from accelerate import Accelerator
-from accelerate.utils import set_seed
+from accelerate.utils import DistributedDataParallelKwargs, set_seed
 from PIL import Image, ImageFile
 from torch.utils.data import DataLoader, Dataset
 from torchvision import transforms
@@ -2643,7 +2643,8 @@ def _run_patch_mpnce_training(
 
 
 def run(args) -> Dict[str, Any]:
-    accelerator = Accelerator(mixed_precision=args.mixed_precision)
+    ddp_kwargs = DistributedDataParallelKwargs(find_unused_parameters=True)
+    accelerator = Accelerator(mixed_precision=args.mixed_precision, kwargs_handlers=[ddp_kwargs])
     _configure_logging(accelerator.is_main_process)
     set_seed(int(args.seed))
 
