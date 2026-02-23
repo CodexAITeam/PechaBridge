@@ -24,6 +24,9 @@ from pechabridge.cli.mine_mnn_pairs import create_parser as create_mnn_pairs_par
 from pechabridge.cli.weak_ocr_label import create_parser as create_weak_ocr_label_parser, run as run_weak_ocr_label
 from pechabridge.eval.eval_faiss_crosspage import create_parser as create_eval_faiss_crosspage_parser
 from pechabridge.eval.eval_faiss_crosspage import run as run_eval_faiss_crosspage
+from scripts.download_merge_openpecha_ocr_lines import (
+    create_parser as create_download_openpecha_ocr_lines_parser,
+)
 
 LOGGER = logging.getLogger("pechabridge_cli")
 
@@ -166,6 +169,16 @@ def _build_root_parser() -> argparse.ArgumentParser:
     )
     hierarchy_parser.set_defaults(handler=_run_export_text_hierarchy)
 
+    openpecha_ocr_parent = create_download_openpecha_ocr_lines_parser(add_help=False)
+    openpecha_ocr_parser = subparsers.add_parser(
+        "download-openpecha-ocr-lines",
+        aliases=["download-merge-openpecha-ocr-lines"],
+        parents=[openpecha_ocr_parent],
+        help="Download and merge OpenPecha OCR Hugging Face datasets into line dataset format",
+        description=openpecha_ocr_parent.description,
+    )
+    openpecha_ocr_parser.set_defaults(handler=_run_download_openpecha_ocr_lines)
+
     gen_patches_parent = create_gen_patches_parser(add_help=False)
     gen_patches_parser = subparsers.add_parser(
         "gen-patches",
@@ -284,6 +297,13 @@ def _run_donut_ocr_workflow(args: argparse.Namespace) -> int:
 
 def _run_export_text_hierarchy(args: argparse.Namespace) -> int:
     from scripts.export_text_hierarchy import run
+
+    run(args)
+    return 0
+
+
+def _run_download_openpecha_ocr_lines(args: argparse.Namespace) -> int:
+    from scripts.download_merge_openpecha_ocr_lines import run
 
     run(args)
     return 0
