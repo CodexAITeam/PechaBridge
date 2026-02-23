@@ -13,6 +13,7 @@ from typing import Dict, Iterable, List, Optional, Sequence, Tuple
 
 import numpy as np
 import torch
+import torch.nn as nn
 from PIL import Image
 from torch.utils.data import Dataset
 from transformers import (
@@ -40,6 +41,84 @@ def _configure_logging() -> None:
         level=logging.INFO,
         format="%(asctime)s | %(levelname)s | %(name)s | %(message)s",
     )
+
+
+def _named_meta_tensors(module: nn.Module) -> List[str]:
+    names: List[str] = []
+    for name, param in module.named_parameters():
+        if getattr(param, "device", None) is not None and param.device.type == "meta":
+            names.append(name)
+    for name, buf in module.named_buffers():
+        if getattr(buf, "device", None) is not None and buf.device.type == "meta":
+            names.append(name)
+    return sorted(set(names))
+
+
+def _drop_encoder_pooler_if_meta(model: VisionEncoderDecoderModel) -> None:
+    encoder = getattr(model, "encoder", None)
+    if encoder is None or not hasattr(encoder, "pooler"):
+        return
+    meta_names = [name for name in _named_meta_tensors(model) if name.startswith("encoder.pooler.")]
+    if not meta_names:
+        return
+    LOGGER.warning(
+        "Dropping encoder.pooler because meta tensors remain after load: %s",
+        ", ".join(meta_names),
+    )
+    try:
+        encoder.pooler = None
+    except Exception:
+        LOGGER.exception("Failed to drop encoder.pooler")
+        return
+    enc_cfg = getattr(encoder, "config", None)
+    if enc_cfg is not None and hasattr(enc_cfg, "add_pooling_layer"):
+        try:
+            enc_cfg.add_pooling_layer = False
+        except Exception:
+            pass
+
+
+def _load_ved_model_robust(model_name_or_path: str) -> VisionEncoderDecoderModel:
+    """Load VisionEncoderDecoderModel robustly across transformers versions.
+
+    On newer transformers builds, meta/lazy initialization can leave a few tensors
+    on the `meta` device (commonly an unused encoder pooler), which later crashes
+    when Trainer moves the model to CUDA. We explicitly disable low-memory meta
+    loading when supported and drop the unused encoder pooler as a fallback.
+    """
+    load_kwargs: Dict[str, object] = {}
+    try:
+        sig = inspect.signature(VisionEncoderDecoderModel.from_pretrained)
+        if "low_cpu_mem_usage" in sig.parameters:
+            load_kwargs["low_cpu_mem_usage"] = False
+    except Exception:
+        # Signature inspection can fail on some wrappers; just try the default call.
+        pass
+
+    try:
+        model = VisionEncoderDecoderModel.from_pretrained(model_name_or_path, **load_kwargs)
+    except TypeError:
+        # Older/newer variants may not accept the kwarg despite signature quirks.
+        model = VisionEncoderDecoderModel.from_pretrained(model_name_or_path)
+
+    meta_before = _named_meta_tensors(model)
+    if meta_before:
+        LOGGER.warning(
+            "Model contains meta tensors after load (%d): %s",
+            len(meta_before),
+            ", ".join(meta_before[:20]) + (" ..." if len(meta_before) > 20 else ""),
+        )
+        _drop_encoder_pooler_if_meta(model)
+    meta_after = _named_meta_tensors(model)
+    if meta_after:
+        raise RuntimeError(
+            "Model still contains meta-device tensors after loading: "
+            + ", ".join(meta_after[:20])
+            + (" ..." if len(meta_after) > 20 else "")
+            + ". This usually indicates a transformers loading bug/version mismatch. "
+            "Try a different checkpoint or transformers version, or patch model initialization."
+        )
+    return model
 
 
 def _parse_csv_tokens(spec: str) -> List[str]:
@@ -377,7 +456,7 @@ def run(args) -> Dict[str, object]:
     image_processor_dir = output_dir / "image_processor"
     image_processor.save_pretrained(str(image_processor_dir))
 
-    model = VisionEncoderDecoderModel.from_pretrained(args.model_name_or_path)
+    model = _load_ved_model_robust(args.model_name_or_path)
     model.decoder.resize_token_embeddings(len(tokenizer))
 
     decoder_start_id = tokenizer.convert_tokens_to_ids(args.decoder_start_token)
