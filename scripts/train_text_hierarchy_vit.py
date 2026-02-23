@@ -743,6 +743,7 @@ class LineTextClipDataset(Dataset):
         return {
             "pixel_values": pixel_values,
             "text": str(sample.text),
+            "sample_index": int(idx),
             "sample_id": str(sample.sample_id),
             "doc_id": str(sample.doc_id),
             "page_id": str(sample.page_id),
@@ -864,6 +865,7 @@ def _collate_line_text_clip(
     )
     meta_rows = [
         {
+            "sample_index": int(row.get("sample_index", i)),
             "sample_id": str(row.get("sample_id", "")),
             "doc_id": str(row.get("doc_id", "")),
             "page_id": str(row.get("page_id", "")),
@@ -877,6 +879,7 @@ def _collate_line_text_clip(
         "pixel_values": pixels,
         "input_ids": tok["input_ids"],
         "attention_mask": tok.get("attention_mask", torch.ones_like(tok["input_ids"])),
+        "sample_indices": torch.tensor([int(row.get("sample_index", i)) for i, row in enumerate(batch)], dtype=torch.long),
         "meta_rows": meta_rows,
     }
 
@@ -1020,6 +1023,111 @@ def _clip_symmetric_loss(
         "acc_t2i": acc_t2i,
         "batch": float(logits.shape[0]),
     }
+
+
+@torch.no_grad()
+def _evaluate_line_clip_retrieval(
+    *,
+    accelerator: Accelerator,
+    backbone: nn.Module,
+    text_encoder: nn.Module,
+    image_projection_head: nn.Module,
+    text_projection_head: nn.Module,
+    val_dataloader: Optional[DataLoader],
+    freeze_backbone: bool,
+    freeze_text_encoder: bool,
+    temperature: float,
+) -> Dict[str, float]:
+    if val_dataloader is None:
+        return {}
+
+    was_backbone_training = bool(backbone.training)
+    was_text_training = bool(text_encoder.training)
+    was_img_head_training = bool(image_projection_head.training)
+    was_txt_head_training = bool(text_projection_head.training)
+
+    backbone.eval()
+    text_encoder.eval()
+    image_projection_head.eval()
+    text_projection_head.eval()
+
+    img_parts: List[torch.Tensor] = []
+    txt_parts: List[torch.Tensor] = []
+    idx_parts: List[torch.Tensor] = []
+
+    for batch in val_dataloader:
+        pixel_values = batch["pixel_values"].to(accelerator.device, non_blocking=True)
+        input_ids = batch["input_ids"].to(accelerator.device, non_blocking=True)
+        attention_mask = batch["attention_mask"].to(accelerator.device, non_blocking=True)
+        sample_indices = batch["sample_indices"].to(accelerator.device, non_blocking=True)
+
+        if freeze_backbone:
+            img_emb = _pooled_image_embedding(backbone, pixel_values)
+        else:
+            img_emb = _pooled_image_embedding(backbone, pixel_values)
+        if freeze_text_encoder:
+            txt_emb = _pooled_text_embedding(text_encoder, input_ids, attention_mask)
+        else:
+            txt_emb = _pooled_text_embedding(text_encoder, input_ids, attention_mask)
+
+        img_z = F.normalize(image_projection_head(img_emb), dim=-1)
+        txt_z = F.normalize(text_projection_head(txt_emb), dim=-1)
+
+        gathered_img = accelerator.gather_for_metrics(img_z)
+        gathered_txt = accelerator.gather_for_metrics(txt_z)
+        gathered_idx = accelerator.gather_for_metrics(sample_indices)
+        if accelerator.is_main_process:
+            img_parts.append(gathered_img.detach().cpu())
+            txt_parts.append(gathered_txt.detach().cpu())
+            idx_parts.append(gathered_idx.detach().cpu())
+
+    metrics: Dict[str, float] = {}
+    if accelerator.is_main_process and img_parts:
+        all_img = torch.cat(img_parts, dim=0)
+        all_txt = torch.cat(txt_parts, dim=0)
+        all_idx = torch.cat(idx_parts, dim=0).long()
+        uniq_img: Dict[int, torch.Tensor] = {}
+        uniq_txt: Dict[int, torch.Tensor] = {}
+        for row_i in range(int(all_idx.shape[0])):
+            key = int(all_idx[row_i].item())
+            if key in uniq_img:
+                continue
+            uniq_img[key] = all_img[row_i]
+            uniq_txt[key] = all_txt[row_i]
+        order = sorted(uniq_img.keys())
+        img_mat = torch.stack([uniq_img[k] for k in order], dim=0).float()
+        txt_mat = torch.stack([uniq_txt[k] for k in order], dim=0).float()
+        tau = max(float(temperature), 1e-6)
+        logits = (img_mat @ txt_mat.T) / tau
+        n = int(logits.shape[0])
+        labels = torch.arange(n, dtype=torch.long)
+
+        def _recall_at_k(mat: torch.Tensor, gold: torch.Tensor, k: int) -> float:
+            kk = max(1, min(int(k), int(mat.shape[1])))
+            topk = torch.topk(mat, k=kk, dim=1).indices
+            return float((topk == gold.unsqueeze(1)).any(dim=1).float().mean().item())
+
+        metrics = {
+            "val_count": float(n),
+            "val_i2t_r1": _recall_at_k(logits, labels, 1),
+            "val_t2i_r1": _recall_at_k(logits.T, labels, 1),
+            "val_i2t_r5": _recall_at_k(logits, labels, 5),
+            "val_t2i_r5": _recall_at_k(logits.T, labels, 5),
+            "val_i2t_r10": _recall_at_k(logits, labels, 10),
+            "val_t2i_r10": _recall_at_k(logits.T, labels, 10),
+        }
+
+    if was_backbone_training and not freeze_backbone:
+        backbone.train()
+    if was_text_training and not freeze_text_encoder:
+        text_encoder.train()
+    if was_img_head_training:
+        image_projection_head.train()
+    if was_txt_head_training:
+        text_projection_head.train()
+
+    accelerator.wait_for_everyone()
+    return metrics if accelerator.is_main_process else {}
 
 
 def _freeze_backbone(backbone: nn.Module) -> None:
@@ -1684,9 +1792,23 @@ def _run_patch_clip_training(
         num_training_steps=max_train_steps,
     )
 
-    backbone, text_encoder, image_projection_head, text_projection_head, optimizer, dataloader, lr_scheduler = accelerator.prepare(
-        backbone, text_encoder, image_projection_head, text_projection_head, optimizer, dataloader, lr_scheduler
-    )
+    if val_dataloader is not None:
+        (
+            backbone,
+            text_encoder,
+            image_projection_head,
+            text_projection_head,
+            optimizer,
+            dataloader,
+            val_dataloader,
+            lr_scheduler,
+        ) = accelerator.prepare(
+            backbone, text_encoder, image_projection_head, text_projection_head, optimizer, dataloader, val_dataloader, lr_scheduler
+        )
+    else:
+        backbone, text_encoder, image_projection_head, text_projection_head, optimizer, dataloader, lr_scheduler = accelerator.prepare(
+            backbone, text_encoder, image_projection_head, text_projection_head, optimizer, dataloader, lr_scheduler
+        )
 
     progress_bar = tqdm(total=max_train_steps, disable=not accelerator.is_local_main_process, desc="train-text-hierarchy-vit-clip")
     global_step = 0
@@ -1694,6 +1816,8 @@ def _run_patch_clip_training(
     acc_i2t_total = 0.0
     acc_t2i_total = 0.0
     stat_steps = 0
+    last_val_metrics: Dict[str, float] = {}
+    val_interval_steps = max(0, int(getattr(args, "checkpoint_every_steps", 0)))
 
     for epoch in range(num_train_epochs):
         if not bool(getattr(args, "freeze_backbone", False)):
@@ -1736,12 +1860,41 @@ def _run_patch_clip_training(
             acc_t2i_total += float(clip_stats.get("acc_t2i", 0.0))
             stat_steps += 1
             progress_bar.update(1)
-            progress_bar.set_postfix(
-                loss=f"{loss.detach().item():.4f}",
-                i2t=f"{float(clip_stats.get('acc_i2t', 0.0)):.2f}",
-                t2i=f"{float(clip_stats.get('acc_t2i', 0.0)):.2f}",
-                lr=f"{lr_scheduler.get_last_lr()[0]:.2e}",
-            )
+            postfix = {
+                "loss": f"{loss.detach().item():.4f}",
+                "i2t": f"{float(clip_stats.get('acc_i2t', 0.0)):.2f}",
+                "t2i": f"{float(clip_stats.get('acc_t2i', 0.0)):.2f}",
+                "lr": f"{lr_scheduler.get_last_lr()[0]:.2e}",
+            }
+            if last_val_metrics:
+                postfix["vi2t@1"] = f"{float(last_val_metrics.get('val_i2t_r1', 0.0)):.2f}"
+                postfix["vt2i@1"] = f"{float(last_val_metrics.get('val_t2i_r1', 0.0)):.2f}"
+            progress_bar.set_postfix(**postfix)
+
+            if val_dataloader is not None and val_interval_steps > 0 and global_step % val_interval_steps == 0:
+                val_metrics = _evaluate_line_clip_retrieval(
+                    accelerator=accelerator,
+                    backbone=backbone,
+                    text_encoder=text_encoder,
+                    image_projection_head=image_projection_head,
+                    text_projection_head=text_projection_head,
+                    val_dataloader=val_dataloader,
+                    freeze_backbone=bool(getattr(args, "freeze_backbone", False)),
+                    freeze_text_encoder=bool(getattr(args, "freeze_text_encoder", False)),
+                    temperature=float(args.temperature),
+                )
+                if accelerator.is_main_process and val_metrics:
+                    last_val_metrics = dict(val_metrics)
+                    LOGGER.info(
+                        "Line CLIP val @ step %d: n=%d i2t@1=%.4f t2i@1=%.4f i2t@5=%.4f t2i@5=%.4f",
+                        global_step,
+                        int(val_metrics.get("val_count", 0.0)),
+                        float(val_metrics.get("val_i2t_r1", 0.0)),
+                        float(val_metrics.get("val_t2i_r1", 0.0)),
+                        float(val_metrics.get("val_i2t_r5", 0.0)),
+                        float(val_metrics.get("val_t2i_r5", 0.0)),
+                    )
+                accelerator.wait_for_everyone()
 
         if global_step >= max_train_steps:
             break
@@ -1767,6 +1920,7 @@ def _run_patch_clip_training(
             "image_preprocess_bdrc": (bdrc_pre_cfg.to_dict() if bdrc_pre_cfg is not None else None),
             "avg_clip_i2t_top1": float(acc_i2t_total / max(1, stat_steps)),
             "avg_clip_t2i_top1": float(acc_t2i_total / max(1, stat_steps)),
+            "last_val_metrics": last_val_metrics,
         }
         final_artifacts = _save_artifacts(
             accelerator=accelerator,
@@ -1856,6 +2010,7 @@ def _run_patch_clip_training(
         "config_path": str(final_artifacts.config_path) if final_artifacts else "",
         "faiss_embeddings_path": emb_path,
         "faiss_embeddings_meta_path": emb_meta_path,
+        "last_val_metrics": last_val_metrics,
     }
 
 
@@ -1938,6 +2093,33 @@ def _run_line_clip_training(
             text_max_length=int(getattr(args, "text_max_length", 128)),
         ),
     )
+    val_samples: List[LineTextSample] = []
+    val_dataloader: Optional[DataLoader] = None
+    if val_manifest is not None and val_manifest.exists() and val_manifest.is_file():
+        val_samples = _load_line_manifest_samples(
+            val_manifest,
+            min_chars=max(1, int(getattr(args, "ocr_min_chars", 1))),
+        )
+        if val_samples:
+            val_dataset = LineTextClipDataset(samples=val_samples, transform=transform)
+            val_dataloader = DataLoader(
+                val_dataset,
+                batch_size=max(1, int(args.batch_size)),
+                shuffle=False,
+                num_workers=max(0, int(args.num_workers)),
+                pin_memory=True,
+                drop_last=False,
+                collate_fn=lambda b: _collate_line_text_clip(
+                    b,
+                    patch_multiple=int(args.patch_multiple),
+                    tokenizer=tokenizer,
+                    text_max_length=int(getattr(args, "text_max_length", 128)),
+                ),
+            )
+            if accelerator.is_main_process:
+                LOGGER.info("Line CLIP validation enabled: val_samples=%d", len(val_samples))
+        elif accelerator.is_main_process:
+            LOGGER.warning("Val manifest provided but no usable validation samples found: %s", str(val_manifest))
     if len(dataloader) == 0:
         raise RuntimeError("line_clip DataLoader has zero batches. Reduce batch_size.")
 
@@ -2087,6 +2269,7 @@ def _run_line_clip_training(
                         "text_max_length": int(getattr(args, "text_max_length", 128)),
                         "freeze_text_encoder": bool(getattr(args, "freeze_text_encoder", False)),
                         "image_preprocess_pipeline": image_preproc_mode,
+                        "last_val_metrics": last_val_metrics,
                     },
                 )
                 LOGGER.info("Saved line_clip checkpoint at step %d -> %s", global_step, artifacts.backbone_dir)
