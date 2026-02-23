@@ -482,15 +482,21 @@ def run(args) -> Dict[str, object]:
         ta_kwargs["eval_strategy"] = ("steps" if has_eval else "no")
     training_args = Seq2SeqTrainingArguments(**ta_kwargs)
 
-    trainer = Seq2SeqTrainer(
+    trainer_kwargs = dict(
         model=model,
         args=training_args,
         train_dataset=train_dataset,
         eval_dataset=val_dataset if has_eval else None,
         data_collator=collator,
-        tokenizer=tokenizer,
         compute_metrics=_compute_metrics if has_eval else None,
     )
+    trainer_sig = inspect.signature(Seq2SeqTrainer.__init__)
+    if "tokenizer" in trainer_sig.parameters:
+        trainer_kwargs["tokenizer"] = tokenizer
+    elif "processing_class" in trainer_sig.parameters:
+        # Newer Transformers versions replaced `tokenizer=` with `processing_class=`.
+        trainer_kwargs["processing_class"] = tokenizer
+    trainer = Seq2SeqTrainer(**trainer_kwargs)
 
     train_result = trainer.train(resume_from_checkpoint=args.resume_from_checkpoint or None)
     trainer.save_model(str(output_dir / "model"))
