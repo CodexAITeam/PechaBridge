@@ -960,11 +960,25 @@ def _pooled_text_embedding(text_encoder: nn.Module, input_ids: torch.Tensor, att
     if attention_mask is not None:
         kwargs["attention_mask"] = attention_mask
     model_for_forward = text_encoder
-    cfg = getattr(text_encoder, "config", None)
-    if bool(getattr(cfg, "is_encoder_decoder", False)) and hasattr(text_encoder, "get_encoder"):
+    # Handle wrapped models (Accelerate/DDP/FSDP style `.module`) so encoder-decoder
+    # text models like T5/ByT5 use the encoder stack only and do not require
+    # decoder_input_ids during CLIP-style embedding.
+    base_model = text_encoder
+    seen_ids = set()
+    while hasattr(base_model, "module") and id(base_model) not in seen_ids:
+        seen_ids.add(id(base_model))
         try:
-            model_for_forward = text_encoder.get_encoder()
+            base_model = getattr(base_model, "module")
         except Exception:
+            break
+    cfg = getattr(base_model, "config", None)
+    if bool(getattr(cfg, "is_encoder_decoder", False)):
+        if hasattr(base_model, "get_encoder"):
+            try:
+                model_for_forward = base_model.get_encoder()
+            except Exception:
+                model_for_forward = text_encoder
+        else:
             model_for_forward = text_encoder
     outputs = model_for_forward(**kwargs)
     pooler = getattr(outputs, "pooler_output", None)
