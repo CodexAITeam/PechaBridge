@@ -1020,6 +1020,8 @@ def add_train_donut_ocr_arguments(parser):
                        help='Path to training JSONL manifest')
     parser.add_argument('--val_manifest', type=str, default='',
                        help='Optional validation JSONL manifest')
+    parser.add_argument('--val_eval_max_samples', '--val-eval-max-samples', dest='val_eval_max_samples', type=int, default=0,
+                       help='Randomly sample at most N validation rows for eval/CER during training (0 = use all)')
     parser.add_argument('--output_dir', type=str, required=True,
                        help='Output directory for checkpoints and final model')
     parser.add_argument('--model_name_or_path', type=str, default='microsoft/trocr-base-stage1',

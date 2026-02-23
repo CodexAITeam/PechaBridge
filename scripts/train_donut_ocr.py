@@ -871,6 +871,18 @@ def run(args) -> Dict[str, object]:
     if not train_rows:
         raise RuntimeError(f"No training samples found in {train_manifest}")
     val_rows = _read_manifest(val_manifest) if val_manifest and val_manifest.exists() else []
+    val_eval_max_samples = max(0, int(getattr(args, "val_eval_max_samples", 0) or 0))
+    if val_rows and val_eval_max_samples > 0 and len(val_rows) > val_eval_max_samples:
+        original_val_rows = len(val_rows)
+        rng = np.random.default_rng(int(args.seed))
+        keep_idx = np.sort(rng.choice(len(val_rows), size=val_eval_max_samples, replace=False))
+        val_rows = [val_rows[int(i)] for i in keep_idx.tolist()]
+        LOGGER.info(
+            "Validation rows subsampled for eval/CER: selected=%d of original=%d (seed=%d)",
+            len(val_rows),
+            original_val_rows,
+            int(args.seed),
+        )
     LOGGER.info("Loaded %d train rows and %d val rows", len(train_rows), len(val_rows))
 
     tokenizer = _load_or_build_tokenizer(args, train_rows)
