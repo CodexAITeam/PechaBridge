@@ -996,6 +996,7 @@ def run(args) -> Dict[str, object]:
         )
 
     collator = OCRDataCollator(tokenizer)
+    zero_cer_debug_count = {"n": 0}
 
     def _compute_metrics(eval_pred):
         predictions, labels = eval_pred
@@ -1005,6 +1006,20 @@ def run(args) -> Dict[str, object]:
         pred_texts = tokenizer.batch_decode(predictions, skip_special_tokens=True)
         ref_texts = tokenizer.batch_decode(labels, skip_special_tokens=True)
         cer = _char_error_rate(pred_texts, ref_texts, args.metric_newline_token)
+        if cer == 0.0 and zero_cer_debug_count["n"] < 3:
+            zero_cer_debug_count["n"] += 1
+            exact_matches = sum(int(p == r) for p, r in zip(pred_texts, ref_texts))
+            LOGGER.warning(
+                "eval_cer is exactly 0.0 on current eval set (n=%d, exact_matches=%d). "
+                "This can be real on a tiny/easy sampled val subset.",
+                len(ref_texts),
+                exact_matches,
+            )
+            for i, (pred, ref) in enumerate(zip(pred_texts[:5], ref_texts[:5]), start=1):
+                pred_s = pred.replace("\n", "\\n")
+                ref_s = ref.replace("\n", "\\n")
+                LOGGER.warning("CER=0 sample %d | REF: %s", i, ref_s[:300])
+                LOGGER.warning("CER=0 sample %d | PRD: %s", i, pred_s[:300])
         return {"cer": cer}
 
     has_eval = val_dataset is not None and len(val_dataset) > 0
