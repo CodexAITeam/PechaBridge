@@ -174,18 +174,77 @@ def _read_jsonl_manifest_rows(path: Path) -> List[Dict[str, Any]]:
     return rows
 
 
-def _coerce_line_text_sample(row: Dict[str, Any], *, default_prefix: str, row_idx: int) -> Optional[LineTextSample]:
-    image_raw = row.get("image")
-    text_raw = row.get("text")
-    if not isinstance(image_raw, str) or not image_raw.strip():
+def _resolve_manifest_image_path(image_value: str, manifest_path: Path) -> Optional[Path]:
+    raw = str(image_value or "").strip()
+    if not raw:
         return None
-    if not isinstance(text_raw, str):
+    p = Path(raw).expanduser()
+    if p.is_absolute():
+        rp = p.resolve()
+        return rp if rp.exists() and rp.is_file() else None
+    mp = Path(manifest_path).expanduser().resolve()
+    candidates = [
+        (mp.parent / p).resolve(),
+        (mp.parent.parent / p).resolve(),
+        (mp.parent.parent.parent / p).resolve(),
+        (Path.cwd() / p).resolve(),
+    ]
+    for cand in candidates:
+        if cand.exists() and cand.is_file():
+            return cand
+    return None
+
+
+def _manifest_first_nonempty_str(row: Dict[str, Any], keys: Sequence[str]) -> str:
+    for k in keys:
+        v = row.get(k)
+        if isinstance(v, str) and v.strip():
+            return v.strip()
+    return ""
+
+
+def _coerce_line_text_sample(
+    row: Dict[str, Any],
+    *,
+    default_prefix: str,
+    row_idx: int,
+    manifest_path: Path,
+) -> Optional[LineTextSample]:
+    image_raw = _manifest_first_nonempty_str(
+        row,
+        [
+            "image",
+            "image_path",
+            "line_path",
+            "line_image",
+            "line_image_path",
+            "image_rel_path",
+            "line_image_rel_path",
+            "src__image",
+            "path",
+        ],
+    )
+    text_raw = _manifest_first_nonempty_str(
+        row,
+        [
+            "text",
+            "transcription",
+            "label",
+            "ocr_text",
+            "line_text",
+            "normalized_text",
+            "content",
+            "src__label",
+            "src__text",
+        ],
+    )
+    if not image_raw:
         return None
     txt = normalize_ocr_text(text_raw)
     if not txt:
         return None
-    image_path = Path(image_raw).expanduser().resolve()
-    if not image_path.exists() or not image_path.is_file():
+    image_path = _resolve_manifest_image_path(image_raw, manifest_path)
+    if image_path is None:
         return None
     sample_id = str(row.get("id", "") or row.get("sample_id", "") or "").strip()
     if not sample_id:
@@ -209,7 +268,7 @@ def _load_line_manifest_samples(train_manifest: Path, *, min_chars: int = 1) -> 
     out: List[LineTextSample] = []
     min_chars_i = max(0, int(min_chars))
     for i, row in enumerate(rows):
-        sample = _coerce_line_text_sample(row, default_prefix=train_manifest.stem, row_idx=i)
+        sample = _coerce_line_text_sample(row, default_prefix=train_manifest.stem, row_idx=i, manifest_path=train_manifest)
         if sample is None:
             continue
         if len(sample.text) < min_chars_i:

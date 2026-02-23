@@ -4,6 +4,7 @@
 from __future__ import annotations
 
 import json
+import inspect
 import logging
 import sys
 from dataclasses import dataclass
@@ -62,6 +63,35 @@ def _read_manifest(path: Path) -> List[Dict[str, object]]:
                 continue
             rows.append(row)
     return rows
+
+
+def _first_nonempty_str(row: Dict[str, object], keys: Sequence[str]) -> str:
+    for key in keys:
+        val = row.get(key)
+        if isinstance(val, str) and val.strip():
+            return val.strip()
+    return ""
+
+
+def _resolve_manifest_image_path(image_value: str, manifest_path: Optional[Path]) -> Optional[Path]:
+    raw = str(image_value or "").strip()
+    if not raw:
+        return None
+    p = Path(raw).expanduser()
+    if p.is_absolute():
+        rp = p.resolve()
+        return rp if rp.exists() else None
+    candidates: List[Path] = []
+    if manifest_path is not None:
+        mp = Path(manifest_path).expanduser().resolve()
+        candidates.append((mp.parent / p).resolve())
+        candidates.append((mp.parent.parent / p).resolve())
+        candidates.append((mp.parent.parent.parent / p).resolve())
+    candidates.append((Path.cwd() / p).resolve())
+    for cand in candidates:
+        if cand.exists() and cand.is_file():
+            return cand
+    return None
 
 
 def _resolve_val_manifest_path(train_manifest: Path, val_manifest_arg: str) -> Optional[Path]:
@@ -178,19 +208,62 @@ class OCRManifestDataset(Dataset):
         tokenizer,
         max_target_length: int,
         image_preprocess_pipeline: str = "none",
+        manifest_path: Optional[Path] = None,
     ):
         self.samples: List[OCRSample] = []
+        self.stats: Dict[str, int] = {
+            "rows_total": 0,
+            "kept": 0,
+            "missing_image_field": 0,
+            "missing_text_field": 0,
+            "image_not_found": 0,
+        }
+        self.example_row_keys: List[str] = []
+        self.manifest_path = Path(manifest_path).expanduser().resolve() if manifest_path is not None else None
         for row in rows:
-            image_raw = row.get("image")
-            text_raw = row.get("text")
-            if not isinstance(image_raw, str) or not image_raw.strip():
+            self.stats["rows_total"] += 1
+            if not self.example_row_keys and isinstance(row, dict):
+                self.example_row_keys = sorted(str(k) for k in row.keys())
+            image_raw = _first_nonempty_str(
+                row,
+                [
+                    "image",
+                    "image_path",
+                    "line_path",
+                    "line_image",
+                    "line_image_path",
+                    "image_rel_path",
+                    "line_image_rel_path",
+                    "src__image",
+                    "path",
+                ],
+            )
+            text_raw = _first_nonempty_str(
+                row,
+                [
+                    "text",
+                    "transcription",
+                    "label",
+                    "ocr_text",
+                    "line_text",
+                    "normalized_text",
+                    "content",
+                    "src__label",
+                    "src__text",
+                ],
+            )
+            if not image_raw:
+                self.stats["missing_image_field"] += 1
                 continue
-            if not isinstance(text_raw, str) or not text_raw.strip():
+            if not text_raw:
+                self.stats["missing_text_field"] += 1
                 continue
-            image_path = Path(image_raw).expanduser().resolve()
-            if not image_path.exists():
+            image_path = _resolve_manifest_image_path(image_raw, self.manifest_path)
+            if image_path is None:
+                self.stats["image_not_found"] += 1
                 continue
             self.samples.append(OCRSample(image_path=image_path, text=text_raw))
+            self.stats["kept"] += 1
         self.image_processor = image_processor
         self.tokenizer = tokenizer
         self.max_target_length = int(max_target_length)
@@ -337,6 +410,7 @@ def run(args) -> Dict[str, object]:
         tokenizer=tokenizer,
         max_target_length=int(args.max_target_length),
         image_preprocess_pipeline=image_preproc_mode,
+        manifest_path=train_manifest,
     )
     val_dataset = OCRManifestDataset(
         val_rows,
@@ -344,11 +418,23 @@ def run(args) -> Dict[str, object]:
         tokenizer=tokenizer,
         max_target_length=int(args.max_target_length),
         image_preprocess_pipeline=image_preproc_mode,
+        manifest_path=val_manifest,
     ) if val_rows else None
 
     LOGGER.info("Train dataset size: %d", len(train_dataset))
     if val_dataset is not None:
         LOGGER.info("Val dataset size: %d", len(val_dataset))
+    LOGGER.info("Train manifest parsing stats: %s", json.dumps(train_dataset.stats, ensure_ascii=False))
+    if getattr(train_dataset, "example_row_keys", None):
+        LOGGER.info("Train manifest example keys: %s", ", ".join(train_dataset.example_row_keys))
+    if val_dataset is not None:
+        LOGGER.info("Val manifest parsing stats: %s", json.dumps(val_dataset.stats, ensure_ascii=False))
+        if getattr(val_dataset, "example_row_keys", None):
+            LOGGER.info("Val manifest example keys: %s", ", ".join(val_dataset.example_row_keys))
+    if len(train_dataset) <= 0:
+        raise RuntimeError(
+            "Train dataset resolved to zero samples. Check manifest image/text field names and whether image paths are relative to the manifest directory."
+        )
 
     collator = OCRDataCollator(tokenizer)
 
@@ -363,7 +449,7 @@ def run(args) -> Dict[str, object]:
         return {"cer": cer}
 
     has_eval = val_dataset is not None and len(val_dataset) > 0
-    training_args = Seq2SeqTrainingArguments(
+    ta_kwargs = dict(
         output_dir=str(output_dir),
         per_device_train_batch_size=int(args.per_device_train_batch_size),
         per_device_eval_batch_size=int(args.per_device_eval_batch_size),
@@ -384,12 +470,17 @@ def run(args) -> Dict[str, object]:
         remove_unused_columns=False,
         report_to=[],
         disable_tqdm=False,
-        evaluation_strategy="steps" if has_eval else "no",
         save_strategy="steps",
         load_best_model_at_end=bool(has_eval),
         metric_for_best_model="cer" if has_eval else None,
         greater_is_better=False if has_eval else None,
     )
+    ta_sig = inspect.signature(Seq2SeqTrainingArguments.__init__)
+    if "evaluation_strategy" in ta_sig.parameters:
+        ta_kwargs["evaluation_strategy"] = ("steps" if has_eval else "no")
+    elif "eval_strategy" in ta_sig.parameters:
+        ta_kwargs["eval_strategy"] = ("steps" if has_eval else "no")
+    training_args = Seq2SeqTrainingArguments(**ta_kwargs)
 
     trainer = Seq2SeqTrainer(
         model=model,
