@@ -6,6 +6,7 @@ from __future__ import annotations
 import json
 import inspect
 import logging
+import os
 import sys
 from collections import Counter
 from dataclasses import dataclass
@@ -25,6 +26,7 @@ from transformers import (
     VisionEncoderDecoderModel,
     set_seed,
 )
+from transformers.trainer_callback import ProgressCallback, TrainerCallback
 
 REPO_ROOT = Path(__file__).resolve().parents[1]
 if str(REPO_ROOT) not in sys.path:
@@ -42,6 +44,98 @@ def _configure_logging() -> None:
         level=logging.INFO,
         format="%(asctime)s | %(levelname)s | %(name)s | %(message)s",
     )
+
+
+class DonutProgressCallback(ProgressCallback):
+    """Progress bar callback that also shows compact train/eval metrics in TQDM postfix."""
+
+    _POSTFIX_KEYS = (
+        "loss",
+        "eval_loss",
+        "eval_cer",
+        "learning_rate",
+        "grad_norm",
+        "epoch",
+    )
+
+    def on_log(self, args, state, control, logs=None, **kwargs):  # type: ignore[override]
+        logs = logs or {}
+        if state.is_world_process_zero and self.training_bar is not None:
+            postfix: Dict[str, object] = {}
+            for key in self._POSTFIX_KEYS:
+                if key not in logs:
+                    continue
+                val = logs[key]
+                if isinstance(val, float):
+                    if key == "learning_rate":
+                        postfix["lr"] = f"{val:.2e}"
+                    elif key in {"loss", "eval_loss", "eval_cer", "grad_norm"}:
+                        postfix[key] = f"{val:.4f}"
+                    elif key == "epoch":
+                        postfix[key] = f"{val:.2f}"
+                    else:
+                        postfix[key] = f"{val:.4g}"
+                else:
+                    postfix[key] = val
+            if postfix:
+                try:
+                    self.training_bar.set_postfix(postfix, refresh=False)
+                except Exception:
+                    pass
+        super().on_log(args, state, control, logs=logs, **kwargs)
+
+
+class DonutCheckpointAliasCallback(TrainerCallback):
+    """Create human-readable checkpoint aliases containing epoch and CER.
+
+    The actual HF checkpoints keep their default `checkpoint-<step>` names for
+    resume compatibility. We add symlink aliases like:
+      checkpoint-epoch-25-cer-0.1234 -> checkpoint-1192425
+    """
+
+    def __init__(self):
+        self._last_eval_metrics: Dict[str, float] = {}
+
+    def on_evaluate(self, args, state, control, metrics=None, **kwargs):  # type: ignore[override]
+        if isinstance(metrics, dict):
+            try:
+                self._last_eval_metrics = {
+                    str(k): float(v) for k, v in metrics.items() if isinstance(v, (float, int))
+                }
+            except Exception:
+                self._last_eval_metrics = {}
+        return super().on_evaluate(args, state, control, **kwargs)
+
+    def on_save(self, args, state, control, **kwargs):  # type: ignore[override]
+        if not getattr(state, "is_world_process_zero", True):
+            return control
+        step = int(getattr(state, "global_step", 0) or 0)
+        if step <= 0:
+            return control
+        output_dir = Path(str(getattr(args, "output_dir", ""))).expanduser().resolve()
+        ckpt_dir = output_dir / f"checkpoint-{step}"
+        if not ckpt_dir.exists():
+            return control
+        epoch_val = getattr(state, "epoch", None)
+        epoch_num = int(round(float(epoch_val))) if epoch_val is not None else None
+        cer = self._last_eval_metrics.get("eval_cer")
+        cer_str = f"{float(cer):.4f}" if cer is not None else "na"
+        epoch_str = str(epoch_num) if epoch_num is not None else "na"
+        alias_name = f"checkpoint-epoch-{epoch_str}-cer-{cer_str}"
+        alias_path = output_dir / alias_name
+        try:
+            if alias_path.exists() or alias_path.is_symlink():
+                if alias_path.is_symlink() or alias_path.is_file():
+                    alias_path.unlink()
+                elif alias_path.is_dir():
+                    # Don't remove real directories; skip to avoid destructive behavior.
+                    LOGGER.warning("Checkpoint alias path exists as directory, skipping: %s", alias_path)
+                    return control
+            os.symlink(ckpt_dir.name, alias_path)  # relative symlink within same output dir
+            LOGGER.info("Created checkpoint alias: %s -> %s", alias_path.name, ckpt_dir.name)
+        except Exception as exc:
+            LOGGER.warning("Could not create checkpoint alias %s: %s", alias_name, exc)
+        return control
 
 
 def _named_meta_tensors(module: nn.Module) -> List[str]:
@@ -950,6 +1044,13 @@ def run(args) -> Dict[str, object]:
         # Newer Transformers versions replaced `tokenizer=` with `processing_class=`.
         trainer_kwargs["processing_class"] = tokenizer
     trainer = Seq2SeqTrainer(**trainer_kwargs)
+    try:
+        trainer.remove_callback(ProgressCallback)
+        trainer.add_callback(DonutProgressCallback())
+        trainer.add_callback(DonutCheckpointAliasCallback())
+        LOGGER.info("Enabled DONUT TQDM postfix metrics callback")
+    except Exception as exc:
+        LOGGER.warning("Could not replace default ProgressCallback: %s", exc)
 
     _log_pretrain_device_report(
         train_dataset=train_dataset,
