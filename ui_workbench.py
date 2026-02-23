@@ -57,10 +57,23 @@ except Exception:
     torch_f = None
 
 try:
-    from transformers import AutoImageProcessor, AutoModel
+    from transformers import AutoImageProcessor, AutoModel, AutoTokenizer
 except Exception:
     AutoImageProcessor = None
     AutoModel = None
+    AutoTokenizer = None
+
+try:
+    from pechabridge.ocr.preprocess import PreprocessConfig as _PBPreprocessConfig, preprocess_patch_image as _pb_preprocess_patch_image
+except Exception:
+    _PBPreprocessConfig = None
+    _pb_preprocess_patch_image = None
+
+try:
+    from pechabridge.ocr.preprocess_bdrc import BDRCPreprocessConfig as _BDRCPreprocessConfig, preprocess_image_bdrc as _preprocess_image_bdrc
+except Exception:
+    _BDRCPreprocessConfig = None
+    _preprocess_image_bdrc = None
 
 
 ROOT = Path(__file__).resolve().parent
@@ -3183,6 +3196,395 @@ def run_donut_ocr_workflow_live(
         + _tail_lines_newest_first(log_lines, 3000)
     )
     yield final_msg, str(dataset_dir), str(prepared_dir), str(model_output_path), str(summary_path)
+
+
+def _resolve_donut_runtime_dirs(model_root_or_model_dir: str) -> Tuple[Optional[Path], Optional[Path], Optional[Path], str]:
+    raw = (model_root_or_model_dir or "").strip()
+    if not raw:
+        return None, None, None, "Empty model path."
+    root = Path(raw).expanduser().resolve()
+    if not root.exists():
+        return None, None, None, f"Path not found: {root}"
+
+    def _is_hf_model_dir(p: Path) -> bool:
+        if not p.exists() or not p.is_dir():
+            return False
+        if not (p / "config.json").exists():
+            return False
+        return (
+            (p / "pytorch_model.bin").exists()
+            or (p / "model.safetensors").exists()
+            or (p / "model.safetensors.index.json").exists()
+        )
+
+    # Accept either output root (`.../donut_openpecha_bdrc`) or direct model dir (`.../model`).
+    if _is_hf_model_dir(root):
+        model_dir = root
+        base_dir = root.parent
+    else:
+        model_dir = root / "model"
+        base_dir = root
+
+    tokenizer_dir = base_dir / "tokenizer"
+    image_processor_dir = base_dir / "image_processor"
+
+    if not _is_hf_model_dir(model_dir):
+        return None, None, None, f"Could not find DONUT/TroCR model dir at {model_dir}"
+    if not tokenizer_dir.exists():
+        tokenizer_dir = model_dir
+    if not image_processor_dir.exists():
+        image_processor_dir = model_dir
+    return model_dir, tokenizer_dir, image_processor_dir, ""
+
+
+@lru_cache(maxsize=8)
+def _load_donut_ocr_runtime_cached(model_dir_s: str, tokenizer_dir_s: str, image_processor_dir_s: str, device_pref: str):
+    if torch is None:
+        raise RuntimeError("PyTorch not available in UI environment.")
+    if AutoImageProcessor is None or AutoTokenizer is None:
+        raise RuntimeError("transformers not available in UI environment.")
+
+    device, device_msg = _resolve_torch_device_for_encoding(device_pref)
+    model_dir = Path(model_dir_s).expanduser().resolve()
+    tokenizer_dir = Path(tokenizer_dir_s).expanduser().resolve()
+    image_processor_dir = Path(image_processor_dir_s).expanduser().resolve()
+
+    from scripts.train_donut_ocr import _load_ved_model_robust  # reuse training-side HF/meta fixes
+
+    model = _load_ved_model_robust(str(model_dir))
+    tokenizer = AutoTokenizer.from_pretrained(str(tokenizer_dir), use_fast=True)
+    image_processor = AutoImageProcessor.from_pretrained(str(image_processor_dir))
+    model.eval()
+    model.to(device)
+    return {
+        "model": model,
+        "tokenizer": tokenizer,
+        "image_processor": image_processor,
+        "device": device,
+        "device_msg": device_msg,
+        "model_dir": str(model_dir),
+        "tokenizer_dir": str(tokenizer_dir),
+        "image_processor_dir": str(image_processor_dir),
+    }
+
+
+def _apply_donut_ui_preprocess(image: Image.Image, pipeline: str) -> Image.Image:
+    mode = (pipeline or "none").strip().lower()
+    rgb = image.convert("RGB")
+    if mode == "pb" and _pb_preprocess_patch_image is not None and _PBPreprocessConfig is not None:
+        try:
+            return _pb_preprocess_patch_image(image=rgb, config=_PBPreprocessConfig()).convert("RGB")
+        except Exception:
+            return rgb
+    if mode == "bdrc" and _preprocess_image_bdrc is not None and _BDRCPreprocessConfig is not None:
+        try:
+            return _preprocess_image_bdrc(image=rgb, config=_BDRCPreprocessConfig.vit_defaults()).convert("RGB")
+        except Exception:
+            return rgb
+    return rgb
+
+
+def run_donut_ocr_inference_ui(
+    image: Optional[np.ndarray],
+    model_root_or_model_dir: str,
+    image_preprocess_pipeline: str,
+    device_preference: str,
+    generation_max_length: int,
+    num_beams: int,
+):
+    if image is None:
+        return None, "", "{}"
+    model_dir, tokenizer_dir, image_processor_dir, err = _resolve_donut_runtime_dirs(model_root_or_model_dir)
+    if err:
+        return image, f"Failed: {err}", json.dumps({"ok": False, "error": err}, ensure_ascii=False, indent=2)
+
+    try:
+        runtime = _load_donut_ocr_runtime_cached(
+            str(model_dir),
+            str(tokenizer_dir),
+            str(image_processor_dir),
+            str(device_preference or "auto"),
+        )
+    except Exception as exc:
+        msg = f"Failed loading DONUT runtime: {type(exc).__name__}: {exc}"
+        return image, msg, json.dumps({"ok": False, "error": msg}, ensure_ascii=False, indent=2)
+
+    try:
+        pil = Image.fromarray(np.asarray(image).astype(np.uint8)).convert("RGB")
+        proc_pil = _apply_donut_ui_preprocess(pil, image_preprocess_pipeline)
+        image_processor = runtime["image_processor"]
+        tokenizer = runtime["tokenizer"]
+        model = runtime["model"]
+        device = runtime["device"]
+
+        pixel_values = image_processor(images=proc_pil, return_tensors="pt").pixel_values
+        pixel_values = pixel_values.to(device)
+        with torch.no_grad():
+            generated = model.generate(
+                pixel_values=pixel_values,
+                max_length=max(8, int(generation_max_length)),
+                num_beams=max(1, int(num_beams)),
+            )
+        text = tokenizer.batch_decode(generated, skip_special_tokens=True)[0] if len(generated) else ""
+
+        debug = {
+            "ok": True,
+            "model_dir": runtime["model_dir"],
+            "tokenizer_dir": runtime["tokenizer_dir"],
+            "image_processor_dir": runtime["image_processor_dir"],
+            "device": runtime["device"],
+            "device_msg": runtime.get("device_msg", ""),
+            "image_preprocess_pipeline": (image_preprocess_pipeline or "none"),
+            "generation_max_length": int(generation_max_length),
+            "num_beams": int(num_beams),
+            "output_length_chars": len(text),
+        }
+        return np.array(proc_pil), text, json.dumps(debug, ensure_ascii=False, indent=2)
+    except Exception as exc:
+        msg = f"Failed DONUT OCR inference: {type(exc).__name__}: {exc}"
+        return image, msg, json.dumps({"ok": False, "error": msg}, ensure_ascii=False, indent=2)
+
+
+def run_donut_ocr_inference_with_gt_ui(
+    image: Optional[np.ndarray],
+    model_root_or_model_dir: str,
+    image_preprocess_pipeline: str,
+    device_preference: str,
+    generation_max_length: int,
+    num_beams: int,
+    ground_truth_text: str,
+):
+    preview, pred_text, debug_json = run_donut_ocr_inference_ui(
+        image=image,
+        model_root_or_model_dir=model_root_or_model_dir,
+        image_preprocess_pipeline=image_preprocess_pipeline,
+        device_preference=device_preference,
+        generation_max_length=generation_max_length,
+        num_beams=num_beams,
+    )
+    gt = str(ground_truth_text or "")
+    cer_text = ""
+    try:
+        debug_obj = json.loads(debug_json or "{}")
+    except Exception:
+        debug_obj = {"raw_debug": debug_json}
+    if isinstance(debug_obj, dict) and bool(debug_obj.get("ok")) and gt.strip():
+        cer = _cer_single_ui(pred_text or "", gt)
+        cer_text = f"{cer:.6f}"
+        debug_obj["ground_truth_length_chars"] = len(gt)
+        debug_obj["cer"] = cer
+        debug_json = json.dumps(debug_obj, ensure_ascii=False, indent=2)
+    return preview, pred_text, gt, cer_text, debug_json
+
+
+def scan_donut_ocr_models_ui(models_dir: str):
+    base = Path(models_dir).expanduser().resolve()
+    if not base.exists() or not base.is_dir():
+        return gr.update(choices=[], value=None), "", f"Directory not found: {base}"
+
+    def _is_hf_model_dir(p: Path) -> bool:
+        if not p.exists() or not p.is_dir():
+            return False
+        if not (p / "config.json").exists():
+            return False
+        return (
+            (p / "pytorch_model.bin").exists()
+            or (p / "model.safetensors").exists()
+            or (p / "model.safetensors.index.json").exists()
+        )
+
+    found_roots: List[str] = []
+    for p in sorted(base.rglob("*")):
+        if not p.is_dir():
+            continue
+        if p.name != "model":
+            continue
+        parent = p.parent
+        if not _is_hf_model_dir(p):
+            continue
+        tok = parent / "tokenizer"
+        imgp = parent / "image_processor"
+        if tok.exists() and imgp.exists():
+            found_roots.append(str(parent.resolve()))
+
+    found_roots = sorted(set(found_roots))
+    default = found_roots[0] if found_roots else ""
+    msg = f"Found {len(found_roots)} DONUT/TroCR model output dir(s) in {base}"
+    return gr.update(choices=found_roots, value=(default if default else None)), default, msg
+
+
+def _read_jsonl_rows_ui(path: Path) -> List[Dict[str, Any]]:
+    rows: List[Dict[str, Any]] = []
+    if not path.exists() or not path.is_file():
+        return rows
+    try:
+        with path.open("r", encoding="utf-8") as f:
+            for line in f:
+                raw = line.strip()
+                if not raw:
+                    continue
+                try:
+                    obj = json.loads(raw)
+                except Exception:
+                    continue
+                if isinstance(obj, dict):
+                    rows.append(obj)
+    except Exception:
+        return []
+    return rows
+
+
+def _resolve_ocr_manifest_image_path_ui(image_value: str, manifest_path: Path) -> Optional[Path]:
+    raw = (image_value or "").strip()
+    if not raw:
+        return None
+    p = Path(raw).expanduser()
+    if p.is_absolute():
+        return p if p.exists() and p.is_file() else None
+    candidates = [
+        (manifest_path.parent / p).resolve(),
+        (manifest_path.parent.parent / p).resolve(),
+        (manifest_path.parent.parent.parent / p).resolve(),
+        (ROOT / p).resolve(),
+    ]
+    for c in candidates:
+        if c.exists() and c.is_file():
+            return c
+    return None
+
+
+def _extract_ocr_manifest_row_fields_ui(row: Dict[str, Any]) -> Tuple[str, str]:
+    image_keys = ["line_path", "src__image", "image", "image_path", "line_image", "line_image_path", "path"]
+    text_keys = ["text", "src__label", "label", "transcription", "ocr_text", "line_text"]
+    img = ""
+    txt = ""
+    for k in image_keys:
+        v = row.get(k)
+        if isinstance(v, str) and v.strip():
+            img = v.strip()
+            break
+    for k in text_keys:
+        v = row.get(k)
+        if isinstance(v, str) and v.strip():
+            txt = v.strip()
+            break
+    return img, txt
+
+
+def scan_donut_ocr_datasets_ui(datasets_dir: str):
+    base = Path(datasets_dir).expanduser().resolve()
+    if not base.exists() or not base.is_dir():
+        empty = gr.update(choices=[], value=None)
+        return empty, gr.update(choices=[], value=None), "", f"Directory not found: {base}"
+
+    dataset_roots: List[str] = []
+    split_map: Dict[str, List[str]] = {}
+    for p in sorted(base.rglob("meta/lines.jsonl")):
+        split_dir = p.parent.parent  # <root>/<split>/meta/lines.jsonl
+        root_dir = split_dir.parent
+        split_name = split_dir.name
+        if split_name not in {"train", "val", "eval", "test"}:
+            continue
+        key = str(root_dir.resolve())
+        split_map.setdefault(key, [])
+        split_map[key].append(split_name)
+    for k in sorted(split_map.keys()):
+        split_map[k] = sorted(set(split_map[k]), key=lambda s: {"train": 0, "val": 1, "eval": 2, "test": 3}.get(s, 9))
+        dataset_roots.append(k)
+
+    default_dataset = dataset_roots[0] if dataset_roots else ""
+    default_splits = split_map.get(default_dataset, [])
+    default_split = default_splits[0] if default_splits else None
+    state_json = json.dumps(split_map, ensure_ascii=False)
+    msg = f"Found {len(dataset_roots)} OCR dataset root(s) with manifests in {base}"
+    return (
+        gr.update(choices=dataset_roots, value=(default_dataset if default_dataset else None)),
+        gr.update(choices=default_splits, value=default_split),
+        state_json,
+        msg,
+    )
+
+
+def on_donut_ocr_dataset_change_ui(dataset_root: str, split_map_json: str):
+    root = (dataset_root or "").strip()
+    try:
+        split_map = json.loads(split_map_json or "{}")
+    except Exception:
+        split_map = {}
+    splits = split_map.get(root, []) if isinstance(split_map, dict) else []
+    default_split = splits[0] if splits else None
+    return gr.update(choices=splits, value=default_split)
+
+
+def _levenshtein_ui(a: str, b: str) -> int:
+    if a == b:
+        return 0
+    if not a:
+        return len(b)
+    if not b:
+        return len(a)
+    prev = list(range(len(b) + 1))
+    for i, ca in enumerate(a, start=1):
+        curr = [i]
+        for j, cb in enumerate(b, start=1):
+            curr.append(min(
+                curr[j - 1] + 1,
+                prev[j] + 1,
+                prev[j - 1] + (0 if ca == cb else 1),
+            ))
+        prev = curr
+    return prev[-1]
+
+
+def _cer_single_ui(pred: str, ref: str) -> float:
+    denom = max(1, len(ref or ""))
+    return float(_levenshtein_ui(pred or "", ref or "") / denom)
+
+
+def load_random_donut_ocr_dataset_sample_ui(dataset_root: str, split_name: str, seed: float):
+    root = Path((dataset_root or "").strip()).expanduser().resolve()
+    split = (split_name or "").strip()
+    if not root.exists():
+        return None, "", "{}", ""
+    manifest = root / split / "meta" / "lines.jsonl"
+    rows = _read_jsonl_rows_ui(manifest)
+    if not rows:
+        msg = f"No rows found in {manifest}"
+        return None, "", json.dumps({"ok": False, "error": msg}, ensure_ascii=False, indent=2), ""
+    try:
+        seed_i = int(float(seed))
+    except Exception:
+        seed_i = int(time.time())
+    rng = np.random.default_rng(seed_i)
+    order = rng.permutation(len(rows)).tolist()
+    chosen_row = None
+    chosen_img_path: Optional[Path] = None
+    for idx in order:
+        row = rows[int(idx)]
+        img_raw, txt = _extract_ocr_manifest_row_fields_ui(row)
+        img_path = _resolve_ocr_manifest_image_path_ui(img_raw, manifest)
+        if img_path is None or not txt:
+            continue
+        chosen_row = row
+        chosen_img_path = img_path
+        break
+    if chosen_row is None or chosen_img_path is None:
+        msg = f"No usable image/text row found in {manifest}"
+        return None, "", json.dumps({"ok": False, "error": msg}, ensure_ascii=False, indent=2), ""
+    with Image.open(chosen_img_path) as im:
+        rgb = im.convert("RGB")
+    _, gt = _extract_ocr_manifest_row_fields_ui(chosen_row)
+    debug = {
+        "ok": True,
+        "dataset_root": str(root),
+        "split": split,
+        "manifest": str(manifest),
+        "image_path": str(chosen_img_path),
+        "line_id": chosen_row.get("line_id"),
+        "page_id": chosen_row.get("page_id"),
+        "doc_id": chosen_row.get("doc_id"),
+    }
+    return np.array(rgb), str(gt), json.dumps(debug, ensure_ascii=False, indent=2), str(chosen_img_path)
 
 
 def refresh_image_list(dataset_dir: str, split: str):
@@ -9875,6 +10277,80 @@ def build_ui() -> gr.Blocks:
                     donut_model_dir = gr.Textbox(label="Model Output Dir", interactive=False)
                     donut_summary_path = gr.Textbox(label="Workflow Summary Path", interactive=False)
 
+            with gr.Accordion("Test Trained DONUT/TroCR OCR Model", open=False):
+                gr.Markdown(
+                    "Load a trained DONUT/TroCR output directory (`.../model`, `.../tokenizer`, `.../image_processor`) "
+                    "and run OCR on an uploaded line image or a random sample from an OCR dataset manifest. "
+                    "Uses the same optional image preprocessing switch as training."
+                )
+                with gr.Row():
+                    with gr.Column(scale=1):
+                        donut_test_models_dir = gr.Textbox(
+                            label="Scan models dir",
+                            value=str((workspace_root / "models").resolve()),
+                        )
+                        with gr.Row():
+                            donut_test_scan_btn = gr.Button("Scan DONUT Models")
+                            donut_test_scan_msg = gr.Textbox(label="Scan Status", interactive=False)
+                        donut_test_model_select = gr.Dropdown(
+                            choices=[],
+                            value=None,
+                            label="Detected DONUT/TroCR model outputs",
+                        )
+                        donut_test_model_dir = gr.Textbox(
+                            label="Trained model output dir (or direct model/ dir)",
+                            value=default_donut_model_output_dir,
+                            placeholder="/path/to/models/donut_openpecha_bdrc",
+                        )
+                        with gr.Row():
+                            donut_test_preproc = gr.Dropdown(
+                                choices=["none", "pb", "bdrc"],
+                                value="bdrc",
+                                label="image_preprocess_pipeline",
+                            )
+                            donut_test_device = gr.Dropdown(
+                                choices=["auto", "cuda:0", "cuda:1", "cuda:2", "cuda:3", "cpu"],
+                                value="auto",
+                                label="device",
+                            )
+                        with gr.Row():
+                            donut_test_max_len = gr.Number(label="generation_max_length", value=512, precision=0)
+                            donut_test_beams = gr.Number(label="num_beams", value=1, precision=0)
+                        with gr.Accordion("Load Random OCR Sample From Dataset", open=False):
+                            donut_test_datasets_dir = gr.Textbox(
+                                label="Scan datasets dir",
+                                value=str((workspace_root / "datasets").resolve()),
+                            )
+                            with gr.Row():
+                                donut_test_dataset_scan_btn = gr.Button("Scan OCR Datasets")
+                                donut_test_dataset_scan_msg = gr.Textbox(label="Dataset Scan Status", interactive=False)
+                            donut_test_dataset_split_map_state = gr.State("{}")
+                            with gr.Row():
+                                donut_test_dataset_root = gr.Dropdown(
+                                    choices=[],
+                                    value=None,
+                                    label="Detected OCR dataset roots",
+                                    allow_custom_value=True,
+                                )
+                                donut_test_dataset_split = gr.Dropdown(
+                                    choices=[],
+                                    value=None,
+                                    label="Split",
+                                )
+                            with gr.Row():
+                                donut_test_dataset_seed = gr.Number(label="random_seed", value=42, precision=0)
+                                donut_test_dataset_sample_btn = gr.Button("Load Random Sample")
+                            donut_test_dataset_sample_path = gr.Textbox(label="Selected sample image path", interactive=False)
+                            donut_test_dataset_sample_meta = gr.Textbox(label="Sample Metadata JSON", lines=8, interactive=False)
+                        donut_test_image = gr.Image(label="Line Image (upload)", type="numpy")
+                        donut_test_gt = gr.Textbox(label="Ground Truth (optional / from dataset sample)", lines=4)
+                        donut_test_btn = gr.Button("Run DONUT OCR Inference", variant="primary")
+                    with gr.Column(scale=1):
+                        donut_test_preview = gr.Image(label="Preprocessed Image", type="numpy")
+                        donut_test_text = gr.Textbox(label="OCR Output", lines=8)
+                        donut_test_cer = gr.Textbox(label="CER (vs Ground Truth)", lines=1)
+                        donut_test_debug = gr.Textbox(label="Runtime / Debug JSON", lines=14)
+
             donut_run_btn.click(
                 fn=run_donut_ocr_workflow_live,
                 inputs=[
@@ -9923,6 +10399,69 @@ def build_ui() -> gr.Blocks:
                     donut_prepared_dir,
                     donut_model_dir,
                     donut_summary_path,
+                ],
+            )
+            donut_test_btn.click(
+                fn=run_donut_ocr_inference_with_gt_ui,
+                inputs=[
+                    donut_test_image,
+                    donut_test_model_dir,
+                    donut_test_preproc,
+                    donut_test_device,
+                    donut_test_max_len,
+                    donut_test_beams,
+                    donut_test_gt,
+                ],
+                outputs=[
+                    donut_test_preview,
+                    donut_test_text,
+                    donut_test_gt,
+                    donut_test_cer,
+                    donut_test_debug,
+                ],
+            )
+            donut_model_dir.change(
+                fn=lambda x: x or "",
+                inputs=[donut_model_dir],
+                outputs=[donut_test_model_dir],
+            )
+            donut_test_scan_btn.click(
+                fn=scan_donut_ocr_models_ui,
+                inputs=[donut_test_models_dir],
+                outputs=[donut_test_model_select, donut_test_model_dir, donut_test_scan_msg],
+            )
+            donut_test_model_select.change(
+                fn=lambda x: x or "",
+                inputs=[donut_test_model_select],
+                outputs=[donut_test_model_dir],
+            )
+            donut_test_dataset_scan_btn.click(
+                fn=scan_donut_ocr_datasets_ui,
+                inputs=[donut_test_datasets_dir],
+                outputs=[
+                    donut_test_dataset_root,
+                    donut_test_dataset_split,
+                    donut_test_dataset_split_map_state,
+                    donut_test_dataset_scan_msg,
+                ],
+            )
+            donut_test_dataset_root.change(
+                fn=on_donut_ocr_dataset_change_ui,
+                inputs=[donut_test_dataset_root, donut_test_dataset_split_map_state],
+                outputs=[donut_test_dataset_split],
+            )
+            donut_test_dataset_sample_btn.click(
+                fn=load_random_donut_ocr_dataset_sample_ui,
+                inputs=[
+                    donut_test_dataset_root,
+                    donut_test_dataset_split,
+                    donut_test_dataset_seed,
+                ],
+                outputs=[
+                    donut_test_image,
+                    donut_test_gt,
+                    donut_test_dataset_sample_meta,
+                    donut_test_dataset_sample_path,
                 ],
             )
 
