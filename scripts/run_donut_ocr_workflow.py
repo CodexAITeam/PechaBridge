@@ -165,6 +165,7 @@ def run(args) -> Dict[str, object]:
             extra_special_tokens="<NL>,<s_ocr>,</s_ocr>,<s_cls1>",
             decoder_start_token="<s_ocr>",
             image_size=int(args.image_size),
+            image_preprocess_pipeline=str(getattr(args, "image_preprocess_pipeline", "none") or "none"),
             max_target_length=int(args.max_target_length),
             generation_max_length=int(args.max_target_length),
             per_device_train_batch_size=int(args.per_device_train_batch_size),

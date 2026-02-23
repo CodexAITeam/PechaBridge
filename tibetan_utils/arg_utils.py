@@ -689,8 +689,18 @@ def add_train_text_hierarchy_vit_arguments(parser):
     parser.add_argument('--checkpoint_every_steps', '--checkpoint-every-steps', dest='checkpoint_every_steps',
                        type=int, default=0, help='Save checkpoint every N optimizer steps (0 disables)')
     parser.add_argument('--train_mode', '--train-mode', dest='train_mode', type=str, default='auto',
-                       choices=['auto', 'legacy', 'patch_mpnce'],
+                       choices=['auto', 'legacy', 'patch_mpnce', 'patch_clip'],
                        help='Training mode selection (auto prefers patch_mpnce when patch parquet exists)')
+    parser.add_argument('--text_encoder_name_or_path', '--text-encoder-name-or-path', dest='text_encoder_name_or_path', type=str,
+                       default='google/byt5-small',
+                       help='HF text encoder ID/path for CLIP-style patch_clip training')
+    parser.add_argument('--text_max_length', '--text-max-length', dest='text_max_length', type=int, default=128,
+                       help='Tokenizer max length for CLIP-style patch_clip training')
+    parser.add_argument('--freeze_text_encoder', '--freeze-text-encoder', dest='freeze_text_encoder',
+                       action='store_true', help='Freeze text encoder in patch_clip mode and train projection heads only')
+    parser.add_argument('--image_preprocess_pipeline', '--image-preprocess-pipeline', dest='image_preprocess_pipeline', type=str,
+                       default='none', choices=['none', 'pb', 'bdrc'],
+                       help='Optional deterministic pre-processing pipeline applied to images before ViT normalization')
     parser.add_argument('--patch_meta_parquet', '--patch-meta-parquet', dest='patch_meta_parquet', type=str, default='',
                        help='Optional explicit path to patch metadata parquet (default: <dataset>/meta/patches.parquet)')
     parser.add_argument('--pairs_parquet', '--pairs-parquet', dest='pairs_parquet', type=str, default='',
@@ -1027,6 +1037,9 @@ def add_train_donut_ocr_arguments(parser):
                        help='Token used as decoder start token')
     parser.add_argument('--image_size', type=int, default=384,
                        help='Square resize used by image processor')
+    parser.add_argument('--image_preprocess_pipeline', '--image-preprocess-pipeline', dest='image_preprocess_pipeline', type=str,
+                       default='none', choices=['none', 'pb', 'bdrc'],
+                       help='Optional deterministic image preprocessing before Donut image processor')
     parser.add_argument('--max_target_length', type=int, default=512,
                        help='Maximum target token length for training labels')
     parser.add_argument('--generation_max_length', type=int, default=512,
@@ -1109,6 +1122,9 @@ def add_run_donut_ocr_workflow_arguments(parser):
                        help='Maximum target length')
     parser.add_argument('--image_size', type=int, default=384,
                        help='Image size for OCR model input')
+    parser.add_argument('--image_preprocess_pipeline', '--image-preprocess-pipeline', dest='image_preprocess_pipeline', type=str,
+                       default='none', choices=['none', 'pb', 'bdrc'],
+                       help='Optional deterministic image preprocessing before Donut image processor in workflow train step')
     parser.add_argument('--seed', type=int, default=42,
                        help='Random seed')
     parser.add_argument('--skip_generation', action='store_true',

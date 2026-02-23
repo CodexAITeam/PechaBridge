@@ -28,6 +28,8 @@ if str(REPO_ROOT) not in sys.path:
     sys.path.insert(0, str(REPO_ROOT))
 
 from tibetan_utils.arg_utils import create_train_donut_ocr_parser
+from pechabridge.ocr.preprocess import PreprocessConfig as PBPreprocessConfig, preprocess_patch_image
+from pechabridge.ocr.preprocess_bdrc import BDRCPreprocessConfig, preprocess_image_bdrc
 
 LOGGER = logging.getLogger("train_donut_ocr")
 
@@ -145,6 +147,22 @@ def _configure_image_processor(image_processor, image_size: int):
         LOGGER.warning("Could not update image processor size: %s", exc)
 
 
+def _image_preprocess_pipeline_name(args) -> str:
+    mode = str(getattr(args, "image_preprocess_pipeline", "none") or "none").strip().lower()
+    if mode not in {"none", "pb", "bdrc"}:
+        return "none"
+    return mode
+
+
+def _apply_image_preprocess_pipeline(image: Image.Image, pipeline: str) -> Image.Image:
+    mode = str(pipeline or "none").strip().lower()
+    if mode == "pb":
+        return preprocess_patch_image(image=image, config=PBPreprocessConfig()).convert("RGB")
+    if mode == "bdrc":
+        return preprocess_image_bdrc(image=image, config=BDRCPreprocessConfig.vit_defaults()).convert("RGB")
+    return image.convert("RGB")
+
+
 @dataclass
 class OCRSample:
     image_path: Path
@@ -159,6 +177,7 @@ class OCRManifestDataset(Dataset):
         image_processor,
         tokenizer,
         max_target_length: int,
+        image_preprocess_pipeline: str = "none",
     ):
         self.samples: List[OCRSample] = []
         for row in rows:
@@ -175,6 +194,7 @@ class OCRManifestDataset(Dataset):
         self.image_processor = image_processor
         self.tokenizer = tokenizer
         self.max_target_length = int(max_target_length)
+        self.image_preprocess_pipeline = str(image_preprocess_pipeline or "none")
 
     def __len__(self) -> int:
         return len(self.samples)
@@ -183,6 +203,7 @@ class OCRManifestDataset(Dataset):
         sample = self.samples[idx]
         with Image.open(sample.image_path) as img:
             rgb = img.convert("RGB")
+        rgb = _apply_image_preprocess_pipeline(rgb, self.image_preprocess_pipeline)
         pixel_values = self.image_processor(images=rgb, return_tensors="pt").pixel_values.squeeze(0)
         labels = self.tokenizer(
             sample.text,
@@ -278,6 +299,8 @@ def run(args) -> Dict[str, object]:
     image_processor_source = args.image_processor_path or args.model_name_or_path
     image_processor = AutoImageProcessor.from_pretrained(image_processor_source)
     _configure_image_processor(image_processor, int(args.image_size))
+    image_preproc_mode = _image_preprocess_pipeline_name(args)
+    LOGGER.info("Donut OCR image preprocessing pipeline: %s", image_preproc_mode)
     image_processor_dir = output_dir / "image_processor"
     image_processor.save_pretrained(str(image_processor_dir))
 
@@ -313,12 +336,14 @@ def run(args) -> Dict[str, object]:
         image_processor=image_processor,
         tokenizer=tokenizer,
         max_target_length=int(args.max_target_length),
+        image_preprocess_pipeline=image_preproc_mode,
     )
     val_dataset = OCRManifestDataset(
         val_rows,
         image_processor=image_processor,
         tokenizer=tokenizer,
         max_target_length=int(args.max_target_length),
+        image_preprocess_pipeline=image_preproc_mode,
     ) if val_rows else None
 
     LOGGER.info("Train dataset size: %d", len(train_dataset))
