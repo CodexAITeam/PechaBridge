@@ -109,6 +109,81 @@ def _summarize_module_devices(module: nn.Module) -> Dict[str, object]:
     }
 
 
+def _find_plain_tensor_attrs(module: nn.Module, *, max_items: int = 512) -> List[Dict[str, object]]:
+    """Find tensor attributes on modules that are neither params nor buffers."""
+    found: List[Dict[str, object]] = []
+
+    def _walk(mod: nn.Module, prefix: str) -> None:
+        if len(found) >= max_items:
+            return
+        registered_params = set(mod._parameters.keys())
+        registered_buffers = set(mod._buffers.keys())
+        registered_children = set(mod._modules.keys())
+        for name, value in vars(mod).items():
+            if name in {"_parameters", "_buffers", "_modules"}:
+                continue
+            if name in registered_params or name in registered_buffers or name in registered_children:
+                continue
+            if torch.is_tensor(value):
+                t = value
+                found.append(
+                    {
+                        "path": f"{prefix}{name}",
+                        "device": str(t.device),
+                        "shape": tuple(int(d) for d in t.shape),
+                        "dtype": str(t.dtype),
+                        "module_type": type(mod).__name__,
+                    }
+                )
+                if len(found) >= max_items:
+                    return
+        for child_name, child in mod.named_children():
+            _walk(child, f"{prefix}{child_name}.")
+
+    _walk(module, "")
+    return found
+
+
+def _materialize_meta_tensor_attrs_inplace(module: nn.Module, *, device: str = "cpu") -> List[str]:
+    """Materialize meta-device *plain tensor attributes* on modules.
+
+    Important for transformers versions where helper tensors (e.g. TrOCR sinusoidal
+    positional embeddings `weights`) are not registered as buffers.
+    """
+    fixed: List[str] = []
+
+    def _walk(mod: nn.Module, prefix: str) -> None:
+        registered_params = set(mod._parameters.keys())
+        registered_buffers = set(mod._buffers.keys())
+        registered_children = set(mod._modules.keys())
+        for name, value in list(vars(mod).items()):
+            if name in {"_parameters", "_buffers", "_modules"}:
+                continue
+            if name in registered_params or name in registered_buffers or name in registered_children:
+                continue
+            if not torch.is_tensor(value) or value.device.type != "meta":
+                continue
+            replacement: torch.Tensor
+            if type(mod).__name__ == "TrOCRSinusoidalPositionalEmbedding" and name == "weights":
+                # Recompute deterministic sinusoidal table instead of zero-filling.
+                try:
+                    num_pos = int(value.shape[0]) if value.ndim >= 1 else int(getattr(mod, "padding_idx", 0) or 0) + 2048
+                    emb_dim = int(getattr(mod, "embedding_dim"))
+                    pad_idx = getattr(mod, "padding_idx", None)
+                    replacement = mod.get_embedding(num_pos, emb_dim, pad_idx).to(device)
+                except Exception:
+                    replacement = torch.zeros(tuple(value.shape), dtype=value.dtype, device=device)
+            else:
+                replacement = torch.zeros(tuple(value.shape), dtype=value.dtype, device=device)
+            setattr(mod, name, replacement)
+            fixed.append(f"{prefix}{name}")
+        for child_name, child in mod.named_children():
+            _walk(child, f"{prefix}{child_name}.")
+
+    _walk(module, "")
+    return fixed
+
+
 def _scan_object_tensors(obj: object, *, max_depth: int = 2, max_items: int = 256) -> List[Dict[str, object]]:
     """Find torch tensors nested in common python containers / object __dict__.
 
@@ -213,6 +288,8 @@ def _log_pretrain_device_report(
     proc_tensors = _scan_object_tensors(image_processor)
     tok_tensors = _scan_object_tensors(tokenizer)
     model_dev = _summarize_module_devices(model)
+    model_plain_tensors = _find_plain_tensor_attrs(model)
+    model_plain_meta = [x for x in model_plain_tensors if x.get("device") == "meta"]
 
     report["train_dataset_sample0"] = sample_report
     report["collated_batch_probe"] = batch_report
@@ -228,6 +305,8 @@ def _log_pretrain_device_report(
     }
     report["model_meta_params"] = model_dev["meta_params"]
     report["model_meta_buffers"] = model_dev["meta_buffers"]
+    report["model_plain_tensor_attrs"] = model_plain_tensors
+    report["model_plain_meta_tensor_attrs"] = model_plain_meta
 
     report_path = output_dir / "device_report_pretrain.json"
     report_path.write_text(json.dumps(report, ensure_ascii=False, indent=2), encoding="utf-8")
@@ -254,6 +333,8 @@ def _log_pretrain_device_report(
         LOGGER.warning("Model meta params: %s", ", ".join(model_dev["meta_params"]))
     if model_dev["meta_buffers"]:
         LOGGER.warning("Model meta buffers: %s", ", ".join(model_dev["meta_buffers"]))
+    if model_plain_meta:
+        LOGGER.warning("Model plain meta tensor attrs: %s", json.dumps(model_plain_meta, ensure_ascii=False))
 
 
 def _drop_encoder_pooler_if_meta(model: VisionEncoderDecoderModel) -> None:
@@ -311,6 +392,13 @@ def _load_ved_model_robust(model_name_or_path: str) -> VisionEncoderDecoderModel
             ", ".join(meta_before[:20]) + (" ..." if len(meta_before) > 20 else ""),
         )
         _drop_encoder_pooler_if_meta(model)
+    plain_fixed = _materialize_meta_tensor_attrs_inplace(model, device="cpu")
+    if plain_fixed:
+        LOGGER.warning(
+            "Materialized meta plain tensor attrs after load (%d): %s",
+            len(plain_fixed),
+            ", ".join(plain_fixed[:20]) + (" ..." if len(plain_fixed) > 20 else ""),
+        )
     meta_after = _named_meta_tensors(model)
     if meta_after:
         raise RuntimeError(
@@ -667,6 +755,13 @@ def run(args) -> Dict[str, object]:
             len(fixed_meta_buffers),
             ", ".join(fixed_meta_buffers[:20]) + (" ..." if len(fixed_meta_buffers) > 20 else ""),
         )
+    fixed_plain_attrs = _materialize_meta_tensor_attrs_inplace(model, device="cpu")
+    if fixed_plain_attrs:
+        LOGGER.warning(
+            "Materialized meta plain tensor attrs after decoder resize (%d): %s",
+            len(fixed_plain_attrs),
+            ", ".join(fixed_plain_attrs[:20]) + (" ..." if len(fixed_plain_attrs) > 20 else ""),
+        )
     _drop_encoder_pooler_if_meta(model)
     meta_after_resize = _named_meta_tensors(model)
     if meta_after_resize:
@@ -675,6 +770,13 @@ def run(args) -> Dict[str, object]:
             + ", ".join(meta_after_resize[:20])
             + (" ..." if len(meta_after_resize) > 20 else "")
             + "."
+        )
+    plain_meta_after_resize = [x for x in _find_plain_tensor_attrs(model) if x.get("device") == "meta"]
+    if plain_meta_after_resize:
+        raise RuntimeError(
+            "Model contains plain meta tensor attrs after tokenizer resize: "
+            + json.dumps(plain_meta_after_resize[:20], ensure_ascii=False)
+            + (" ..." if len(plain_meta_after_resize) > 20 else "")
         )
 
     decoder_start_id = tokenizer.convert_tokens_to_ids(args.decoder_start_token)
