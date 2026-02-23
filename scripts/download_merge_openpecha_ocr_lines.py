@@ -1,16 +1,22 @@
 #!/usr/bin/env python3
 """Download and merge OpenPecha OCR Hugging Face datasets into a line dataset.
 
-Output format is TextHierarchy-like (line folders with `line.png`) plus merged metadata:
+Output format is TextHierarchy-like (line folders with `line.png`) plus merged metadata.
+Known HF split names are normalized into `train`, `test`, `eval` output folders.
 
 out_dir/
-  TextHierarchy/
-    dataset=<dataset>/split=<split>/doc=<doc_id>/page=<page_id>/line_<id>/line.png
+  train|test|eval/
+    TextHierarchy/
+      dataset=<dataset>/doc=<doc_id>/page=<page_id>/line_<id>/line.png
+    meta/
+      lines.jsonl
+      lines.parquet
   meta/
-    lines.jsonl
-    lines.parquet
+    lines.jsonl        # all splits combined
+    lines.parquet      # all splits combined
     summary.json
     source_columns.json
+    split_mapping.json
 
 The script preserves source columns under the `src__*` prefix. Nested/list values are
 serialized to JSON strings so they can be merged across datasets and written to parquet.
@@ -19,6 +25,7 @@ serialized to JSON strings so they can be merged across datasets and written to 
 from __future__ import annotations
 
 import argparse
+import contextlib
 import io
 import json
 import logging
@@ -100,6 +107,10 @@ LINE_COLUMN_CANDIDATES: Tuple[str, ...] = (
     "index",
 )
 
+_TRAIN_SPLIT_ALIASES = {"train", "training"}
+_TEST_SPLIT_ALIASES = {"test", "testing"}
+_EVAL_SPLIT_ALIASES = {"eval", "evaluation", "val", "valid", "validation", "dev", "development"}
+
 
 def _configure_logging(verbose: bool = False) -> None:
     logging.basicConfig(
@@ -123,6 +134,18 @@ def _sanitize_id(value: Any) -> str:
 
 def _dataset_short_name(dataset_id: str) -> str:
     return _sanitize_id(dataset_id.split("/")[-1] if "/" in dataset_id else dataset_id)
+
+
+def _canonical_split_name(split_name: str) -> str:
+    raw = str(split_name or "").strip()
+    norm = raw.lower()
+    if norm in _TRAIN_SPLIT_ALIASES:
+        return "train"
+    if norm in _TEST_SPLIT_ALIASES:
+        return "test"
+    if norm in _EVAL_SPLIT_ALIASES:
+        return "eval"
+    return _sanitize_id(raw or "train")
 
 
 def _is_hf_image_feature(feature: Any) -> bool:
@@ -388,6 +411,10 @@ def _safe_jsonl_write_line(fp, record: Mapping[str, Any]) -> None:
 
 
 def _write_parquet_from_jsonl(jsonl_path: Path, parquet_path: Path) -> None:
+    if not jsonl_path.exists() or jsonl_path.stat().st_size <= 0:
+        parquet_path.parent.mkdir(parents=True, exist_ok=True)
+        pd.DataFrame().to_parquet(parquet_path, index=False)
+        return
     df = pd.read_json(jsonl_path, lines=True)
     for col in ("doc_id", "page_id", "line_path", "source_dataset", "source_split", "source_config", "text"):
         if col in df.columns:
@@ -418,7 +445,7 @@ def create_parser(add_help: bool = True) -> argparse.ArgumentParser:
         "--output-dir",
         type=str,
         required=True,
-        help="Output dataset directory (will create TextHierarchy/ and meta/).",
+        help="Output dataset directory (creates train/test/eval subfolders with TextHierarchy/ and meta/).",
     )
     parser.add_argument(
         "--dataset",
@@ -454,20 +481,20 @@ def create_parser(add_help: bool = True) -> argparse.ArgumentParser:
 def run(args: argparse.Namespace) -> Dict[str, Any]:
     _configure_logging(bool(args.verbose))
     out_dir = Path(args.output_dir).expanduser().resolve()
-    text_root = out_dir / "TextHierarchy"
-    meta_dir = out_dir / "meta"
-    jsonl_path = meta_dir / "lines.jsonl"
-    parquet_path = meta_dir / "lines.parquet"
-    summary_path = meta_dir / "summary.json"
-    source_cols_path = meta_dir / "source_columns.json"
+    root_meta_dir = out_dir / "meta"
+    root_jsonl_path = root_meta_dir / "lines.jsonl"
+    root_parquet_path = root_meta_dir / "lines.parquet"
+    summary_path = root_meta_dir / "summary.json"
+    source_cols_path = root_meta_dir / "source_columns.json"
+    split_mapping_path = root_meta_dir / "split_mapping.json"
 
-    text_root.mkdir(parents=True, exist_ok=True)
-    meta_dir.mkdir(parents=True, exist_ok=True)
+    root_meta_dir.mkdir(parents=True, exist_ok=True)
 
     datasets_to_process = [d.strip() for d in (args.datasets or []) if str(d).strip()] or list(DEFAULT_DATASETS)
     split_filter = {s.strip() for s in (args.splits or []) if str(s).strip()}
 
     source_columns: Dict[str, Dict[str, Any]] = {}
+    split_mapping: Dict[str, str] = {}
     line_counters: Dict[Tuple[str, str, str, str], int] = defaultdict(int)
     path_collision_counters: Dict[Tuple[str, str, str, str, int], int] = defaultdict(int)
 
@@ -482,11 +509,40 @@ def run(args: argparse.Namespace) -> Dict[str, Any]:
             "rows_skipped_no_image_column": 0,
             "rows_skipped_image_decode": 0,
             "splits_skipped_by_filter": 0,
+            "canonical_splits_created": 0,
         }
     )
     counts_by_dataset: Dict[str, Counter] = defaultdict(Counter)
+    counts_by_canonical_split: Dict[str, Counter] = defaultdict(Counter)
+    split_outputs: Dict[str, Dict[str, Any]] = {}
 
-    with jsonl_path.open("w", encoding="utf-8") as fp:
+    with contextlib.ExitStack() as stack:
+        root_fp = stack.enter_context(root_jsonl_path.open("w", encoding="utf-8"))
+
+        def _ensure_split_output(canonical_split: str) -> Dict[str, Any]:
+            state = split_outputs.get(canonical_split)
+            if state is not None:
+                return state
+            split_root = out_dir / canonical_split
+            split_text_root = split_root / "TextHierarchy"
+            split_meta_dir = split_root / "meta"
+            split_text_root.mkdir(parents=True, exist_ok=True)
+            split_meta_dir.mkdir(parents=True, exist_ok=True)
+            split_jsonl_path = split_meta_dir / "lines.jsonl"
+            split_parquet_path = split_meta_dir / "lines.parquet"
+            split_fp = stack.enter_context(split_jsonl_path.open("w", encoding="utf-8"))
+            state = {
+                "root": split_root,
+                "text_root": split_text_root,
+                "meta_dir": split_meta_dir,
+                "jsonl_path": split_jsonl_path,
+                "parquet_path": split_parquet_path,
+                "fp": split_fp,
+            }
+            split_outputs[canonical_split] = state
+            totals["canonical_splits_created"] = int(len(split_outputs))
+            return state
+
         for dataset_id in datasets_to_process:
             dataset_short = _dataset_short_name(dataset_id)
             LOGGER.info("Loading dataset: %s", dataset_id)
@@ -521,6 +577,8 @@ def run(args: argparse.Namespace) -> Dict[str, Any]:
                         totals["splits_skipped_by_filter"] += 1
                         continue
                     totals["splits_processed"] += 1
+                    canonical_split = _canonical_split_name(split_name)
+                    split_mapping[str(split_name)] = canonical_split
 
                     column_names = list(getattr(split_ds, "column_names", []) or [])
                     features = getattr(split_ds, "features", None)
@@ -533,6 +591,7 @@ def run(args: argparse.Namespace) -> Dict[str, Any]:
                         "dataset_short": dataset_short,
                         "config": config_label,
                         "split": split_name,
+                        "canonical_split": canonical_split,
                         "columns": column_names,
                         "image_column_detected": image_col or "",
                         "text_column_detected": text_col or "",
@@ -551,7 +610,7 @@ def run(args: argparse.Namespace) -> Dict[str, Any]:
                     progress = tqdm(
                         enumerate(split_ds),
                         total=getattr(split_ds, "num_rows", None),
-                        desc=f"{dataset_short}:{split_name}",
+                        desc=f"{dataset_short}:{split_name}->{canonical_split}",
                     )
                     for row_idx, row in progress:
                         if int(args.max_rows_per_split) > 0 and row_idx >= int(args.max_rows_per_split):
@@ -579,15 +638,15 @@ def run(args: argparse.Namespace) -> Dict[str, Any]:
                             line_counters=line_counters,
                         )
 
-                        collision_key = (dataset_short, split_name, doc_id, page_id, int(line_id))
+                        collision_key = (dataset_short, canonical_split, doc_id, page_id, int(line_id))
                         dup_idx = int(path_collision_counters[collision_key])
                         path_collision_counters[collision_key] += 1
 
+                        split_state = _ensure_split_output(canonical_split)
                         line_dir_name = f"line_{int(line_id):06d}" if dup_idx == 0 else f"line_{int(line_id):06d}_dup{dup_idx:03d}"
                         line_dir = (
-                            text_root
+                            Path(split_state["text_root"])
                             / f"dataset={dataset_short}"
-                            / f"split={_sanitize_id(split_name)}"
                             / f"doc={doc_id}"
                             / f"page={page_id}"
                             / line_dir_name
@@ -610,6 +669,8 @@ def run(args: argparse.Namespace) -> Dict[str, Any]:
 
                         text_value = _safe_text(row.get(text_col, "")) if text_col else ""
                         rec: Dict[str, Any] = {
+                            "split": canonical_split,
+                            "canonical_split": canonical_split,
                             "source_dataset": dataset_id,
                             "source_dataset_short": dataset_short,
                             "source_config": config_label,
@@ -629,30 +690,57 @@ def run(args: argparse.Namespace) -> Dict[str, Any]:
                             **id_meta,
                             **source_record,
                         }
-                        _safe_jsonl_write_line(fp, rec)
+                        _safe_jsonl_write_line(root_fp, rec)
+                        _safe_jsonl_write_line(split_state["fp"], rec)
 
                         totals["rows_saved"] += 1
                         counts_by_dataset[dataset_id]["rows_saved"] += 1
                         counts_by_dataset[dataset_id][f"split::{split_name}"] += 1
+                        counts_by_canonical_split[canonical_split]["rows_saved"] += 1
+                        counts_by_canonical_split[canonical_split][f"source_split::{split_name}"] += 1
 
     if not bool(args.skip_parquet):
         try:
-            LOGGER.info("Converting merged metadata to parquet: %s", parquet_path)
-            _write_parquet_from_jsonl(jsonl_path, parquet_path)
+            LOGGER.info("Converting merged metadata to parquet: %s", root_parquet_path)
+            _write_parquet_from_jsonl(root_jsonl_path, root_parquet_path)
         except Exception as exc:
             LOGGER.exception("Failed to write parquet metadata: %s", exc)
+        for canonical_split, split_state in split_outputs.items():
+            try:
+                LOGGER.info(
+                    "Converting split metadata to parquet: split=%s path=%s",
+                    canonical_split,
+                    split_state["parquet_path"],
+                )
+                _write_parquet_from_jsonl(Path(split_state["jsonl_path"]), Path(split_state["parquet_path"]))
+            except Exception as exc:
+                LOGGER.exception(
+                    "Failed to write split parquet metadata for %s: %s",
+                    canonical_split,
+                    exc,
+                )
 
     summary: Dict[str, Any] = {
         "output_dir": str(out_dir),
-        "text_root": str(text_root),
-        "meta_jsonl": str(jsonl_path),
-        "meta_parquet": str(parquet_path),
+        "meta_jsonl": str(root_jsonl_path),
+        "meta_parquet": str(root_parquet_path),
         "datasets": datasets_to_process,
         "totals": dict(totals),
         "per_dataset": {k: dict(v) for k, v in counts_by_dataset.items()},
+        "per_canonical_split": {k: dict(v) for k, v in counts_by_canonical_split.items()},
+        "split_outputs": {
+            k: {
+                "root": str(v["root"]),
+                "text_root": str(v["text_root"]),
+                "meta_jsonl": str(v["jsonl_path"]),
+                "meta_parquet": str(v["parquet_path"]),
+            }
+            for k, v in split_outputs.items()
+        },
     }
     summary_path.write_text(json.dumps(summary, ensure_ascii=False, indent=2), encoding="utf-8")
     source_cols_path.write_text(json.dumps(source_columns, ensure_ascii=False, indent=2), encoding="utf-8")
+    split_mapping_path.write_text(json.dumps(split_mapping, ensure_ascii=False, indent=2), encoding="utf-8")
     LOGGER.info("Done. Saved summary to %s", summary_path)
     return summary
 
