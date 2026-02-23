@@ -47,8 +47,10 @@ Available subcommands:
 - `faiss-text-hierarchy-search`
 - `eval-faiss-crosspage`
 - `prepare-donut-ocr-dataset`
+- `eval-ocr-tokenizer`
 - `train-donut-ocr`
 - `run-donut-ocr-workflow`
+- `download-openpecha-ocr-lines`
 
 ## Example CLI Workflow
 
@@ -181,6 +183,38 @@ python cli.py train-donut-ocr \
   --model_name_or_path microsoft/trocr-base-stage1 \
   --train_tokenizer
 ```
+
+Recommended for OpenPecha OCR line datasets (`BoSentencePiece`, no tokenizer retraining):
+
+```bash
+# A) Download and merge OpenPecha OCR HF datasets into train/test/eval line format
+python cli.py download-openpecha-ocr-lines \
+  --output-dir ./datasets/openpecha_ocr_lines
+
+# B) Prepare Donut manifests from line metadata (val auto-maps to eval)
+python cli.py prepare-donut-ocr-dataset \
+  --dataset_dir ./datasets/openpecha_ocr_lines \
+  --output_dir ./datasets/openpecha_ocr_lines/donut_manifests \
+  --splits train,val \
+  --text_field text
+
+# C) Compare BoSentencePiece vs baselines before training
+python cli.py eval-ocr-tokenizer \
+  --manifests-dir ./datasets/openpecha_ocr_lines/donut_manifests \
+  --tokenizer openpecha/BoSentencePiece \
+  --with-baselines \
+  --output-json ./datasets/openpecha_ocr_lines/donut_manifests/tokenizer_compare.json
+
+# D) Train Donut OCR with the same tokenizer used in evaluation
+python cli.py train-donut-ocr \
+  --train_manifest ./datasets/openpecha_ocr_lines/donut_manifests/train_manifest.jsonl \
+  --val_manifest ./datasets/openpecha_ocr_lines/donut_manifests/val_manifest.jsonl \
+  --output_dir ./models/donut-openpecha-ocr \
+  --model_name_or_path microsoft/trocr-base-stage1 \
+  --tokenizer_path openpecha/BoSentencePiece
+```
+
+Note: Do not pass `--train_tokenizer` if you want training to use exactly the same tokenizer that was evaluated.
 
 ### 6) Patch Retrieval Dataset + mp-InfoNCE ViT Training (current)
 

@@ -27,6 +27,7 @@ from pechabridge.eval.eval_faiss_crosspage import run as run_eval_faiss_crosspag
 from scripts.download_merge_openpecha_ocr_lines import (
     create_parser as create_download_openpecha_ocr_lines_parser,
 )
+from scripts.eval_ocr_tokenizer import create_parser as create_eval_ocr_tokenizer_parser
 
 LOGGER = logging.getLogger("pechabridge_cli")
 
@@ -115,6 +116,15 @@ def _build_root_parser() -> argparse.ArgumentParser:
         description=prepare_donut_parent.description,
     )
     prepare_donut_parser.set_defaults(handler=_run_prepare_donut_ocr_dataset)
+
+    eval_ocr_tokenizer_parent = create_eval_ocr_tokenizer_parser(add_help=False)
+    eval_ocr_tokenizer_parser = subparsers.add_parser(
+        "eval-ocr-tokenizer",
+        parents=[eval_ocr_tokenizer_parent],
+        help="Evaluate tokenizer coverage/length behavior on OCR manifests (e.g. BoSentencePiece)",
+        description=eval_ocr_tokenizer_parent.description,
+    )
+    eval_ocr_tokenizer_parser.set_defaults(handler=_run_eval_ocr_tokenizer)
 
     train_donut_parent = create_train_donut_ocr_parser(add_help=False)
     train_donut_parser = subparsers.add_parser(
@@ -276,6 +286,13 @@ def _run_faiss_text_hierarchy_search(args: argparse.Namespace) -> int:
 
 def _run_prepare_donut_ocr_dataset(args: argparse.Namespace) -> int:
     from scripts.prepare_donut_ocr_dataset import run
+
+    run(args)
+    return 0
+
+
+def _run_eval_ocr_tokenizer(args: argparse.Namespace) -> int:
+    from scripts.eval_ocr_tokenizer import run
 
     run(args)
     return 0

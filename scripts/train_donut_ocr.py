@@ -62,6 +62,32 @@ def _read_manifest(path: Path) -> List[Dict[str, object]]:
     return rows
 
 
+def _resolve_val_manifest_path(train_manifest: Path, val_manifest_arg: str) -> Optional[Path]:
+    raw = str(val_manifest_arg or "").strip()
+    if raw:
+        p = Path(raw).expanduser().resolve()
+        if p.exists():
+            return p
+        # Quality-of-life fallback for prepared OpenPecha manifests using eval_manifest.jsonl.
+        if p.name == "val_manifest.jsonl":
+            alt = p.with_name("eval_manifest.jsonl")
+            if alt.exists():
+                LOGGER.info("val_manifest not found, using eval manifest instead: %s", alt)
+                return alt
+        return p
+
+    candidates = [
+        train_manifest.parent / "val_manifest.jsonl",
+        train_manifest.parent / "eval_manifest.jsonl",
+    ]
+    for cand in candidates:
+        if cand.exists():
+            if cand.name != "val_manifest.jsonl":
+                LOGGER.info("Using validation manifest fallback: %s", cand)
+            return cand.resolve()
+    return None
+
+
 def _iter_texts(rows: Sequence[Dict[str, object]]) -> Iterable[str]:
     for row in rows:
         text = row.get("text", "")
@@ -80,6 +106,7 @@ def _ensure_pad_token(tokenizer) -> None:
 
 def _load_or_build_tokenizer(args, train_rows: Sequence[Dict[str, object]]):
     base_path = args.tokenizer_path or args.model_name_or_path
+    LOGGER.info("Loading tokenizer for OCR training from: %s", base_path)
     tokenizer = AutoTokenizer.from_pretrained(base_path, use_fast=True)
     special_tokens = _parse_csv_tokens(args.extra_special_tokens)
 
@@ -232,7 +259,7 @@ def run(args) -> Dict[str, object]:
     set_seed(int(args.seed))
 
     train_manifest = Path(args.train_manifest).expanduser().resolve()
-    val_manifest = Path(args.val_manifest).expanduser().resolve() if args.val_manifest else None
+    val_manifest = _resolve_val_manifest_path(train_manifest, str(getattr(args, "val_manifest", "") or ""))
     output_dir = Path(args.output_dir).expanduser().resolve()
     output_dir.mkdir(parents=True, exist_ok=True)
 
@@ -331,6 +358,7 @@ def run(args) -> Dict[str, object]:
         bf16=bool(args.bf16),
         remove_unused_columns=False,
         report_to=[],
+        disable_tqdm=False,
         evaluation_strategy="steps" if has_eval else "no",
         save_strategy="steps",
         load_best_model_at_end=bool(has_eval),

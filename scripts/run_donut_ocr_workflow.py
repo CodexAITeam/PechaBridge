@@ -158,7 +158,7 @@ def run(args) -> Dict[str, object]:
             output_dir=str(model_output_dir),
             model_name_or_path=str(args.model_name_or_path),
             image_processor_path="",
-            tokenizer_path="",
+            tokenizer_path=str(args.tokenizer_path),
             train_tokenizer=bool(args.train_tokenizer),
             tokenizer_vocab_size=int(args.tokenizer_vocab_size),
             tokenizer_output_dir="",

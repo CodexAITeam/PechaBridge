@@ -952,15 +952,15 @@ def create_faiss_text_hierarchy_search_parser(add_help: bool = True):
 def add_prepare_donut_ocr_dataset_arguments(parser):
     """Arguments for preparing label-filtered OCR manifests for Donut-style training."""
     parser.add_argument('--dataset_dir', type=str, required=True,
-                       help='Dataset root containing train/val with ocr_targets and ocr_crops')
+                       help='Dataset root containing legacy train/val ocr_targets or canonical train/test/eval meta/lines.*')
     parser.add_argument('--output_dir', type=str, required=True,
                        help='Output directory for train/val manifests')
     parser.add_argument('--label_id', type=int, default=1,
-                       help='Class label ID to keep for OCR training (default: 1)')
+                       help='Class label ID to keep for legacy ocr_targets format (ignored for line-meta datasets)')
     parser.add_argument('--splits', type=str, default='train,val',
-                       help='Comma-separated splits to process (default: train,val)')
-    parser.add_argument('--text_field', type=str, choices=['target_text', 'rendered_text'], default='target_text',
-                       help='Which text field from ocr_targets records to use')
+                       help='Comma-separated output splits to process (default: train,val; val auto-falls back to eval)')
+    parser.add_argument('--text_field', type=str, default='target_text',
+                       help='Preferred text field; auto-falls back to text/text_raw for line-meta datasets')
     parser.add_argument('--normalization', type=str, default='NFC',
                        choices=['NFC', 'NFKC', 'NFD', 'NFKD', 'none'],
                        help='Unicode normalization strategy for output text')
@@ -1012,8 +1012,8 @@ def add_train_donut_ocr_arguments(parser):
                        help='VisionEncoderDecoder checkpoint to fine-tune')
     parser.add_argument('--image_processor_path', type=str, default='',
                        help='Optional image processor checkpoint/path override')
-    parser.add_argument('--tokenizer_path', type=str, default='',
-                       help='Optional tokenizer checkpoint/path override')
+    parser.add_argument('--tokenizer_path', type=str, default='openpecha/BoSentencePiece',
+                       help='Tokenizer checkpoint/path (default: openpecha/BoSentencePiece; empty string falls back to model tokenizer)')
     parser.add_argument('--train_tokenizer', action='store_true',
                        help='Train a new tokenizer from training targets')
     parser.add_argument('--tokenizer_vocab_size', type=int, default=16000,
@@ -1091,6 +1091,8 @@ def add_run_donut_ocr_workflow_arguments(parser):
                        help='Output directory for trained OCR model')
     parser.add_argument('--model_name_or_path', type=str, default='microsoft/trocr-base-stage1',
                        help='VisionEncoderDecoder checkpoint to fine-tune')
+    parser.add_argument('--tokenizer_path', type=str, default='openpecha/BoSentencePiece',
+                       help='Tokenizer checkpoint/path for Donut training step (default: openpecha/BoSentencePiece)')
     parser.add_argument('--train_tokenizer', action='store_true',
                        help='Train a tokenizer from label-1 OCR targets')
     parser.add_argument('--tokenizer_vocab_size', type=int, default=16000,
