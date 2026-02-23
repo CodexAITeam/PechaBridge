@@ -689,8 +689,12 @@ def add_train_text_hierarchy_vit_arguments(parser):
     parser.add_argument('--checkpoint_every_steps', '--checkpoint-every-steps', dest='checkpoint_every_steps',
                        type=int, default=0, help='Save checkpoint every N optimizer steps (0 disables)')
     parser.add_argument('--train_mode', '--train-mode', dest='train_mode', type=str, default='auto',
-                       choices=['auto', 'legacy', 'patch_mpnce', 'patch_clip'],
+                       choices=['auto', 'legacy', 'patch_mpnce', 'patch_clip', 'line_clip'],
                        help='Training mode selection (auto prefers patch_mpnce when patch parquet exists)')
+    parser.add_argument('--train_manifest', '--train-manifest', dest='train_manifest', type=str, default='',
+                       help='JSONL manifest for line_clip training (expects {"image":..., "text":...})')
+    parser.add_argument('--val_manifest', '--val-manifest', dest='val_manifest', type=str, default='',
+                       help='Optional JSONL manifest for line_clip validation/eval/export metadata context')
     parser.add_argument('--text_encoder_name_or_path', '--text-encoder-name-or-path', dest='text_encoder_name_or_path', type=str,
                        default='google/byt5-small',
                        help='HF text encoder ID/path for CLIP-style patch_clip training')
