@@ -54,6 +54,29 @@ def _named_meta_tensors(module: nn.Module) -> List[str]:
     return sorted(set(names))
 
 
+def _materialize_meta_buffers_inplace(module: nn.Module, *, device: str = "cpu") -> List[str]:
+    """Replace meta-device buffers with zero-initialized real tensors.
+
+    This is primarily needed for some HF/TroCR positional embedding helper
+    buffers (e.g. `_float_tensor`) that can remain on `meta` in newer
+    transformers/torch combinations.
+    """
+    fixed: List[str] = []
+
+    def _walk(mod: nn.Module, prefix: str) -> None:
+        for buf_name, buf in list(mod._buffers.items()):
+            if buf is None or getattr(buf, "device", None) is None or buf.device.type != "meta":
+                continue
+            new_buf = torch.zeros(tuple(buf.shape), dtype=buf.dtype, device=device)
+            mod._buffers[buf_name] = new_buf
+            fixed.append(f"{prefix}{buf_name}")
+        for child_name, child in mod.named_children():
+            _walk(child, f"{prefix}{child_name}.")
+
+    _walk(module, "")
+    return fixed
+
+
 def _drop_encoder_pooler_if_meta(model: VisionEncoderDecoderModel) -> None:
     encoder = getattr(model, "encoder", None)
     if encoder is None or not hasattr(encoder, "pooler"):
@@ -458,6 +481,22 @@ def run(args) -> Dict[str, object]:
 
     model = _load_ved_model_robust(args.model_name_or_path)
     model.decoder.resize_token_embeddings(len(tokenizer))
+    fixed_meta_buffers = _materialize_meta_buffers_inplace(model, device="cpu")
+    if fixed_meta_buffers:
+        LOGGER.warning(
+            "Materialized meta buffers after decoder resize (%d): %s",
+            len(fixed_meta_buffers),
+            ", ".join(fixed_meta_buffers[:20]) + (" ..." if len(fixed_meta_buffers) > 20 else ""),
+        )
+    _drop_encoder_pooler_if_meta(model)
+    meta_after_resize = _named_meta_tensors(model)
+    if meta_after_resize:
+        raise RuntimeError(
+            "Model contains meta tensors after tokenizer resize: "
+            + ", ".join(meta_after_resize[:20])
+            + (" ..." if len(meta_after_resize) > 20 else "")
+            + "."
+        )
 
     decoder_start_id = tokenizer.convert_tokens_to_ids(args.decoder_start_token)
     unk_id = tokenizer.unk_token_id
