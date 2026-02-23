@@ -873,7 +873,7 @@ def _collate_line_text_clip(
             "path": str(row.get("path", "")),
             "text": str(row.get("text", "")),
         }
-        for row in batch
+        for i, row in enumerate(batch)
     ]
     return {
         "pixel_values": pixels,
