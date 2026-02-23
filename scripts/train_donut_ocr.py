@@ -7,6 +7,7 @@ import json
 import inspect
 import logging
 import sys
+from collections import Counter
 from dataclasses import dataclass
 from pathlib import Path
 from typing import Dict, Iterable, List, Optional, Sequence, Tuple
@@ -75,6 +76,184 @@ def _materialize_meta_buffers_inplace(module: nn.Module, *, device: str = "cpu")
 
     _walk(module, "")
     return fixed
+
+
+def _summarize_module_devices(module: nn.Module) -> Dict[str, object]:
+    param_counts: Counter[str] = Counter()
+    param_numel: Counter[str] = Counter()
+    buffer_counts: Counter[str] = Counter()
+    buffer_numel: Counter[str] = Counter()
+    meta_params: List[str] = []
+    meta_buffers: List[str] = []
+
+    for name, param in module.named_parameters():
+        dev = str(param.device)
+        param_counts[dev] += 1
+        param_numel[dev] += int(param.numel())
+        if param.device.type == "meta":
+            meta_params.append(name)
+    for name, buf in module.named_buffers():
+        dev = str(buf.device)
+        buffer_counts[dev] += 1
+        buffer_numel[dev] += int(buf.numel())
+        if buf.device.type == "meta":
+            meta_buffers.append(name)
+
+    return {
+        "param_counts_by_device": dict(param_counts),
+        "param_numel_by_device": dict(param_numel),
+        "buffer_counts_by_device": dict(buffer_counts),
+        "buffer_numel_by_device": dict(buffer_numel),
+        "meta_params": meta_params,
+        "meta_buffers": meta_buffers,
+    }
+
+
+def _scan_object_tensors(obj: object, *, max_depth: int = 2, max_items: int = 256) -> List[Dict[str, object]]:
+    """Find torch tensors nested in common python containers / object __dict__.
+
+    This is for diagnostics only (processor/tokenizer usually have no tensors).
+    """
+    found: List[Dict[str, object]] = []
+    seen: set[int] = set()
+
+    def _walk(x: object, path: str, depth: int) -> None:
+        if len(found) >= max_items:
+            return
+        oid = id(x)
+        if oid in seen:
+            return
+        seen.add(oid)
+        if torch.is_tensor(x):
+            t = x
+            found.append(
+                {
+                    "path": path,
+                    "device": str(t.device),
+                    "shape": tuple(int(d) for d in t.shape),
+                    "dtype": str(t.dtype),
+                }
+            )
+            return
+        if depth >= max_depth:
+            return
+        if isinstance(x, dict):
+            for k, v in list(x.items())[:max_items]:
+                _walk(v, f"{path}.{k}" if path else str(k), depth + 1)
+            return
+        if isinstance(x, (list, tuple)):
+            for i, v in enumerate(list(x)[:max_items]):
+                _walk(v, f"{path}[{i}]", depth + 1)
+            return
+        if hasattr(x, "__dict__"):
+            try:
+                items = list(vars(x).items())[:max_items]
+            except Exception:
+                return
+            for k, v in items:
+                _walk(v, f"{path}.{k}" if path else str(k), depth + 1)
+
+    _walk(obj, "", 0)
+    return found
+
+
+def _describe_batch_like(data: Dict[str, object]) -> Dict[str, object]:
+    out: Dict[str, object] = {}
+    for key, value in data.items():
+        if torch.is_tensor(value):
+            t = value
+            out[key] = {
+                "kind": "tensor",
+                "device": str(t.device),
+                "shape": tuple(int(d) for d in t.shape),
+                "dtype": str(t.dtype),
+            }
+        elif isinstance(value, list):
+            out[key] = {
+                "kind": "list",
+                "len": len(value),
+                "elem_type": type(value[0]).__name__ if value else "n/a",
+            }
+        else:
+            out[key] = {"kind": type(value).__name__}
+    return out
+
+
+def _log_pretrain_device_report(
+    *,
+    train_dataset: "OCRManifestDataset",
+    collator: "OCRDataCollator",
+    image_processor: object,
+    tokenizer: object,
+    model: nn.Module,
+    output_dir: Path,
+) -> None:
+    report: Dict[str, object] = {
+        "cuda_available": bool(torch.cuda.is_available()),
+        "cuda_device_count": int(torch.cuda.device_count()) if torch.cuda.is_available() else 0,
+        "torch_cuda_current_device": (int(torch.cuda.current_device()) if torch.cuda.is_available() else None),
+        "train_dataset_len": int(len(train_dataset)),
+    }
+
+    sample_report: Dict[str, object] = {}
+    batch_report: Dict[str, object] = {}
+    try:
+        sample0 = train_dataset[0]
+        sample_report = _describe_batch_like(sample0)
+        sample_feats = [sample0]
+        if len(train_dataset) > 1:
+            sample_feats.append(train_dataset[1])
+        collated = collator(sample_feats)
+        batch_report = _describe_batch_like(collated)
+    except Exception as exc:
+        sample_report = {"error": f"{type(exc).__name__}: {exc}"}
+        batch_report = {"error": f"{type(exc).__name__}: {exc}"}
+        LOGGER.exception("Failed to build sample/collated batch for device report")
+
+    proc_tensors = _scan_object_tensors(image_processor)
+    tok_tensors = _scan_object_tensors(tokenizer)
+    model_dev = _summarize_module_devices(model)
+
+    report["train_dataset_sample0"] = sample_report
+    report["collated_batch_probe"] = batch_report
+    report["image_processor_tensors"] = proc_tensors
+    report["tokenizer_tensors"] = tok_tensors
+    report["model_device_summary"] = {
+        "param_counts_by_device": model_dev["param_counts_by_device"],
+        "param_numel_by_device": model_dev["param_numel_by_device"],
+        "buffer_counts_by_device": model_dev["buffer_counts_by_device"],
+        "buffer_numel_by_device": model_dev["buffer_numel_by_device"],
+        "meta_params_count": len(model_dev["meta_params"]),
+        "meta_buffers_count": len(model_dev["meta_buffers"]),
+    }
+    report["model_meta_params"] = model_dev["meta_params"]
+    report["model_meta_buffers"] = model_dev["meta_buffers"]
+
+    report_path = output_dir / "device_report_pretrain.json"
+    report_path.write_text(json.dumps(report, ensure_ascii=False, indent=2), encoding="utf-8")
+
+    LOGGER.info("Pre-train device report written to %s", report_path)
+    LOGGER.info("Device report dataset sample0: %s", json.dumps(sample_report, ensure_ascii=False))
+    LOGGER.info("Device report collated batch probe: %s", json.dumps(batch_report, ensure_ascii=False))
+    if proc_tensors:
+        LOGGER.info("Image processor tensor devices: %s", json.dumps(proc_tensors, ensure_ascii=False))
+    else:
+        LOGGER.info("Image processor tensor devices: none detected (config-only object)")
+    if tok_tensors:
+        LOGGER.info("Tokenizer tensor devices: %s", json.dumps(tok_tensors, ensure_ascii=False))
+    else:
+        LOGGER.info("Tokenizer tensor devices: none detected (config-only object)")
+    LOGGER.info(
+        "Model device summary: params=%s buffers=%s meta_params=%d meta_buffers=%d",
+        json.dumps(model_dev["param_counts_by_device"], ensure_ascii=False),
+        json.dumps(model_dev["buffer_counts_by_device"], ensure_ascii=False),
+        len(model_dev["meta_params"]),
+        len(model_dev["meta_buffers"]),
+    )
+    if model_dev["meta_params"]:
+        LOGGER.warning("Model meta params: %s", ", ".join(model_dev["meta_params"]))
+    if model_dev["meta_buffers"]:
+        LOGGER.warning("Model meta buffers: %s", ", ".join(model_dev["meta_buffers"]))
 
 
 def _drop_encoder_pooler_if_meta(model: VisionEncoderDecoderModel) -> None:
@@ -615,6 +794,15 @@ def run(args) -> Dict[str, object]:
         # Newer Transformers versions replaced `tokenizer=` with `processing_class=`.
         trainer_kwargs["processing_class"] = tokenizer
     trainer = Seq2SeqTrainer(**trainer_kwargs)
+
+    _log_pretrain_device_report(
+        train_dataset=train_dataset,
+        collator=collator,
+        image_processor=image_processor,
+        tokenizer=tokenizer,
+        model=model,
+        output_dir=output_dir,
+    )
 
     train_result = trainer.train(resume_from_checkpoint=args.resume_from_checkpoint or None)
     trainer.save_model(str(output_dir / "model"))
