@@ -1870,6 +1870,10 @@ def _run_line_clip_training(
     image_std: Sequence[float],
     image_processor: Any,
 ) -> Dict[str, Any]:
+    if accelerator.is_main_process:
+        output_dir.mkdir(parents=True, exist_ok=True)
+    accelerator.wait_for_everyone()
+
     train_manifest_raw = str(getattr(args, "train_manifest", "") or "").strip()
     if train_manifest_raw:
         train_manifest = Path(train_manifest_raw).expanduser().resolve()
@@ -2051,6 +2055,41 @@ def _run_line_clip_training(
                 t2i=f"{float(clip_stats.get('acc_t2i', 0.0)):.2f}",
                 lr=f"{lr_scheduler.get_last_lr()[0]:.2e}",
             )
+
+            if (
+                int(args.checkpoint_every_steps) > 0
+                and global_step % int(args.checkpoint_every_steps) == 0
+                and accelerator.is_main_process
+            ):
+                prefix = f"checkpoint_step_{global_step:07d}"
+                artifacts = _save_artifacts(
+                    accelerator=accelerator,
+                    output_dir=output_dir,
+                    backbone=backbone,
+                    projection_head=image_projection_head,
+                    image_processor=image_processor,
+                    args=args,
+                    num_groups=len(line_samples),
+                    num_assets=len(line_samples),
+                    width_buckets=width_buckets,
+                    steps_per_epoch=steps_per_epoch,
+                    effective_max_train_steps=max_train_steps,
+                    effective_num_train_epochs=num_train_epochs,
+                    prefix=prefix,
+                    global_step=global_step,
+                    extra_config={
+                        "mode": "line_clip",
+                        "loss_type": "clip_symmetric_infonce",
+                        "train_manifest": str(train_manifest),
+                        "val_manifest": (str(val_manifest) if val_manifest else ""),
+                        "line_samples": int(len(line_samples)),
+                        "text_encoder_name_or_path": str(getattr(args, "text_encoder_name_or_path", "")),
+                        "text_max_length": int(getattr(args, "text_max_length", 128)),
+                        "freeze_text_encoder": bool(getattr(args, "freeze_text_encoder", False)),
+                        "image_preprocess_pipeline": image_preproc_mode,
+                    },
+                )
+                LOGGER.info("Saved line_clip checkpoint at step %d -> %s", global_step, artifacts.backbone_dir)
         if global_step >= max_train_steps:
             break
 
