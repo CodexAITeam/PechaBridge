@@ -184,6 +184,46 @@ def _materialize_meta_tensor_attrs_inplace(module: nn.Module, *, device: str = "
     return fixed
 
 
+def _register_trocr_sinusoidal_weights_as_buffer(module: nn.Module) -> List[str]:
+    """Convert TrOCR sinusoidal `weights` helper tensors into registered buffers.
+
+    `TrOCRSinusoidalPositionalEmbedding.weights` is a plain tensor attribute in
+    transformers 5.x, so `model.to(device)` and `DataParallel` do not move it.
+    Registering it as a non-persistent buffer fixes device placement and keeps
+    the original module logic intact (future assignments stay in `_buffers`).
+    """
+    converted: List[str] = []
+
+    for prefix, mod in module.named_modules():
+        if type(mod).__name__ != "TrOCRSinusoidalPositionalEmbedding":
+            continue
+        if not hasattr(mod, "weights"):
+            continue
+        weights = getattr(mod, "weights")
+        if not torch.is_tensor(weights):
+            continue
+        # Already a registered buffer in some versions/custom forks.
+        if "weights" in getattr(mod, "_buffers", {}):
+            continue
+        try:
+            # Remove plain attribute first; register_buffer rejects existing attrs.
+            delattr(mod, "weights")
+        except Exception:
+            LOGGER.exception("Failed to delete plain weights attr on %s", prefix or "<root>")
+            continue
+        try:
+            mod.register_buffer("weights", weights, persistent=False)
+            converted.append(f"{prefix}.weights" if prefix else "weights")
+        except Exception:
+            LOGGER.exception("Failed to register weights buffer on %s", prefix or "<root>")
+            # Best effort restore plain attr to avoid leaving module broken.
+            try:
+                setattr(mod, "weights", weights)
+            except Exception:
+                pass
+    return converted
+
+
 def _scan_object_tensors(obj: object, *, max_depth: int = 2, max_items: int = 256) -> List[Dict[str, object]]:
     """Find torch tensors nested in common python containers / object __dict__.
 
@@ -398,6 +438,13 @@ def _load_ved_model_robust(model_name_or_path: str) -> VisionEncoderDecoderModel
             "Materialized meta plain tensor attrs after load (%d): %s",
             len(plain_fixed),
             ", ".join(plain_fixed[:20]) + (" ..." if len(plain_fixed) > 20 else ""),
+        )
+    registered_plain = _register_trocr_sinusoidal_weights_as_buffer(model)
+    if registered_plain:
+        LOGGER.warning(
+            "Registered TrOCR sinusoidal plain tensor attrs as buffers after load (%d): %s",
+            len(registered_plain),
+            ", ".join(registered_plain[:20]) + (" ..." if len(registered_plain) > 20 else ""),
         )
     meta_after = _named_meta_tensors(model)
     if meta_after:
@@ -761,6 +808,13 @@ def run(args) -> Dict[str, object]:
             "Materialized meta plain tensor attrs after decoder resize (%d): %s",
             len(fixed_plain_attrs),
             ", ".join(fixed_plain_attrs[:20]) + (" ..." if len(fixed_plain_attrs) > 20 else ""),
+        )
+    registered_plain_after_resize = _register_trocr_sinusoidal_weights_as_buffer(model)
+    if registered_plain_after_resize:
+        LOGGER.warning(
+            "Registered TrOCR sinusoidal plain tensor attrs as buffers after decoder resize (%d): %s",
+            len(registered_plain_after_resize),
+            ", ".join(registered_plain_after_resize[:20]) + (" ..." if len(registered_plain_after_resize) > 20 else ""),
         )
     _drop_encoder_pooler_if_meta(model)
     meta_after_resize = _named_meta_tensors(model)
