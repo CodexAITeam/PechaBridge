@@ -188,6 +188,119 @@ def _maybe_use_local_bosentencepiece(spec: str) -> str:
     return clean
 
 
+def _is_degenerate_sp_tokenizer(tok) -> bool:
+    try:
+        if int(len(tok)) > 32:
+            return False
+    except Exception:
+        return False
+    return getattr(tok, "sp_model", None) is None and getattr(tok, "vocab_file", None) is None
+
+
+def _try_albert_fast_from_local_dir(local_dir: Path):
+    try:
+        from transformers import AlbertTokenizerFast
+    except Exception:
+        return None
+    if not (local_dir / "tokenizer.json").exists():
+        return None
+    try:
+        tok_fast = AlbertTokenizerFast.from_pretrained(str(local_dir))
+    except Exception:
+        return None
+    try:
+        if int(len(tok_fast)) > 32:
+            return tok_fast
+    except Exception:
+        return None
+    return None
+
+
+class _RawSentencePieceAdapter:
+    """Minimal tokenizer-like wrapper for diagnostics when HF tokenizer load is broken."""
+
+    def __init__(self, sp):
+        self._sp = sp
+        self.unk_token_id = self._safe_int(getattr(sp, "unk_id", lambda: -1)())
+        self.pad_token_id = self._safe_int(getattr(sp, "pad_id", lambda: -1)())
+        self.bos_token_id = self._safe_int(getattr(sp, "bos_id", lambda: -1)())
+        self.eos_token_id = self._safe_int(getattr(sp, "eos_id", lambda: -1)())
+        self.cls_token_id = None
+        self.sep_token_id = None
+        self.all_special_ids = [x for x in [self.pad_token_id, self.bos_token_id, self.eos_token_id] if isinstance(x, int) and x >= 0]
+        self.all_special_tokens = [self._sp.id_to_piece(int(i)) for i in self.all_special_ids]
+
+    @staticmethod
+    def _safe_int(v) -> Optional[int]:
+        try:
+            iv = int(v)
+        except Exception:
+            return None
+        return iv if iv >= 0 else None
+
+    def __len__(self) -> int:
+        return int(self._sp.get_piece_size())
+
+    def __call__(self, text: str, add_special_tokens: bool = False, **_: object) -> Dict[str, List[int]]:
+        ids = [int(x) for x in self._sp.encode_as_ids(str(text or ""))]
+        if add_special_tokens and self.bos_token_id is not None:
+            ids = [int(self.bos_token_id)] + ids
+        if add_special_tokens and self.eos_token_id is not None:
+            ids = ids + [int(self.eos_token_id)]
+        return {"input_ids": ids}
+
+    def convert_ids_to_tokens(self, ids: Sequence[int]) -> List[str]:
+        out: List[str] = []
+        for i in ids:
+            try:
+                out.append(str(self._sp.id_to_piece(int(i))))
+            except Exception:
+                out.append("")
+        return out
+
+    def decode(self, ids: Sequence[int], skip_special_tokens: bool = True, clean_up_tokenization_spaces: bool = False) -> str:
+        _ = clean_up_tokenization_spaces
+        keep: List[int] = []
+        specials = set(int(x) for x in self.all_special_ids)
+        for i in ids:
+            try:
+                ii = int(i)
+            except Exception:
+                continue
+            if skip_special_tokens and ii in specials:
+                continue
+            keep.append(ii)
+        try:
+            return str(self._sp.decode_ids(keep))
+        except Exception:
+            try:
+                pieces = [str(self._sp.id_to_piece(i)) for i in keep]
+                return str(self._sp.decode_pieces(pieces))
+            except Exception:
+                return ""
+
+
+def _try_raw_sentencepiece_from_local_dir(local_dir: Path):
+    sp_model_candidates = [local_dir / "sentencepiece.model", local_dir / "spiece.model"]
+    sp_model_path = next((p for p in sp_model_candidates if p.exists()), None)
+    if sp_model_path is None:
+        return None
+    try:
+        import sentencepiece as spm
+    except Exception:
+        return None
+    try:
+        sp = spm.SentencePieceProcessor()
+        ok = sp.load(str(sp_model_path))
+        if not ok:
+            return None
+        if int(sp.get_piece_size()) <= 32:
+            return None
+        return _RawSentencePieceAdapter(sp)
+    except Exception:
+        return None
+
+
 def _load_tokenizer_robust(spec: str):
     try:
         from transformers import AutoTokenizer
@@ -200,12 +313,23 @@ def _load_tokenizer_robust(spec: str):
         _ensure_spiece_alias_if_needed(p.resolve())
 
     tok = AutoTokenizer.from_pretrained(resolved_spec, use_fast=True)
+    if p.exists() and p.is_dir() and _is_degenerate_sp_tokenizer(tok):
+        tok_fast = _try_albert_fast_from_local_dir(p.resolve())
+        if tok_fast is not None:
+            return tok_fast, resolved_spec
+        tok_raw = _try_raw_sentencepiece_from_local_dir(p.resolve())
+        if tok_raw is not None:
+            return tok_raw, resolved_spec
     if int(len(tok)) <= 32 and getattr(tok, "sp_model", None) is None and getattr(tok, "vocab_file", None) is None:
         raise RuntimeError(
             "Tokenizer loaded with tiny vocab and no SentencePiece model "
             f"(len={len(tok)}, class={tok.__class__.__name__}). "
             "This usually means `spiece.model` was not found. "
-            "If using BoSentencePiece, download it to `ext/BoSentencePiece` and ensure `sentencepiece.model` is present."
+            "If using BoSentencePiece, run `python cli.py download-bosentencepiece-tokenizer` "
+            "(or `python scripts/download_bosentencepiece_tokenizer.py`) from the repo root, "
+            "then use `--tokenizer ./ext/BoSentencePiece`. "
+            "Also verify `sentencepiece` is installed/importable in this venv. "
+            "This checker can fall back to raw `sentencepiece` if the import works."
         )
     return tok, resolved_spec
 

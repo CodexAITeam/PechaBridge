@@ -790,6 +790,44 @@ def _maybe_use_local_bosentencepiece(base_path: str) -> str:
     return spec
 
 
+def _is_degenerate_sp_tokenizer(tok) -> bool:
+    try:
+        tok_len = int(len(tok))
+    except Exception:
+        return False
+    if tok_len > 32:
+        return False
+    sp_model = getattr(tok, "sp_model", None)
+    vocab_file = getattr(tok, "vocab_file", None)
+    return sp_model is None and vocab_file is None
+
+
+def _try_albert_fast_from_local_dir(local_dir: Path):
+    """Try explicit fast tokenizer load from local files when AutoTokenizer falls back badly."""
+    try:
+        from transformers import AlbertTokenizerFast
+    except Exception:
+        return None
+    tok_json = local_dir / "tokenizer.json"
+    if not tok_json.exists():
+        return None
+    try:
+        tok_fast = AlbertTokenizerFast.from_pretrained(str(local_dir))
+    except Exception:
+        return None
+    try:
+        if int(len(tok_fast)) > 32:
+            LOGGER.warning(
+                "Recovered BoSentencePiece via AlbertTokenizerFast fallback (len=%d) from %s",
+                int(len(tok_fast)),
+                local_dir,
+            )
+            return tok_fast
+    except Exception:
+        return None
+    return None
+
+
 def _load_tokenizer_robust(base_path: str):
     spec = _maybe_use_local_bosentencepiece(base_path)
     local_dir: Optional[Path] = None
@@ -799,6 +837,10 @@ def _load_tokenizer_robust(base_path: str):
         _ensure_spiece_alias_if_needed(local_dir)
 
     tokenizer = AutoTokenizer.from_pretrained(spec, use_fast=True)
+    if local_dir is not None and _is_degenerate_sp_tokenizer(tokenizer):
+        tok_fast = _try_albert_fast_from_local_dir(local_dir)
+        if tok_fast is not None:
+            return tok_fast
 
     # Fail fast on the known degenerate ALBERT fallback (only special tokens).
     tok_len = int(len(tokenizer))
@@ -817,6 +859,12 @@ def _load_tokenizer_robust(base_path: str):
                 f"(len={tok_len}, class={tokenizer.__class__.__name__}). "
                 "This usually means the SentencePiece model was not loaded and only ALBERT special tokens are present."
                 + hint
+                + " To fix BoSentencePiece locally, run from the repo root: "
+                "`python cli.py download-bosentencepiece-tokenizer` "
+                "(or `python scripts/download_bosentencepiece_tokenizer.py`). "
+                "Then set `--tokenizer_path ./ext/BoSentencePiece`. "
+                "Also verify your environment has a working `sentencepiece` install "
+                "(e.g. `python -c \"import sentencepiece; print(sentencepiece.__version__)\"`)."
             )
     return tokenizer
 
