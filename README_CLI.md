@@ -181,7 +181,6 @@ python cli.py train-donut-ocr \
   --val_manifest ./datasets/tibetan-donut-ocr-label1/donut_ocr_label1/val_manifest.jsonl \
   --output_dir ./models/donut-ocr-label1 \
   --model_name_or_path microsoft/trocr-base-stage1 \
-  --train_tokenizer
 ```
 
 Recommended for OpenPecha OCR line datasets (`BoSentencePiece`, no tokenizer retraining):
@@ -214,7 +213,7 @@ python cli.py train-donut-ocr \
   --tokenizer_path openpecha/BoSentencePiece
 ```
 
-Note: Do not pass `--train_tokenizer` if you want training to use exactly the same tokenizer that was evaluated.
+Note: The Donut OCR training flow now always reuses the configured tokenizer path directly (no tokenizer retraining flag).
 
 ### 6) Patch Retrieval Dataset + mp-InfoNCE ViT Training (current)
 

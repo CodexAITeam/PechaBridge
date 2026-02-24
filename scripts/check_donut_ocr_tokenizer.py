@@ -13,7 +13,6 @@ from collections import Counter
 from pathlib import Path
 from typing import Dict, Iterable, List, Optional, Sequence, Tuple
 
-
 TEXT_KEY_FALLBACKS: Sequence[str] = (
     "text",
     "transcription",
@@ -27,6 +26,13 @@ TEXT_KEY_FALLBACKS: Sequence[str] = (
 )
 
 REPO_ROOT = Path(__file__).resolve().parents[1]
+if str(REPO_ROOT) not in sys.path:
+    sys.path.insert(0, str(REPO_ROOT))
+
+from pechabridge.ocr.sentencepiece_tokenizer_adapter import (
+    find_sentencepiece_model_path as sp_find_model_path,
+    load_sentencepiece_tokenizer as load_sentencepiece_tokenizer_adapter,
+)
 
 
 def _parse_args() -> argparse.Namespace:
@@ -391,15 +397,26 @@ def _try_raw_sentencepiece_from_local_dir(local_dir: Path):
 
 def _load_tokenizer_robust(spec: str):
     _patch_sentencepiece_compat()
-    try:
-        from transformers import AutoTokenizer
-    except Exception as exc:
-        raise RuntimeError(f"transformers import failed: {exc}") from exc
-
     resolved_spec = _maybe_use_local_bosentencepiece(spec)
     p = Path(str(resolved_spec)).expanduser()
     if p.exists() and p.is_dir():
         _ensure_spiece_alias_if_needed(p.resolve())
+        if sp_find_model_path(p.resolve()) is not None:
+            tok = load_sentencepiece_tokenizer_adapter(p.resolve())
+            return tok, resolved_spec
+
+    if str(resolved_spec).strip() == "openpecha/BoSentencePiece":
+        raise RuntimeError(
+            "BoSentencePiece must be downloaded locally for direct sentencepiece loading. "
+            "Run `python cli.py download-bosentencepiece-tokenizer` (or "
+            "`python scripts/download_bosentencepiece_tokenizer.py`) and then use "
+            "`--tokenizer ./ext/BoSentencePiece`."
+        )
+
+    try:
+        from transformers import AutoTokenizer
+    except Exception as exc:
+        raise RuntimeError(f"transformers import failed: {exc}") from exc
 
     tok = AutoTokenizer.from_pretrained(resolved_spec, use_fast=True)
     if p.exists() and p.is_dir() and _is_degenerate_sp_tokenizer(tok):

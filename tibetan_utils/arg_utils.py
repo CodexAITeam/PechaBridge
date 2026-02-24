@@ -1030,10 +1030,6 @@ def add_train_donut_ocr_arguments(parser):
                        help='Optional image processor checkpoint/path override')
     parser.add_argument('--tokenizer_path', type=str, default='openpecha/BoSentencePiece',
                        help='Tokenizer checkpoint/path (default: openpecha/BoSentencePiece; empty string falls back to model tokenizer)')
-    parser.add_argument('--train_tokenizer', action='store_true',
-                       help='Train a new tokenizer from training targets')
-    parser.add_argument('--tokenizer_vocab_size', type=int, default=16000,
-                       help='Vocabulary size when train_tokenizer is enabled')
     parser.add_argument('--tokenizer_output_dir', type=str, default='',
                        help='Optional explicit path where tokenizer is saved')
     parser.add_argument('--extra_special_tokens', type=str,
@@ -1120,10 +1116,6 @@ def add_run_donut_ocr_workflow_arguments(parser):
                        help='VisionEncoderDecoder checkpoint to fine-tune')
     parser.add_argument('--tokenizer_path', type=str, default='openpecha/BoSentencePiece',
                        help='Tokenizer checkpoint/path for Donut training step (default: openpecha/BoSentencePiece)')
-    parser.add_argument('--train_tokenizer', action='store_true',
-                       help='Train a tokenizer from label-1 OCR targets')
-    parser.add_argument('--tokenizer_vocab_size', type=int, default=16000,
-                       help='Tokenizer vocab size when train_tokenizer is enabled')
     parser.add_argument('--per_device_train_batch_size', type=int, default=4,
                        help='Train batch size per device')
     parser.add_argument('--per_device_eval_batch_size', type=int, default=4,

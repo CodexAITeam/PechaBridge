@@ -2918,8 +2918,8 @@ def run_donut_ocr_workflow_live(
     prepared_output_dir: str,
     model_output_dir: str,
     model_name_or_path: str,
-    train_tokenizer: bool,
-    tokenizer_vocab_size: int,
+    _unused_tokenizer_retrain_flag: bool,
+    _unused_tokenizer_retrain_vocab_size: int,
     per_device_train_batch_size: int,
     per_device_eval_batch_size: int,
     num_train_epochs: float,
@@ -3007,8 +3007,6 @@ def run_donut_ocr_workflow_live(
         str(model_output_path),
         "--model_name_or_path",
         (model_name_or_path or "microsoft/trocr-base-stage1").strip(),
-        "--tokenizer_vocab_size",
-        str(int(tokenizer_vocab_size)),
         "--per_device_train_batch_size",
         str(int(per_device_train_batch_size)),
         "--per_device_eval_batch_size",
@@ -3028,8 +3026,6 @@ def run_donut_ocr_workflow_live(
     prepared_output_clean = (prepared_output_dir or "").strip()
     if prepared_output_clean:
         cmd.extend(["--prepared_output_dir", str(Path(prepared_output_clean).expanduser())])
-    if train_tokenizer:
-        cmd.append("--train_tokenizer")
     if skip_generation:
         cmd.append("--skip_generation")
     if skip_prepare:

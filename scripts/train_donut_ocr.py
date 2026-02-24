@@ -12,7 +12,7 @@ import sys
 from collections import Counter
 from dataclasses import dataclass
 from pathlib import Path
-from typing import Dict, Iterable, List, Optional, Sequence, Tuple
+from typing import Dict, List, Optional, Sequence, Tuple
 
 import numpy as np
 import torch
@@ -36,6 +36,10 @@ if str(REPO_ROOT) not in sys.path:
 from tibetan_utils.arg_utils import create_train_donut_ocr_parser
 from pechabridge.ocr.preprocess import PreprocessConfig as PBPreprocessConfig, preprocess_patch_image
 from pechabridge.ocr.preprocess_bdrc import BDRCPreprocessConfig, preprocess_image_bdrc
+from pechabridge.ocr.sentencepiece_tokenizer_adapter import (
+    find_sentencepiece_model_path as sp_find_model_path,
+    load_sentencepiece_tokenizer as load_sentencepiece_tokenizer_adapter,
+)
 
 LOGGER = logging.getLogger("train_donut_ocr")
 
@@ -931,6 +935,22 @@ def _load_tokenizer_robust(base_path: str):
     if p.exists() and p.is_dir():
         local_dir = p.resolve()
         _ensure_spiece_alias_if_needed(local_dir)
+        if sp_find_model_path(local_dir) is not None:
+            tok = load_sentencepiece_tokenizer_adapter(local_dir)
+            LOGGER.info(
+                "Loaded tokenizer directly via sentencepiece adapter from %s (len=%d)",
+                local_dir,
+                int(len(tok)),
+            )
+            return tok
+
+    if str(spec).strip() == "openpecha/BoSentencePiece":
+        raise RuntimeError(
+            "BoSentencePiece must be downloaded locally for direct sentencepiece loading. "
+            "Run `python cli.py download-bosentencepiece-tokenizer` (or "
+            "`python scripts/download_bosentencepiece_tokenizer.py`) and then use "
+            "`--tokenizer_path ./ext/BoSentencePiece`."
+        )
 
     tokenizer = AutoTokenizer.from_pretrained(spec, use_fast=True)
     if local_dir is not None and _is_degenerate_sp_tokenizer(tokenizer):
@@ -1041,13 +1061,6 @@ def _resolve_val_manifest_path(train_manifest: Path, val_manifest_arg: str) -> O
     return None
 
 
-def _iter_texts(rows: Sequence[Dict[str, object]]) -> Iterable[str]:
-    for row in rows:
-        text = row.get("text", "")
-        if isinstance(text, str) and text.strip():
-            yield text
-
-
 def _ensure_pad_token(tokenizer) -> None:
     if tokenizer.pad_token_id is not None:
         return
@@ -1062,19 +1075,6 @@ def _load_or_build_tokenizer(args, train_rows: Sequence[Dict[str, object]]):
     LOGGER.info("Loading tokenizer for OCR training from: %s", base_path)
     tokenizer = _load_tokenizer_robust(base_path)
     special_tokens = _parse_csv_tokens(args.extra_special_tokens)
-
-    if args.train_tokenizer:
-        corpus_iter = _iter_texts(train_rows)
-        LOGGER.info(
-            "Training tokenizer from iterator (vocab_size=%d) using base=%s",
-            int(args.tokenizer_vocab_size),
-            base_path,
-        )
-        tokenizer = tokenizer.train_new_from_iterator(
-            corpus_iter,
-            vocab_size=int(args.tokenizer_vocab_size),
-            new_special_tokens=special_tokens,
-        )
 
     if special_tokens:
         tokenizer.add_special_tokens({"additional_special_tokens": special_tokens})

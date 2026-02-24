@@ -9,8 +9,14 @@ import shutil
 import sys
 from pathlib import Path
 
-
 REPO_ROOT = Path(__file__).resolve().parents[1]
+if str(REPO_ROOT) not in sys.path:
+    sys.path.insert(0, str(REPO_ROOT))
+
+from pechabridge.ocr.sentencepiece_tokenizer_adapter import (
+    load_sentencepiece_tokenizer as load_sentencepiece_tokenizer_adapter,
+)
+
 DEFAULT_DEST = REPO_ROOT / "ext" / "BoSentencePiece"
 
 
@@ -133,6 +139,39 @@ def run(args: argparse.Namespace) -> int:
     for p in sorted(dest.iterdir()):
         kind = "dir" if p.is_dir() else "file"
         print(f"  - {p.name} ({kind})")
+
+    # Validate via direct sentencepiece-backed adapter (authoritative path used by training/checker).
+    try:
+        tok = load_sentencepiece_tokenizer_adapter(dest)
+        print("Direct sentencepiece adapter validation:")
+        print(f"class: {tok.__class__.__name__}")
+        print(f"len(tokenizer): {len(tok)}")
+        print(
+            "special ids: "
+            + json.dumps(
+                {
+                    "pad": tok.pad_token_id,
+                    "unk": tok.unk_token_id,
+                    "bos": tok.bos_token_id,
+                    "eos": tok.eos_token_id,
+                    "cls": tok.cls_token_id,
+                    "sep": tok.sep_token_id,
+                },
+                ensure_ascii=False,
+            )
+        )
+        sample_text = "བོད་སྐད་ཀྱི་ཚིག་གྲུབ་འདི་ཡིན།"
+        sample_ids = tok(sample_text, add_special_tokens=False)["input_ids"]
+        sample_pieces = tok.convert_ids_to_tokens(sample_ids)
+        print(f"sample ids: {sample_ids}")
+        print(f"sample pieces: {sample_pieces}")
+        print(f"sample decode: {tok.decode(sample_ids, skip_special_tokens=True)}")
+        print("\nUse this in training:")
+        print(f"  --tokenizer_path {dest}")
+        return 0
+    except Exception as exc:
+        print(f"ERROR: direct sentencepiece adapter validation failed: {exc}", file=sys.stderr)
+        return 1
 
     try:
         from transformers import AutoTokenizer
