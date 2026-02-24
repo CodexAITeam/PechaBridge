@@ -1203,7 +1203,7 @@ class OCRManifestDataset(Dataset):
             sample.text,
             truncation=True,
             max_length=self.max_target_length,
-            add_special_tokens=True,
+            add_special_tokens=False,
         )["input_ids"]
         return {
             "pixel_values": pixel_values,
