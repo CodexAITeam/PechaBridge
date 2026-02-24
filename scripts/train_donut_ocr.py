@@ -7,8 +7,10 @@ import json
 import inspect
 import logging
 import os
+import re
 import shutil
 import sys
+import unicodedata
 from collections import Counter
 from dataclasses import dataclass
 from pathlib import Path
@@ -42,6 +44,43 @@ from pechabridge.ocr.sentencepiece_tokenizer_adapter import (
 )
 
 LOGGER = logging.getLogger("train_donut_ocr")
+
+
+_ZERO_WIDTH_CHARS = ("\u200b", "\u200c", "\u200d", "\ufeff")
+
+
+def _paired_end_token_for_start(start_token: str) -> str:
+    s = str(start_token or "").strip()
+    if s.startswith("<s_") and s.endswith(">"):
+        return "</" + s[1:]
+    return ""
+
+
+def _format_ocr_target_text(raw_text: str, *, start_token: str, end_token: str) -> str:
+    text = str(raw_text or "")
+    st = str(start_token or "").strip()
+    et = str(end_token or "").strip()
+    if not st or not et:
+        return text
+    # Avoid double-wrapping if the manifest text already contains task tokens.
+    if text.startswith(st) and et in text:
+        return text
+    return f"{st}{text}{et}"
+
+
+def _strip_special_token_strings(text: str, tokenizer) -> str:
+    out = str(text or "")
+    try:
+        toks = sorted(
+            [str(t) for t in getattr(tokenizer, "all_special_tokens", []) if isinstance(t, str) and t],
+            key=len,
+            reverse=True,
+        )
+    except Exception:
+        toks = []
+    for tok in toks:
+        out = out.replace(tok, "")
+    return out
 
 
 def _configure_logging() -> None:
@@ -1137,6 +1176,8 @@ class OCRManifestDataset(Dataset):
         tokenizer,
         max_target_length: int,
         image_preprocess_pipeline: str = "none",
+        target_start_token: str = "",
+        target_end_token: str = "",
         manifest_path: Optional[Path] = None,
     ):
         self.samples: List[OCRSample] = []
@@ -1197,6 +1238,8 @@ class OCRManifestDataset(Dataset):
         self.tokenizer = tokenizer
         self.max_target_length = int(max_target_length)
         self.image_preprocess_pipeline = str(image_preprocess_pipeline or "none")
+        self.target_start_token = str(target_start_token or "")
+        self.target_end_token = str(target_end_token or "")
 
     def __len__(self) -> int:
         return len(self.samples)
@@ -1207,8 +1250,13 @@ class OCRManifestDataset(Dataset):
             rgb = img.convert("RGB")
         rgb = _apply_image_preprocess_pipeline(rgb, self.image_preprocess_pipeline)
         pixel_values = self.image_processor(images=rgb, return_tensors="pt").pixel_values.squeeze(0)
-        labels = self.tokenizer(
+        target_text = _format_ocr_target_text(
             sample.text,
+            start_token=self.target_start_token,
+            end_token=self.target_end_token,
+        )
+        labels = self.tokenizer(
+            target_text,
             truncation=True,
             max_length=self.max_target_length,
             add_special_tokens=False,
@@ -1222,6 +1270,7 @@ class OCRManifestDataset(Dataset):
 class OCRDataCollator:
     def __init__(self, tokenizer):
         self.tokenizer = tokenizer
+        self._sanity_logged = False
 
     def __call__(self, features: Sequence[Dict[str, object]]) -> Dict[str, torch.Tensor]:
         pixel_values = torch.stack([item["pixel_values"] for item in features])
@@ -1232,6 +1281,26 @@ class OCRDataCollator:
             return_tensors="pt",
         )["input_ids"]
         padded[padded == self.tokenizer.pad_token_id] = -100
+        if not self._sanity_logged:
+            self._sanity_logged = True
+            try:
+                total = int(padded.numel())
+                masked = int((padded == -100).sum().item())
+                non_ignored_per_row = (padded != -100).sum(dim=1).tolist()
+                sample0 = padded[0].detach().cpu().clone()
+                pad_id = int(getattr(self.tokenizer, "pad_token_id", 0) or 0)
+                sample0[sample0 == -100] = pad_id
+                sample0_text = self.tokenizer.decode(sample0.tolist(), skip_special_tokens=False)
+                LOGGER.info(
+                    "label_sanity batch0 | masked_ratio=%.4f non_ignored[min=%d max=%d mean=%.1f] sample0_decoded_head=%r",
+                    (masked / total) if total > 0 else 0.0,
+                    int(min(non_ignored_per_row) if non_ignored_per_row else 0),
+                    int(max(non_ignored_per_row) if non_ignored_per_row else 0),
+                    float(sum(non_ignored_per_row) / max(1, len(non_ignored_per_row))),
+                    str(sample0_text)[:200],
+                )
+            except Exception as exc:
+                LOGGER.warning("Could not log label_sanity batch0: %s", exc)
         return {
             "pixel_values": pixel_values,
             "labels": padded,
@@ -1258,12 +1327,31 @@ def _levenshtein(a: str, b: str) -> int:
 
 
 def _normalize_for_metric(text: str, newline_token: str) -> str:
-    out = text.replace("\r\n", "\n").replace("\r", "\n")
-    if newline_token == "<NL>":
-        out = out.replace("<NL>", "\n")
-    else:
-        out = out.replace("<NL>", "\n")
+    out = str(text or "")
+    out = out.replace("\r\n", "\n").replace("\r", "\n")
+    out = out.replace("<NL>", "\n")
+    for ch in _ZERO_WIDTH_CHARS:
+        out = out.replace(ch, "")
+    out = unicodedata.normalize("NFC", out)
+    # Normalize horizontal whitespace while preserving line breaks.
+    out = re.sub(r"[ \t]+", " ", out)
+    out = re.sub(r" *\n *", "\n", out)
+    _ = newline_token  # reserved for future metric variants
     return out.strip()
+
+
+def _decode_for_metric(tokenizer, sequences, *, newline_token: str) -> List[str]:
+    texts = tokenizer.batch_decode(sequences, skip_special_tokens=True)
+    out: List[str] = []
+    for t in texts:
+        cleaned = _strip_special_token_strings(str(t or ""), tokenizer)
+        out.append(_normalize_for_metric(cleaned, newline_token))
+    return out
+
+
+def _sample_cer(pred: str, ref: str) -> float:
+    denom = max(1, len(ref))
+    return float(_levenshtein(pred, ref) / denom)
 
 
 def _char_error_rate(preds: Sequence[str], refs: Sequence[str], newline_token: str) -> float:
@@ -1370,17 +1458,40 @@ def run(args) -> Dict[str, object]:
         )
     ):
         raise ValueError(f"decoder_start_token not found in tokenizer: {args.decoder_start_token}")
+    task_end_token = _paired_end_token_for_start(str(args.decoder_start_token))
+    task_end_id = None
+    if task_end_token:
+        try:
+            _candidate = tokenizer.convert_tokens_to_ids(task_end_token)
+            if _candidate is not None and int(_candidate) >= 0:
+                if tokenizer.unk_token_id is None or int(_candidate) != int(tokenizer.unk_token_id):
+                    task_end_id = int(_candidate)
+        except Exception:
+            task_end_id = None
+
+    effective_eos_id = int(task_end_id) if task_end_id is not None else (
+        int(tokenizer.eos_token_id) if tokenizer.eos_token_id is not None else None
+    )
+
     model.config.decoder_start_token_id = int(decoder_start_id)
     model.config.pad_token_id = int(tokenizer.pad_token_id)
-    if tokenizer.eos_token_id is not None:
-        model.config.eos_token_id = int(tokenizer.eos_token_id)
+    if effective_eos_id is not None:
+        model.config.eos_token_id = int(effective_eos_id)
     model.config.vocab_size = model.decoder.config.vocab_size
 
     model.generation_config.decoder_start_token_id = int(decoder_start_id)
     model.generation_config.pad_token_id = int(tokenizer.pad_token_id)
-    if tokenizer.eos_token_id is not None:
-        model.generation_config.eos_token_id = int(tokenizer.eos_token_id)
+    if effective_eos_id is not None:
+        model.generation_config.eos_token_id = int(effective_eos_id)
     model.generation_config.max_length = int(args.generation_max_length)
+    model.generation_config.num_beams = 1
+    LOGGER.info(
+        "Donut target formatting: start=%r end=%r eos_id=%s tokenizer_eos_id=%s",
+        str(args.decoder_start_token),
+        task_end_token,
+        str(effective_eos_id),
+        str(getattr(tokenizer, "eos_token_id", None)),
+    )
 
     train_dataset = OCRManifestDataset(
         train_rows,
@@ -1388,6 +1499,8 @@ def run(args) -> Dict[str, object]:
         tokenizer=tokenizer,
         max_target_length=int(args.max_target_length),
         image_preprocess_pipeline=image_preproc_mode,
+        target_start_token=str(args.decoder_start_token),
+        target_end_token=str(task_end_token),
         manifest_path=train_manifest,
     )
     val_dataset = OCRManifestDataset(
@@ -1396,6 +1509,8 @@ def run(args) -> Dict[str, object]:
         tokenizer=tokenizer,
         max_target_length=int(args.max_target_length),
         image_preprocess_pipeline=image_preproc_mode,
+        target_start_token=str(args.decoder_start_token),
+        target_end_token=str(task_end_token),
         manifest_path=val_manifest,
     ) if val_rows else None
 
@@ -1416,16 +1531,17 @@ def run(args) -> Dict[str, object]:
 
     collator = OCRDataCollator(tokenizer)
     zero_cer_debug_count = {"n": 0}
+    high_cer_debug_count = {"n": 0}
 
     def _compute_metrics(eval_pred):
         predictions, labels = eval_pred
         if isinstance(predictions, tuple):
             predictions = predictions[0]
         labels = np.where(labels == -100, tokenizer.pad_token_id, labels)
-        pred_texts = tokenizer.batch_decode(predictions, skip_special_tokens=True)
-        ref_texts = tokenizer.batch_decode(labels, skip_special_tokens=True)
-        pred_norms = [_normalize_for_metric(str(p or ""), args.metric_newline_token) for p in pred_texts]
-        ref_norms = [_normalize_for_metric(str(r or ""), args.metric_newline_token) for r in ref_texts]
+        pred_texts = _decode_for_metric(tokenizer, predictions, newline_token=args.metric_newline_token)
+        ref_texts = _decode_for_metric(tokenizer, labels, newline_token=args.metric_newline_token)
+        pred_norms = [str(p or "") for p in pred_texts]
+        ref_norms = [str(r or "") for r in ref_texts]
         valid_pairs: List[Tuple[str, str]] = []
         empty_ref_count = 0
         empty_pred_count = 0
@@ -1464,8 +1580,38 @@ def run(args) -> Dict[str, object]:
             for i, (pred, ref) in enumerate(valid_pairs[:5], start=1):
                 LOGGER.warning("CER=0 sample %d | REF: %r", i, ref[:300])
                 LOGGER.warning("CER=0 sample %d | PRD: %r", i, pred[:300])
+        if cer > 1.0 and high_cer_debug_count["n"] < 3:
+            high_cer_debug_count["n"] += 1
+            sample_rows = []
+            for p, r in valid_pairs[:]:
+                sample_rows.append(
+                    {
+                        "ref_len": len(r),
+                        "pred_len": len(p),
+                        "sample_cer": round(_sample_cer(p, r), 4),
+                        "ref": r[:180],
+                        "pred": p[:180],
+                    }
+                )
+            sample_rows = sorted(sample_rows, key=lambda x: (x["sample_cer"], x["pred_len"]), reverse=True)
+            LOGGER.warning(
+                "High eval_cer detected (%.4f ratio ~= %.1f%%) on current eval set; showing top sample outliers.",
+                float(cer),
+                float(cer) * 100.0,
+            )
+            for i, row in enumerate(sample_rows[:5], start=1):
+                LOGGER.warning(
+                    "high_cer sample %d | cer=%.4f ref_len=%d pred_len=%d | REF=%r | PRD=%r",
+                    i,
+                    float(row["sample_cer"]),
+                    int(row["ref_len"]),
+                    int(row["pred_len"]),
+                    row["ref"],
+                    row["pred"],
+                )
         return {
             "cer": float(cer),
+            "cer_percent": float(cer) * 100.0,
             "cer_valid_n": int(len(valid_pairs)),
             "cer_empty_ref_count": int(empty_ref_count),
             "cer_empty_pred_count": int(empty_pred_count),
