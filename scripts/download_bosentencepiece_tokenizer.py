@@ -4,6 +4,7 @@
 from __future__ import annotations
 
 import argparse
+import json
 import shutil
 import sys
 from pathlib import Path
@@ -47,6 +48,16 @@ def _ensure_spiece_alias(tokenizer_dir: Path, *, force_copy: bool = False) -> Pa
     if force_copy:
         shutil.copy2(sentencepiece_model, spiece_model)
         return spiece_model
+
+
+def _tok_cfg_value_to_str(value):
+    if isinstance(value, str):
+        return value
+    if isinstance(value, dict):
+        content = value.get("content")
+        if isinstance(content, str):
+            return content
+    return None
     try:
         spiece_model.symlink_to(sentencepiece_model.name)
         return spiece_model
@@ -146,6 +157,42 @@ def run(args: argparse.Namespace) -> int:
                 return 0
         except Exception as exc:
             print(f"AlbertTokenizerFast fallback failed: {exc}")
+
+        try:
+            from transformers import PreTrainedTokenizerFast
+            cfg_kwargs = {}
+            cfg_path = dest / "tokenizer_config.json"
+            if cfg_path.exists():
+                try:
+                    cfg = json.loads(cfg_path.read_text(encoding="utf-8"))
+                    if isinstance(cfg, dict):
+                        for key in ("unk_token", "bos_token", "eos_token", "sep_token", "pad_token", "cls_token", "mask_token"):
+                            sval = _tok_cfg_value_to_str(cfg.get(key))
+                            if sval:
+                                cfg_kwargs[key] = sval
+                        addl = cfg.get("additional_special_tokens")
+                        if isinstance(addl, list):
+                            addl_vals = [s for s in (_tok_cfg_value_to_str(x) for x in addl) if s]
+                            if addl_vals:
+                                cfg_kwargs["additional_special_tokens"] = addl_vals
+                        mml = cfg.get("model_max_length")
+                        if isinstance(mml, (int, float)) and int(mml) > 0:
+                            cfg_kwargs["model_max_length"] = int(mml)
+                except Exception as exc:
+                    print(f"tokenizer_config parse error: {exc}")
+            tok_ptf = PreTrainedTokenizerFast(tokenizer_file=str(dest / 'tokenizer.json'), **cfg_kwargs)
+            print("PreTrainedTokenizerFast(tokenizer.json) fallback validation:")
+            print(f"class: {tok_ptf.__class__.__name__}")
+            print(f"len(tokenizer): {len(tok_ptf)}")
+            sample = "བོད་སྐད་ཀྱི་ཚིག་གྲུབ་འདི་ཡིན།"
+            sample_ids = tok_ptf(sample, add_special_tokens=False)["input_ids"]
+            print(f"sample ids len: {len(sample_ids)}")
+            print(f"sample decode: {tok_ptf.decode(sample_ids, skip_special_tokens=True, clean_up_tokenization_spaces=False)}")
+            if int(len(tok_ptf)) > 32:
+                print("AutoTokenizer/AlbertTokenizerFast were degenerate, but PreTrainedTokenizerFast(tokenizer.json) works.")
+                return 0
+        except Exception as exc:
+            print(f"PreTrainedTokenizerFast(tokenizer.json) fallback failed: {exc}")
 
         print(
             "ERROR: tokenizer still loaded with tiny vocab. Check local files and transformers/tokenizers/sentencepiece versions. "

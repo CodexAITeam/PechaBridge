@@ -194,7 +194,7 @@ def _is_degenerate_sp_tokenizer(tok) -> bool:
             return False
     except Exception:
         return False
-    return getattr(tok, "sp_model", None) is None and getattr(tok, "vocab_file", None) is None
+    return getattr(tok, "sp_model", None) is None
 
 
 def _try_albert_fast_from_local_dir(local_dir: Path):
@@ -206,6 +206,56 @@ def _try_albert_fast_from_local_dir(local_dir: Path):
         return None
     try:
         tok_fast = AlbertTokenizerFast.from_pretrained(str(local_dir))
+    except Exception:
+        return None
+    try:
+        if int(len(tok_fast)) > 32:
+            return tok_fast
+    except Exception:
+        return None
+    return None
+
+
+def _tok_cfg_value_to_str(value) -> Optional[str]:
+    if isinstance(value, str):
+        return value
+    if isinstance(value, dict):
+        content = value.get("content")
+        if isinstance(content, str):
+            return content
+    return None
+
+
+def _try_pretrained_fast_from_tokenizer_json(local_dir: Path):
+    try:
+        from transformers import PreTrainedTokenizerFast
+    except Exception:
+        return None
+    tok_json = local_dir / "tokenizer.json"
+    if not tok_json.exists():
+        return None
+    kwargs: Dict[str, object] = {}
+    cfg_path = local_dir / "tokenizer_config.json"
+    if cfg_path.exists():
+        try:
+            cfg = json.loads(cfg_path.read_text(encoding="utf-8"))
+            if isinstance(cfg, dict):
+                for key in ("unk_token", "bos_token", "eos_token", "sep_token", "pad_token", "cls_token", "mask_token"):
+                    sval = _tok_cfg_value_to_str(cfg.get(key))
+                    if sval:
+                        kwargs[key] = sval
+                addl = cfg.get("additional_special_tokens")
+                if isinstance(addl, list):
+                    addl_vals = [s for s in (_tok_cfg_value_to_str(x) for x in addl) if s]
+                    if addl_vals:
+                        kwargs["additional_special_tokens"] = addl_vals
+                mml = cfg.get("model_max_length")
+                if isinstance(mml, (int, float)) and int(mml) > 0:
+                    kwargs["model_max_length"] = int(mml)
+        except Exception:
+            pass
+    try:
+        tok_fast = PreTrainedTokenizerFast(tokenizer_file=str(tok_json), **kwargs)
     except Exception:
         return None
     try:
@@ -317,10 +367,13 @@ def _load_tokenizer_robust(spec: str):
         tok_fast = _try_albert_fast_from_local_dir(p.resolve())
         if tok_fast is not None:
             return tok_fast, resolved_spec
+        tok_ptf = _try_pretrained_fast_from_tokenizer_json(p.resolve())
+        if tok_ptf is not None:
+            return tok_ptf, resolved_spec
         tok_raw = _try_raw_sentencepiece_from_local_dir(p.resolve())
         if tok_raw is not None:
             return tok_raw, resolved_spec
-    if int(len(tok)) <= 32 and getattr(tok, "sp_model", None) is None and getattr(tok, "vocab_file", None) is None:
+    if int(len(tok)) <= 32 and getattr(tok, "sp_model", None) is None:
         raise RuntimeError(
             "Tokenizer loaded with tiny vocab and no SentencePiece model "
             f"(len={len(tok)}, class={tok.__class__.__name__}). "

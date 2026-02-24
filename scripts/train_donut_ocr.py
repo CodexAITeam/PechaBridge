@@ -798,8 +798,64 @@ def _is_degenerate_sp_tokenizer(tok) -> bool:
     if tok_len > 32:
         return False
     sp_model = getattr(tok, "sp_model", None)
-    vocab_file = getattr(tok, "vocab_file", None)
-    return sp_model is None and vocab_file is None
+    return sp_model is None
+
+
+def _tok_cfg_value_to_str(value) -> Optional[str]:
+    if isinstance(value, str):
+        return value
+    if isinstance(value, dict):
+        content = value.get("content")
+        if isinstance(content, str):
+            return content
+    return None
+
+
+def _try_pretrained_fast_from_tokenizer_json(local_dir: Path):
+    try:
+        from transformers import PreTrainedTokenizerFast
+    except Exception:
+        return None
+    tok_json = local_dir / "tokenizer.json"
+    if not tok_json.exists():
+        return None
+
+    kwargs: Dict[str, object] = {}
+    cfg_path = local_dir / "tokenizer_config.json"
+    if cfg_path.exists():
+        try:
+            cfg = json.loads(cfg_path.read_text(encoding="utf-8"))
+            if isinstance(cfg, dict):
+                for key in ("unk_token", "bos_token", "eos_token", "sep_token", "pad_token", "cls_token", "mask_token"):
+                    sval = _tok_cfg_value_to_str(cfg.get(key))
+                    if sval:
+                        kwargs[key] = sval
+                addl = cfg.get("additional_special_tokens")
+                if isinstance(addl, list):
+                    addl_vals = [s for s in (_tok_cfg_value_to_str(x) for x in addl) if s]
+                    if addl_vals:
+                        kwargs["additional_special_tokens"] = addl_vals
+                mml = cfg.get("model_max_length")
+                if isinstance(mml, (int, float)) and int(mml) > 0:
+                    kwargs["model_max_length"] = int(mml)
+        except Exception:
+            pass
+
+    try:
+        tok_fast = PreTrainedTokenizerFast(tokenizer_file=str(tok_json), **kwargs)
+    except Exception:
+        return None
+    try:
+        if int(len(tok_fast)) > 32:
+            LOGGER.warning(
+                "Recovered BoSentencePiece via PreTrainedTokenizerFast(tokenizer.json) fallback (len=%d) from %s",
+                int(len(tok_fast)),
+                local_dir,
+            )
+            return tok_fast
+    except Exception:
+        return None
+    return None
 
 
 def _try_albert_fast_from_local_dir(local_dir: Path):
@@ -841,13 +897,15 @@ def _load_tokenizer_robust(base_path: str):
         tok_fast = _try_albert_fast_from_local_dir(local_dir)
         if tok_fast is not None:
             return tok_fast
+        tok_ptf = _try_pretrained_fast_from_tokenizer_json(local_dir)
+        if tok_ptf is not None:
+            return tok_ptf
 
     # Fail fast on the known degenerate ALBERT fallback (only special tokens).
     tok_len = int(len(tokenizer))
     if tok_len <= 32:
         sp_model = getattr(tokenizer, "sp_model", None)
-        vocab_file = getattr(tokenizer, "vocab_file", None)
-        if sp_model is None and vocab_file is None:
+        if sp_model is None:
             hint = ""
             if local_dir is not None:
                 hint = (
