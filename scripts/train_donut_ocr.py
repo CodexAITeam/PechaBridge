@@ -138,6 +138,196 @@ class DonutCheckpointAliasCallback(TrainerCallback):
         return control
 
 
+class DonutDebugSeq2SeqTrainer(Seq2SeqTrainer):
+    """Seq2SeqTrainer that logs one decoded training sample (GT vs argmax decode) each step."""
+
+    def __init__(
+        self,
+        *args,
+        tokenizer_for_debug=None,
+        metric_newline_token: str = "<NL>",
+        debug_train_trace: bool = False,
+        debug_train_trace_every_steps: int = 1,
+        debug_train_trace_topk: int = 5,
+        debug_train_trace_max_positions: int = 8,
+        **kwargs,
+    ):
+        super().__init__(*args, **kwargs)
+        self._debug_tokenizer = tokenizer_for_debug
+        self._debug_metric_newline_token = str(metric_newline_token or "<NL>")
+        self._debug_train_trace = bool(debug_train_trace)
+        self._debug_train_trace_every_steps = max(1, int(debug_train_trace_every_steps or 1))
+        self._debug_train_trace_topk = max(1, int(debug_train_trace_topk or 5))
+        self._debug_train_trace_max_positions = max(1, int(debug_train_trace_max_positions or 8))
+
+    def compute_loss(self, model, inputs, return_outputs=False, **kwargs):  # type: ignore[override]
+        out = super().compute_loss(model, inputs, return_outputs=True, **kwargs)
+        if isinstance(out, tuple) and len(out) == 2:
+            loss, outputs = out
+        else:
+            loss, outputs = out, None
+        try:
+            self._log_decoded_training_sample(inputs, outputs)
+        except Exception as exc:
+            if self.is_world_process_zero():
+                LOGGER.warning("Could not log decoded training sample preview: %s", exc)
+        return (loss, outputs) if return_outputs else loss
+
+    def _log_decoded_training_sample(self, inputs, outputs) -> None:
+        if not self.is_world_process_zero():
+            return
+        if self._debug_tokenizer is None:
+            return
+        if not getattr(model := getattr(self, "model", None), "training", False):
+            return
+        if outputs is None:
+            return
+        logits = getattr(outputs, "logits", None)
+        labels = inputs.get("labels") if isinstance(inputs, dict) else None
+        if logits is None or labels is None:
+            return
+        if not torch.is_tensor(logits) or not torch.is_tensor(labels):
+            return
+        if logits.ndim != 3 or labels.ndim != 2 or logits.shape[0] <= 0 or labels.shape[0] <= 0:
+            return
+
+        pred_ids = torch.argmax(logits[0].detach(), dim=-1).to("cpu")
+        label_ids = labels[0].detach().to("cpu")
+        pad_id = getattr(self._debug_tokenizer, "pad_token_id", None)
+        if pad_id is None:
+            pad_id = 0
+        label_ids = label_ids.clone()
+        label_ids[label_ids == -100] = int(pad_id)
+
+        pred_text = self._debug_tokenizer.decode(pred_ids.tolist(), skip_special_tokens=True)
+        gt_text = self._debug_tokenizer.decode(label_ids.tolist(), skip_special_tokens=True)
+        pred_norm = _normalize_for_metric(str(pred_text or ""), self._debug_metric_newline_token)
+        gt_norm = _normalize_for_metric(str(gt_text or ""), self._debug_metric_newline_token)
+        step = int(getattr(self.state, "global_step", 0) or 0)
+        pred_ids_head = pred_ids.tolist()[:32]
+        label_ids_head = label_ids.tolist()[:32]
+        LOGGER.info("train_decode step=%d | GT: %r", step, gt_norm[:500])
+        LOGGER.info("train_decode step=%d | PRD: %r", step, pred_norm[:500])
+        LOGGER.info(
+            "train_decode step=%d | GT_len=%d PRD_len=%d label_ids_head=%s pred_ids_head=%s",
+            step,
+            len(gt_norm),
+            len(pred_norm),
+            label_ids_head,
+            pred_ids_head,
+        )
+        if self._debug_train_trace and (step % self._debug_train_trace_every_steps == 0):
+            self._log_verbose_training_trace(inputs=inputs, outputs=outputs, step=step, logits=logits, labels=labels)
+
+    def _log_verbose_training_trace(self, *, inputs, outputs, step: int, logits: torch.Tensor, labels: torch.Tensor) -> None:
+        tok = self._debug_tokenizer
+        if tok is None:
+            return
+        try:
+            pixel_values = inputs.get("pixel_values") if isinstance(inputs, dict) else None
+            if torch.is_tensor(pixel_values) and pixel_values.ndim >= 4 and pixel_values.shape[0] > 0:
+                pv0 = pixel_values[0].detach()
+                pv0f = pv0.float()
+                LOGGER.info(
+                    "train_trace step=%d | pixel_values batch_shape=%s dtype=%s device=%s sample0_shape=%s min=%.6f max=%.6f mean=%.6f std=%.6f",
+                    step,
+                    tuple(int(x) for x in pixel_values.shape),
+                    str(pixel_values.dtype),
+                    str(pixel_values.device),
+                    tuple(int(x) for x in pv0.shape),
+                    float(pv0f.min().item()),
+                    float(pv0f.max().item()),
+                    float(pv0f.mean().item()),
+                    float(pv0f.std(unbiased=False).item()),
+                )
+            LOGGER.info(
+                "train_trace step=%d | labels batch_shape=%s dtype=%s device=%s",
+                step,
+                tuple(int(x) for x in labels.shape),
+                str(labels.dtype),
+                str(labels.device),
+            )
+            enc = getattr(outputs, "encoder_last_hidden_state", None)
+            if torch.is_tensor(enc):
+                enc0 = enc[0].detach().float()
+                LOGGER.info(
+                    "train_trace step=%d | encoder_last_hidden_state shape=%s dtype=%s device=%s sample0[min=%.6f max=%.6f mean=%.6f std=%.6f]",
+                    step,
+                    tuple(int(x) for x in enc.shape),
+                    str(enc.dtype),
+                    str(enc.device),
+                    float(enc0.min().item()),
+                    float(enc0.max().item()),
+                    float(enc0.mean().item()),
+                    float(enc0.std(unbiased=False).item()),
+                )
+            lg0 = logits[0].detach().float().cpu()
+            LOGGER.info(
+                "train_trace step=%d | logits shape=%s dtype=%s device=%s sample0[min=%.6f max=%.6f mean=%.6f std=%.6f]",
+                step,
+                tuple(int(x) for x in logits.shape),
+                str(logits.dtype),
+                str(logits.device),
+                float(lg0.min().item()),
+                float(lg0.max().item()),
+                float(lg0.mean().item()),
+                float(lg0.std(unbiased=False).item()),
+            )
+
+            label0 = labels[0].detach().cpu().clone()
+            pad_id = getattr(tok, "pad_token_id", None)
+            if pad_id is None:
+                pad_id = 0
+            label0[label0 == -100] = int(pad_id)
+            pred0 = torch.argmax(logits[0].detach(), dim=-1).cpu()
+
+            label0_ids = [int(x) for x in label0.tolist()]
+            pred0_ids = [int(x) for x in pred0.tolist()]
+            label0_tokens = tok.convert_ids_to_tokens(label0_ids[:32])
+            pred0_tokens = tok.convert_ids_to_tokens(pred0_ids[:32])
+            LOGGER.info("train_trace step=%d | label0_ids_head=%s", step, label0_ids[:32])
+            LOGGER.info("train_trace step=%d | label0_toks_head=%s", step, label0_tokens)
+            LOGGER.info("train_trace step=%d | pred0_ids_head=%s", step, pred0_ids[:32])
+            LOGGER.info("train_trace step=%d | pred0_toks_head=%s", step, pred0_tokens)
+
+            pos_cap = min(self._debug_train_trace_max_positions, int(lg0.shape[0]))
+            topk = min(self._debug_train_trace_topk, int(lg0.shape[-1]))
+            probs0 = torch.softmax(lg0[:pos_cap], dim=-1)
+            top_probs, top_ids = torch.topk(probs0, k=topk, dim=-1)
+            for pos in range(pos_cap):
+                tgt_id = int(label0_ids[pos]) if pos < len(label0_ids) else None
+                pred_id = int(pred0_ids[pos]) if pos < len(pred0_ids) else None
+                tgt_tok = tok.convert_ids_to_tokens([tgt_id])[0] if tgt_id is not None else None
+                pred_tok = tok.convert_ids_to_tokens([pred_id])[0] if pred_id is not None else None
+                cands = []
+                for j in range(topk):
+                    cid = int(top_ids[pos, j].item())
+                    cp = float(top_probs[pos, j].item())
+                    ctok = tok.convert_ids_to_tokens([cid])[0]
+                    cands.append({"id": cid, "tok": ctok, "p": round(cp, 6)})
+                LOGGER.info(
+                    "train_trace step=%d | pos=%d tgt=(%s,%r) pred=(%s,%r) topk=%s",
+                    step,
+                    pos,
+                    str(tgt_id),
+                    tgt_tok,
+                    str(pred_id),
+                    pred_tok,
+                    cands,
+                )
+
+            special_ids = {
+                "bos": getattr(tok, "bos_token_id", None),
+                "eos": getattr(tok, "eos_token_id", None),
+                "pad": getattr(tok, "pad_token_id", None),
+                "unk": getattr(tok, "unk_token_id", None),
+                "decoder_start(model)": getattr(getattr(self.model, "config", None), "decoder_start_token_id", None),
+            }
+            LOGGER.info("train_trace step=%d | special_token_ids=%s", step, special_ids)
+        except Exception as exc:
+            LOGGER.warning("Verbose train trace failed at step=%d: %s", step, exc)
+
+
 def _named_meta_tensors(module: nn.Module) -> List[str]:
     names: List[str] = []
     for name, param in module.named_parameters():
@@ -1005,22 +1195,52 @@ def run(args) -> Dict[str, object]:
         labels = np.where(labels == -100, tokenizer.pad_token_id, labels)
         pred_texts = tokenizer.batch_decode(predictions, skip_special_tokens=True)
         ref_texts = tokenizer.batch_decode(labels, skip_special_tokens=True)
-        cer = _char_error_rate(pred_texts, ref_texts, args.metric_newline_token)
+        pred_norms = [_normalize_for_metric(str(p or ""), args.metric_newline_token) for p in pred_texts]
+        ref_norms = [_normalize_for_metric(str(r or ""), args.metric_newline_token) for r in ref_texts]
+        valid_pairs: List[Tuple[str, str]] = []
+        empty_ref_count = 0
+        empty_pred_count = 0
+        for p, r in zip(pred_norms, ref_norms):
+            if not r:
+                empty_ref_count += 1
+                continue
+            if not p:
+                empty_pred_count += 1
+            valid_pairs.append((p, r))
+        if valid_pairs:
+            cer = _char_error_rate(
+                [p for p, _ in valid_pairs],
+                [r for _, r in valid_pairs],
+                args.metric_newline_token,
+            )
+        else:
+            cer = 1.0
+            LOGGER.warning(
+                "No valid non-empty references for CER in current eval batch/set (n=%d, empty_ref=%d). Returning CER=1.0 sentinel.",
+                len(ref_texts),
+                empty_ref_count,
+            )
         if cer == 0.0 and zero_cer_debug_count["n"] < 3:
             zero_cer_debug_count["n"] += 1
-            exact_matches = sum(int(p == r) for p, r in zip(pred_texts, ref_texts))
+            exact_matches = sum(int(p == r) for p, r in valid_pairs)
             LOGGER.warning(
-                "eval_cer is exactly 0.0 on current eval set (n=%d, exact_matches=%d). "
-                "This can be real on a tiny/easy sampled val subset.",
+                "eval_cer is exactly 0.0 on current eval set (n=%d, valid_n=%d, empty_ref=%d, empty_pred=%d, exact_matches=%d). "
+                "This can be real on a tiny/easy sampled val subset, but inspect samples below.",
                 len(ref_texts),
+                len(valid_pairs),
+                empty_ref_count,
+                empty_pred_count,
                 exact_matches,
             )
-            for i, (pred, ref) in enumerate(zip(pred_texts[:5], ref_texts[:5]), start=1):
-                pred_s = pred.replace("\n", "\\n")
-                ref_s = ref.replace("\n", "\\n")
-                LOGGER.warning("CER=0 sample %d | REF: %s", i, ref_s[:300])
-                LOGGER.warning("CER=0 sample %d | PRD: %s", i, pred_s[:300])
-        return {"cer": cer}
+            for i, (pred, ref) in enumerate(valid_pairs[:5], start=1):
+                LOGGER.warning("CER=0 sample %d | REF: %r", i, ref[:300])
+                LOGGER.warning("CER=0 sample %d | PRD: %r", i, pred[:300])
+        return {
+            "cer": float(cer),
+            "cer_valid_n": int(len(valid_pairs)),
+            "cer_empty_ref_count": int(empty_ref_count),
+            "cer_empty_pred_count": int(empty_pred_count),
+        }
 
     has_eval = val_dataset is not None and len(val_dataset) > 0
     ta_kwargs = dict(
@@ -1070,7 +1290,27 @@ def run(args) -> Dict[str, object]:
     elif "processing_class" in trainer_sig.parameters:
         # Newer Transformers versions replaced `tokenizer=` with `processing_class=`.
         trainer_kwargs["processing_class"] = tokenizer
-    trainer = Seq2SeqTrainer(**trainer_kwargs)
+    debug_train_trace = bool(getattr(args, "debug_train_trace", False))
+    debug_train_trace_every_steps = int(getattr(args, "debug_train_trace_every_steps", 1) or 1)
+    debug_train_trace_topk = int(getattr(args, "debug_train_trace_topk", 5) or 5)
+    debug_train_trace_max_positions = int(getattr(args, "debug_train_trace_max_positions", 8) or 8)
+    if debug_train_trace:
+        LOGGER.warning(
+            "Advanced DONUT train trace enabled: every_steps=%d topk=%d max_positions=%d (high log volume / slower training).",
+            debug_train_trace_every_steps,
+            debug_train_trace_topk,
+            debug_train_trace_max_positions,
+        )
+
+    trainer = DonutDebugSeq2SeqTrainer(
+        **trainer_kwargs,
+        tokenizer_for_debug=tokenizer,
+        metric_newline_token=str(args.metric_newline_token),
+        debug_train_trace=debug_train_trace,
+        debug_train_trace_every_steps=debug_train_trace_every_steps,
+        debug_train_trace_topk=debug_train_trace_topk,
+        debug_train_trace_max_positions=debug_train_trace_max_positions,
+    )
     try:
         trainer.remove_callback(ProgressCallback)
         trainer.add_callback(DonutProgressCallback())

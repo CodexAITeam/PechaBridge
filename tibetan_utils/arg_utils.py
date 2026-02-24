@@ -1082,6 +1082,14 @@ def add_train_donut_ocr_arguments(parser):
                        help='Enable bf16 training')
     parser.add_argument('--metric_newline_token', type=str, choices=['<NL>', '\\n'], default='<NL>',
                        help='Newline token normalization used for CER computation')
+    parser.add_argument('--debug_train_trace', '--debug-train-trace', dest='debug_train_trace', action='store_true',
+                       help='Enable verbose per-step DONUT training trace (inputs/encoder/logits/top-k decode debug)')
+    parser.add_argument('--debug_train_trace_every_steps', '--debug-train-trace-every-steps', dest='debug_train_trace_every_steps', type=int, default=1,
+                       help='Log verbose DONUT training trace every N steps when --debug_train_trace is enabled')
+    parser.add_argument('--debug_train_trace_topk', '--debug-train-trace-topk', dest='debug_train_trace_topk', type=int, default=5,
+                       help='Top-k token candidates to log per timestep in verbose DONUT training trace')
+    parser.add_argument('--debug_train_trace_max_positions', '--debug-train-trace-max-positions', dest='debug_train_trace_max_positions', type=int, default=8,
+                       help='Number of decoding positions to log in verbose DONUT training trace')
     parser.add_argument('--resume_from_checkpoint', type=str, default='',
                        help='Optional checkpoint path to resume training from')
 

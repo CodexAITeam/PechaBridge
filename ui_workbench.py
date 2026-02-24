@@ -3254,6 +3254,29 @@ def _load_donut_ocr_runtime_cached(model_dir_s: str, tokenizer_dir_s: str, image
     model = _load_ved_model_robust(str(model_dir))
     tokenizer = AutoTokenizer.from_pretrained(str(tokenizer_dir), use_fast=True)
     image_processor = AutoImageProcessor.from_pretrained(str(image_processor_dir))
+    # Align generation/model token IDs with the loaded tokenizer (same idea as training script).
+    try:
+        if tokenizer.pad_token_id is not None:
+            model.config.pad_token_id = int(tokenizer.pad_token_id)
+            model.generation_config.pad_token_id = int(tokenizer.pad_token_id)
+        if tokenizer.eos_token_id is not None:
+            model.config.eos_token_id = int(tokenizer.eos_token_id)
+            model.generation_config.eos_token_id = int(tokenizer.eos_token_id)
+        decoder_start_id = getattr(model.config, "decoder_start_token_id", None)
+        if decoder_start_id is None or int(decoder_start_id) < 0:
+            for cand in (
+                getattr(tokenizer, "bos_token_id", None),
+                getattr(tokenizer, "cls_token_id", None),
+                getattr(tokenizer, "eos_token_id", None),
+            ):
+                if cand is not None and int(cand) >= 0:
+                    decoder_start_id = int(cand)
+                    break
+        if decoder_start_id is not None and int(decoder_start_id) >= 0:
+            model.config.decoder_start_token_id = int(decoder_start_id)
+            model.generation_config.decoder_start_token_id = int(decoder_start_id)
+    except Exception:
+        pass
     model.eval()
     model.to(device)
     return {
@@ -3269,8 +3292,16 @@ def _load_donut_ocr_runtime_cached(model_dir_s: str, tokenizer_dir_s: str, image
 
 
 def _apply_donut_ui_preprocess(image: Image.Image, pipeline: str) -> Image.Image:
-    mode = (pipeline or "none").strip().lower()
     rgb = image.convert("RGB")
+    # Prefer the exact training-side preprocessing function to avoid UI/training mismatches.
+    try:
+        from scripts.train_donut_ocr import _apply_image_preprocess_pipeline as _apply_train_donut_preproc
+
+        return _apply_train_donut_preproc(rgb, str(pipeline or "none")).convert("RGB")
+    except Exception:
+        pass
+
+    mode = (pipeline or "none").strip().lower()
     if mode == "pb" and _pb_preprocess_patch_image is not None and _PBPreprocessConfig is not None:
         try:
             return _pb_preprocess_patch_image(image=rgb, config=_PBPreprocessConfig()).convert("RGB")
@@ -3326,6 +3357,12 @@ def run_donut_ocr_inference_ui(
                 num_beams=max(1, int(num_beams)),
             )
         text = tokenizer.batch_decode(generated, skip_special_tokens=True)[0] if len(generated) else ""
+        gen_ids: List[int] = []
+        try:
+            if len(generated):
+                gen_ids = [int(x) for x in generated[0].detach().cpu().tolist()]
+        except Exception:
+            gen_ids = []
 
         debug = {
             "ok": True,
@@ -3337,6 +3374,13 @@ def run_donut_ocr_inference_ui(
             "image_preprocess_pipeline": (image_preprocess_pipeline or "none"),
             "generation_max_length": int(generation_max_length),
             "num_beams": int(num_beams),
+            "decoder_start_token_id": getattr(model.config, "decoder_start_token_id", None),
+            "pad_token_id": getattr(model.config, "pad_token_id", None),
+            "eos_token_id": getattr(model.config, "eos_token_id", None),
+            "tokenizer_bos_token_id": getattr(tokenizer, "bos_token_id", None),
+            "tokenizer_pad_token_id": getattr(tokenizer, "pad_token_id", None),
+            "tokenizer_eos_token_id": getattr(tokenizer, "eos_token_id", None),
+            "generated_token_ids_head": gen_ids[:32],
             "output_length_chars": len(text),
         }
         return np.array(proc_pil), text, json.dumps(debug, ensure_ascii=False, indent=2)
@@ -3393,24 +3437,35 @@ def scan_donut_ocr_models_ui(models_dir: str):
             or (p / "model.safetensors.index.json").exists()
         )
 
-    found_roots: List[str] = []
+    found_entries: List[str] = []
+
     for p in sorted(base.rglob("*")):
         if not p.is_dir():
             continue
-        if p.name != "model":
-            continue
-        parent = p.parent
-        if not _is_hf_model_dir(p):
-            continue
-        tok = parent / "tokenizer"
-        imgp = parent / "image_processor"
-        if tok.exists() and imgp.exists():
-            found_roots.append(str(parent.resolve()))
 
-    found_roots = sorted(set(found_roots))
-    default = found_roots[0] if found_roots else ""
-    msg = f"Found {len(found_roots)} DONUT/TroCR model output dir(s) in {base}"
-    return gr.update(choices=found_roots, value=(default if default else None)), default, msg
+        # Final train output root layout: <root>/model + tokenizer + image_processor
+        if p.name == "model" and _is_hf_model_dir(p):
+            parent = p.parent
+            tok = parent / "tokenizer"
+            imgp = parent / "image_processor"
+            if tok.exists() and imgp.exists():
+                found_entries.append(str(parent.resolve()))
+            continue
+
+        # In-training checkpoints: <root>/checkpoint-XXXX + tokenizer + image_processor in parent
+        if p.name.startswith("checkpoint-") and _is_hf_model_dir(p):
+            parent = p.parent
+            tok = parent / "tokenizer"
+            imgp = parent / "image_processor"
+            if tok.exists() and imgp.exists():
+                found_entries.append(str(p.resolve()))
+
+    found_entries = sorted(set(found_entries))
+    default = found_entries[0] if found_entries else ""
+    msg = (
+        f"Found {len(found_entries)} DONUT/TroCR model entries (final outputs and/or checkpoints) in {base}"
+    )
+    return gr.update(choices=found_entries, value=(default if default else None)), default, msg
 
 
 def _read_jsonl_rows_ui(path: Path) -> List[Dict[str, Any]]:
@@ -10170,237 +10225,81 @@ def build_ui() -> gr.Blocks:
                 outputs=[diff_lora_path],
             )
 
-        # 12) Donut OCR workflow
-        with gr.Tab("12. Donut OCR Workflow"):
+        # 12) Donut OCR inference / evaluation
+        with gr.Tab("12. Donut OCR Inference"):
             gr.Markdown(
-                "Run label-1 Donut-style OCR training end-to-end "
-                "(synthetic generation -> OCR manifest prep -> Vision Transformer encoder + autoregressive decoder training)."
+                "Test trained DONUT/TroCR OCR checkpoints or final model outputs on uploaded line images or "
+                "random samples from OCR datasets. Displays OCR output, ground truth, and CER."
             )
             with gr.Row():
                 with gr.Column(scale=1):
-                    donut_dataset_name = gr.Textbox(label="dataset_name", value=default_donut_dataset_name)
-                    donut_dataset_output_dir = gr.Textbox(label="dataset_output_dir", value=default_donut_dataset_output_dir)
-                    donut_prepared_output_dir = gr.Textbox(
-                        label="prepared_output_dir (optional)",
-                        value="",
-                        placeholder="Leave empty for <dataset>/donut_ocr_label1",
-                    )
-                    donut_model_output_dir = gr.Textbox(label="model_output_dir", value=default_donut_model_output_dir)
-                    donut_model_name = gr.Textbox(
-                        label="model_name_or_path",
-                        value="microsoft/trocr-base-stage1",
+                    donut_test_models_dir = gr.Textbox(
+                        label="Scan models dir",
+                        value=str((workspace_root / "models").resolve()),
                     )
                     with gr.Row():
-                        donut_train_samples = gr.Number(label="train_samples", value=2000, precision=0)
-                        donut_val_samples = gr.Number(label="val_samples", value=200, precision=0)
+                        donut_test_scan_btn = gr.Button("Scan DONUT Models")
+                        donut_test_scan_msg = gr.Textbox(label="Scan Status", interactive=False)
+                    donut_test_model_select = gr.Dropdown(
+                        choices=[],
+                        value=None,
+                        label="Detected DONUT/TroCR model outputs / checkpoints",
+                    )
+                    donut_test_model_dir = gr.Textbox(
+                        label="Trained model output dir (or checkpoint / direct model dir)",
+                        value=default_donut_model_output_dir,
+                        placeholder="/path/to/models/donut_openpecha_bdrc/checkpoint-4000",
+                    )
                     with gr.Row():
-                        donut_font_tibetan = gr.Textbox(label="font_path_tibetan", value=default_donut_font_tibetan)
-                        donut_font_chinese = gr.Textbox(label="font_path_chinese", value=default_donut_font_chinese)
-                    with gr.Row():
-                        donut_augmentation = gr.Dropdown(
-                            choices=["rotate", "noise", "none"],
-                            value="noise",
-                            label="augmentation",
+                        donut_test_preproc = gr.Dropdown(
+                            choices=["none", "pb", "bdrc"],
+                            value="bdrc",
+                            label="image_preprocess_pipeline",
                         )
-                        donut_newline_token = gr.Dropdown(
-                            choices=["<NL>", "\\n"],
-                            value="<NL>",
-                            label="target_newline_token",
+                        donut_test_device = gr.Dropdown(
+                            choices=["auto", "cuda:0", "cuda:1", "cuda:2", "cuda:3", "cpu"],
+                            value="auto",
+                            label="device",
                         )
                     with gr.Row():
-                        donut_train_batch = gr.Number(label="per_device_train_batch_size", value=4, precision=0)
-                        donut_eval_batch = gr.Number(label="per_device_eval_batch_size", value=4, precision=0)
-                    with gr.Row():
-                        donut_epochs = gr.Number(label="num_train_epochs", value=8.0)
-                        donut_lr = gr.Number(label="learning_rate", value=5e-5)
-                    with gr.Row():
-                        donut_max_target_length = gr.Number(label="max_target_length", value=512, precision=0)
-                        donut_image_size = gr.Number(label="image_size", value=384, precision=0)
-                    with gr.Row():
-                        donut_seed = gr.Number(label="seed", value=42, precision=0)
-                        donut_tokenizer_vocab_size = gr.Number(label="tokenizer_vocab_size", value=16000, precision=0)
-                    with gr.Row():
-                        donut_train_tokenizer = gr.Checkbox(label="train_tokenizer", value=True)
-                        donut_skip_generation = gr.Checkbox(label="skip_generation", value=False)
-                        donut_skip_prepare = gr.Checkbox(label="skip_prepare", value=False)
-                        donut_skip_train = gr.Checkbox(label="skip_train", value=False)
-
-                    with gr.Accordion("Optional LoRA augmentation during generation", open=False):
-                        donut_lora_path = gr.Textbox(
-                            label="lora_augment_path",
-                            value="",
-                            placeholder="Optional path to LoRA .safetensors or folder",
+                        donut_test_max_len = gr.Number(label="generation_max_length", value=512, precision=0)
+                        donut_test_beams = gr.Number(label="num_beams", value=1, precision=0)
+                    with gr.Accordion("Load Random OCR Sample From Dataset", open=False):
+                        donut_test_datasets_dir = gr.Textbox(
+                            label="Scan datasets dir",
+                            value=str((workspace_root / "datasets").resolve()),
                         )
                         with gr.Row():
-                            donut_lora_family = gr.Dropdown(
-                                choices=["sdxl", "sd21"],
-                                value="sdxl",
-                                label="lora_augment_model_family",
+                            donut_test_dataset_scan_btn = gr.Button("Scan OCR Datasets")
+                            donut_test_dataset_scan_msg = gr.Textbox(label="Dataset Scan Status", interactive=False)
+                        donut_test_dataset_split_map_state = gr.State("{}")
+                        with gr.Row():
+                            donut_test_dataset_root = gr.Dropdown(
+                                choices=[],
+                                value=None,
+                                label="Detected OCR dataset roots",
+                                allow_custom_value=True,
                             )
-                            donut_lora_targets = gr.Dropdown(
-                                choices=["images", "images_and_ocr_crops"],
-                                value="images_and_ocr_crops",
-                                label="lora_augment_targets",
+                            donut_test_dataset_split = gr.Dropdown(
+                                choices=[],
+                                value=None,
+                                label="Split",
                             )
-                        donut_lora_prompt = gr.Textbox(
-                            label="lora_augment_prompt",
-                            value=DEFAULT_TEXTURE_PROMPT,
-                            lines=2,
-                        )
                         with gr.Row():
-                            donut_lora_splits = gr.Textbox(label="lora_augment_splits", value="train")
-                            donut_lora_seed = gr.Number(label="lora_augment_seed (-1=unset)", value=-1, precision=0)
-                        with gr.Row():
-                            donut_lora_scale = gr.Slider(0.0, 2.0, value=0.8, step=0.05, label="lora_augment_scale")
-                            donut_lora_strength = gr.Slider(0.0, 0.25, value=0.2, step=0.01, label="lora_augment_strength")
-                            donut_lora_steps = gr.Number(label="lora_augment_steps", value=28, precision=0)
-                        with gr.Row():
-                            donut_lora_guidance = gr.Slider(0.0, 4.0, value=1.0, step=0.1, label="lora_augment_guidance_scale")
-                            donut_lora_controlnet = gr.Slider(0.5, 3.0, value=2.0, step=0.1, label="lora_augment_controlnet_scale")
-                        with gr.Row():
-                            donut_lora_canny_low = gr.Number(label="lora_augment_canny_low", value=100, precision=0)
-                            donut_lora_canny_high = gr.Number(label="lora_augment_canny_high", value=200, precision=0)
-                        donut_lora_base_model = gr.Textbox(
-                            label="lora_augment_base_model_id",
-                            value="stabilityai/stable-diffusion-xl-base-1.0",
-                        )
-                        donut_lora_controlnet_model = gr.Textbox(
-                            label="lora_augment_controlnet_model_id",
-                            value="diffusers/controlnet-canny-sdxl-1.0",
-                        )
-
-                    donut_run_btn = gr.Button("Run Donut OCR Workflow", variant="primary")
+                            donut_test_dataset_seed = gr.Number(label="random_seed", value=42, precision=0)
+                            donut_test_dataset_sample_btn = gr.Button("Load Random Sample")
+                        donut_test_dataset_sample_path = gr.Textbox(label="Selected sample image path", interactive=False)
+                        donut_test_dataset_sample_meta = gr.Textbox(label="Sample Metadata JSON", lines=8, interactive=False)
+                    donut_test_image = gr.Image(label="Line Image (upload / dataset sample)", type="numpy")
+                    donut_test_btn = gr.Button("Run DONUT OCR Inference", variant="primary")
                 with gr.Column(scale=1):
-                    donut_log = gr.Textbox(label="Workflow Log", lines=24, interactive=False)
-                    donut_dataset_dir = gr.Textbox(label="Dataset Dir", interactive=False)
-                    donut_prepared_dir = gr.Textbox(label="Prepared Manifest Dir", interactive=False)
-                    donut_model_dir = gr.Textbox(label="Model Output Dir", interactive=False)
-                    donut_summary_path = gr.Textbox(label="Workflow Summary Path", interactive=False)
-
-            with gr.Accordion("Test Trained DONUT/TroCR OCR Model", open=False):
-                gr.Markdown(
-                    "Load a trained DONUT/TroCR output directory (`.../model`, `.../tokenizer`, `.../image_processor`) "
-                    "and run OCR on an uploaded line image or a random sample from an OCR dataset manifest. "
-                    "Uses the same optional image preprocessing switch as training."
-                )
-                with gr.Row():
-                    with gr.Column(scale=1):
-                        donut_test_models_dir = gr.Textbox(
-                            label="Scan models dir",
-                            value=str((workspace_root / "models").resolve()),
-                        )
-                        with gr.Row():
-                            donut_test_scan_btn = gr.Button("Scan DONUT Models")
-                            donut_test_scan_msg = gr.Textbox(label="Scan Status", interactive=False)
-                        donut_test_model_select = gr.Dropdown(
-                            choices=[],
-                            value=None,
-                            label="Detected DONUT/TroCR model outputs",
-                        )
-                        donut_test_model_dir = gr.Textbox(
-                            label="Trained model output dir (or direct model/ dir)",
-                            value=default_donut_model_output_dir,
-                            placeholder="/path/to/models/donut_openpecha_bdrc",
-                        )
-                        with gr.Row():
-                            donut_test_preproc = gr.Dropdown(
-                                choices=["none", "pb", "bdrc"],
-                                value="bdrc",
-                                label="image_preprocess_pipeline",
-                            )
-                            donut_test_device = gr.Dropdown(
-                                choices=["auto", "cuda:0", "cuda:1", "cuda:2", "cuda:3", "cpu"],
-                                value="auto",
-                                label="device",
-                            )
-                        with gr.Row():
-                            donut_test_max_len = gr.Number(label="generation_max_length", value=512, precision=0)
-                            donut_test_beams = gr.Number(label="num_beams", value=1, precision=0)
-                        with gr.Accordion("Load Random OCR Sample From Dataset", open=False):
-                            donut_test_datasets_dir = gr.Textbox(
-                                label="Scan datasets dir",
-                                value=str((workspace_root / "datasets").resolve()),
-                            )
-                            with gr.Row():
-                                donut_test_dataset_scan_btn = gr.Button("Scan OCR Datasets")
-                                donut_test_dataset_scan_msg = gr.Textbox(label="Dataset Scan Status", interactive=False)
-                            donut_test_dataset_split_map_state = gr.State("{}")
-                            with gr.Row():
-                                donut_test_dataset_root = gr.Dropdown(
-                                    choices=[],
-                                    value=None,
-                                    label="Detected OCR dataset roots",
-                                    allow_custom_value=True,
-                                )
-                                donut_test_dataset_split = gr.Dropdown(
-                                    choices=[],
-                                    value=None,
-                                    label="Split",
-                                )
-                            with gr.Row():
-                                donut_test_dataset_seed = gr.Number(label="random_seed", value=42, precision=0)
-                                donut_test_dataset_sample_btn = gr.Button("Load Random Sample")
-                            donut_test_dataset_sample_path = gr.Textbox(label="Selected sample image path", interactive=False)
-                            donut_test_dataset_sample_meta = gr.Textbox(label="Sample Metadata JSON", lines=8, interactive=False)
-                        donut_test_image = gr.Image(label="Line Image (upload)", type="numpy")
-                        donut_test_gt = gr.Textbox(label="Ground Truth (optional / from dataset sample)", lines=4)
-                        donut_test_btn = gr.Button("Run DONUT OCR Inference", variant="primary")
-                    with gr.Column(scale=1):
-                        donut_test_preview = gr.Image(label="Preprocessed Image", type="numpy")
+                    donut_test_preview = gr.Image(label="Preprocessed Image", type="numpy")
+                    with gr.Row():
                         donut_test_text = gr.Textbox(label="OCR Output", lines=8)
-                        donut_test_cer = gr.Textbox(label="CER (vs Ground Truth)", lines=1)
-                        donut_test_debug = gr.Textbox(label="Runtime / Debug JSON", lines=14)
+                        donut_test_gt = gr.Textbox(label="Ground Truth", lines=8)
+                    donut_test_cer = gr.Textbox(label="CER (vs Ground Truth)", lines=1)
+                    donut_test_debug = gr.Textbox(label="Runtime / Debug JSON", lines=14)
 
-            donut_run_btn.click(
-                fn=run_donut_ocr_workflow_live,
-                inputs=[
-                    donut_dataset_name,
-                    donut_dataset_output_dir,
-                    donut_train_samples,
-                    donut_val_samples,
-                    donut_font_tibetan,
-                    donut_font_chinese,
-                    donut_augmentation,
-                    donut_newline_token,
-                    donut_prepared_output_dir,
-                    donut_model_output_dir,
-                    donut_model_name,
-                    donut_train_tokenizer,
-                    donut_tokenizer_vocab_size,
-                    donut_train_batch,
-                    donut_eval_batch,
-                    donut_epochs,
-                    donut_lr,
-                    donut_max_target_length,
-                    donut_image_size,
-                    donut_seed,
-                    donut_skip_generation,
-                    donut_skip_prepare,
-                    donut_skip_train,
-                    donut_lora_path,
-                    donut_lora_family,
-                    donut_lora_base_model,
-                    donut_lora_controlnet_model,
-                    donut_lora_prompt,
-                    donut_lora_scale,
-                    donut_lora_strength,
-                    donut_lora_steps,
-                    donut_lora_guidance,
-                    donut_lora_controlnet,
-                    donut_lora_seed,
-                    donut_lora_splits,
-                    donut_lora_targets,
-                    donut_lora_canny_low,
-                    donut_lora_canny_high,
-                ],
-                outputs=[
-                    donut_log,
-                    donut_dataset_dir,
-                    donut_prepared_dir,
-                    donut_model_dir,
-                    donut_summary_path,
-                ],
-            )
             donut_test_btn.click(
                 fn=run_donut_ocr_inference_with_gt_ui,
                 inputs=[
@@ -10419,11 +10318,6 @@ def build_ui() -> gr.Blocks:
                     donut_test_cer,
                     donut_test_debug,
                 ],
-            )
-            donut_model_dir.change(
-                fn=lambda x: x or "",
-                inputs=[donut_model_dir],
-                outputs=[donut_test_model_dir],
             )
             donut_test_scan_btn.click(
                 fn=scan_donut_ocr_models_ui,
