@@ -23,6 +23,7 @@ import tempfile
 import textwrap
 import time
 import zipfile
+import csv
 from concurrent.futures import ThreadPoolExecutor, as_completed
 from functools import lru_cache
 from pathlib import Path
@@ -3645,8 +3646,8 @@ def scan_line_clip_dual_models_ui(models_dir: str):
         empty = gr.update(choices=[], value=None)
         return empty, "", "", "", "", "{}", f"Directory not found: {base}"
 
-    found_roots: List[str] = []
     bundles: Dict[str, Dict[str, str]] = {}
+    bundle_rows: List[Dict[str, Any]] = []
 
     def _parse_ckpt_sort_fields(name: str) -> Tuple[int, float, float]:
         low = str(name or "").lower()
@@ -3676,7 +3677,22 @@ def scan_line_clip_dual_models_ui(models_dir: str):
                 except Exception:
                     t2i1 = -1.0
         return step, i2t1, t2i1
-    for cfg_path in sorted(base.rglob("training_config.json")):
+
+    def _to_f(raw: Any, default: float = -1.0) -> float:
+        try:
+            val = float(raw)
+            if math.isfinite(val):
+                return float(val)
+        except Exception:
+            pass
+        return float(default)
+
+    def _fmt_metric(v: float) -> str:
+        if not math.isfinite(float(v)) or float(v) < 0.0:
+            return "na"
+        return f"{float(v):.4f}"
+
+    for cfg_path in sorted(base.rglob("*training_config.json")):
         try:
             data = json.loads(cfg_path.read_text(encoding="utf-8"))
         except Exception:
@@ -3701,32 +3717,73 @@ def scan_line_clip_dual_models_ui(models_dir: str):
         if not (img_backbone.exists() and img_head.exists() and txt_encoder.exists() and txt_head.exists()):
             continue
         key = str(root if not prefix else (root / prefix))
-        found_roots.append(key)
+        last_val = data.get("last_val_metrics") if isinstance(data.get("last_val_metrics"), dict) else {}
+        cfg_i2t1 = _to_f(last_val.get("val_i2t_r1", -1.0))
+        cfg_t2i1 = _to_f(last_val.get("val_t2i_r1", -1.0))
+        cfg_i2t5 = _to_f(last_val.get("val_i2t_r5", -1.0))
+        cfg_t2i5 = _to_f(last_val.get("val_t2i_r5", -1.0))
+        cfg_n = int(_to_int(last_val.get("val_count", 0), 0))
+        cfg_step = int(_to_int(data.get("global_step", -1), -1))
+        name_step, name_i2t1, name_t2i1 = _parse_ckpt_sort_fields(Path(key).name)
+        # Prefer explicit config metrics; fallback to checkpoint suffix parsing.
+        sort_i2t1 = cfg_i2t1 if cfg_i2t1 >= 0.0 else name_i2t1
+        sort_t2i1 = cfg_t2i1 if cfg_t2i1 >= 0.0 else name_t2i1
+        sort_step = max(cfg_step, name_step)
+        score_primary = ((sort_i2t1 if sort_i2t1 >= 0 else -1.0) + (sort_t2i1 if sort_t2i1 >= 0 else -1.0)) / 2.0
+
+        bundle_name = Path(key).name
+        metrics_label = (
+            f"i2t@1={_fmt_metric(cfg_i2t1 if cfg_i2t1 >= 0 else name_i2t1)} "
+            f"t2i@1={_fmt_metric(cfg_t2i1 if cfg_t2i1 >= 0 else name_t2i1)} "
+            f"i2t@5={_fmt_metric(cfg_i2t5)} t2i@5={_fmt_metric(cfg_t2i5)}"
+        )
+        extra_label = f"step={sort_step if sort_step >= 0 else 'na'} n={cfg_n if cfg_n > 0 else 'na'}"
+        dropdown_label = f"{bundle_name} | {metrics_label} | {extra_label}"
         bundles[key] = {
             "image_backbone": str(img_backbone.resolve()),
             "image_head": str(img_head.resolve()),
             "text_encoder": str(txt_encoder.resolve()),
             "text_head": str(txt_head.resolve()),
+            "bundle_root": str(Path(key).resolve()),
+            "config_path": str(cfg_path.resolve()),
+            "display_label": dropdown_label,
+            "sort_score_primary": f"{float(score_primary):.6f}",
+            "sort_i2t1": f"{float(sort_i2t1):.6f}",
+            "sort_t2i1": f"{float(sort_t2i1):.6f}",
+            "sort_step": str(int(sort_step)),
+            "val_count": str(int(cfg_n)),
         }
+        bundle_rows.append(
+            {
+                "key": key,
+                "label": dropdown_label,
+                "score_primary": float(score_primary),
+                "i2t1": float(sort_i2t1),
+                "t2i1": float(sort_t2i1),
+                "step": int(sort_step),
+            }
+        )
 
-    found_roots = sorted(set(found_roots))
-    # Prefer recent/strong checkpoints first: step desc, then i2t@1 desc, then t2i@1 desc.
-    found_roots = sorted(
-        found_roots,
+    # Prefer strongest validation performance first, then step.
+    bundle_rows = sorted(
+        bundle_rows,
         key=lambda p: (
-            _parse_ckpt_sort_fields(Path(p).name)[0],
-            _parse_ckpt_sort_fields(Path(p).name)[1],
-            _parse_ckpt_sort_fields(Path(p).name)[2],
-            str(p),
+            float(p.get("score_primary", -1.0)),
+            float(p.get("i2t1", -1.0)),
+            float(p.get("t2i1", -1.0)),
+            int(p.get("step", -1)),
+            str(p.get("key", "")),
         ),
         reverse=True,
     )
+    found_roots = [str(r.get("key", "")) for r in bundle_rows if str(r.get("key", ""))]
+    choice_tuples = [(str(r.get("label", r.get("key", ""))), str(r.get("key", ""))) for r in bundle_rows]
     default_root = found_roots[0] if found_roots else ""
     default_bundle = bundles.get(default_root, {}) if default_root else {}
     state_json = json.dumps(bundles, ensure_ascii=False)
-    msg = f"Found {len(found_roots)} line_clip model bundle(s) in {base}"
+    msg = f"Found {len(found_roots)} line_clip model bundle(s) in {base} (sorted by val retrieval performance, then step)"
     return (
-        gr.update(choices=found_roots, value=(default_root if default_root else None)),
+        gr.update(choices=choice_tuples, value=(default_root if default_root else None)),
         default_bundle.get("image_backbone", ""),
         default_bundle.get("image_head", ""),
         default_bundle.get("text_encoder", ""),
@@ -4116,6 +4173,62 @@ def _load_image_as_rgb_np_ui(path: str) -> np.ndarray:
         return np.asarray(im.convert("RGB")).astype(np.uint8, copy=False)
 
 
+def _write_line_clip_debug_results_csv_ui(
+    *,
+    rows: List[Dict[str, Any]],
+    order: np.ndarray,
+    sims: np.ndarray,
+    top_k: int,
+    gt_idx: int,
+    query_desc: Dict[str, Any],
+) -> str:
+    out_dir = (Path(tempfile.gettempdir()) / "pechabridge_ui" / "line_clip_debug_exports").resolve()
+    out_dir.mkdir(parents=True, exist_ok=True)
+    ts = time.strftime("%Y%m%d_%H%M%S")
+    mode = str(query_desc.get("mode", "retrieval") or "retrieval")
+    safe_mode = re.sub(r"[^a-zA-Z0-9_.-]+", "_", mode).strip("_") or "retrieval"
+    out_path = (out_dir / f"{safe_mode}_{ts}.csv").resolve()
+    k = max(1, min(int(top_k), int(len(order))))
+    with out_path.open("w", encoding="utf-8", newline="") as f:
+        writer = csv.DictWriter(
+            f,
+            fieldnames=[
+                "rank",
+                "score",
+                "sample_index",
+                "doc_id",
+                "page_id",
+                "line_id",
+                "image_path",
+                "text",
+                "is_ground_truth",
+                "query_mode",
+                "query_text",
+                "query_image_path",
+            ],
+        )
+        writer.writeheader()
+        for rank, idx in enumerate(order[:k].tolist(), start=1):
+            rec = rows[int(idx)]
+            writer.writerow(
+                {
+                    "rank": int(rank),
+                    "score": float(sims[int(idx)]),
+                    "sample_index": int(rec.get("_sample_index", idx)),
+                    "doc_id": str(rec.get("doc_id", "") or ""),
+                    "page_id": str(rec.get("page_id", "") or ""),
+                    "line_id": _to_int(rec.get("line_id", -1), -1),
+                    "image_path": str(rec.get("_image_path_resolved", "") or ""),
+                    "text": str(rec.get("_text_resolved", "") or ""),
+                    "is_ground_truth": bool(int(idx) == int(gt_idx) and gt_idx >= 0),
+                    "query_mode": str(query_desc.get("mode", "") or ""),
+                    "query_text": str(query_desc.get("query_text", "") or ""),
+                    "query_image_path": str(query_desc.get("query_image_path", "") or ""),
+                }
+            )
+    return str(out_path)
+
+
 def run_line_clip_dataset_debug_retrieval_ui(
     sample_image: Optional[np.ndarray],
     sample_ground_truth: str,
@@ -4136,15 +4249,16 @@ def run_line_clip_dataset_debug_retrieval_ui(
 ):
     gt_placeholder = _line_profile_placeholder("Load a random OCR sample or upload one.")
     if not (dataset_root or "").strip() or not (split_name or "").strip():
-        return gt_placeholder, [], "{}", "Please scan/select an OCR dataset + split.", sample_state
+        return gt_placeholder, [], "{}", "", "Please scan/select an OCR dataset + split.", sample_state
     if not (image_backbone_path or "").strip() or not (text_encoder_dir or "").strip() or not (text_head_path or "").strip():
-        return gt_placeholder, [], "{}", "Please select a complete line_clip model (image backbone/head + text encoder/head).", sample_state
+        return gt_placeholder, [], "{}", "", "Please select a complete line_clip model (image backbone/head + text encoder/head).", sample_state
     qmode = str(query_mode or "Text -> Image").strip().lower()
     use_text_query = qmode.startswith("text")
+    use_image_to_text = (not use_text_query) and ("text" in qmode)
     if use_text_query and not str(query_text or "").strip():
-        return gt_placeholder, [], "{}", "Text query is empty.", sample_state
+        return gt_placeholder, [], "{}", "", "Text query is empty.", sample_state
     if (not use_text_query) and sample_image is None:
-        return gt_placeholder, [], "{}", "No sample image available for image query.", sample_state
+        return gt_placeholder, [], "{}", "", "No sample image available for image query.", sample_state
 
     try:
         corpus = _get_or_build_line_clip_debug_corpus_ui(
@@ -4161,6 +4275,7 @@ def run_line_clip_dataset_debug_retrieval_ui(
         )
         rows = corpus["rows"]
         img_emb = np.asarray(corpus["image_embeddings"], dtype=np.float32)
+        txt_emb = np.asarray(corpus.get("text_embeddings", np.zeros((0, 1), dtype=np.float32)), dtype=np.float32)
         runtime = _load_line_clip_dual_runtime_cached(
             image_backbone_path,
             image_head_path,
@@ -4170,6 +4285,8 @@ def run_line_clip_dataset_debug_retrieval_ui(
         )
         if img_emb.ndim != 2 or img_emb.shape[0] != len(rows):
             raise RuntimeError("Cached image embeddings are invalid.")
+        if txt_emb.ndim != 2 or txt_emb.shape[0] != len(rows):
+            raise RuntimeError("Cached text embeddings are invalid.")
 
         if use_text_query:
             qtxt = str(query_text or "")
@@ -4181,6 +4298,7 @@ def run_line_clip_dataset_debug_retrieval_ui(
                 text_max_length=max(8, int(text_max_length)),
             )[0]
             query_desc = {"mode": "text_to_image", "query_text": qtxt}
+            bank = img_emb
         else:
             q_img = np.asarray(sample_image).astype(np.uint8)
             tmp_path = _persist_faiss_ui_query_crop(q_img)
@@ -4192,9 +4310,13 @@ def run_line_clip_dataset_debug_retrieval_ui(
                 batch_size=1,
                 l2_normalize=bool(l2_normalize),
             )[0]
-            query_desc = {"mode": "image_to_image", "query_image_path": tmp_path}
+            query_desc = {
+                "mode": ("image_to_text" if use_image_to_text else "image_to_image"),
+                "query_image_path": tmp_path,
+            }
+            bank = txt_emb if use_image_to_text else img_emb
 
-        sims = np.matmul(img_emb, np.asarray(q_vec, dtype=np.float32))
+        sims = np.matmul(bank, np.asarray(q_vec, dtype=np.float32))
         order = np.argsort(-sims)
         k = max(1, min(int(top_k), 50))
         top_idx = [int(i) for i in order[:k].tolist()]
@@ -4235,6 +4357,14 @@ def run_line_clip_dataset_debug_retrieval_ui(
             )
             gallery_items.append((img_np, caption))
 
+        export_csv_path = _write_line_clip_debug_results_csv_ui(
+            rows=rows,
+            order=order,
+            sims=np.asarray(sims, dtype=np.float32),
+            top_k=k,
+            gt_idx=gt_idx,
+            query_desc=query_desc,
+        )
         debug = {
             "ok": True,
             "query": query_desc,
@@ -4248,16 +4378,18 @@ def run_line_clip_dataset_debug_retrieval_ui(
             "ground_truth_text_length": len(str(sample_ground_truth or "")),
             "device": str(corpus.get("device", "")),
             "device_msg": str(corpus.get("device_msg", "")),
+            "results_csv_path": export_csv_path,
         }
         status = (
-            f"line_clip debug retrieval ({'Text->Image' if use_text_query else 'Image->Image'}) "
+            f"line_clip debug retrieval ({'Text->Image' if use_text_query else ('Image->Text' if use_image_to_text else 'Image->Image')}) "
             f"on split={split_name}: corpus={len(rows)} topk={k} "
             f"| GT rank={rank_of_gt if rank_of_gt > 0 else 'not found'}"
+            f" | CSV={export_csv_path}"
         )
-        return gt_image, gallery_items, json.dumps(debug, ensure_ascii=False, indent=2), status, sample_state
+        return gt_image, gallery_items, json.dumps(debug, ensure_ascii=False, indent=2), export_csv_path, status, sample_state
     except Exception as exc:
         msg = f"Line CLIP debug retrieval failed: {type(exc).__name__}: {exc}"
-        return gt_placeholder, [], json.dumps({"ok": False, "error": msg}, ensure_ascii=False, indent=2), msg, sample_state
+        return gt_placeholder, [], json.dumps({"ok": False, "error": msg}, ensure_ascii=False, indent=2), "", msg, sample_state
 
 
 def refresh_image_list(dataset_dir: str, split: str):
@@ -10977,12 +11109,174 @@ def build_ui() -> gr.Blocks:
                 ],
             )
 
-        # 13) Retrieval encoders + evaluation + FAISS search
-        with gr.Tab("13. Retrieval Encoders"):
+        # 13) Pretrained line_clip workbench
+        with gr.Tab("13. line_clip Workbench"):
             gr.Markdown(
-                "Train and evaluate retrieval components for Tibetan n-gram search: "
-                "A) image encoder training, "
-                "B) Patch-Hierarchy ViT evaluation, C) FAISS similarity search."
+                "Experiment with a pretrained line_clip dual encoder only. "
+                "Scan model bundles automatically (sorted by validation retrieval performance), "
+                "load a sample line, and run Text->Image / Image->Image / Image->Text retrieval."
+            )
+            lineclip_dbg_sample_state = gr.State({})
+            lineclip_dbg_bundle_state = gr.State("{}")
+            with gr.Row():
+                with gr.Column(scale=1):
+                    with gr.Row():
+                        lineclip_dbg_models_dir = gr.Textbox(label="models_dir (line_clip scan)", value=str((workspace_root / "models").resolve()))
+                        lineclip_dbg_scan_models_btn = gr.Button("Scan line_clip Models")
+                    lineclip_dbg_model_scan_status = gr.Textbox(label="line_clip Model Scan Status", interactive=False)
+                    lineclip_dbg_bundle_select = gr.Dropdown(
+                        label="Detected line_clip bundles (auto-scanned, sorted by val retrieval performance)",
+                        choices=[],
+                        value=None,
+                        allow_custom_value=True,
+                    )
+                    with gr.Row():
+                        lineclip_dbg_datasets_dir = gr.Textbox(label="datasets_dir (OCR manifests)", value=str((workspace_root / "datasets").resolve()))
+                        lineclip_dbg_scan_datasets_btn = gr.Button("Scan OCR Datasets")
+                    lineclip_dbg_dataset_scan_status = gr.Textbox(label="OCR Dataset Scan Status", interactive=False)
+                    lineclip_dbg_dataset_split_state = gr.State("{}")
+                    with gr.Row():
+                        lineclip_dbg_dataset_root = gr.Dropdown(
+                            label="OCR dataset root",
+                            choices=[],
+                            value=None,
+                            allow_custom_value=True,
+                        )
+                        lineclip_dbg_split = gr.Dropdown(label="Split", choices=[], value=None)
+                    with gr.Row():
+                        lineclip_dbg_seed = gr.Number(label="random_seed", value=42, precision=0)
+                        lineclip_dbg_load_sample_btn = gr.Button("Load Random Sample")
+                    lineclip_dbg_sample_path = gr.Textbox(label="Sample image path", interactive=False)
+                    lineclip_dbg_sample_meta = gr.Textbox(label="Sample metadata JSON", lines=7, interactive=False)
+                    lineclip_dbg_sample_image = gr.Image(label="Query/GT line image", type="numpy")
+                    with gr.Accordion("Advanced: Detected Artifact Paths", open=False):
+                        with gr.Row():
+                            lineclip_dbg_img_backbone = gr.Textbox(label="image_backbone_dir")
+                            lineclip_dbg_img_head = gr.Textbox(label="image_projection_head")
+                        with gr.Row():
+                            lineclip_dbg_txt_encoder = gr.Textbox(label="text_encoder_dir")
+                            lineclip_dbg_txt_head = gr.Textbox(label="text_projection_head")
+                with gr.Column(scale=1):
+                    lineclip_dbg_query_mode = gr.Radio(
+                        choices=["Text -> Image", "Image -> Image", "Image -> Text"],
+                        value="Text -> Image",
+                        label="Query mode",
+                    )
+                    lineclip_dbg_gt_text = gr.Textbox(label="Ground-truth text", lines=4)
+                    lineclip_dbg_query_text = gr.Textbox(label="Text query (used for Text -> Image)", lines=4)
+                    lineclip_dbg_topk = gr.Number(label="top_k", value=5, precision=0)
+                    lineclip_dbg_run_btn = gr.Button("Run line_clip Debug Retrieval", variant="primary")
+                    lineclip_dbg_export_csv = gr.Textbox(label="Results CSV Export Path", interactive=False)
+                    lineclip_dbg_status = gr.Textbox(label="Debug Retrieval Status", interactive=False)
+                    lineclip_dbg_debug_json = gr.Code(label="Debug JSON", language="json")
+                    with gr.Accordion("Advanced Retrieval Settings", open=False):
+                        with gr.Row():
+                            lineclip_dbg_device = gr.Dropdown(
+                                choices=["auto", "cuda", "cuda:0", "cuda:1", "cuda:2", "cuda:3", "cpu", "mps"],
+                                value="auto",
+                                label="device",
+                            )
+                            lineclip_dbg_l2 = gr.Checkbox(label="l2_normalize_embeddings", value=True)
+                        with gr.Row():
+                            lineclip_dbg_batch = gr.Number(label="embedding_batch_size", value=32, precision=0)
+                            lineclip_dbg_text_max_len = gr.Number(label="text_max_length", value=256, precision=0)
+            with gr.Row():
+                with gr.Column(scale=1):
+                    lineclip_dbg_gt_image = gr.Image(label="Ground Truth Line (reference)", type="numpy")
+                with gr.Column(scale=2):
+                    lineclip_dbg_results_gallery = gr.Gallery(
+                        label="Top-K Retrieval Results (side-by-side vs ground truth)",
+                        columns=5,
+                        rows=1,
+                        object_fit="contain",
+                        height=280,
+                    )
+
+            lineclip_dbg_scan_models_btn.click(
+                fn=scan_line_clip_dual_models_ui,
+                inputs=[lineclip_dbg_models_dir],
+                outputs=[
+                    lineclip_dbg_bundle_select,
+                    lineclip_dbg_img_backbone,
+                    lineclip_dbg_img_head,
+                    lineclip_dbg_txt_encoder,
+                    lineclip_dbg_txt_head,
+                    lineclip_dbg_bundle_state,
+                    lineclip_dbg_model_scan_status,
+                ],
+            )
+            lineclip_dbg_bundle_select.change(
+                fn=on_line_clip_bundle_change_ui,
+                inputs=[lineclip_dbg_bundle_select, lineclip_dbg_bundle_state],
+                outputs=[
+                    lineclip_dbg_img_backbone,
+                    lineclip_dbg_img_head,
+                    lineclip_dbg_txt_encoder,
+                    lineclip_dbg_txt_head,
+                ],
+            )
+            lineclip_dbg_scan_datasets_btn.click(
+                fn=scan_donut_ocr_datasets_ui,
+                inputs=[lineclip_dbg_datasets_dir],
+                outputs=[
+                    lineclip_dbg_dataset_root,
+                    lineclip_dbg_split,
+                    lineclip_dbg_dataset_split_state,
+                    lineclip_dbg_dataset_scan_status,
+                ],
+            )
+            lineclip_dbg_dataset_root.change(
+                fn=on_donut_ocr_dataset_change_ui,
+                inputs=[lineclip_dbg_dataset_root, lineclip_dbg_dataset_split_state],
+                outputs=[lineclip_dbg_split],
+            )
+            lineclip_dbg_load_sample_btn.click(
+                fn=load_random_line_clip_debug_sample_ui,
+                inputs=[lineclip_dbg_dataset_root, lineclip_dbg_split, lineclip_dbg_seed],
+                outputs=[
+                    lineclip_dbg_sample_image,
+                    lineclip_dbg_gt_text,
+                    lineclip_dbg_query_text,
+                    lineclip_dbg_sample_meta,
+                    lineclip_dbg_sample_path,
+                    lineclip_dbg_sample_state,
+                ],
+            )
+            lineclip_dbg_run_btn.click(
+                fn=run_line_clip_dataset_debug_retrieval_ui,
+                inputs=[
+                    lineclip_dbg_sample_image,
+                    lineclip_dbg_gt_text,
+                    lineclip_dbg_query_text,
+                    lineclip_dbg_query_mode,
+                    lineclip_dbg_dataset_root,
+                    lineclip_dbg_split,
+                    lineclip_dbg_img_backbone,
+                    lineclip_dbg_img_head,
+                    lineclip_dbg_txt_encoder,
+                    lineclip_dbg_txt_head,
+                    lineclip_dbg_device,
+                    lineclip_dbg_batch,
+                    lineclip_dbg_text_max_len,
+                    lineclip_dbg_l2,
+                    lineclip_dbg_topk,
+                    lineclip_dbg_sample_state,
+                ],
+                outputs=[
+                    lineclip_dbg_gt_image,
+                    lineclip_dbg_results_gallery,
+                    lineclip_dbg_debug_json,
+                    lineclip_dbg_export_csv,
+                    lineclip_dbg_status,
+                    lineclip_dbg_sample_state,
+                ],
+            )
+
+        # 14) Retrieval advanced tools (training / eval / FAISS)
+        with gr.Tab("14. Retrieval Advanced"):
+            gr.Markdown(
+                "Advanced retrieval tools: training, evaluation, and FAISS search for Tibetan n-gram retrieval. "
+                "Use the dedicated `line_clip Workbench` tab for pretrained line_clip experiments."
             )
 
             gr.Markdown("### Shared Artifact Scan (Backbone / Projection / FAISS)")
@@ -11003,80 +11297,6 @@ def build_ui() -> gr.Blocks:
                     label="shared_faiss_meta_path",
                     value=f"{default_text_hierarchy_faiss_index}.meta.json",
                 )
-
-            gr.Markdown("### A0) Line-CLIP Debug (OpenPecha/BDRC line retrieval on server datasets)")
-            lineclip_dbg_sample_state = gr.State({})
-            lineclip_dbg_bundle_state = gr.State("{}")
-            with gr.Row():
-                with gr.Column(scale=1):
-                    with gr.Row():
-                        lineclip_dbg_models_dir = gr.Textbox(label="models_dir (line_clip scan)", value=str((workspace_root / "models").resolve()))
-                        lineclip_dbg_scan_models_btn = gr.Button("Scan line_clip Models")
-                    lineclip_dbg_model_scan_status = gr.Textbox(label="line_clip Model Scan Status", interactive=False)
-                    lineclip_dbg_bundle_select = gr.Dropdown(
-                        label="Detected line_clip bundles (final models)",
-                        choices=[],
-                        value=None,
-                        allow_custom_value=True,
-                    )
-                    with gr.Row():
-                        lineclip_dbg_img_backbone = gr.Textbox(label="image_backbone_dir")
-                        lineclip_dbg_img_head = gr.Textbox(label="image_projection_head")
-                    with gr.Row():
-                        lineclip_dbg_txt_encoder = gr.Textbox(label="text_encoder_dir")
-                        lineclip_dbg_txt_head = gr.Textbox(label="text_projection_head")
-                    with gr.Row():
-                        lineclip_dbg_datasets_dir = gr.Textbox(label="datasets_dir (OCR manifests)", value=str((workspace_root / "datasets").resolve()))
-                        lineclip_dbg_scan_datasets_btn = gr.Button("Scan OCR Datasets")
-                    lineclip_dbg_dataset_scan_status = gr.Textbox(label="OCR Dataset Scan Status", interactive=False)
-                    lineclip_dbg_dataset_split_state = gr.State("{}")
-                    with gr.Row():
-                        lineclip_dbg_dataset_root = gr.Dropdown(
-                            label="OCR dataset root",
-                            choices=[],
-                            value=None,
-                            allow_custom_value=True,
-                        )
-                        lineclip_dbg_split = gr.Dropdown(label="Split", choices=[], value=None)
-                    with gr.Row():
-                        lineclip_dbg_seed = gr.Number(label="random_seed", value=42, precision=0)
-                        lineclip_dbg_load_sample_btn = gr.Button("Load Random Sample")
-                    lineclip_dbg_sample_path = gr.Textbox(label="Sample image path", interactive=False)
-                    lineclip_dbg_sample_meta = gr.Textbox(label="Sample metadata JSON", lines=7, interactive=False)
-                    lineclip_dbg_sample_image = gr.Image(label="Query/GT line image", type="numpy")
-                with gr.Column(scale=1):
-                    with gr.Row():
-                        lineclip_dbg_query_mode = gr.Radio(
-                            choices=["Text -> Image", "Image -> Image"],
-                            value="Text -> Image",
-                            label="Query mode",
-                        )
-                        lineclip_dbg_device = gr.Dropdown(
-                            choices=["auto", "cuda", "cuda:0", "cuda:1", "cuda:2", "cuda:3", "cpu", "mps"],
-                            value="auto",
-                            label="device",
-                        )
-                    lineclip_dbg_gt_text = gr.Textbox(label="Ground-truth text", lines=4)
-                    lineclip_dbg_query_text = gr.Textbox(label="Text query (used for Text -> Image)", lines=4)
-                    with gr.Row():
-                        lineclip_dbg_batch = gr.Number(label="embedding_batch_size", value=32, precision=0)
-                        lineclip_dbg_text_max_len = gr.Number(label="text_max_length", value=256, precision=0)
-                        lineclip_dbg_topk = gr.Number(label="top_k", value=5, precision=0)
-                    lineclip_dbg_l2 = gr.Checkbox(label="l2_normalize_embeddings", value=True)
-                    lineclip_dbg_run_btn = gr.Button("Run line_clip Debug Retrieval", variant="primary")
-                    lineclip_dbg_status = gr.Textbox(label="Debug Retrieval Status", interactive=False)
-                    lineclip_dbg_debug_json = gr.Code(label="Debug JSON", language="json")
-            with gr.Row():
-                with gr.Column(scale=1):
-                    lineclip_dbg_gt_image = gr.Image(label="Ground Truth Line (reference)", type="numpy")
-                with gr.Column(scale=2):
-                    lineclip_dbg_results_gallery = gr.Gallery(
-                        label="Top-5 Retrieval Results (side-by-side vs ground truth)",
-                        columns=5,
-                        rows=1,
-                        object_fit="contain",
-                        height=280,
-                    )
 
             gr.Markdown("### A) Train Image Encoder (SimCLR-style)")
             with gr.Row():
@@ -11306,85 +11526,6 @@ def build_ui() -> gr.Blocks:
                 fn=on_faiss_index_change_ui,
                 inputs=[retr_faiss_select],
                 outputs=[retr_faiss_index_path, retr_faiss_meta_path],
-            )
-
-            lineclip_dbg_scan_models_btn.click(
-                fn=scan_line_clip_dual_models_ui,
-                inputs=[lineclip_dbg_models_dir],
-                outputs=[
-                    lineclip_dbg_bundle_select,
-                    lineclip_dbg_img_backbone,
-                    lineclip_dbg_img_head,
-                    lineclip_dbg_txt_encoder,
-                    lineclip_dbg_txt_head,
-                    lineclip_dbg_bundle_state,
-                    lineclip_dbg_model_scan_status,
-                ],
-            )
-            lineclip_dbg_bundle_select.change(
-                fn=on_line_clip_bundle_change_ui,
-                inputs=[lineclip_dbg_bundle_select, lineclip_dbg_bundle_state],
-                outputs=[
-                    lineclip_dbg_img_backbone,
-                    lineclip_dbg_img_head,
-                    lineclip_dbg_txt_encoder,
-                    lineclip_dbg_txt_head,
-                ],
-            )
-            lineclip_dbg_scan_datasets_btn.click(
-                fn=scan_donut_ocr_datasets_ui,
-                inputs=[lineclip_dbg_datasets_dir],
-                outputs=[
-                    lineclip_dbg_dataset_root,
-                    lineclip_dbg_split,
-                    lineclip_dbg_dataset_split_state,
-                    lineclip_dbg_dataset_scan_status,
-                ],
-            )
-            lineclip_dbg_dataset_root.change(
-                fn=on_donut_ocr_dataset_change_ui,
-                inputs=[lineclip_dbg_dataset_root, lineclip_dbg_dataset_split_state],
-                outputs=[lineclip_dbg_split],
-            )
-            lineclip_dbg_load_sample_btn.click(
-                fn=load_random_line_clip_debug_sample_ui,
-                inputs=[lineclip_dbg_dataset_root, lineclip_dbg_split, lineclip_dbg_seed],
-                outputs=[
-                    lineclip_dbg_sample_image,
-                    lineclip_dbg_gt_text,
-                    lineclip_dbg_query_text,
-                    lineclip_dbg_sample_meta,
-                    lineclip_dbg_sample_path,
-                    lineclip_dbg_sample_state,
-                ],
-            )
-            lineclip_dbg_run_btn.click(
-                fn=run_line_clip_dataset_debug_retrieval_ui,
-                inputs=[
-                    lineclip_dbg_sample_image,
-                    lineclip_dbg_gt_text,
-                    lineclip_dbg_query_text,
-                    lineclip_dbg_query_mode,
-                    lineclip_dbg_dataset_root,
-                    lineclip_dbg_split,
-                    lineclip_dbg_img_backbone,
-                    lineclip_dbg_img_head,
-                    lineclip_dbg_txt_encoder,
-                    lineclip_dbg_txt_head,
-                    lineclip_dbg_device,
-                    lineclip_dbg_batch,
-                    lineclip_dbg_text_max_len,
-                    lineclip_dbg_l2,
-                    lineclip_dbg_topk,
-                    lineclip_dbg_sample_state,
-                ],
-                outputs=[
-                    lineclip_dbg_gt_image,
-                    lineclip_dbg_results_gallery,
-                    lineclip_dbg_debug_json,
-                    lineclip_dbg_status,
-                    lineclip_dbg_sample_state,
-                ],
             )
 
             eval_th_run_btn.click(
