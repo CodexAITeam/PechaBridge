@@ -20,6 +20,7 @@ import shutil
 import subprocess
 import sys
 import tempfile
+import textwrap
 import time
 import zipfile
 from concurrent.futures import ThreadPoolExecutor, as_completed
@@ -3640,6 +3641,579 @@ def load_random_donut_ocr_dataset_sample_ui(dataset_root: str, split_name: str, 
         "doc_id": chosen_row.get("doc_id"),
     }
     return np.array(rgb), str(gt), json.dumps(debug, ensure_ascii=False, indent=2), str(chosen_img_path)
+
+
+def scan_line_clip_dual_models_ui(models_dir: str):
+    base = Path(models_dir).expanduser().resolve()
+    if not base.exists() or not base.is_dir():
+        empty = gr.update(choices=[], value=None)
+        return empty, "", "", "", "", "{}", f"Directory not found: {base}"
+
+    found_roots: List[str] = []
+    bundles: Dict[str, Dict[str, str]] = {}
+    for cfg_path in sorted(base.rglob("training_config.json")):
+        try:
+            data = json.loads(cfg_path.read_text(encoding="utf-8"))
+        except Exception:
+            continue
+        if not isinstance(data, dict):
+            continue
+        if str(data.get("mode", "")).strip().lower() != "line_clip":
+            continue
+        root = cfg_path.parent.resolve()
+        img_backbone = root / "text_hierarchy_vit_backbone"
+        img_head = root / "text_hierarchy_projection_head.pt"
+        txt_encoder = root / "text_hierarchy_clip_text_encoder"
+        txt_head = root / "text_hierarchy_clip_text_projection_head.pt"
+        if not (img_backbone.exists() and img_head.exists() and txt_encoder.exists() and txt_head.exists()):
+            continue
+        key = str(root)
+        found_roots.append(key)
+        bundles[key] = {
+            "image_backbone": str(img_backbone.resolve()),
+            "image_head": str(img_head.resolve()),
+            "text_encoder": str(txt_encoder.resolve()),
+            "text_head": str(txt_head.resolve()),
+        }
+
+    found_roots = sorted(set(found_roots))
+    default_root = found_roots[0] if found_roots else ""
+    default_bundle = bundles.get(default_root, {}) if default_root else {}
+    state_json = json.dumps(bundles, ensure_ascii=False)
+    msg = f"Found {len(found_roots)} line_clip model bundle(s) in {base}"
+    return (
+        gr.update(choices=found_roots, value=(default_root if default_root else None)),
+        default_bundle.get("image_backbone", ""),
+        default_bundle.get("image_head", ""),
+        default_bundle.get("text_encoder", ""),
+        default_bundle.get("text_head", ""),
+        state_json,
+        msg,
+    )
+
+
+def on_line_clip_bundle_change_ui(bundle_root: str, bundle_state_json: str):
+    root = str(bundle_root or "").strip()
+    bundles: Dict[str, Dict[str, str]] = {}
+    try:
+        bundles = json.loads(str(bundle_state_json or "{}"))
+    except Exception:
+        bundles = {}
+    rec = bundles.get(root, {}) if isinstance(bundles, dict) else {}
+    return (
+        str(rec.get("image_backbone", "") or ""),
+        str(rec.get("image_head", "") or ""),
+        str(rec.get("text_encoder", "") or ""),
+        str(rec.get("text_head", "") or ""),
+    )
+
+
+def _load_ui_projection_head_from_file(projection_head_path: str, in_dim_hint: int) -> Optional[Any]:
+    if torch is None or nn is None:
+        return None
+    ppath_raw = (projection_head_path or "").strip()
+    if not ppath_raw:
+        return None
+    ppath = Path(ppath_raw).expanduser().resolve()
+    if not ppath.exists() or not ppath.is_file():
+        return None
+    payload = torch.load(str(ppath), map_location="cpu")
+    if isinstance(payload, dict) and "state_dict" in payload:
+        state_dict = payload.get("state_dict", {})
+        in_dim = _to_int(payload.get("input_dim", 0), 0)
+        out_dim = _to_int(payload.get("output_dim", 0), 0)
+    else:
+        state_dict = payload
+        in_dim = 0
+        out_dim = 0
+    if in_dim <= 0:
+        in_dim = int(in_dim_hint)
+    if out_dim <= 0:
+        out_dim = int(in_dim)
+    if in_dim <= 0 or out_dim <= 0:
+        return None
+    head = _UIProjectionHead(in_dim=int(in_dim), out_dim=int(out_dim))
+    head.load_state_dict(state_dict, strict=False)
+    head.eval()
+    return head
+
+
+def _pooled_text_embedding_for_ui(text_encoder: Any, input_ids: Any, attention_mask: Any):
+    kwargs: Dict[str, Any] = {"input_ids": input_ids, "return_dict": True}
+    if attention_mask is not None:
+        kwargs["attention_mask"] = attention_mask
+    model_for_forward = text_encoder
+    base_model = text_encoder
+    seen_ids = set()
+    while hasattr(base_model, "module") and id(base_model) not in seen_ids:
+        seen_ids.add(id(base_model))
+        try:
+            base_model = getattr(base_model, "module")
+        except Exception:
+            break
+    cfg = getattr(base_model, "config", None)
+    if bool(getattr(cfg, "is_encoder_decoder", False)) and hasattr(base_model, "get_encoder"):
+        try:
+            model_for_forward = base_model.get_encoder()
+        except Exception:
+            model_for_forward = text_encoder
+    outputs = model_for_forward(**kwargs)
+    pooler = getattr(outputs, "pooler_output", None)
+    if pooler is not None:
+        return pooler
+    hidden = getattr(outputs, "last_hidden_state", None)
+    if hidden is None:
+        raise RuntimeError("Text encoder output has no pooler_output/last_hidden_state")
+    if hidden.ndim != 3:
+        return hidden
+    if attention_mask is None:
+        return hidden.mean(dim=1)
+    mask = attention_mask.to(hidden.device).float().unsqueeze(-1)
+    denom = mask.sum(dim=1).clamp(min=1.0)
+    return (hidden * mask).sum(dim=1) / denom
+
+
+@lru_cache(maxsize=4)
+def _load_line_clip_dual_runtime_cached(
+    image_backbone_path: str,
+    image_head_path: str,
+    text_encoder_dir: str,
+    text_head_path: str,
+    device_pref: str,
+):
+    if torch is None or AutoModel is None or AutoTokenizer is None or nn is None:
+        raise RuntimeError("line_clip debug requires torch + transformers.")
+    image_processor, image_backbone, image_head = _load_hierarchy_vit_encoder_bundle(image_backbone_path, image_head_path)
+    txt_dir = Path((text_encoder_dir or "").strip()).expanduser().resolve()
+    if not txt_dir.exists() or not txt_dir.is_dir():
+        raise FileNotFoundError(f"text encoder dir not found: {txt_dir}")
+    text_tokenizer = AutoTokenizer.from_pretrained(str(txt_dir), use_fast=True)
+    text_encoder = AutoModel.from_pretrained(str(txt_dir))
+    txt_hidden = _to_int(getattr(getattr(text_encoder, "config", None), "hidden_size", 0), 0)
+    if txt_hidden <= 0:
+        txt_hidden = _to_int(getattr(getattr(text_encoder, "config", None), "d_model", 0), 0)
+    text_head = _load_ui_projection_head_from_file(text_head_path, in_dim_hint=txt_hidden)
+    if text_head is None:
+        raise RuntimeError(f"Could not load text projection head: {text_head_path}")
+
+    resolved_device, device_note = _resolve_torch_device_for_encoding(device_pref)
+    image_backbone = image_backbone.to(resolved_device).eval()
+    text_encoder = text_encoder.to(resolved_device).eval()
+    if image_head is not None:
+        image_head = image_head.to(resolved_device).eval()
+    text_head = text_head.to(resolved_device).eval()
+    runtime_cfg = _load_hierarchy_encoder_runtime_config(image_backbone_path, image_head_path)
+    return {
+        "image_processor": image_processor,
+        "image_backbone": image_backbone,
+        "image_head": image_head,
+        "text_tokenizer": text_tokenizer,
+        "text_encoder": text_encoder,
+        "text_head": text_head,
+        "runtime_cfg": runtime_cfg,
+        "device": resolved_device,
+        "device_msg": device_note,
+    }
+
+
+def _collect_ocr_split_rows_ui(dataset_root: str, split_name: str) -> List[Dict[str, Any]]:
+    root = Path((dataset_root or "").strip()).expanduser().resolve()
+    split = str(split_name or "").strip()
+    manifest = root / split / "meta" / "lines.jsonl"
+    rows = _read_jsonl_rows_ui(manifest)
+    usable: List[Dict[str, Any]] = []
+    for i, row in enumerate(rows):
+        if not isinstance(row, dict):
+            continue
+        img_raw, txt = _extract_ocr_manifest_row_fields_ui(row)
+        img_path = _resolve_ocr_manifest_image_path_ui(img_raw, manifest)
+        if img_path is None:
+            continue
+        rec = dict(row)
+        rec["_image_path_resolved"] = str(img_path)
+        rec["_text_resolved"] = str(txt or "")
+        rec["_sample_index"] = int(i)
+        usable.append(rec)
+    return usable
+
+
+def _encode_line_clip_image_crops_ui(
+    runtime: Dict[str, Any],
+    image_paths: List[str],
+    batch_size: int,
+    l2_normalize: bool,
+) -> np.ndarray:
+    if torch is None:
+        raise RuntimeError("PyTorch not available")
+    image_backbone = runtime["image_backbone"]
+    image_head = runtime["image_head"]
+    image_processor = runtime["image_processor"]
+    runtime_cfg = runtime.get("runtime_cfg") or {}
+    device = runtime["device"]
+    width_buckets = _parse_width_buckets_for_encoding(
+        raw=runtime_cfg.get("width_buckets", [256, 384, 512, 768]),
+        patch_multiple=_to_int(runtime_cfg.get("patch_multiple", 16), 16),
+        max_width=_to_int(runtime_cfg.get("max_width", 1024), 1024),
+    )
+    mean = list(getattr(image_processor, "image_mean", [0.5, 0.5, 0.5]))
+    std = list(getattr(image_processor, "image_std", [0.5, 0.5, 0.5]))
+    if len(mean) == 1:
+        mean = mean * 3
+    if len(std) == 1:
+        std = std * 3
+    mean_t = torch.tensor([float(v) for v in mean[:3]], dtype=torch.float32).view(1, 3, 1, 1)
+    std_t = torch.tensor([max(1e-6, float(v)) for v in std[:3]], dtype=torch.float32).view(1, 3, 1, 1)
+
+    out_batches: List[np.ndarray] = []
+    bs = max(1, int(batch_size))
+    with torch.no_grad():
+        for start in range(0, len(image_paths), bs):
+            chunk = image_paths[start : start + bs]
+            tensors: List[Any] = []
+            for p in chunk:
+                with Image.open(p) as im:
+                    rgb = im.convert("RGB")
+                norm_img = _normalize_for_vit_encoding(
+                    image=rgb,
+                    target_height=_to_int(runtime_cfg.get("target_height", 64), 64),
+                    width_buckets=width_buckets,
+                    patch_multiple=_to_int(runtime_cfg.get("patch_multiple", 16), 16),
+                    max_width=_to_int(runtime_cfg.get("max_width", 1024), 1024),
+                )
+                arr = np.asarray(norm_img).astype(np.float32) / 255.0
+                ten = torch.from_numpy(arr).permute(2, 0, 1).contiguous().float()
+                tensors.append(ten)
+            max_w = max(int(t.shape[-1]) for t in tensors)
+            pm = max(1, _to_int(runtime_cfg.get("patch_multiple", 16), 16))
+            max_w = int(math.ceil(max_w / pm) * pm)
+            padded = []
+            for t in tensors:
+                if int(t.shape[-1]) < max_w:
+                    t = torch_f.pad(t, (0, max_w - int(t.shape[-1]), 0, 0), mode="replicate")
+                elif int(t.shape[-1]) > max_w:
+                    t = t[:, :, :max_w]
+                padded.append(t)
+            px = torch.stack(padded, dim=0)
+            px = ((px - mean_t) / std_t).to(device)
+            emb = _pooled_image_embedding_for_ui(image_backbone, px)
+            if image_head is not None:
+                emb = image_head(emb)
+            if bool(l2_normalize) and torch_f is not None:
+                emb = torch_f.normalize(emb, dim=-1)
+            out_batches.append(emb.detach().cpu().float().numpy())
+    return np.concatenate(out_batches, axis=0) if out_batches else np.zeros((0, 1), dtype=np.float32)
+
+
+def _encode_line_clip_texts_ui(
+    runtime: Dict[str, Any],
+    texts: List[str],
+    batch_size: int,
+    l2_normalize: bool,
+    text_max_length: int,
+) -> np.ndarray:
+    if torch is None:
+        raise RuntimeError("PyTorch not available")
+    tokenizer = runtime["text_tokenizer"]
+    text_encoder = runtime["text_encoder"]
+    text_head = runtime["text_head"]
+    device = runtime["device"]
+    bs = max(1, int(batch_size))
+    out_batches: List[np.ndarray] = []
+    with torch.no_grad():
+        for start in range(0, len(texts), bs):
+            chunk = [str(t or "") for t in texts[start : start + bs]]
+            tok = tokenizer(
+                chunk,
+                padding=True,
+                truncation=True,
+                max_length=max(8, int(text_max_length)),
+                return_tensors="pt",
+            )
+            input_ids = tok["input_ids"].to(device)
+            attn = tok.get("attention_mask")
+            if attn is not None:
+                attn = attn.to(device)
+            txt_emb = _pooled_text_embedding_for_ui(text_encoder, input_ids, attn)
+            txt_z = text_head(txt_emb)
+            if bool(l2_normalize) and torch_f is not None:
+                txt_z = torch_f.normalize(txt_z, dim=-1)
+            out_batches.append(txt_z.detach().cpu().float().numpy())
+    return np.concatenate(out_batches, axis=0) if out_batches else np.zeros((0, 1), dtype=np.float32)
+
+
+_LINE_CLIP_DEBUG_CACHE: Dict[str, Dict[str, Any]] = {}
+
+
+def _line_clip_debug_cache_key(
+    dataset_root: str,
+    split_name: str,
+    image_backbone_path: str,
+    image_head_path: str,
+    text_encoder_dir: str,
+    text_head_path: str,
+    text_max_length: int,
+    l2_normalize: bool,
+) -> str:
+    return "||".join([
+        str(Path(dataset_root).expanduser().resolve()),
+        str(split_name or ""),
+        str(Path(image_backbone_path).expanduser().resolve()),
+        str(Path(image_head_path).expanduser().resolve()) if (image_head_path or "").strip() else "",
+        str(Path(text_encoder_dir).expanduser().resolve()),
+        str(Path(text_head_path).expanduser().resolve()),
+        str(int(text_max_length)),
+        "1" if bool(l2_normalize) else "0",
+    ])
+
+
+def _get_or_build_line_clip_debug_corpus_ui(
+    dataset_root: str,
+    split_name: str,
+    image_backbone_path: str,
+    image_head_path: str,
+    text_encoder_dir: str,
+    text_head_path: str,
+    device_pref: str,
+    batch_size: int,
+    text_max_length: int,
+    l2_normalize: bool,
+) -> Dict[str, Any]:
+    key = _line_clip_debug_cache_key(
+        dataset_root=dataset_root,
+        split_name=split_name,
+        image_backbone_path=image_backbone_path,
+        image_head_path=image_head_path,
+        text_encoder_dir=text_encoder_dir,
+        text_head_path=text_head_path,
+        text_max_length=text_max_length,
+        l2_normalize=l2_normalize,
+    )
+    cached = _LINE_CLIP_DEBUG_CACHE.get(key)
+    if cached is not None:
+        return cached
+
+    rows = _collect_ocr_split_rows_ui(dataset_root, split_name)
+    if not rows:
+        raise RuntimeError("No usable OCR rows found for selected dataset/split.")
+
+    runtime = _load_line_clip_dual_runtime_cached(
+        image_backbone_path,
+        image_head_path,
+        text_encoder_dir,
+        text_head_path,
+        device_pref,
+    )
+    image_paths = [str(r.get("_image_path_resolved", "")) for r in rows]
+    texts = [str(r.get("_text_resolved", "")) for r in rows]
+    image_emb = _encode_line_clip_image_crops_ui(runtime, image_paths=image_paths, batch_size=batch_size, l2_normalize=l2_normalize)
+    text_emb = _encode_line_clip_texts_ui(
+        runtime,
+        texts=texts,
+        batch_size=batch_size,
+        l2_normalize=l2_normalize,
+        text_max_length=text_max_length,
+    )
+    corpus = {
+        "rows": rows,
+        "image_embeddings": image_emb.astype(np.float32, copy=False),
+        "text_embeddings": text_emb.astype(np.float32, copy=False),
+        "device": str(runtime.get("device", "")),
+        "device_msg": str(runtime.get("device_msg", "")),
+        "count": int(len(rows)),
+    }
+    _LINE_CLIP_DEBUG_CACHE[key] = corpus
+    if len(_LINE_CLIP_DEBUG_CACHE) > 3:
+        for k in list(_LINE_CLIP_DEBUG_CACHE.keys())[:-3]:
+            _LINE_CLIP_DEBUG_CACHE.pop(k, None)
+    return corpus
+
+
+def load_random_line_clip_debug_sample_ui(dataset_root: str, split_name: str, seed: float):
+    image_arr, gt_text, meta_json, img_path = load_random_donut_ocr_dataset_sample_ui(dataset_root, split_name, seed)
+    sample_state = {}
+    try:
+        meta = json.loads(meta_json or "{}")
+    except Exception:
+        meta = {}
+    if isinstance(meta, dict) and bool(meta.get("ok")):
+        sample_state = {
+            "dataset_root": str(meta.get("dataset_root", dataset_root)),
+            "split": str(meta.get("split", split_name)),
+            "image_path": str(meta.get("image_path", img_path)),
+            "ground_truth": str(gt_text or ""),
+            "doc_id": str(meta.get("doc_id", "")),
+            "page_id": str(meta.get("page_id", "")),
+            "line_id": _to_int(meta.get("line_id", -1), -1),
+        }
+    return image_arr, gt_text, gt_text, meta_json, img_path, sample_state
+
+
+def _line_clip_debug_find_ground_truth_index(rows: List[Dict[str, Any]], sample_state: Dict[str, Any]) -> int:
+    img_path = str(sample_state.get("image_path", "") or "")
+    if img_path:
+        for i, r in enumerate(rows):
+            if str(r.get("_image_path_resolved", "") or "") == img_path:
+                return int(i)
+    gt = str(sample_state.get("ground_truth", "") or "")
+    page_id = str(sample_state.get("page_id", "") or "")
+    line_id = _to_int(sample_state.get("line_id", -1), -1)
+    for i, r in enumerate(rows):
+        if page_id and str(r.get("page_id", "") or "") != page_id:
+            continue
+        if line_id >= 0 and _to_int(r.get("line_id", -1), -1) != line_id:
+            continue
+        if gt and str(r.get("_text_resolved", "") or "") == gt:
+            return int(i)
+    return -1
+
+
+def _load_image_as_rgb_np_ui(path: str) -> np.ndarray:
+    with Image.open(path) as im:
+        return np.asarray(im.convert("RGB")).astype(np.uint8, copy=False)
+
+
+def run_line_clip_dataset_debug_retrieval_ui(
+    sample_image: Optional[np.ndarray],
+    sample_ground_truth: str,
+    query_text: str,
+    query_mode: str,
+    dataset_root: str,
+    split_name: str,
+    image_backbone_path: str,
+    image_head_path: str,
+    text_encoder_dir: str,
+    text_head_path: str,
+    device_pref: str,
+    batch_size: int,
+    text_max_length: int,
+    l2_normalize: bool,
+    top_k: int,
+    sample_state: Dict[str, Any],
+):
+    gt_placeholder = _line_profile_placeholder("Load a random OCR sample or upload one.")
+    if not (dataset_root or "").strip() or not (split_name or "").strip():
+        return gt_placeholder, [], "{}", "Please scan/select an OCR dataset + split.", sample_state
+    if not (image_backbone_path or "").strip() or not (text_encoder_dir or "").strip() or not (text_head_path or "").strip():
+        return gt_placeholder, [], "{}", "Please select a complete line_clip model (image backbone/head + text encoder/head).", sample_state
+    qmode = str(query_mode or "Text -> Image").strip().lower()
+    use_text_query = qmode.startswith("text")
+    if use_text_query and not str(query_text or "").strip():
+        return gt_placeholder, [], "{}", "Text query is empty.", sample_state
+    if (not use_text_query) and sample_image is None:
+        return gt_placeholder, [], "{}", "No sample image available for image query.", sample_state
+
+    try:
+        corpus = _get_or_build_line_clip_debug_corpus_ui(
+            dataset_root=dataset_root,
+            split_name=split_name,
+            image_backbone_path=image_backbone_path,
+            image_head_path=image_head_path,
+            text_encoder_dir=text_encoder_dir,
+            text_head_path=text_head_path,
+            device_pref=device_pref,
+            batch_size=max(1, int(batch_size)),
+            text_max_length=max(8, int(text_max_length)),
+            l2_normalize=bool(l2_normalize),
+        )
+        rows = corpus["rows"]
+        img_emb = np.asarray(corpus["image_embeddings"], dtype=np.float32)
+        runtime = _load_line_clip_dual_runtime_cached(
+            image_backbone_path,
+            image_head_path,
+            text_encoder_dir,
+            text_head_path,
+            device_pref,
+        )
+        if img_emb.ndim != 2 or img_emb.shape[0] != len(rows):
+            raise RuntimeError("Cached image embeddings are invalid.")
+
+        if use_text_query:
+            qtxt = str(query_text or "")
+            q_vec = _encode_line_clip_texts_ui(
+                runtime,
+                texts=[qtxt],
+                batch_size=1,
+                l2_normalize=bool(l2_normalize),
+                text_max_length=max(8, int(text_max_length)),
+            )[0]
+            query_desc = {"mode": "text_to_image", "query_text": qtxt}
+        else:
+            q_img = np.asarray(sample_image).astype(np.uint8)
+            tmp_path = _persist_faiss_ui_query_crop(q_img)
+            if not tmp_path:
+                raise RuntimeError("Could not persist temporary query image.")
+            q_vec = _encode_line_clip_image_crops_ui(
+                runtime,
+                image_paths=[tmp_path],
+                batch_size=1,
+                l2_normalize=bool(l2_normalize),
+            )[0]
+            query_desc = {"mode": "image_to_image", "query_image_path": tmp_path}
+
+        sims = np.matmul(img_emb, np.asarray(q_vec, dtype=np.float32))
+        order = np.argsort(-sims)
+        k = max(1, min(int(top_k), 50))
+        top_idx = [int(i) for i in order[:k].tolist()]
+
+        gt_idx = _line_clip_debug_find_ground_truth_index(rows, sample_state if isinstance(sample_state, dict) else {})
+        gt_image_path = ""
+        gt_image = gt_placeholder
+        if gt_idx >= 0:
+            gt_image_path = str(rows[gt_idx].get("_image_path_resolved", "") or "")
+        elif isinstance(sample_state, dict):
+            gt_image_path = str(sample_state.get("image_path", "") or "")
+        if gt_image_path:
+            try:
+                gt_image = _load_image_as_rgb_np_ui(gt_image_path)
+            except Exception:
+                gt_image = gt_placeholder
+
+        gallery_items: List[Tuple[np.ndarray, str]] = []
+        rank_of_gt = -1
+        for rank, idx in enumerate(order.tolist(), start=1):
+            if int(idx) == int(gt_idx):
+                rank_of_gt = int(rank)
+                break
+        for rank, idx in enumerate(top_idx, start=1):
+            rec = rows[idx]
+            p = str(rec.get("_image_path_resolved", "") or "")
+            try:
+                img_np = _load_image_as_rgb_np_ui(p)
+            except Exception:
+                img_np = _line_profile_placeholder("Could not load result image.")
+            txt = str(rec.get("_text_resolved", "") or "")
+            is_gt = (idx == gt_idx and gt_idx >= 0)
+            caption = (
+                f"#{rank} sim={float(sims[idx]):.4f}"
+                + (" [GT]" if is_gt else "")
+                + f"\npage={str(rec.get('page_id', ''))} line={_to_int(rec.get('line_id', -1), -1)}"
+                + (f"\n{textwrap.shorten(txt, width=120, placeholder='...')}" if 'textwrap' in globals() else f"\n{txt[:120]}")
+            )
+            gallery_items.append((img_np, caption))
+
+        debug = {
+            "ok": True,
+            "query": query_desc,
+            "dataset_root": str(Path(dataset_root).expanduser().resolve()),
+            "split": str(split_name),
+            "corpus_count": int(len(rows)),
+            "top_k": int(k),
+            "ground_truth_index": int(gt_idx),
+            "ground_truth_rank_in_full_retrieval": int(rank_of_gt),
+            "ground_truth_image_path": gt_image_path,
+            "ground_truth_text_length": len(str(sample_ground_truth or "")),
+            "device": str(corpus.get("device", "")),
+            "device_msg": str(corpus.get("device_msg", "")),
+        }
+        status = (
+            f"line_clip debug retrieval ({'Text->Image' if use_text_query else 'Image->Image'}) "
+            f"on split={split_name}: corpus={len(rows)} topk={k} "
+            f"| GT rank={rank_of_gt if rank_of_gt > 0 else 'not found'}"
+        )
+        return gt_image, gallery_items, json.dumps(debug, ensure_ascii=False, indent=2), status, sample_state
+    except Exception as exc:
+        msg = f"Line CLIP debug retrieval failed: {type(exc).__name__}: {exc}"
+        return gt_placeholder, [], json.dumps({"ok": False, "error": msg}, ensure_ascii=False, indent=2), msg, sample_state
 
 
 def refresh_image_list(dataset_dir: str, split: str):
@@ -10386,6 +10960,80 @@ def build_ui() -> gr.Blocks:
                     value=f"{default_text_hierarchy_faiss_index}.meta.json",
                 )
 
+            gr.Markdown("### A0) Line-CLIP Debug (OpenPecha/BDRC line retrieval on server datasets)")
+            lineclip_dbg_sample_state = gr.State({})
+            lineclip_dbg_bundle_state = gr.State("{}")
+            with gr.Row():
+                with gr.Column(scale=1):
+                    with gr.Row():
+                        lineclip_dbg_models_dir = gr.Textbox(label="models_dir (line_clip scan)", value=str((workspace_root / "models").resolve()))
+                        lineclip_dbg_scan_models_btn = gr.Button("Scan line_clip Models")
+                    lineclip_dbg_model_scan_status = gr.Textbox(label="line_clip Model Scan Status", interactive=False)
+                    lineclip_dbg_bundle_select = gr.Dropdown(
+                        label="Detected line_clip bundles (final models)",
+                        choices=[],
+                        value=None,
+                        allow_custom_value=True,
+                    )
+                    with gr.Row():
+                        lineclip_dbg_img_backbone = gr.Textbox(label="image_backbone_dir")
+                        lineclip_dbg_img_head = gr.Textbox(label="image_projection_head")
+                    with gr.Row():
+                        lineclip_dbg_txt_encoder = gr.Textbox(label="text_encoder_dir")
+                        lineclip_dbg_txt_head = gr.Textbox(label="text_projection_head")
+                    with gr.Row():
+                        lineclip_dbg_datasets_dir = gr.Textbox(label="datasets_dir (OCR manifests)", value=str((workspace_root / "datasets").resolve()))
+                        lineclip_dbg_scan_datasets_btn = gr.Button("Scan OCR Datasets")
+                    lineclip_dbg_dataset_scan_status = gr.Textbox(label="OCR Dataset Scan Status", interactive=False)
+                    lineclip_dbg_dataset_split_state = gr.State("{}")
+                    with gr.Row():
+                        lineclip_dbg_dataset_root = gr.Dropdown(
+                            label="OCR dataset root",
+                            choices=[],
+                            value=None,
+                            allow_custom_value=True,
+                        )
+                        lineclip_dbg_split = gr.Dropdown(label="Split", choices=[], value=None)
+                    with gr.Row():
+                        lineclip_dbg_seed = gr.Number(label="random_seed", value=42, precision=0)
+                        lineclip_dbg_load_sample_btn = gr.Button("Load Random Sample")
+                    lineclip_dbg_sample_path = gr.Textbox(label="Sample image path", interactive=False)
+                    lineclip_dbg_sample_meta = gr.Textbox(label="Sample metadata JSON", lines=7, interactive=False)
+                    lineclip_dbg_sample_image = gr.Image(label="Query/GT line image", type="numpy")
+                with gr.Column(scale=1):
+                    with gr.Row():
+                        lineclip_dbg_query_mode = gr.Radio(
+                            choices=["Text -> Image", "Image -> Image"],
+                            value="Text -> Image",
+                            label="Query mode",
+                        )
+                        lineclip_dbg_device = gr.Dropdown(
+                            choices=["auto", "cuda", "cuda:0", "cuda:1", "cuda:2", "cuda:3", "cpu", "mps"],
+                            value="auto",
+                            label="device",
+                        )
+                    lineclip_dbg_gt_text = gr.Textbox(label="Ground-truth text", lines=4)
+                    lineclip_dbg_query_text = gr.Textbox(label="Text query (used for Text -> Image)", lines=4)
+                    with gr.Row():
+                        lineclip_dbg_batch = gr.Number(label="embedding_batch_size", value=32, precision=0)
+                        lineclip_dbg_text_max_len = gr.Number(label="text_max_length", value=256, precision=0)
+                        lineclip_dbg_topk = gr.Number(label="top_k", value=5, precision=0)
+                    lineclip_dbg_l2 = gr.Checkbox(label="l2_normalize_embeddings", value=True)
+                    lineclip_dbg_run_btn = gr.Button("Run line_clip Debug Retrieval", variant="primary")
+                    lineclip_dbg_status = gr.Textbox(label="Debug Retrieval Status", interactive=False)
+                    lineclip_dbg_debug_json = gr.Code(label="Debug JSON", language="json")
+            with gr.Row():
+                with gr.Column(scale=1):
+                    lineclip_dbg_gt_image = gr.Image(label="Ground Truth Line (reference)", type="numpy")
+                with gr.Column(scale=2):
+                    lineclip_dbg_results_gallery = gr.Gallery(
+                        label="Top-5 Retrieval Results (side-by-side vs ground truth)",
+                        columns=5,
+                        rows=1,
+                        object_fit="contain",
+                        height=280,
+                    )
+
             gr.Markdown("### A) Train Image Encoder (SimCLR-style)")
             with gr.Row():
                 with gr.Column(scale=1):
@@ -10614,6 +11262,85 @@ def build_ui() -> gr.Blocks:
                 fn=on_faiss_index_change_ui,
                 inputs=[retr_faiss_select],
                 outputs=[retr_faiss_index_path, retr_faiss_meta_path],
+            )
+
+            lineclip_dbg_scan_models_btn.click(
+                fn=scan_line_clip_dual_models_ui,
+                inputs=[lineclip_dbg_models_dir],
+                outputs=[
+                    lineclip_dbg_bundle_select,
+                    lineclip_dbg_img_backbone,
+                    lineclip_dbg_img_head,
+                    lineclip_dbg_txt_encoder,
+                    lineclip_dbg_txt_head,
+                    lineclip_dbg_bundle_state,
+                    lineclip_dbg_model_scan_status,
+                ],
+            )
+            lineclip_dbg_bundle_select.change(
+                fn=on_line_clip_bundle_change_ui,
+                inputs=[lineclip_dbg_bundle_select, lineclip_dbg_bundle_state],
+                outputs=[
+                    lineclip_dbg_img_backbone,
+                    lineclip_dbg_img_head,
+                    lineclip_dbg_txt_encoder,
+                    lineclip_dbg_txt_head,
+                ],
+            )
+            lineclip_dbg_scan_datasets_btn.click(
+                fn=scan_donut_ocr_datasets_ui,
+                inputs=[lineclip_dbg_datasets_dir],
+                outputs=[
+                    lineclip_dbg_dataset_root,
+                    lineclip_dbg_split,
+                    lineclip_dbg_dataset_split_state,
+                    lineclip_dbg_dataset_scan_status,
+                ],
+            )
+            lineclip_dbg_dataset_root.change(
+                fn=on_donut_ocr_dataset_change_ui,
+                inputs=[lineclip_dbg_dataset_root, lineclip_dbg_dataset_split_state],
+                outputs=[lineclip_dbg_split],
+            )
+            lineclip_dbg_load_sample_btn.click(
+                fn=load_random_line_clip_debug_sample_ui,
+                inputs=[lineclip_dbg_dataset_root, lineclip_dbg_split, lineclip_dbg_seed],
+                outputs=[
+                    lineclip_dbg_sample_image,
+                    lineclip_dbg_gt_text,
+                    lineclip_dbg_query_text,
+                    lineclip_dbg_sample_meta,
+                    lineclip_dbg_sample_path,
+                    lineclip_dbg_sample_state,
+                ],
+            )
+            lineclip_dbg_run_btn.click(
+                fn=run_line_clip_dataset_debug_retrieval_ui,
+                inputs=[
+                    lineclip_dbg_sample_image,
+                    lineclip_dbg_gt_text,
+                    lineclip_dbg_query_text,
+                    lineclip_dbg_query_mode,
+                    lineclip_dbg_dataset_root,
+                    lineclip_dbg_split,
+                    lineclip_dbg_img_backbone,
+                    lineclip_dbg_img_head,
+                    lineclip_dbg_txt_encoder,
+                    lineclip_dbg_txt_head,
+                    lineclip_dbg_device,
+                    lineclip_dbg_batch,
+                    lineclip_dbg_text_max_len,
+                    lineclip_dbg_l2,
+                    lineclip_dbg_topk,
+                    lineclip_dbg_sample_state,
+                ],
+                outputs=[
+                    lineclip_dbg_gt_image,
+                    lineclip_dbg_results_gallery,
+                    lineclip_dbg_debug_json,
+                    lineclip_dbg_status,
+                    lineclip_dbg_sample_state,
+                ],
             )
 
             eval_th_run_btn.click(
