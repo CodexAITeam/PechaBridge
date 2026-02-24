@@ -3647,6 +3647,35 @@ def scan_line_clip_dual_models_ui(models_dir: str):
 
     found_roots: List[str] = []
     bundles: Dict[str, Dict[str, str]] = {}
+
+    def _parse_ckpt_sort_fields(name: str) -> Tuple[int, float, float]:
+        low = str(name or "").lower()
+        step = -1
+        i2t1 = -1.0
+        t2i1 = -1.0
+        m_step = re.search(r"checkpoint_step_(\d+)", low)
+        if m_step:
+            try:
+                step = int(m_step.group(1))
+            except Exception:
+                step = -1
+        m_i2t1 = re.search(r"_i2t1-([0-9]+p[0-9]+|na)", low)
+        if m_i2t1:
+            tok = m_i2t1.group(1)
+            if tok != "na":
+                try:
+                    i2t1 = float(tok.replace("p", "."))
+                except Exception:
+                    i2t1 = -1.0
+        m_t2i1 = re.search(r"_t2i1-([0-9]+p[0-9]+|na)", low)
+        if m_t2i1:
+            tok = m_t2i1.group(1)
+            if tok != "na":
+                try:
+                    t2i1 = float(tok.replace("p", "."))
+                except Exception:
+                    t2i1 = -1.0
+        return step, i2t1, t2i1
     for cfg_path in sorted(base.rglob("training_config.json")):
         try:
             data = json.loads(cfg_path.read_text(encoding="utf-8"))
@@ -3657,13 +3686,21 @@ def scan_line_clip_dual_models_ui(models_dir: str):
         if str(data.get("mode", "")).strip().lower() != "line_clip":
             continue
         root = cfg_path.parent.resolve()
-        img_backbone = root / "text_hierarchy_vit_backbone"
-        img_head = root / "text_hierarchy_projection_head.pt"
-        txt_encoder = root / "text_hierarchy_clip_text_encoder"
-        txt_head = root / "text_hierarchy_clip_text_projection_head.pt"
+        stem = cfg_path.stem
+        prefix = ""
+        if stem.endswith("_training_config"):
+            prefix = stem[: -len("_training_config")]
+        elif stem != "training_config":
+            prefix = stem
+        pfx = f"{prefix}_" if prefix else ""
+
+        img_backbone = root / f"{pfx}text_hierarchy_vit_backbone"
+        img_head = root / f"{pfx}text_hierarchy_projection_head.pt"
+        txt_encoder = root / f"{pfx}text_hierarchy_clip_text_encoder"
+        txt_head = root / f"{pfx}text_hierarchy_clip_text_projection_head.pt"
         if not (img_backbone.exists() and img_head.exists() and txt_encoder.exists() and txt_head.exists()):
             continue
-        key = str(root)
+        key = str(root if not prefix else (root / prefix))
         found_roots.append(key)
         bundles[key] = {
             "image_backbone": str(img_backbone.resolve()),
@@ -3673,6 +3710,17 @@ def scan_line_clip_dual_models_ui(models_dir: str):
         }
 
     found_roots = sorted(set(found_roots))
+    # Prefer recent/strong checkpoints first: step desc, then i2t@1 desc, then t2i@1 desc.
+    found_roots = sorted(
+        found_roots,
+        key=lambda p: (
+            _parse_ckpt_sort_fields(Path(p).name)[0],
+            _parse_ckpt_sort_fields(Path(p).name)[1],
+            _parse_ckpt_sort_fields(Path(p).name)[2],
+            str(p),
+        ),
+        reverse=True,
+    )
     default_root = found_roots[0] if found_roots else ""
     default_bundle = bundles.get(default_root, {}) if default_root else {}
     state_json = json.dumps(bundles, ensure_ascii=False)

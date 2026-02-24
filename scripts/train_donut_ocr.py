@@ -1519,8 +1519,8 @@ def run(args) -> Dict[str, object]:
     elif "processing_class" in trainer_sig.parameters:
         # Newer Transformers versions replaced `tokenizer=` with `processing_class=`.
         trainer_kwargs["processing_class"] = tokenizer
-    debug_train_decode_preview = not bool(getattr(args, "disable_train_decode_preview", False))
-    debug_train_decode_every_steps = int(getattr(args, "debug_train_decode_every_steps", 1) or 1)
+    debug_train_decode_preview = bool(getattr(args, "enable_train_decode_preview", False))
+    debug_train_decode_every_steps = int(getattr(args, "debug_train_decode_every_steps", 100) or 100)
     debug_train_trace = bool(getattr(args, "debug_train_trace", False))
     debug_train_trace_every_steps = int(getattr(args, "debug_train_trace_every_steps", 1) or 1)
     debug_train_trace_topk = int(getattr(args, "debug_train_trace_topk", 5) or 5)

@@ -1639,6 +1639,64 @@ def _save_artifacts(
     )
 
 
+def _save_line_clip_text_artifacts(
+    *,
+    accelerator: Accelerator,
+    output_dir: Path,
+    text_encoder: nn.Module,
+    text_projection_head: nn.Module,
+    tokenizer: Any,
+    text_encoder_name_or_path: str,
+    global_step: int,
+    prefix: str = "",
+) -> Tuple[Path, Path]:
+    output_dir.mkdir(parents=True, exist_ok=True)
+    suffix = f"{prefix}_" if prefix else ""
+    text_encoder_dir = (output_dir / f"{suffix}text_hierarchy_clip_text_encoder").resolve()
+    text_head_path = (output_dir / f"{suffix}text_hierarchy_clip_text_projection_head.pt").resolve()
+
+    unwrapped_text_encoder = accelerator.unwrap_model(text_encoder)
+    unwrapped_text_head = accelerator.unwrap_model(text_projection_head)
+
+    text_encoder_dir.mkdir(parents=True, exist_ok=True)
+    unwrapped_text_encoder.save_pretrained(str(text_encoder_dir))
+    try:
+        tokenizer.save_pretrained(str(text_encoder_dir))
+    except Exception as exc:
+        LOGGER.warning("Could not save tokenizer to %s: %s", text_encoder_dir, exc)
+
+    torch.save(
+        {
+            "state_dict": unwrapped_text_head.state_dict(),
+            "input_dim": int(unwrapped_text_head.net[0].in_features),
+            "output_dim": int(unwrapped_text_head.net[-1].out_features),
+            "text_encoder_name_or_path": str(text_encoder_name_or_path or ""),
+            "global_step": int(global_step),
+        },
+        text_head_path,
+    )
+    return text_encoder_dir, text_head_path
+
+
+def _line_clip_val_suffix_for_checkpoint(last_val_metrics: Optional[Dict[str, Any]]) -> str:
+    if not isinstance(last_val_metrics, dict) or not last_val_metrics:
+        return ""
+
+    def _fmt(v: Any) -> str:
+        try:
+            x = float(v)
+        except Exception:
+            return "na"
+        # path-safe, compact decimal formatting
+        return f"{x:.4f}".replace(".", "p")
+
+    i2t1 = _fmt(last_val_metrics.get("val_i2t_r1"))
+    t2i1 = _fmt(last_val_metrics.get("val_t2i_r1"))
+    i2t5 = _fmt(last_val_metrics.get("val_i2t_r5"))
+    t2i5 = _fmt(last_val_metrics.get("val_t2i_r5"))
+    return f"_i2t1-{i2t1}_t2i1-{t2i1}_i2t5-{i2t5}_t2i5-{t2i5}"
+
+
 def _run_patch_clip_training(
     *,
     args,
@@ -1939,27 +1997,17 @@ def _run_patch_clip_training(
             global_step=global_step,
             extra_config=extra_cfg,
         )
-        unwrapped_text_encoder = accelerator.unwrap_model(text_encoder)
-        unwrapped_text_head = accelerator.unwrap_model(text_projection_head)
-        text_encoder_dir_p = (output_dir / "text_hierarchy_clip_text_encoder").resolve()
-        text_encoder_dir_p.mkdir(parents=True, exist_ok=True)
-        unwrapped_text_encoder.save_pretrained(str(text_encoder_dir_p))
-        try:
-            tokenizer.save_pretrained(str(text_encoder_dir_p))
-        except Exception as exc:
-            LOGGER.warning("Could not save tokenizer to %s: %s", text_encoder_dir_p, exc)
-        text_encoder_dir = str(text_encoder_dir_p)
-        text_head_path_p = (output_dir / "text_hierarchy_clip_text_projection_head.pt").resolve()
-        torch.save(
-            {
-                "state_dict": unwrapped_text_head.state_dict(),
-                "input_dim": int(unwrapped_text_head.net[0].in_features),
-                "output_dim": int(unwrapped_text_head.net[-1].out_features),
-                "text_encoder_name_or_path": str(getattr(args, "text_encoder_name_or_path", "")),
-                "global_step": int(global_step),
-            },
-            text_head_path_p,
+        text_encoder_dir_p, text_head_path_p = _save_line_clip_text_artifacts(
+            accelerator=accelerator,
+            output_dir=output_dir,
+            text_encoder=text_encoder,
+            text_projection_head=text_projection_head,
+            tokenizer=tokenizer,
+            text_encoder_name_or_path=str(getattr(args, "text_encoder_name_or_path", "")),
+            global_step=global_step,
+            prefix="",
         )
+        text_encoder_dir = str(text_encoder_dir_p)
         text_projection_head_path = str(text_head_path_p)
 
         emb_p, emb_meta_p = _export_faiss_embeddings(
@@ -2288,7 +2336,8 @@ def _run_line_clip_training(
                 and global_step % int(args.checkpoint_every_steps) == 0
                 and accelerator.is_main_process
             ):
-                prefix = f"checkpoint_step_{global_step:07d}"
+                val_suffix = _line_clip_val_suffix_for_checkpoint(last_val_metrics)
+                prefix = f"checkpoint_step_{global_step:07d}{val_suffix}"
                 artifacts = _save_artifacts(
                     accelerator=accelerator,
                     output_dir=output_dir,
@@ -2316,6 +2365,16 @@ def _run_line_clip_training(
                         "image_preprocess_pipeline": image_preproc_mode,
                         "last_val_metrics": last_val_metrics,
                     },
+                )
+                _save_line_clip_text_artifacts(
+                    accelerator=accelerator,
+                    output_dir=output_dir,
+                    text_encoder=text_encoder,
+                    text_projection_head=text_projection_head,
+                    tokenizer=tokenizer,
+                    text_encoder_name_or_path=str(getattr(args, "text_encoder_name_or_path", "")),
+                    global_step=global_step,
+                    prefix=prefix,
                 )
                 LOGGER.info("Saved line_clip checkpoint at step %d -> %s", global_step, artifacts.backbone_dir)
         if global_step >= max_train_steps:
