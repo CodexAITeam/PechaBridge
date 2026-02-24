@@ -7,6 +7,7 @@ import json
 import inspect
 import logging
 import os
+import shutil
 import sys
 from collections import Counter
 from dataclasses import dataclass
@@ -746,6 +747,80 @@ def _parse_csv_tokens(spec: str) -> List[str]:
     return [tok.strip() for tok in str(spec).split(",") if tok.strip()]
 
 
+def _ensure_spiece_alias_if_needed(tokenizer_dir: Path) -> Optional[Path]:
+    """Create `spiece.model` alias for Albert tokenizers if repo ships `sentencepiece.model`.
+
+    Some repos (including OpenPecha BoSentencePiece) store the SentencePiece model
+    as `sentencepiece.model`, while `AlbertTokenizer` often looks for
+    `spiece.model`. Creating an alias avoids loading a degenerate tokenizer with
+    only special tokens.
+    """
+    try:
+        td = Path(tokenizer_dir).expanduser().resolve()
+    except Exception:
+        td = Path(tokenizer_dir)
+    if not td.exists() or not td.is_dir():
+        return None
+    sentencepiece_model = td / "sentencepiece.model"
+    spiece_model = td / "spiece.model"
+    if not sentencepiece_model.exists() or spiece_model.exists():
+        return spiece_model if spiece_model.exists() else None
+    try:
+        try:
+            spiece_model.symlink_to(sentencepiece_model.name)
+            LOGGER.info("Created symlink tokenizer alias: %s -> %s", spiece_model, sentencepiece_model.name)
+        except Exception:
+            shutil.copy2(sentencepiece_model, spiece_model)
+            LOGGER.info("Copied tokenizer alias: %s <- %s", spiece_model, sentencepiece_model.name)
+        return spiece_model
+    except Exception as exc:
+        LOGGER.warning("Could not create spiece.model alias in %s: %s", td, exc)
+        return None
+
+
+def _maybe_use_local_bosentencepiece(base_path: str) -> str:
+    spec = str(base_path or "").strip()
+    if spec != "openpecha/BoSentencePiece":
+        return spec
+    local = (REPO_ROOT / "ext" / "BoSentencePiece").resolve()
+    if local.exists() and local.is_dir():
+        LOGGER.info("Using local BoSentencePiece mirror: %s", local)
+        _ensure_spiece_alias_if_needed(local)
+        return str(local)
+    return spec
+
+
+def _load_tokenizer_robust(base_path: str):
+    spec = _maybe_use_local_bosentencepiece(base_path)
+    local_dir: Optional[Path] = None
+    p = Path(str(spec)).expanduser()
+    if p.exists() and p.is_dir():
+        local_dir = p.resolve()
+        _ensure_spiece_alias_if_needed(local_dir)
+
+    tokenizer = AutoTokenizer.from_pretrained(spec, use_fast=True)
+
+    # Fail fast on the known degenerate ALBERT fallback (only special tokens).
+    tok_len = int(len(tokenizer))
+    if tok_len <= 32:
+        sp_model = getattr(tokenizer, "sp_model", None)
+        vocab_file = getattr(tokenizer, "vocab_file", None)
+        if sp_model is None and vocab_file is None:
+            hint = ""
+            if local_dir is not None:
+                hint = (
+                    f" Local tokenizer dir={local_dir}. If it contains `sentencepiece.model`, "
+                    "ensure `spiece.model` exists (the loader will try to create it automatically)."
+                )
+            raise RuntimeError(
+                "Tokenizer loaded with suspiciously tiny vocab "
+                f"(len={tok_len}, class={tokenizer.__class__.__name__}). "
+                "This usually means the SentencePiece model was not loaded and only ALBERT special tokens are present."
+                + hint
+            )
+    return tokenizer
+
+
 def _read_manifest(path: Path) -> List[Dict[str, object]]:
     rows: List[Dict[str, object]] = []
     if not path.exists():
@@ -839,7 +914,7 @@ def _ensure_pad_token(tokenizer) -> None:
 def _load_or_build_tokenizer(args, train_rows: Sequence[Dict[str, object]]):
     base_path = args.tokenizer_path or args.model_name_or_path
     LOGGER.info("Loading tokenizer for OCR training from: %s", base_path)
-    tokenizer = AutoTokenizer.from_pretrained(base_path, use_fast=True)
+    tokenizer = _load_tokenizer_robust(base_path)
     special_tokens = _parse_csv_tokens(args.extra_special_tokens)
 
     if args.train_tokenizer:

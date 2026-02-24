@@ -6,6 +6,7 @@ from __future__ import annotations
 import argparse
 import json
 import random
+import shutil
 import sys
 import unicodedata
 from collections import Counter
@@ -24,6 +25,8 @@ TEXT_KEY_FALLBACKS: Sequence[str] = (
     "src__label",
     "src__text",
 )
+
+REPO_ROOT = Path(__file__).resolve().parents[1]
 
 
 def _parse_args() -> argparse.Namespace:
@@ -159,18 +162,60 @@ def _iter_selected_rows(rows: List[Dict[str, object]], max_samples: int, sample_
         yield i, rows[i]
 
 
+def _ensure_spiece_alias_if_needed(tokenizer_dir: Path) -> Optional[Path]:
+    sentencepiece_model = tokenizer_dir / "sentencepiece.model"
+    spiece_model = tokenizer_dir / "spiece.model"
+    if not sentencepiece_model.exists() or spiece_model.exists():
+        return spiece_model if spiece_model.exists() else None
+    try:
+        try:
+            spiece_model.symlink_to(sentencepiece_model.name)
+        except Exception:
+            shutil.copy2(sentencepiece_model, spiece_model)
+        return spiece_model
+    except Exception:
+        return None
+
+
+def _maybe_use_local_bosentencepiece(spec: str) -> str:
+    clean = str(spec or "").strip()
+    if clean != "openpecha/BoSentencePiece":
+        return clean
+    local = (REPO_ROOT / "ext" / "BoSentencePiece").resolve()
+    if local.exists() and local.is_dir():
+        _ensure_spiece_alias_if_needed(local)
+        return str(local)
+    return clean
+
+
+def _load_tokenizer_robust(spec: str):
+    try:
+        from transformers import AutoTokenizer
+    except Exception as exc:
+        raise RuntimeError(f"transformers import failed: {exc}") from exc
+
+    resolved_spec = _maybe_use_local_bosentencepiece(spec)
+    p = Path(str(resolved_spec)).expanduser()
+    if p.exists() and p.is_dir():
+        _ensure_spiece_alias_if_needed(p.resolve())
+
+    tok = AutoTokenizer.from_pretrained(resolved_spec, use_fast=True)
+    if int(len(tok)) <= 32 and getattr(tok, "sp_model", None) is None and getattr(tok, "vocab_file", None) is None:
+        raise RuntimeError(
+            "Tokenizer loaded with tiny vocab and no SentencePiece model "
+            f"(len={len(tok)}, class={tok.__class__.__name__}). "
+            "This usually means `spiece.model` was not found. "
+            "If using BoSentencePiece, download it to `ext/BoSentencePiece` and ensure `sentencepiece.model` is present."
+        )
+    return tok, resolved_spec
+
+
 def main() -> int:
     args = _parse_args()
 
     manifest_path = Path(args.manifest).expanduser().resolve()
     if not manifest_path.exists():
         print(f"ERROR: manifest not found: {manifest_path}", file=sys.stderr)
-        return 2
-
-    try:
-        from transformers import AutoTokenizer
-    except Exception as exc:
-        print(f"ERROR: transformers import failed: {exc}", file=sys.stderr)
         return 2
 
     print(f"Loading manifest: {manifest_path}")
@@ -180,7 +225,13 @@ def main() -> int:
         return 1
 
     print(f"Loading tokenizer: {args.tokenizer}")
-    tokenizer = AutoTokenizer.from_pretrained(args.tokenizer, use_fast=True)
+    try:
+        tokenizer, resolved_tokenizer = _load_tokenizer_robust(str(args.tokenizer))
+    except Exception as exc:
+        print(f"ERROR: tokenizer load failed: {exc}", file=sys.stderr)
+        return 2
+    if str(resolved_tokenizer) != str(args.tokenizer):
+        print(f"Resolved tokenizer path: {resolved_tokenizer}")
 
     text_keys = [args.text_key] if str(args.text_key).strip() else list(TEXT_KEY_FALLBACKS)
     key_usage = Counter()
