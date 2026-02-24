@@ -151,6 +151,8 @@ class DonutDebugSeq2SeqTrainer(Seq2SeqTrainer):
         *args,
         tokenizer_for_debug=None,
         metric_newline_token: str = "<NL>",
+        debug_train_decode_preview: bool = True,
+        debug_train_decode_every_steps: int = 1,
         debug_train_trace: bool = False,
         debug_train_trace_every_steps: int = 1,
         debug_train_trace_topk: int = 5,
@@ -160,6 +162,8 @@ class DonutDebugSeq2SeqTrainer(Seq2SeqTrainer):
         super().__init__(*args, **kwargs)
         self._debug_tokenizer = tokenizer_for_debug
         self._debug_metric_newline_token = str(metric_newline_token or "<NL>")
+        self._debug_train_decode_preview = bool(debug_train_decode_preview)
+        self._debug_train_decode_every_steps = max(1, int(debug_train_decode_every_steps or 1))
         self._debug_train_trace = bool(debug_train_trace)
         self._debug_train_trace_every_steps = max(1, int(debug_train_trace_every_steps or 1))
         self._debug_train_trace_topk = max(1, int(debug_train_trace_topk or 5))
@@ -209,6 +213,10 @@ class DonutDebugSeq2SeqTrainer(Seq2SeqTrainer):
         pred_norm = _normalize_for_metric(str(pred_text or ""), self._debug_metric_newline_token)
         gt_norm = _normalize_for_metric(str(gt_text or ""), self._debug_metric_newline_token)
         step = int(getattr(self.state, "global_step", 0) or 0)
+        if (not self._debug_train_decode_preview) or (step % self._debug_train_decode_every_steps != 0):
+            if self._debug_train_trace and (step % self._debug_train_trace_every_steps == 0):
+                self._log_verbose_training_trace(inputs=inputs, outputs=outputs, step=step, logits=logits, labels=labels)
+            return
         pred_ids_head = pred_ids.tolist()[:32]
         label_ids_head = label_ids.tolist()[:32]
         LOGGER.info("train_decode step=%d | GT: %r", step, gt_norm[:500])
@@ -1511,10 +1519,18 @@ def run(args) -> Dict[str, object]:
     elif "processing_class" in trainer_sig.parameters:
         # Newer Transformers versions replaced `tokenizer=` with `processing_class=`.
         trainer_kwargs["processing_class"] = tokenizer
+    debug_train_decode_preview = not bool(getattr(args, "disable_train_decode_preview", False))
+    debug_train_decode_every_steps = int(getattr(args, "debug_train_decode_every_steps", 1) or 1)
     debug_train_trace = bool(getattr(args, "debug_train_trace", False))
     debug_train_trace_every_steps = int(getattr(args, "debug_train_trace_every_steps", 1) or 1)
     debug_train_trace_topk = int(getattr(args, "debug_train_trace_topk", 5) or 5)
     debug_train_trace_max_positions = int(getattr(args, "debug_train_trace_max_positions", 8) or 8)
+    if (not debug_train_decode_preview) or debug_train_decode_every_steps > 1:
+        LOGGER.info(
+            "DONUT train decode preview: enabled=%s every_steps=%d",
+            bool(debug_train_decode_preview),
+            int(debug_train_decode_every_steps),
+        )
     if debug_train_trace:
         LOGGER.warning(
             "Advanced DONUT train trace enabled: every_steps=%d topk=%d max_positions=%d (high log volume / slower training).",
@@ -1527,6 +1543,8 @@ def run(args) -> Dict[str, object]:
         **trainer_kwargs,
         tokenizer_for_debug=tokenizer,
         metric_newline_token=str(args.metric_newline_token),
+        debug_train_decode_preview=debug_train_decode_preview,
+        debug_train_decode_every_steps=debug_train_decode_every_steps,
         debug_train_trace=debug_train_trace,
         debug_train_trace_every_steps=debug_train_trace_every_steps,
         debug_train_trace_topk=debug_train_trace_topk,

@@ -1078,6 +1078,10 @@ def add_train_donut_ocr_arguments(parser):
                        help='Enable bf16 training')
     parser.add_argument('--metric_newline_token', type=str, choices=['<NL>', '\\n'], default='<NL>',
                        help='Newline token normalization used for CER computation')
+    parser.add_argument('--debug_train_decode_every_steps', '--debug-train-decode-every-steps', dest='debug_train_decode_every_steps', type=int, default=1,
+                       help='Log compact train_decode preview every N train steps (default: 1 = every step)')
+    parser.add_argument('--disable_train_decode_preview', '--disable-train-decode-preview', dest='disable_train_decode_preview', action='store_true',
+                       help='Disable compact per-step train_decode preview logging (GT/PRD sample)')
     parser.add_argument('--debug_train_trace', '--debug-train-trace', dest='debug_train_trace', action='store_true',
                        help='Enable verbose per-step DONUT training trace (inputs/encoder/logits/top-k decode debug)')
     parser.add_argument('--debug_train_trace_every_steps', '--debug-train-trace-every-steps', dest='debug_train_trace_every_steps', type=int, default=1,
