@@ -14,6 +14,44 @@ REPO_ROOT = Path(__file__).resolve().parents[1]
 DEFAULT_DEST = REPO_ROOT / "ext" / "BoSentencePiece"
 
 
+def _patch_sentencepiece_compat() -> bool:
+    """Add legacy SentencePiece camelCase methods expected by some HF tokenizers."""
+    try:
+        import sentencepiece as spm
+    except Exception:
+        return False
+    cls = getattr(spm, "SentencePieceProcessor", None)
+    if cls is None:
+        return False
+    mappings = {
+        "Load": "load",
+        "LoadFromSerializedProto": "load_from_serialized_proto",
+        "EncodeAsPieces": "encode_as_pieces",
+        "EncodeAsIds": "encode_as_ids",
+        "SampleEncodeAsPieces": "sample_encode_as_pieces",
+        "SampleEncodeAsIds": "sample_encode_as_ids",
+        "NBestEncodeAsPieces": "nbest_encode_as_pieces",
+        "NBestEncodeAsIds": "nbest_encode_as_ids",
+        "DecodePieces": "decode_pieces",
+        "DecodeIds": "decode_ids",
+        "PieceToId": "piece_to_id",
+        "IdToPiece": "id_to_piece",
+        "GetPieceSize": "get_piece_size",
+        "SetEncodeExtraOptions": "set_encode_extra_options",
+        "SetDecodeExtraOptions": "set_decode_extra_options",
+    }
+    patched = False
+    for legacy, modern in mappings.items():
+        if hasattr(cls, legacy) or not hasattr(cls, modern):
+            continue
+        try:
+            setattr(cls, legacy, getattr(cls, modern))
+            patched = True
+        except Exception:
+            continue
+    return patched
+
+
 def create_parser(add_help: bool = True) -> argparse.ArgumentParser:
     p = argparse.ArgumentParser(
         description="Download OpenPecha BoSentencePiece tokenizer locally and prepare an Albert-compatible spiece.model alias.",
@@ -48,6 +86,12 @@ def _ensure_spiece_alias(tokenizer_dir: Path, *, force_copy: bool = False) -> Pa
     if force_copy:
         shutil.copy2(sentencepiece_model, spiece_model)
         return spiece_model
+    try:
+        spiece_model.symlink_to(sentencepiece_model.name)
+        return spiece_model
+    except Exception:
+        shutil.copy2(sentencepiece_model, spiece_model)
+        return spiece_model
 
 
 def _tok_cfg_value_to_str(value):
@@ -58,12 +102,6 @@ def _tok_cfg_value_to_str(value):
         if isinstance(content, str):
             return content
     return None
-    try:
-        spiece_model.symlink_to(sentencepiece_model.name)
-        return spiece_model
-    except Exception:
-        shutil.copy2(sentencepiece_model, spiece_model)
-        return spiece_model
 
 
 def run(args: argparse.Namespace) -> int:
@@ -101,6 +139,10 @@ def run(args: argparse.Namespace) -> int:
     except Exception as exc:
         print(f"WARNING: transformers not available for validation: {exc}")
         return 0
+
+    sp_compat_patched = _patch_sentencepiece_compat()
+    if sp_compat_patched:
+        print("Applied sentencepiece compatibility shim (camelCase aliases).")
 
     try:
         import transformers as _tf

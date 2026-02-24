@@ -188,6 +188,44 @@ def _maybe_use_local_bosentencepiece(spec: str) -> str:
     return clean
 
 
+def _patch_sentencepiece_compat() -> bool:
+    """Add legacy SentencePiece camelCase methods expected by some HF tokenizers."""
+    try:
+        import sentencepiece as spm
+    except Exception:
+        return False
+    cls = getattr(spm, "SentencePieceProcessor", None)
+    if cls is None:
+        return False
+    mappings = {
+        "Load": "load",
+        "LoadFromSerializedProto": "load_from_serialized_proto",
+        "EncodeAsPieces": "encode_as_pieces",
+        "EncodeAsIds": "encode_as_ids",
+        "SampleEncodeAsPieces": "sample_encode_as_pieces",
+        "SampleEncodeAsIds": "sample_encode_as_ids",
+        "NBestEncodeAsPieces": "nbest_encode_as_pieces",
+        "NBestEncodeAsIds": "nbest_encode_as_ids",
+        "DecodePieces": "decode_pieces",
+        "DecodeIds": "decode_ids",
+        "PieceToId": "piece_to_id",
+        "IdToPiece": "id_to_piece",
+        "GetPieceSize": "get_piece_size",
+        "SetEncodeExtraOptions": "set_encode_extra_options",
+        "SetDecodeExtraOptions": "set_decode_extra_options",
+    }
+    patched = False
+    for legacy, modern in mappings.items():
+        if hasattr(cls, legacy) or not hasattr(cls, modern):
+            continue
+        try:
+            setattr(cls, legacy, getattr(cls, modern))
+            patched = True
+        except Exception:
+            continue
+    return patched
+
+
 def _is_degenerate_sp_tokenizer(tok) -> bool:
     try:
         if int(len(tok)) > 32:
@@ -352,6 +390,7 @@ def _try_raw_sentencepiece_from_local_dir(local_dir: Path):
 
 
 def _load_tokenizer_robust(spec: str):
+    _patch_sentencepiece_compat()
     try:
         from transformers import AutoTokenizer
     except Exception as exc:
