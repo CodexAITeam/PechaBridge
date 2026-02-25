@@ -628,7 +628,7 @@ def add_train_text_encoder_arguments(parser):
 def add_train_text_hierarchy_vit_arguments(parser):
     """Arguments for ViT retrieval training on exported TextHierarchy crops."""
     parser.add_argument('--dataset_dir', '--dataset-dir', dest='dataset_dir', type=str, required=True,
-                       help='Root containing TextHierarchy/ and optional NumberCrops/')
+                       help='Dataset root (legacy TextHierarchy/ or new patches/ + meta/patches.parquet)')
     parser.add_argument('--output_dir', '--output-dir', dest='output_dir', type=str, required=True,
                        help='Directory where trained ViT artifacts are saved')
     parser.add_argument('--model_name_or_path', '--model-name-or-path', dest='model_name_or_path', type=str,
@@ -688,6 +688,101 @@ def add_train_text_hierarchy_vit_arguments(parser):
                        help='Random seed')
     parser.add_argument('--checkpoint_every_steps', '--checkpoint-every-steps', dest='checkpoint_every_steps',
                        type=int, default=0, help='Save checkpoint every N optimizer steps (0 disables)')
+    parser.add_argument('--train_mode', '--train-mode', dest='train_mode', type=str, default='auto',
+                       choices=['auto', 'legacy', 'patch_mpnce', 'patch_clip', 'line_clip'],
+                       help='Training mode selection (auto prefers patch_mpnce when patch parquet exists)')
+    parser.add_argument('--train_manifest', '--train-manifest', dest='train_manifest', type=str, default='',
+                       help='JSONL manifest for line_clip training (expects {"image":..., "text":...})')
+    parser.add_argument('--val_manifest', '--val-manifest', dest='val_manifest', type=str, default='',
+                       help='Optional JSONL manifest for line_clip validation/eval/export metadata context')
+    parser.add_argument('--text_encoder_name_or_path', '--text-encoder-name-or-path', dest='text_encoder_name_or_path', type=str,
+                       default='google/byt5-small',
+                       help='HF text encoder ID/path for CLIP-style patch_clip training')
+    parser.add_argument('--text_max_length', '--text-max-length', dest='text_max_length', type=int, default=128,
+                       help='Tokenizer max length for CLIP-style patch_clip training')
+    parser.add_argument('--freeze_text_encoder', '--freeze-text-encoder', dest='freeze_text_encoder',
+                       action='store_true', help='Freeze text encoder in patch_clip mode and train projection heads only')
+    parser.add_argument('--image_preprocess_pipeline', '--image-preprocess-pipeline', dest='image_preprocess_pipeline', type=str,
+                       default='none', choices=['none', 'pb', 'bdrc'],
+                       help='Optional deterministic pre-processing pipeline applied to images before ViT normalization')
+    parser.add_argument('--patch_meta_parquet', '--patch-meta-parquet', dest='patch_meta_parquet', type=str, default='',
+                       help='Optional explicit path to patch metadata parquet (default: <dataset>/meta/patches.parquet)')
+    parser.add_argument('--pairs_parquet', '--pairs-parquet', dest='pairs_parquet', type=str, default='',
+                       help='Optional explicit path to MNN pairs parquet (default: <dataset>/meta/mnn_pairs.parquet)')
+    parser.add_argument('--ink_ratio_min', '--ink-ratio-min', dest='ink_ratio_min', type=float, default=0.0,
+                       help='Patch filter: minimum ink_ratio')
+    parser.add_argument('--boundary_score_min', '--boundary-score-min', dest='boundary_score_min', type=float, default=0.0,
+                       help='Patch filter: minimum boundary_score')
+    parser.add_argument('--positive_sources', '--positive-sources', dest='positive_sources', type=str, default='mnn',
+                       choices=['mnn', 'ocr', 'both'],
+                       help='Which weak positive sources to use in mp-InfoNCE')
+    parser.add_argument('--require_pairs', '--require-pairs', dest='require_pairs', action='store_true',
+                       help='Fail if no selected weak positives (MNN/OCR) remain after filtering')
+    parser.add_argument('--pair_min_sim', '--pair-min-sim', dest='pair_min_sim', type=float, default=0.25,
+                       help='Minimum pair similarity from mnn_pairs.parquet')
+    parser.add_argument('--pair_min_stability_ratio', '--pair-min-stability-ratio', dest='pair_min_stability_ratio',
+                       type=float, default=0.5, help='Minimum stability_ratio from mnn_pairs.parquet')
+    parser.add_argument('--pair_require_multi_scale_ok', '--pair-require-multi-scale-ok', dest='pair_require_multi_scale_ok',
+                       action='store_true', help='Require multi_scale_ok=true in mnn_pairs parquet')
+    parser.add_argument('--max_neighbors_per_anchor', '--max-neighbors-per-anchor', dest='max_neighbors_per_anchor',
+                       type=int, default=0, help='Cap loaded MNN neighbors per anchor (0 = unlimited)')
+    parser.add_argument('--p_pair', '--p-pair', dest='p_pair', type=float, default=0.6,
+                       help='Pair-aware sampler probability of adding an in-batch MNN partner')
+    parser.add_argument('--hard_negative_ratio', '--hard-negative-ratio', dest='hard_negative_ratio', type=float, default=0.2,
+                       help='Sampler fraction of same-page different-line hard negatives in each batch')
+    parser.add_argument('--pair_sampling_seed', '--pair-sampling-seed', dest='pair_sampling_seed', type=int, default=42,
+                       help='Random seed for pair-aware batch sampler')
+    parser.add_argument('--w_mnn_scale', '--w-mnn-scale', dest='w_mnn_scale', type=float, default=1.0,
+                       help='Global scale factor applied to MNN edge weights')
+    parser.add_argument('--weak_ocr_parquet', '--weak-ocr-parquet', dest='weak_ocr_parquet', type=str, default='',
+                       help='Optional weak OCR labels parquet (default: <dataset>/meta/weak_ocr.parquet)')
+    parser.add_argument('--ocr_min_confidence', '--ocr-min-confidence', dest='ocr_min_confidence', type=float, default=0.2,
+                       help='Weak OCR filter: minimum OCR confidence')
+    parser.add_argument('--ocr_min_chars', '--ocr-min-chars', dest='ocr_min_chars', type=int, default=2,
+                       help='Weak OCR filter: minimum character count')
+    parser.add_argument('--ocr_max_group_size', '--ocr-max-group-size', dest='ocr_max_group_size', type=int, default=128,
+                       help='Skip weak OCR text clusters larger than this size (0 disables)')
+    parser.add_argument('--ocr_max_neighbors_per_anchor', '--ocr-max-neighbors-per-anchor', dest='ocr_max_neighbors_per_anchor',
+                       type=int, default=0, help='Cap OCR-derived neighbors per anchor (0 = unlimited)')
+    parser.add_argument('--ocr_require_no_error', '--ocr-require-no-error', dest='ocr_require_no_error', action='store_true',
+                       help='Only use weak OCR rows without error_code')
+    parser.add_argument('--no_ocr_require_no_error', '--no-ocr-require-no-error', dest='ocr_require_no_error', action='store_false',
+                       help='Allow weak OCR rows with error_code')
+    parser.set_defaults(ocr_require_no_error=True)
+    parser.add_argument('--w_ocr_scale', '--w-ocr-scale', dest='w_ocr_scale', type=float, default=1.0,
+                       help='Global scale factor applied while building OCR weak edges')
+    parser.add_argument('--w_ocr', '--w-ocr', dest='w_ocr', type=float, default=0.5,
+                       help='Loss weight multiplier for OCR weak positives in mp-InfoNCE numerator')
+    parser.add_argument('--w_overlap', '--w-overlap', dest='w_overlap', type=float, default=0.3,
+                       help='Weight for overlap positives in mp-InfoNCE')
+    parser.add_argument('--w_multiscale', '--w-multiscale', dest='w_multiscale', type=float, default=0.2,
+                       help='Weight for multiscale positives in mp-InfoNCE')
+    parser.add_argument('--t_iou', '--t-iou', dest='t_iou', type=float, default=0.6,
+                       help='1D IoU threshold for overlap positives')
+    parser.add_argument('--eps_center', '--eps-center', dest='eps_center', type=float, default=0.06,
+                       help='Normalized center distance for multiscale positives')
+    parser.add_argument('--min_positives_per_anchor', '--min-positives-per-anchor', dest='min_positives_per_anchor',
+                       type=int, default=1, help='Minimum positives required per anchor for mp-InfoNCE')
+    parser.add_argument('--min_valid_anchors_per_batch', '--min-valid-anchors-per-batch', dest='min_valid_anchors_per_batch',
+                       type=int, default=1, help='Skip optimizer step if batch has fewer valid anchors')
+    parser.add_argument('--allow_self_fallback', '--allow-self-fallback', dest='allow_self_fallback', action='store_true',
+                       help='Allow same patch_id second-view fallback positives when no other positives exist')
+    parser.add_argument('--no_allow_self_fallback', '--no-allow-self-fallback', dest='allow_self_fallback', action='store_false',
+                       help='Disable same patch_id fallback positives')
+    parser.set_defaults(allow_self_fallback=True)
+    parser.add_argument('--exclude_same_page_in_denominator', '--exclude-same-page-in-denominator',
+                       dest='exclude_same_page_in_denominator', action='store_true',
+                       help='Exclude same-page non-positive samples from InfoNCE denominator')
+    parser.add_argument('--lambda_smooth', '--lambda-smooth', dest='lambda_smooth', type=float, default=0.05,
+                       help='Overlap-only smoothness regularizer weight')
+    parser.add_argument('--phase1_epochs', '--phase1-epochs', dest='phase1_epochs', type=int, default=0,
+                       help='Phase-1 epochs (backbone frozen, head training). 0 => auto split')
+    parser.add_argument('--phase2_epochs', '--phase2-epochs', dest='phase2_epochs', type=int, default=0,
+                       help='Phase-2 epochs (unfreeze last transformer blocks). 0 => auto split')
+    parser.add_argument('--unfreeze_last_n_blocks', '--unfreeze-last-n-blocks', dest='unfreeze_last_n_blocks',
+                       type=int, default=2, help='Number of final transformer blocks to unfreeze in phase 2')
+    parser.add_argument('--phase2_lr_scale', '--phase2-lr-scale', dest='phase2_lr_scale', type=float, default=0.1,
+                       help='Learning-rate scale factor applied at phase-2 transition')
 
 
 def create_train_image_encoder_parser(add_help: bool = True):
@@ -713,7 +808,7 @@ def create_train_text_encoder_parser(add_help: bool = True):
 def create_train_text_hierarchy_vit_parser(add_help: bool = True):
     """Create parser for ViT training on TextHierarchy crops."""
     parser = argparse.ArgumentParser(
-        description="Train ViT retrieval encoder on exported TextHierarchy dataset",
+        description="Train ViT retrieval encoder on legacy TextHierarchy or new patch-parquet dataset",
         add_help=add_help,
     )
     add_train_text_hierarchy_vit_arguments(parser)
@@ -723,7 +818,7 @@ def create_train_text_hierarchy_vit_parser(add_help: bool = True):
 def add_eval_text_hierarchy_vit_arguments(parser):
     """Arguments for retrieval evaluation of a trained TextHierarchy ViT encoder."""
     parser.add_argument('--dataset_dir', '--dataset-dir', dest='dataset_dir', type=str, required=True,
-                       help='Root containing TextHierarchy/ and optional NumberCrops/')
+                       help='Dataset root (legacy TextHierarchy/ or new patches/ + meta/patches.parquet)')
     parser.add_argument('--backbone_dir', '--backbone-dir', dest='backbone_dir', type=str, required=True,
                        help='Path to trained backbone directory (e.g. text_hierarchy_vit_backbone)')
     parser.add_argument('--projection_head_path', '--projection-head-path', dest='projection_head_path', type=str, default='',
@@ -787,7 +882,7 @@ def add_eval_text_hierarchy_vit_arguments(parser):
 def create_eval_text_hierarchy_vit_parser(add_help: bool = True):
     """Create parser for evaluating a TextHierarchy ViT retrieval encoder."""
     parser = argparse.ArgumentParser(
-        description="Evaluate ViT retrieval encoder on exported TextHierarchy dataset",
+        description="Evaluate ViT retrieval encoder on legacy TextHierarchy or new patch-parquet dataset",
         add_help=add_help,
     )
     add_eval_text_hierarchy_vit_arguments(parser)
@@ -810,7 +905,7 @@ def add_faiss_text_hierarchy_search_arguments(parser):
     parser.add_argument('--meta_path', '--meta-path', dest='meta_path', type=str, default='',
                        help='Optional explicit metadata sidecar path for existing FAISS DB')
     parser.add_argument('--dataset_dir', '--dataset-dir', dest='dataset_dir', type=str, default='',
-                       help='Dataset root to build FAISS DB when --index-path is not given')
+                       help='Dataset root to build FAISS DB (legacy TextHierarchy or new patch-parquet)')
     parser.add_argument('--save_index_path', '--save-index-path', dest='save_index_path', type=str, default='',
                        help='Path where newly built FAISS DB is saved (default: <output_dir>/text_hierarchy.faiss)')
 
@@ -861,7 +956,7 @@ def add_faiss_text_hierarchy_search_arguments(parser):
 def create_faiss_text_hierarchy_search_parser(add_help: bool = True):
     """Create parser for FAISS-based TextHierarchy similarity search."""
     parser = argparse.ArgumentParser(
-        description="FAISS similarity search on TextHierarchy embeddings",
+        description="FAISS similarity search on TextHierarchy/patch-parquet embeddings",
         add_help=add_help,
     )
     add_faiss_text_hierarchy_search_arguments(parser)
@@ -871,15 +966,15 @@ def create_faiss_text_hierarchy_search_parser(add_help: bool = True):
 def add_prepare_donut_ocr_dataset_arguments(parser):
     """Arguments for preparing label-filtered OCR manifests for Donut-style training."""
     parser.add_argument('--dataset_dir', type=str, required=True,
-                       help='Dataset root containing train/val with ocr_targets and ocr_crops')
+                       help='Dataset root containing legacy train/val ocr_targets or canonical train/test/eval meta/lines.*')
     parser.add_argument('--output_dir', type=str, required=True,
                        help='Output directory for train/val manifests')
     parser.add_argument('--label_id', type=int, default=1,
-                       help='Class label ID to keep for OCR training (default: 1)')
+                       help='Class label ID to keep for legacy ocr_targets format (ignored for line-meta datasets)')
     parser.add_argument('--splits', type=str, default='train,val',
-                       help='Comma-separated splits to process (default: train,val)')
-    parser.add_argument('--text_field', type=str, choices=['target_text', 'rendered_text'], default='target_text',
-                       help='Which text field from ocr_targets records to use')
+                       help='Comma-separated output splits to process (default: train,val; val auto-falls back to eval)')
+    parser.add_argument('--text_field', type=str, default='target_text',
+                       help='Preferred text field; auto-falls back to text/text_raw for line-meta datasets')
     parser.add_argument('--normalization', type=str, default='NFC',
                        choices=['NFC', 'NFKC', 'NFD', 'NFKD', 'none'],
                        help='Unicode normalization strategy for output text')
@@ -925,18 +1020,20 @@ def add_train_donut_ocr_arguments(parser):
                        help='Path to training JSONL manifest')
     parser.add_argument('--val_manifest', type=str, default='',
                        help='Optional validation JSONL manifest')
+    parser.add_argument('--val_eval_max_samples', '--val-eval-max-samples', dest='val_eval_max_samples', type=int, default=0,
+                       help='Randomly sample at most N validation rows for eval/CER during training (0 = use all)')
+    parser.add_argument('--resume_probe_eval_samples', '--resume-probe-eval-samples', dest='resume_probe_eval_samples', type=int, default=5,
+                       help='If resuming from checkpoint, run a quick pre-train eval on N val samples to detect generation collapse (0 disables)')
+    parser.add_argument('--allow_resume_probe_empty_pred', '--allow-resume-probe-empty-pred', dest='allow_resume_probe_empty_pred', action='store_true',
+                       help='Do not abort training when the resume checkpoint probe predicts empty strings for all probe validation samples')
     parser.add_argument('--output_dir', type=str, required=True,
                        help='Output directory for checkpoints and final model')
     parser.add_argument('--model_name_or_path', type=str, default='microsoft/trocr-base-stage1',
                        help='VisionEncoderDecoder checkpoint to fine-tune')
     parser.add_argument('--image_processor_path', type=str, default='',
                        help='Optional image processor checkpoint/path override')
-    parser.add_argument('--tokenizer_path', type=str, default='',
-                       help='Optional tokenizer checkpoint/path override')
-    parser.add_argument('--train_tokenizer', action='store_true',
-                       help='Train a new tokenizer from training targets')
-    parser.add_argument('--tokenizer_vocab_size', type=int, default=16000,
-                       help='Vocabulary size when train_tokenizer is enabled')
+    parser.add_argument('--tokenizer_path', type=str, default='openpecha/BoSentencePiece',
+                       help='Tokenizer checkpoint/path (default: openpecha/BoSentencePiece; empty string falls back to model tokenizer)')
     parser.add_argument('--tokenizer_output_dir', type=str, default='',
                        help='Optional explicit path where tokenizer is saved')
     parser.add_argument('--extra_special_tokens', type=str,
@@ -946,10 +1043,15 @@ def add_train_donut_ocr_arguments(parser):
                        help='Token used as decoder start token')
     parser.add_argument('--image_size', type=int, default=384,
                        help='Square resize used by image processor')
+    parser.add_argument('--image_preprocess_pipeline', '--image-preprocess-pipeline', dest='image_preprocess_pipeline', type=str,
+                       default='none', choices=['none', 'pb', 'bdrc'],
+                       help='Optional deterministic image preprocessing before Donut image processor')
     parser.add_argument('--max_target_length', type=int, default=512,
                        help='Maximum target token length for training labels')
     parser.add_argument('--generation_max_length', type=int, default=512,
                        help='Maximum generated token length during eval')
+    parser.add_argument('--generation_min_new_tokens', '--generation-min-new-tokens', dest='generation_min_new_tokens', type=int, default=0,
+                       help='Minimum number of new tokens to generate during eval before EOS is allowed (0 disables)')
     parser.add_argument('--per_device_train_batch_size', type=int, default=4,
                        help='Train batch size per device')
     parser.add_argument('--per_device_eval_batch_size', type=int, default=4,
@@ -982,6 +1084,18 @@ def add_train_donut_ocr_arguments(parser):
                        help='Enable bf16 training')
     parser.add_argument('--metric_newline_token', type=str, choices=['<NL>', '\\n'], default='<NL>',
                        help='Newline token normalization used for CER computation')
+    parser.add_argument('--debug_train_decode_every_steps', '--debug-train-decode-every-steps', dest='debug_train_decode_every_steps', type=int, default=100,
+                       help='Log compact train_decode preview every N train steps when enabled (default: 100)')
+    parser.add_argument('--enable_train_decode_preview', '--enable-train-decode-preview', dest='enable_train_decode_preview', action='store_true',
+                       help='Enable compact train_decode preview logging (GT/PRD sample); disabled by default')
+    parser.add_argument('--debug_train_trace', '--debug-train-trace', dest='debug_train_trace', action='store_true',
+                       help='Enable verbose per-step DONUT training trace (inputs/encoder/logits/top-k decode debug)')
+    parser.add_argument('--debug_train_trace_every_steps', '--debug-train-trace-every-steps', dest='debug_train_trace_every_steps', type=int, default=1,
+                       help='Log verbose DONUT training trace every N steps when --debug_train_trace is enabled')
+    parser.add_argument('--debug_train_trace_topk', '--debug-train-trace-topk', dest='debug_train_trace_topk', type=int, default=5,
+                       help='Top-k token candidates to log per timestep in verbose DONUT training trace')
+    parser.add_argument('--debug_train_trace_max_positions', '--debug-train-trace-max-positions', dest='debug_train_trace_max_positions', type=int, default=8,
+                       help='Number of decoding positions to log in verbose DONUT training trace')
     parser.add_argument('--resume_from_checkpoint', type=str, default='',
                        help='Optional checkpoint path to resume training from')
 
@@ -1010,10 +1124,8 @@ def add_run_donut_ocr_workflow_arguments(parser):
                        help='Output directory for trained OCR model')
     parser.add_argument('--model_name_or_path', type=str, default='microsoft/trocr-base-stage1',
                        help='VisionEncoderDecoder checkpoint to fine-tune')
-    parser.add_argument('--train_tokenizer', action='store_true',
-                       help='Train a tokenizer from label-1 OCR targets')
-    parser.add_argument('--tokenizer_vocab_size', type=int, default=16000,
-                       help='Tokenizer vocab size when train_tokenizer is enabled')
+    parser.add_argument('--tokenizer_path', type=str, default='openpecha/BoSentencePiece',
+                       help='Tokenizer checkpoint/path for Donut training step (default: openpecha/BoSentencePiece)')
     parser.add_argument('--per_device_train_batch_size', type=int, default=4,
                        help='Train batch size per device')
     parser.add_argument('--per_device_eval_batch_size', type=int, default=4,
@@ -1026,6 +1138,9 @@ def add_run_donut_ocr_workflow_arguments(parser):
                        help='Maximum target length')
     parser.add_argument('--image_size', type=int, default=384,
                        help='Image size for OCR model input')
+    parser.add_argument('--image_preprocess_pipeline', '--image-preprocess-pipeline', dest='image_preprocess_pipeline', type=str,
+                       default='none', choices=['none', 'pb', 'bdrc'],
+                       help='Optional deterministic image preprocessing before Donut image processor in workflow train step')
     parser.add_argument('--seed', type=int, default=42,
                        help='Random seed')
     parser.add_argument('--skip_generation', action='store_true',

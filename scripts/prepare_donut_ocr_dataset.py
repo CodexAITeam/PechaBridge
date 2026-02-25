@@ -9,7 +9,7 @@ import random
 import sys
 import unicodedata
 from pathlib import Path
-from typing import Dict, Iterable, List, Sequence, Tuple
+from typing import Any, Dict, Iterable, List, Optional, Sequence, Tuple
 
 REPO_ROOT = Path(__file__).resolve().parents[1]
 if str(REPO_ROOT) not in sys.path:
@@ -18,6 +18,7 @@ if str(REPO_ROOT) not in sys.path:
 from tibetan_utils.arg_utils import create_prepare_donut_ocr_dataset_parser
 
 LOGGER = logging.getLogger("prepare_donut_ocr_dataset")
+_VAL_SPLIT_ALIASES = ("val", "validation", "eval")
 
 
 def _configure_logging() -> None:
@@ -88,6 +89,139 @@ def _iter_records_for_split(split_dir: Path) -> Iterable[Tuple[Path, int, Dict[s
                 yield target_file, idx, rec
 
 
+def _iter_jsonl_records(path: Path) -> Iterable[Tuple[int, Dict[str, object]]]:
+    if not path.exists():
+        return
+    with path.open("r", encoding="utf-8") as f:
+        for idx, line in enumerate(f):
+            raw = line.strip()
+            if not raw:
+                continue
+            try:
+                row = json.loads(raw)
+            except Exception as exc:
+                LOGGER.warning("Skipping invalid JSONL row %s:%d (%s)", path, idx + 1, exc)
+                continue
+            if isinstance(row, dict):
+                yield idx, row
+
+
+def _iter_line_meta_records(dataset_dir: Path, split: str) -> Iterable[Tuple[Path, int, Dict[str, object]]]:
+    """Yield rows from split/meta/lines.jsonl|parquet or root meta/lines.jsonl|parquet."""
+    split_dir = dataset_dir / split
+    split_meta_jsonl = split_dir / "meta" / "lines.jsonl"
+    split_meta_parquet = split_dir / "meta" / "lines.parquet"
+    root_meta_jsonl = dataset_dir / "meta" / "lines.jsonl"
+    root_meta_parquet = dataset_dir / "meta" / "lines.parquet"
+
+    if split_meta_jsonl.exists():
+        for idx, row in _iter_jsonl_records(split_meta_jsonl):
+            yield split_meta_jsonl, idx, row
+        return
+
+    if split_meta_parquet.exists():
+        try:
+            import pandas as pd
+        except Exception as exc:  # pragma: no cover
+            raise RuntimeError("pandas is required to read line metadata parquet.") from exc
+        try:
+            df = pd.read_parquet(split_meta_parquet)
+        except Exception as exc:
+            raise RuntimeError(f"Failed to read line metadata parquet: {split_meta_parquet}") from exc
+        for idx, rec in enumerate(df.to_dict(orient="records")):
+            if isinstance(rec, dict):
+                yield split_meta_parquet, idx, rec
+        return
+
+    if root_meta_jsonl.exists():
+        for idx, row in _iter_jsonl_records(root_meta_jsonl):
+            row_split = str(row.get("canonical_split") or row.get("split") or row.get("source_split") or "").strip().lower()
+            if _split_name_matches(row_split, split):
+                yield root_meta_jsonl, idx, row
+        return
+
+    if root_meta_parquet.exists():
+        try:
+            import pandas as pd
+        except Exception as exc:  # pragma: no cover
+            raise RuntimeError("pandas is required to read line metadata parquet.") from exc
+        try:
+            df = pd.read_parquet(root_meta_parquet)
+        except Exception as exc:
+            raise RuntimeError(f"Failed to read line metadata parquet: {root_meta_parquet}") from exc
+        for idx, rec in enumerate(df.to_dict(orient="records")):
+            if not isinstance(rec, dict):
+                continue
+            row_split = str(rec.get("canonical_split") or rec.get("split") or rec.get("source_split") or "").strip().lower()
+            if _split_name_matches(row_split, split):
+                yield root_meta_parquet, idx, rec
+        return
+
+
+def _split_dir_candidates(dataset_dir: Path, split: str) -> List[Tuple[str, Path]]:
+    raw = str(split).strip()
+    if not raw:
+        return []
+    candidates: List[str] = [raw]
+    norm = raw.lower()
+    if norm in {"val", "validation", "eval"}:
+        for alt in _VAL_SPLIT_ALIASES:
+            if alt not in candidates:
+                candidates.append(alt)
+    elif norm == "dev":
+        for alt in ("eval", "val"):
+            if alt not in candidates:
+                candidates.append(alt)
+    out: List[Tuple[str, Path]] = []
+    seen = set()
+    for name in candidates:
+        p = dataset_dir / name
+        key = str(p)
+        if key in seen:
+            continue
+        seen.add(key)
+        out.append((name, p))
+    return out
+
+
+def _split_name_matches(row_split: str, requested_split: str) -> bool:
+    row_norm = str(row_split or "").strip().lower()
+    req_norm = str(requested_split or "").strip().lower()
+    if row_norm == req_norm:
+        return True
+    if row_norm in {"eval", "val", "validation"} and req_norm in {"eval", "val", "validation"}:
+        return True
+    return False
+
+
+def _resolve_line_meta_image_path(row: Dict[str, object], *, dataset_dir: Path, split_dir: Path) -> Optional[Path]:
+    for key in ("image", "line_path", "src__image", "src__line_path"):
+        raw = row.get(key)
+        if not isinstance(raw, str) or not raw.strip():
+            continue
+        p = Path(raw).expanduser()
+        candidates = [p]
+        if not p.is_absolute():
+            candidates = [dataset_dir / p, split_dir / p, p]
+        for cand in candidates:
+            try:
+                rp = cand.resolve()
+            except Exception:
+                rp = cand
+            if rp.exists():
+                return rp
+    return None
+
+
+def _pick_line_meta_text_field(rec: Dict[str, object], preferred: str) -> str:
+    if preferred and preferred in rec:
+        return preferred
+    for key in ("text", "text_raw", "target_text", "rendered_text", "src__target_text", "src__rendered_text"):
+        if key in rec:
+            return key
+    return preferred or "text"
+
+
 def _wrap_target_text(
     text: str,
     *,
@@ -120,9 +254,11 @@ def _collect_split_samples(
     task_end_token: str,
     include_class_token: bool,
     class_token: str,
-) -> Tuple[List[Dict[str, object]], Dict[str, int]]:
+) -> Tuple[List[Dict[str, object]], Dict[str, object]]:
     split_dir = dataset_dir / split
-    stats = {
+    stats: Dict[str, object] = {
+        "source_format": "legacy_ocr_targets",
+        "source_split_dir": split,
         "targets_seen": 0,
         "records_seen": 0,
         "label_filtered": 0,
@@ -132,20 +268,96 @@ def _collect_split_samples(
     }
     samples: List[Dict[str, object]] = []
 
+    # New OpenPecha line-dataset format:
+    #   <dataset>/<train|test|eval>/meta/lines.jsonl
+    # (optionally fallback to root meta/lines.jsonl with split filtering).
+    resolved_split_dir = None
+    for candidate_name, candidate_dir in _split_dir_candidates(dataset_dir, split):
+        if (candidate_dir / "meta" / "lines.jsonl").exists() or (candidate_dir / "meta" / "lines.parquet").exists():
+            resolved_split_dir = candidate_dir
+            stats["source_split_dir"] = candidate_name
+            break
+    if resolved_split_dir is None and ((dataset_dir / "meta" / "lines.jsonl").exists() or (dataset_dir / "meta" / "lines.parquet").exists()):
+        resolved_split_dir = dataset_dir / split
+        stats["source_split_dir"] = split
+
+    if resolved_split_dir is not None:
+        stats["source_format"] = "line_meta"
+        line_meta_split = str(stats.get("source_split_dir") or split)
+        for meta_path, idx, rec in _iter_line_meta_records(dataset_dir, line_meta_split):
+            stats["records_seen"] = int(stats.get("records_seen", 0)) + 1
+            image_path = _resolve_line_meta_image_path(rec, dataset_dir=dataset_dir, split_dir=resolved_split_dir)
+            if image_path is None or not image_path.exists():
+                stats["missing_crop"] = int(stats.get("missing_crop", 0)) + 1
+                continue
+
+            text_key = _pick_line_meta_text_field(rec, text_field)
+            raw_text = rec.get(text_key, "")
+            if not isinstance(raw_text, str):
+                raw_text = str(raw_text)
+            normalized_text = _normalize_text(
+                raw_text,
+                normalization=normalization,
+                output_newline_token=output_newline_token,
+                min_chars=min_chars,
+                max_chars=max_chars,
+            )
+            if not normalized_text:
+                stats["empty_text"] = int(stats.get("empty_text", 0)) + 1
+                continue
+
+            target_text = _wrap_target_text(
+                normalized_text,
+                wrap_task_tokens=wrap_task_tokens,
+                task_start_token=task_start_token,
+                task_end_token=task_end_token,
+                include_class_token=include_class_token,
+                class_token=class_token,
+            )
+
+            rec_split = str(rec.get("canonical_split") or rec.get("split") or split)
+            rec_line_id = rec.get("line_id")
+            try:
+                line_id_value = int(rec_line_id) if rec_line_id is not None and str(rec_line_id) != "" else -1
+            except Exception:
+                line_id_value = -1
+            sample = {
+                "id": f"{Path(meta_path).stem}_{idx:08d}",
+                "split": split,
+                "source_split": rec_split,
+                "image": str(image_path.resolve()),
+                "text": target_text,
+                "text_raw": normalized_text,
+                "source_line_meta": str(Path(meta_path).resolve()),
+                "source_row_idx": int(idx),
+                "source_dataset": str(rec.get("source_dataset") or ""),
+                "source_dataset_short": str(rec.get("source_dataset_short") or ""),
+                "doc_id": str(rec.get("doc_id") or ""),
+                "page_id": str(rec.get("page_id") or ""),
+                "line_id": int(line_id_value),
+                "line_path": str(rec.get("line_path") or ""),
+                "text_field_used": text_key,
+            }
+            samples.append(sample)
+            stats["kept"] = int(stats.get("kept", 0)) + 1
+            stats["targets_seen"] = int(stats.get("targets_seen", 0)) + 1
+
+        return samples, stats
+
     for target_file, idx, rec in _iter_records_for_split(split_dir):
-        stats["records_seen"] += 1
+        stats["records_seen"] = int(stats.get("records_seen", 0)) + 1
         class_id = rec.get("class_id")
         if class_id is None or int(class_id) != int(label_id):
-            stats["label_filtered"] += 1
+            stats["label_filtered"] = int(stats.get("label_filtered", 0)) + 1
             continue
 
         crop_rel_path = rec.get("crop_rel_path")
         if not isinstance(crop_rel_path, str) or not crop_rel_path.strip():
-            stats["missing_crop"] += 1
+            stats["missing_crop"] = int(stats.get("missing_crop", 0)) + 1
             continue
         image_path = (split_dir / crop_rel_path).resolve()
         if not image_path.exists():
-            stats["missing_crop"] += 1
+            stats["missing_crop"] = int(stats.get("missing_crop", 0)) + 1
             continue
 
         raw_text = rec.get(text_field, "")
@@ -159,7 +371,7 @@ def _collect_split_samples(
             max_chars=max_chars,
         )
         if not normalized_text:
-            stats["empty_text"] += 1
+            stats["empty_text"] = int(stats.get("empty_text", 0)) + 1
             continue
 
         target_text = _wrap_target_text(
@@ -180,8 +392,8 @@ def _collect_split_samples(
             "source_target_file": str(target_file.resolve()),
         }
         samples.append(sample)
-        stats["kept"] += 1
-        stats["targets_seen"] += 1
+        stats["kept"] = int(stats.get("kept", 0)) + 1
+        stats["targets_seen"] = int(stats.get("targets_seen", 0)) + 1
 
     return samples, stats
 
@@ -227,7 +439,7 @@ def run(args) -> Dict[str, object]:
     LOGGER.info("Preparing OCR manifests from %s", dataset_dir)
     LOGGER.info("Using splits=%s label_id=%d", splits, int(args.label_id))
 
-    split_stats: Dict[str, Dict[str, int]] = {}
+    split_stats: Dict[str, Dict[str, object]] = {}
     manifest_paths: Dict[str, str] = {}
     train_text_records: List[Dict[str, str]] = []
 
@@ -265,7 +477,14 @@ def run(args) -> Dict[str, object]:
         _write_jsonl(manifest_path, samples)
         manifest_paths[split] = str(manifest_path)
         split_stats[split] = stats
-        LOGGER.info("Split %s: kept %d samples -> %s", split, len(samples), manifest_path)
+        LOGGER.info(
+            "Split %s: kept %d samples (format=%s source_split_dir=%s) -> %s",
+            split,
+            len(samples),
+            str(stats.get("source_format", "")),
+            str(stats.get("source_split_dir", split)),
+            manifest_path,
+        )
 
         if split == "train":
             train_text_records = [{"text": str(row["text"])} for row in samples]
@@ -297,4 +516,3 @@ def main(argv: List[str] | None = None) -> int:
 
 if __name__ == "__main__":
     raise SystemExit(main())
-

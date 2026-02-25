@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""Train a ViT-based retrieval encoder on TextHierarchy crops."""
+"""Train a ViT-based retrieval encoder on TextHierarchy or patch-parquet datasets."""
 
 from __future__ import annotations
 
@@ -17,18 +17,29 @@ import torch
 import torch.nn as nn
 import torch.nn.functional as F
 from accelerate import Accelerator
-from accelerate.utils import set_seed
+from accelerate.utils import DistributedDataParallelKwargs, set_seed
 from PIL import Image, ImageFile
 from torch.utils.data import DataLoader, Dataset
 from torchvision import transforms
 from tqdm.auto import tqdm
-from transformers import AutoImageProcessor, AutoModel, get_scheduler
+from transformers import AutoImageProcessor, AutoModel, AutoTokenizer, get_scheduler
 
 REPO_ROOT = Path(__file__).resolve().parents[1]
 if str(REPO_ROOT) not in sys.path:
     sys.path.insert(0, str(REPO_ROOT))
 
 from tibetan_utils.arg_utils import create_train_text_hierarchy_vit_parser
+from pechabridge.ocr.preprocess import PreprocessConfig as PBPreprocessConfig, preprocess_patch_image
+from pechabridge.ocr.preprocess_bdrc import BDRCPreprocessConfig, preprocess_image_bdrc
+from pechabridge.training.losses import MpNCEConfig, multi_positive_infonce
+from pechabridge.training.mnn_pairs import PatchMeta, load_mnn_map, load_patch_metadata, patch_id_to_index_map
+from pechabridge.training.samplers.pair_batch_sampler import PairBatchSampler, SamplerConfig
+from pechabridge.training.weak_ocr_pairs import load_ocr_weak_map, merge_positive_maps, normalize_ocr_text
+
+try:
+    import pandas as pd
+except Exception:  # pragma: no cover
+    pd = None
 
 LOGGER = logging.getLogger("train_text_hierarchy_vit")
 IMAGE_EXTENSIONS = {".png", ".jpg", ".jpeg", ".bmp", ".tif", ".tiff", ".webp"}
@@ -83,6 +94,252 @@ class HierarchyGroup:
     assets: List[Path]
 
 
+@dataclass(frozen=True)
+class PatchTextSample:
+    patch: PatchMeta
+    text: str
+    confidence: float
+
+
+@dataclass(frozen=True)
+class LineTextSample:
+    sample_id: str
+    image_path: Path
+    text: str
+    doc_id: str
+    page_id: str
+    line_id: int
+
+
+def _sanitize_id(value: Any) -> str:
+    txt = str(value or "").strip()
+    if not txt:
+        return "unknown"
+    out: List[str] = []
+    for ch in txt:
+        if ch.isalnum() or ch in {"-", "_", "."}:
+            out.append(ch)
+        else:
+            out.append("_")
+    return "".join(out).strip("_") or "unknown"
+
+
+def _resolve_patch_asset_path(dataset_dir: Path, row: Dict[str, Any]) -> Path:
+    raw_patch_path = str(row.get("patch_path", "") or "").strip()
+    if raw_patch_path:
+        try:
+            raw = Path(raw_patch_path).expanduser()
+            if raw.is_absolute():
+                if raw.exists():
+                    return raw.resolve()
+            else:
+                candidate = (dataset_dir / raw).resolve()
+                if candidate.exists():
+                    return candidate
+        except Exception:
+            pass
+
+    doc_id = _sanitize_id(row.get("doc_id", ""))
+    page_id = _sanitize_id(row.get("page_id", ""))
+    line_id = int(row.get("line_id", -1))
+    scale_w = int(row.get("scale_w", -1))
+    patch_id = int(row.get("patch_id", -1))
+    return (
+        dataset_dir
+        / "patches"
+        / f"doc={doc_id}"
+        / f"page={page_id}"
+        / f"line={line_id}"
+        / f"scale={scale_w}"
+        / f"patch_{patch_id}.png"
+    ).resolve()
+
+
+def _read_jsonl_manifest_rows(path: Path) -> List[Dict[str, Any]]:
+    rows: List[Dict[str, Any]] = []
+    p = Path(path).expanduser().resolve()
+    if not p.exists() or not p.is_file():
+        raise FileNotFoundError(f"Manifest not found: {p}")
+    with p.open("r", encoding="utf-8") as f:
+        for idx, line in enumerate(f, start=1):
+            raw = line.strip()
+            if not raw:
+                continue
+            try:
+                payload = json.loads(raw)
+            except Exception as exc:
+                raise ValueError(f"Invalid JSON in {p}:{idx}: {type(exc).__name__}: {exc}") from exc
+            if isinstance(payload, dict):
+                rows.append(dict(payload))
+    return rows
+
+
+def _resolve_manifest_image_path(image_value: str, manifest_path: Path) -> Optional[Path]:
+    raw = str(image_value or "").strip()
+    if not raw:
+        return None
+    p = Path(raw).expanduser()
+    if p.is_absolute():
+        rp = p.resolve()
+        return rp if rp.exists() and rp.is_file() else None
+    mp = Path(manifest_path).expanduser().resolve()
+    candidates = [
+        (mp.parent / p).resolve(),
+        (mp.parent.parent / p).resolve(),
+        (mp.parent.parent.parent / p).resolve(),
+        (Path.cwd() / p).resolve(),
+    ]
+    for cand in candidates:
+        if cand.exists() and cand.is_file():
+            return cand
+    return None
+
+
+def _manifest_first_nonempty_str(row: Dict[str, Any], keys: Sequence[str]) -> str:
+    for k in keys:
+        v = row.get(k)
+        if isinstance(v, str) and v.strip():
+            return v.strip()
+    return ""
+
+
+def _coerce_line_text_sample(
+    row: Dict[str, Any],
+    *,
+    default_prefix: str,
+    row_idx: int,
+    manifest_path: Path,
+) -> Optional[LineTextSample]:
+    image_raw = _manifest_first_nonempty_str(
+        row,
+        [
+            "image",
+            "image_path",
+            "line_path",
+            "line_image",
+            "line_image_path",
+            "image_rel_path",
+            "line_image_rel_path",
+            "src__image",
+            "path",
+        ],
+    )
+    text_raw = _manifest_first_nonempty_str(
+        row,
+        [
+            "text",
+            "transcription",
+            "label",
+            "ocr_text",
+            "line_text",
+            "normalized_text",
+            "content",
+            "src__label",
+            "src__text",
+        ],
+    )
+    if not image_raw:
+        return None
+    txt = normalize_ocr_text(text_raw)
+    if not txt:
+        return None
+    image_path = _resolve_manifest_image_path(image_raw, manifest_path)
+    if image_path is None:
+        return None
+    sample_id = str(row.get("id", "") or row.get("sample_id", "") or "").strip()
+    if not sample_id:
+        sample_id = f"{default_prefix}:{row_idx}"
+    try:
+        line_id = int(row.get("line_id", -1))
+    except Exception:
+        line_id = -1
+    return LineTextSample(
+        sample_id=str(sample_id),
+        image_path=image_path,
+        text=txt,
+        doc_id=str(row.get("doc_id", "") or ""),
+        page_id=str(row.get("page_id", "") or ""),
+        line_id=int(line_id),
+    )
+
+
+def _load_line_manifest_samples(train_manifest: Path, *, min_chars: int = 1) -> List[LineTextSample]:
+    rows = _read_jsonl_manifest_rows(train_manifest)
+    out: List[LineTextSample] = []
+    min_chars_i = max(0, int(min_chars))
+    for i, row in enumerate(rows):
+        sample = _coerce_line_text_sample(row, default_prefix=train_manifest.stem, row_idx=i, manifest_path=train_manifest)
+        if sample is None:
+            continue
+        if len(sample.text) < min_chars_i:
+            continue
+        out.append(sample)
+    return out
+
+
+def _discover_patch_parquet_groups(
+    dataset_dir: Path,
+    include_line_images: bool,
+    include_word_crops: bool,
+    min_assets_per_group: int,
+) -> List[HierarchyGroup]:
+    meta_path = dataset_dir / "meta" / "patches.parquet"
+    if not meta_path.exists() or not meta_path.is_file():
+        return []
+    if pd is None:  # pragma: no cover
+        raise RuntimeError("pandas is required to read patch parquet metadata.")
+
+    use_patch_assets = bool(include_word_crops or include_line_images)
+    if not use_patch_assets:
+        LOGGER.warning(
+            "Patch parquet dataset found at %s, but both include flags are disabled.",
+            meta_path,
+        )
+        return []
+
+    cols = [
+        "patch_id",
+        "doc_id",
+        "page_id",
+        "line_id",
+        "scale_w",
+        "patch_path",
+    ]
+    df = pd.read_parquet(meta_path, columns=cols)
+    if df.empty:
+        return []
+
+    grouped: Dict[str, List[Path]] = {}
+    for row in df.to_dict(orient="records"):
+        try:
+            line_id = int(row.get("line_id", -1))
+            scale_w = int(row.get("scale_w", -1))
+        except Exception:
+            continue
+        if line_id < 0 or scale_w <= 0:
+            continue
+        path = _resolve_patch_asset_path(dataset_dir, row)
+        if not path.exists() or not path.is_file():
+            continue
+        doc_id = str(row.get("doc_id", "") or "")
+        page_id = str(row.get("page_id", "") or "")
+        key = (
+            f"patches/doc={_sanitize_id(doc_id)}"
+            f"/page={_sanitize_id(page_id)}"
+            f"/line={line_id}"
+            f"/scale={scale_w}"
+        )
+        grouped.setdefault(key, []).append(path)
+
+    groups: List[HierarchyGroup] = []
+    required = max(1, int(min_assets_per_group))
+    for key in sorted(grouped.keys()):
+        uniq = sorted({str(p.resolve()): p.resolve() for p in grouped[key]}.values(), key=lambda p: str(p))
+        if len(uniq) >= required:
+            groups.append(HierarchyGroup(key=key, assets=uniq))
+    return groups
+
+
 def _discover_hierarchy_groups(
     dataset_dir: Path,
     include_line_images: bool,
@@ -90,6 +347,83 @@ def _discover_hierarchy_groups(
     include_number_crops: bool,
     min_assets_per_group: int,
 ) -> List[HierarchyGroup]:
+    patch_groups = _discover_patch_parquet_groups(
+        dataset_dir=dataset_dir,
+        include_line_images=include_line_images,
+        include_word_crops=include_word_crops,
+        min_assets_per_group=min_assets_per_group,
+    )
+
+
+def _image_preprocess_pipeline_name(args) -> str:
+    mode = str(getattr(args, "image_preprocess_pipeline", "none") or "none").strip().lower()
+    if mode not in {"none", "pb", "bdrc"}:
+        return "none"
+    return mode
+
+
+def _build_image_preprocess_configs(args) -> Tuple[str, Optional[PBPreprocessConfig], Optional[BDRCPreprocessConfig]]:
+    mode = _image_preprocess_pipeline_name(args)
+    if mode == "pb":
+        return mode, PBPreprocessConfig(), None
+    if mode == "bdrc":
+        return mode, None, BDRCPreprocessConfig.vit_defaults()
+    return "none", None, None
+
+
+def _apply_image_preprocess_pipeline(
+    image: Image.Image,
+    *,
+    pipeline: str,
+    pb_config: Optional[PBPreprocessConfig],
+    bdrc_config: Optional[BDRCPreprocessConfig],
+) -> Image.Image:
+    mode = str(pipeline or "none").strip().lower()
+    if mode == "pb":
+        pre = preprocess_patch_image(image=image, config=(pb_config or PBPreprocessConfig()))
+        return pre.convert("RGB")
+    if mode == "bdrc":
+        pre = preprocess_image_bdrc(image=image, config=(bdrc_config or BDRCPreprocessConfig.vit_defaults()))
+        return pre.convert("RGB")
+    return image.convert("RGB")
+
+
+def _ensure_tokenizer_pad_token(tokenizer: Any) -> None:
+    pad_id = getattr(tokenizer, "pad_token_id", None)
+    if pad_id is not None:
+        return
+    eos_tok = getattr(tokenizer, "eos_token", None)
+    if eos_tok is not None:
+        try:
+            tokenizer.pad_token = eos_tok
+            return
+        except Exception:
+            pass
+    if hasattr(tokenizer, "add_special_tokens"):
+        try:
+            tokenizer.add_special_tokens({"pad_token": "<pad>"})
+        except Exception:
+            pass
+    if patch_groups:
+        groups: List[HierarchyGroup] = list(patch_groups)
+        if include_number_crops:
+            number_root = dataset_dir / "NumberCrops"
+            if number_root.exists() and number_root.is_dir():
+                for img_path in sorted(
+                    p for p in number_root.rglob("*") if p.is_file() and p.suffix.lower() in IMAGE_EXTENSIONS
+                ):
+                    try:
+                        key = str(img_path.relative_to(dataset_dir))
+                    except Exception:
+                        key = str(img_path)
+                    groups.append(HierarchyGroup(key=f"number::{key}", assets=[img_path]))
+        LOGGER.info(
+            "Using patch parquet dataset: groups=%d source=%s",
+            len(groups),
+            str((dataset_dir / "meta" / "patches.parquet").resolve()),
+        )
+        return groups
+
     groups: List[HierarchyGroup] = []
     text_root = dataset_dir / "TextHierarchy"
     if text_root.exists() and text_root.is_dir():
@@ -178,6 +512,9 @@ class HierarchyTwoViewTransform:
         max_width: int,
         mean: List[float],
         std: List[float],
+        image_preprocess_pipeline: str = "none",
+        pb_preprocess_config: Optional[PBPreprocessConfig] = None,
+        bdrc_preprocess_config: Optional[BDRCPreprocessConfig] = None,
     ):
         self.target_height = int(target_height)
         self.width_buckets = list(width_buckets)
@@ -185,6 +522,9 @@ class HierarchyTwoViewTransform:
         self.max_width = int(max_width)
         self.tensor = transforms.ToTensor()
         self.normalize = transforms.Normalize(mean=mean, std=std)
+        self.image_preprocess_pipeline = str(image_preprocess_pipeline or "none")
+        self.pb_preprocess_config = pb_preprocess_config
+        self.bdrc_preprocess_config = bdrc_preprocess_config
         self.augment = transforms.Compose(
             [
                 transforms.RandomApply(
@@ -203,8 +543,14 @@ class HierarchyTwoViewTransform:
         )
 
     def _encode(self, image: Image.Image) -> torch.Tensor:
-        normalized = _normalize_for_vit(
+        image_rgb = _apply_image_preprocess_pipeline(
             image=image,
+            pipeline=self.image_preprocess_pipeline,
+            pb_config=self.pb_preprocess_config,
+            bdrc_config=self.bdrc_preprocess_config,
+        )
+        normalized = _normalize_for_vit(
+            image=image_rgb,
             target_height=self.target_height,
             width_buckets=self.width_buckets,
             patch_multiple=self.patch_multiple,
@@ -216,6 +562,67 @@ class HierarchyTwoViewTransform:
 
     def __call__(self, image_a: Image.Image, image_b: Image.Image) -> Tuple[torch.Tensor, torch.Tensor]:
         return self._encode(image_a), self._encode(image_b)
+
+
+class PatchSingleViewTransform:
+    """Single-view transform for image-text (CLIP-style) training on patch datasets."""
+
+    def __init__(
+        self,
+        *,
+        target_height: int,
+        width_buckets: Sequence[int],
+        patch_multiple: int,
+        max_width: int,
+        mean: List[float],
+        std: List[float],
+        image_preprocess_pipeline: str = "none",
+        pb_preprocess_config: Optional[PBPreprocessConfig] = None,
+        bdrc_preprocess_config: Optional[BDRCPreprocessConfig] = None,
+    ):
+        self.target_height = int(target_height)
+        self.width_buckets = list(width_buckets)
+        self.patch_multiple = int(patch_multiple)
+        self.max_width = int(max_width)
+        self.tensor = transforms.ToTensor()
+        self.normalize = transforms.Normalize(mean=mean, std=std)
+        self.image_preprocess_pipeline = str(image_preprocess_pipeline or "none")
+        self.pb_preprocess_config = pb_preprocess_config
+        self.bdrc_preprocess_config = bdrc_preprocess_config
+        self.augment = transforms.Compose(
+            [
+                transforms.RandomApply(
+                    [transforms.ColorJitter(brightness=0.12, contrast=0.12, saturation=0.05, hue=0.01)],
+                    p=0.30,
+                ),
+                transforms.RandomApply([transforms.GaussianBlur(kernel_size=3, sigma=(0.1, 1.2))], p=0.10),
+                transforms.RandomAffine(
+                    degrees=1.0,
+                    translate=(0.02, 0.03),
+                    scale=(0.98, 1.02),
+                    interpolation=transforms.InterpolationMode.BICUBIC,
+                    fill=(255, 255, 255),
+                ),
+            ]
+        )
+
+    def __call__(self, image: Image.Image) -> torch.Tensor:
+        image_rgb = _apply_image_preprocess_pipeline(
+            image=image,
+            pipeline=self.image_preprocess_pipeline,
+            pb_config=self.pb_preprocess_config,
+            bdrc_config=self.bdrc_preprocess_config,
+        )
+        normalized = _normalize_for_vit(
+            image=image_rgb,
+            target_height=self.target_height,
+            width_buckets=self.width_buckets,
+            patch_multiple=self.patch_multiple,
+            max_width=self.max_width,
+        )
+        aug = self.augment(normalized)
+        ten = self.tensor(aug)
+        return self.normalize(ten)
 
 
 class HierarchyPairDataset(Dataset):
@@ -254,6 +661,227 @@ class HierarchyPairDataset(Dataset):
             "path_a": str(path_a),
             "path_b": str(path_b),
         }
+
+
+class PatchTwoViewDataset(Dataset):
+    """Dataset for patch-level mpNCE training with two augmented views per patch."""
+
+    def __init__(self, records: Sequence[PatchMeta], transform: HierarchyTwoViewTransform):
+        self.records = list(records)
+        self.transform = transform
+
+    def __len__(self) -> int:
+        return len(self.records)
+
+    def __getitem__(self, idx: int) -> Dict[str, Any]:
+        rec = self.records[int(idx)]
+        with Image.open(rec.image_path) as im:
+            rgb = im.convert("RGB")
+        view_one, view_two = self.transform(rgb, rgb)
+        return {
+            "view_one": view_one,
+            "view_two": view_two,
+            "patch_id": int(rec.patch_id),
+            "doc_id": str(rec.doc_id),
+            "page_id": str(rec.page_id),
+            "line_id": int(rec.line_id),
+            "scale_w": int(rec.scale_w),
+            "k": int(rec.k),
+            "x0_norm": float(rec.x0_norm),
+            "x1_norm": float(rec.x1_norm),
+            "path": str(rec.image_path),
+        }
+
+
+class PatchTextClipDataset(Dataset):
+    """Patch image + weak OCR text pairs for CLIP-style dual-encoder training."""
+
+    def __init__(self, samples: Sequence[PatchTextSample], transform: PatchSingleViewTransform):
+        self.samples = list(samples)
+        self.transform = transform
+
+    def __len__(self) -> int:
+        return len(self.samples)
+
+    def __getitem__(self, idx: int) -> Dict[str, Any]:
+        sample = self.samples[int(idx)]
+        rec = sample.patch
+        with Image.open(rec.image_path) as im:
+            rgb = im.convert("RGB")
+        pixel_values = self.transform(rgb)
+        return {
+            "pixel_values": pixel_values,
+            "text": str(sample.text),
+            "confidence": float(sample.confidence),
+            "patch_id": int(rec.patch_id),
+            "doc_id": str(rec.doc_id),
+            "page_id": str(rec.page_id),
+            "line_id": int(rec.line_id),
+            "scale_w": int(rec.scale_w),
+            "k": int(rec.k),
+            "x0_norm": float(rec.x0_norm),
+            "x1_norm": float(rec.x1_norm),
+            "path": str(rec.image_path),
+        }
+
+
+class LineTextClipDataset(Dataset):
+    """Line image + text pairs loaded from JSONL manifests (BDRC/OpenPecha style)."""
+
+    def __init__(self, samples: Sequence[LineTextSample], transform: PatchSingleViewTransform):
+        self.samples = list(samples)
+        self.transform = transform
+
+    def __len__(self) -> int:
+        return len(self.samples)
+
+    def __getitem__(self, idx: int) -> Dict[str, Any]:
+        sample = self.samples[int(idx)]
+        with Image.open(sample.image_path) as im:
+            rgb = im.convert("RGB")
+        pixel_values = self.transform(rgb)
+        return {
+            "pixel_values": pixel_values,
+            "text": str(sample.text),
+            "sample_index": int(idx),
+            "sample_id": str(sample.sample_id),
+            "doc_id": str(sample.doc_id),
+            "page_id": str(sample.page_id),
+            "line_id": int(sample.line_id),
+            "path": str(sample.image_path),
+        }
+
+
+def _patch_meta_from_batch_row(row: Dict[str, Any]) -> PatchMeta:
+    return PatchMeta(
+        patch_id=int(row["patch_id"]),
+        doc_id=str(row["doc_id"]),
+        page_id=str(row["page_id"]),
+        line_id=int(row["line_id"]),
+        scale_w=int(row["scale_w"]),
+        k=int(row["k"]),
+        x0_norm=float(row["x0_norm"]),
+        x1_norm=float(row["x1_norm"]),
+        ink_ratio=0.0,
+        boundary_score=0.0,
+        image_path=Path(str(row.get("path", ""))),
+    )
+
+
+def _collate_patch_pairs(batch: List[Dict[str, Any]], patch_multiple: int) -> Dict[str, Any]:
+    if not batch:
+        raise RuntimeError("Empty batch")
+    pm = max(1, int(patch_multiple))
+    widths = [int(row["view_one"].shape[-1]) for row in batch] + [int(row["view_two"].shape[-1]) for row in batch]
+    max_w = int(math.ceil(max(widths) / pm) * pm)
+    view_one = torch.stack([_pad_right_to_width(row["view_one"], max_w) for row in batch], dim=0)
+    view_two = torch.stack([_pad_right_to_width(row["view_two"], max_w) for row in batch], dim=0)
+    meta_rows = [
+        {
+            "patch_id": int(row["patch_id"]),
+            "doc_id": str(row["doc_id"]),
+            "page_id": str(row["page_id"]),
+            "line_id": int(row["line_id"]),
+            "scale_w": int(row["scale_w"]),
+            "k": int(row["k"]),
+            "x0_norm": float(row["x0_norm"]),
+            "x1_norm": float(row["x1_norm"]),
+            "path": str(row["path"]),
+        }
+        for row in batch
+    ]
+    return {
+        "view_one": view_one,
+        "view_two": view_two,
+        "meta_rows": meta_rows,
+    }
+
+
+def _collate_patch_text_clip(
+    batch: List[Dict[str, Any]],
+    *,
+    patch_multiple: int,
+    tokenizer: Any,
+    text_max_length: int,
+) -> Dict[str, Any]:
+    if not batch:
+        raise RuntimeError("Empty batch")
+    pm = max(1, int(patch_multiple))
+    widths = [int(row["pixel_values"].shape[-1]) for row in batch]
+    max_w = int(math.ceil(max(widths) / pm) * pm)
+    pixels = torch.stack([_pad_right_to_width(row["pixel_values"], max_w) for row in batch], dim=0)
+    texts = [str(row.get("text", "")) for row in batch]
+    tok = tokenizer(
+        texts,
+        padding=True,
+        truncation=True,
+        max_length=max(8, int(text_max_length)),
+        return_tensors="pt",
+    )
+    meta_rows = [
+        {
+            "patch_id": int(row["patch_id"]),
+            "doc_id": str(row["doc_id"]),
+            "page_id": str(row["page_id"]),
+            "line_id": int(row["line_id"]),
+            "scale_w": int(row["scale_w"]),
+            "k": int(row["k"]),
+            "x0_norm": float(row["x0_norm"]),
+            "x1_norm": float(row["x1_norm"]),
+            "path": str(row["path"]),
+            "text": str(row["text"]),
+            "confidence": float(row.get("confidence", 0.0)),
+        }
+        for row in batch
+    ]
+    return {
+        "pixel_values": pixels,
+        "input_ids": tok["input_ids"],
+        "attention_mask": tok.get("attention_mask", torch.ones_like(tok["input_ids"])),
+        "meta_rows": meta_rows,
+    }
+
+
+def _collate_line_text_clip(
+    batch: List[Dict[str, Any]],
+    *,
+    patch_multiple: int,
+    tokenizer: Any,
+    text_max_length: int,
+) -> Dict[str, Any]:
+    if not batch:
+        raise RuntimeError("Empty batch")
+    pm = max(1, int(patch_multiple))
+    widths = [int(row["pixel_values"].shape[-1]) for row in batch]
+    max_w = int(math.ceil(max(widths) / pm) * pm)
+    pixels = torch.stack([_pad_right_to_width(row["pixel_values"], max_w) for row in batch], dim=0)
+    texts = [str(row.get("text", "")) for row in batch]
+    tok = tokenizer(
+        texts,
+        padding=True,
+        truncation=True,
+        max_length=max(8, int(text_max_length)),
+        return_tensors="pt",
+    )
+    meta_rows = [
+        {
+            "sample_index": int(row.get("sample_index", i)),
+            "sample_id": str(row.get("sample_id", "")),
+            "doc_id": str(row.get("doc_id", "")),
+            "page_id": str(row.get("page_id", "")),
+            "line_id": int(row.get("line_id", -1)),
+            "path": str(row.get("path", "")),
+            "text": str(row.get("text", "")),
+        }
+        for i, row in enumerate(batch)
+    ]
+    return {
+        "pixel_values": pixels,
+        "input_ids": tok["input_ids"],
+        "attention_mask": tok.get("attention_mask", torch.ones_like(tok["input_ids"])),
+        "sample_indices": torch.tensor([int(row.get("sample_index", i)) for i, row in enumerate(batch)], dtype=torch.long),
+        "meta_rows": meta_rows,
+    }
 
 
 def _pad_right_to_width(tensor: torch.Tensor, target_width: int) -> torch.Tensor:
@@ -327,6 +955,582 @@ def _pooled_image_embedding(backbone: nn.Module, pixel_values: torch.Tensor) -> 
     return hidden
 
 
+def _pooled_text_embedding(text_encoder: nn.Module, input_ids: torch.Tensor, attention_mask: Optional[torch.Tensor]) -> torch.Tensor:
+    kwargs: Dict[str, Any] = {
+        "input_ids": input_ids,
+        "return_dict": True,
+    }
+    if attention_mask is not None:
+        kwargs["attention_mask"] = attention_mask
+    model_for_forward = text_encoder
+    # Handle wrapped models (Accelerate/DDP/FSDP style `.module`) so encoder-decoder
+    # text models like T5/ByT5 use the encoder stack only and do not require
+    # decoder_input_ids during CLIP-style embedding.
+    base_model = text_encoder
+    seen_ids = set()
+    while hasattr(base_model, "module") and id(base_model) not in seen_ids:
+        seen_ids.add(id(base_model))
+        try:
+            base_model = getattr(base_model, "module")
+        except Exception:
+            break
+    cfg = getattr(base_model, "config", None)
+    if bool(getattr(cfg, "is_encoder_decoder", False)):
+        if hasattr(base_model, "get_encoder"):
+            try:
+                model_for_forward = base_model.get_encoder()
+            except Exception:
+                model_for_forward = text_encoder
+        else:
+            model_for_forward = text_encoder
+    outputs = model_for_forward(**kwargs)
+    pooler = getattr(outputs, "pooler_output", None)
+    if pooler is not None:
+        return pooler
+    hidden = getattr(outputs, "last_hidden_state", None)
+    if hidden is None:
+        raise RuntimeError("Text encoder output does not contain last_hidden_state/pooler_output")
+    if hidden.ndim != 3:
+        return hidden
+    if attention_mask is None:
+        return hidden.mean(dim=1)
+    mask = attention_mask.to(hidden.device).float().unsqueeze(-1)
+    denom = mask.sum(dim=1).clamp(min=1.0)
+    return (hidden * mask).sum(dim=1) / denom
+
+
+def _clip_symmetric_loss(
+    img_z: torch.Tensor,
+    txt_z: torch.Tensor,
+    temperature: float,
+) -> Tuple[torch.Tensor, Dict[str, float]]:
+    if img_z.ndim != 2 or txt_z.ndim != 2 or img_z.shape[0] != txt_z.shape[0]:
+        raise ValueError(f"Expected [B,D] image/text embeddings with same B, got {tuple(img_z.shape)} and {tuple(txt_z.shape)}")
+    img_z = F.normalize(img_z, dim=-1)
+    txt_z = F.normalize(txt_z, dim=-1)
+    tau = max(float(temperature), 1e-6)
+    logits = torch.matmul(img_z, txt_z.T).float() / tau
+    labels = torch.arange(logits.shape[0], device=logits.device, dtype=torch.long)
+    loss_i2t = F.cross_entropy(logits, labels)
+    loss_t2i = F.cross_entropy(logits.T, labels)
+    with torch.no_grad():
+        top_i = torch.argmax(logits, dim=1)
+        top_t = torch.argmax(logits.T, dim=1)
+        acc_i2t = float((top_i == labels).float().mean().item())
+        acc_t2i = float((top_t == labels).float().mean().item())
+    return (loss_i2t + loss_t2i) * 0.5, {
+        "acc_i2t": acc_i2t,
+        "acc_t2i": acc_t2i,
+        "batch": float(logits.shape[0]),
+    }
+
+
+@torch.no_grad()
+def _evaluate_line_clip_retrieval(
+    *,
+    accelerator: Accelerator,
+    backbone: nn.Module,
+    text_encoder: nn.Module,
+    image_projection_head: nn.Module,
+    text_projection_head: nn.Module,
+    val_dataloader: Optional[DataLoader],
+    freeze_backbone: bool,
+    freeze_text_encoder: bool,
+    temperature: float,
+) -> Dict[str, float]:
+    if val_dataloader is None:
+        return {}
+
+    was_backbone_training = bool(backbone.training)
+    was_text_training = bool(text_encoder.training)
+    was_img_head_training = bool(image_projection_head.training)
+    was_txt_head_training = bool(text_projection_head.training)
+
+    backbone.eval()
+    text_encoder.eval()
+    image_projection_head.eval()
+    text_projection_head.eval()
+
+    img_parts: List[torch.Tensor] = []
+    txt_parts: List[torch.Tensor] = []
+    idx_parts: List[torch.Tensor] = []
+
+    for batch in val_dataloader:
+        pixel_values = batch["pixel_values"].to(accelerator.device, non_blocking=True)
+        input_ids = batch["input_ids"].to(accelerator.device, non_blocking=True)
+        attention_mask = batch["attention_mask"].to(accelerator.device, non_blocking=True)
+        sample_indices = batch["sample_indices"].to(accelerator.device, non_blocking=True)
+
+        if freeze_backbone:
+            img_emb = _pooled_image_embedding(backbone, pixel_values)
+        else:
+            img_emb = _pooled_image_embedding(backbone, pixel_values)
+        if freeze_text_encoder:
+            txt_emb = _pooled_text_embedding(text_encoder, input_ids, attention_mask)
+        else:
+            txt_emb = _pooled_text_embedding(text_encoder, input_ids, attention_mask)
+
+        img_z = F.normalize(image_projection_head(img_emb), dim=-1)
+        txt_z = F.normalize(text_projection_head(txt_emb), dim=-1)
+
+        gathered_img = accelerator.gather_for_metrics(img_z)
+        gathered_txt = accelerator.gather_for_metrics(txt_z)
+        gathered_idx = accelerator.gather_for_metrics(sample_indices)
+        if accelerator.is_main_process:
+            img_parts.append(gathered_img.detach().cpu())
+            txt_parts.append(gathered_txt.detach().cpu())
+            idx_parts.append(gathered_idx.detach().cpu())
+
+    metrics: Dict[str, float] = {}
+    if accelerator.is_main_process and img_parts:
+        all_img = torch.cat(img_parts, dim=0)
+        all_txt = torch.cat(txt_parts, dim=0)
+        all_idx = torch.cat(idx_parts, dim=0).long()
+        uniq_img: Dict[int, torch.Tensor] = {}
+        uniq_txt: Dict[int, torch.Tensor] = {}
+        for row_i in range(int(all_idx.shape[0])):
+            key = int(all_idx[row_i].item())
+            if key in uniq_img:
+                continue
+            uniq_img[key] = all_img[row_i]
+            uniq_txt[key] = all_txt[row_i]
+        order = sorted(uniq_img.keys())
+        img_mat = torch.stack([uniq_img[k] for k in order], dim=0).float()
+        txt_mat = torch.stack([uniq_txt[k] for k in order], dim=0).float()
+        tau = max(float(temperature), 1e-6)
+        logits = (img_mat @ txt_mat.T) / tau
+        n = int(logits.shape[0])
+        labels = torch.arange(n, dtype=torch.long)
+
+        def _recall_at_k(mat: torch.Tensor, gold: torch.Tensor, k: int) -> float:
+            kk = max(1, min(int(k), int(mat.shape[1])))
+            topk = torch.topk(mat, k=kk, dim=1).indices
+            return float((topk == gold.unsqueeze(1)).any(dim=1).float().mean().item())
+
+        metrics = {
+            "val_count": float(n),
+            "val_i2t_r1": _recall_at_k(logits, labels, 1),
+            "val_t2i_r1": _recall_at_k(logits.T, labels, 1),
+            "val_i2t_r5": _recall_at_k(logits, labels, 5),
+            "val_t2i_r5": _recall_at_k(logits.T, labels, 5),
+            "val_i2t_r10": _recall_at_k(logits, labels, 10),
+            "val_t2i_r10": _recall_at_k(logits.T, labels, 10),
+        }
+
+    if was_backbone_training and not freeze_backbone:
+        backbone.train()
+    if was_text_training and not freeze_text_encoder:
+        text_encoder.train()
+    if was_img_head_training:
+        image_projection_head.train()
+    if was_txt_head_training:
+        text_projection_head.train()
+
+    accelerator.wait_for_everyone()
+    return metrics if accelerator.is_main_process else {}
+
+
+def _freeze_backbone(backbone: nn.Module) -> None:
+    for p in backbone.parameters():
+        p.requires_grad = False
+
+
+def _load_patch_text_samples_from_weak_ocr(
+    *,
+    dataset_dir: Path,
+    records: Sequence[PatchMeta],
+    weak_ocr_path: Path,
+    min_confidence: float,
+    min_chars: int,
+    require_no_error: bool,
+) -> List[PatchTextSample]:
+    if pd is None:
+        raise RuntimeError("pandas is required for patch_clip mode.")
+    p = Path(weak_ocr_path).expanduser().resolve()
+    if not p.exists() or not p.is_file():
+        raise FileNotFoundError(f"Weak OCR parquet not found: {p}")
+    df = pd.read_parquet(p)
+    if df is None or getattr(df, "empty", True):
+        return []
+    needed = {"patch_id", "text", "confidence"}
+    if not needed.issubset(set(df.columns)):
+        raise RuntimeError(f"Weak OCR parquet missing required columns: {sorted(needed - set(df.columns))}")
+
+    rec_by_pid: Dict[int, PatchMeta] = {int(r.patch_id): r for r in records}
+    rows_best: Dict[int, Tuple[str, float]] = {}
+    minc = float(min_confidence)
+    min_chars_i = max(0, int(min_chars))
+    for row in df.to_dict(orient="records"):
+        try:
+            pid = int(row.get("patch_id", -1))
+            conf = float(row.get("confidence", 0.0))
+        except Exception:
+            continue
+        if pid < 0 or pid not in rec_by_pid:
+            continue
+        if not math.isfinite(conf) or conf < minc:
+            continue
+        if bool(require_no_error):
+            err = str(row.get("error_code", "") or "").strip()
+            if err:
+                continue
+        txt = normalize_ocr_text(str(row.get("text", "") or ""))
+        if not txt:
+            continue
+        n_chars = int(row.get("char_count", 0) or 0)
+        if n_chars <= 0:
+            n_chars = len(txt)
+        if n_chars < min_chars_i:
+            continue
+        prev = rows_best.get(int(pid))
+        if prev is None or float(conf) > float(prev[1]):
+            rows_best[int(pid)] = (txt, float(conf))
+
+    samples: List[PatchTextSample] = []
+    for pid in sorted(rows_best.keys()):
+        rec = rec_by_pid.get(int(pid))
+        if rec is None:
+            continue
+        txt, conf = rows_best[int(pid)]
+        samples.append(PatchTextSample(patch=rec, text=str(txt), confidence=float(conf)))
+    return samples
+
+
+def _find_backbone_blocks(backbone: nn.Module) -> List[nn.Module]:
+    # ViT / DINOv2 patterns.
+    if hasattr(backbone, "encoder") and hasattr(backbone.encoder, "layer"):
+        try:
+            return list(backbone.encoder.layer)
+        except Exception:
+            pass
+    if hasattr(backbone, "vit") and hasattr(backbone.vit, "encoder") and hasattr(backbone.vit.encoder, "layer"):
+        try:
+            return list(backbone.vit.encoder.layer)
+        except Exception:
+            pass
+    if hasattr(backbone, "blocks"):
+        try:
+            return list(backbone.blocks)
+        except Exception:
+            pass
+    return []
+
+
+def _unfreeze_last_n_blocks(backbone: nn.Module, n_blocks: int) -> int:
+    blocks = _find_backbone_blocks(backbone)
+    n = max(0, int(n_blocks))
+    if n <= 0:
+        return 0
+    if not blocks:
+        # Fallback: unfreeze full backbone if block structure is unknown.
+        for p in backbone.parameters():
+            p.requires_grad = True
+        return sum(1 for p in backbone.parameters() if p.requires_grad)
+
+    for blk in blocks[-n:]:
+        for p in blk.parameters():
+            p.requires_grad = True
+    # Keep final norms trainable if present.
+    for attr in ("layernorm", "post_layernorm", "ln_f", "norm"):
+        mod = getattr(backbone, attr, None)
+        if mod is None:
+            continue
+        for p in mod.parameters():
+            p.requires_grad = True
+    return sum(1 for p in backbone.parameters() if p.requires_grad)
+
+
+class _PatchEvalDataset(Dataset):
+    def __init__(
+        self,
+        records: Sequence[PatchMeta],
+        *,
+        target_height: int,
+        width_buckets: Sequence[int],
+        patch_multiple: int,
+        max_width: int,
+        mean: Sequence[float],
+        std: Sequence[float],
+        image_preprocess_pipeline: str = "none",
+        pb_preprocess_config: Optional[PBPreprocessConfig] = None,
+        bdrc_preprocess_config: Optional[BDRCPreprocessConfig] = None,
+    ):
+        self.records = list(records)
+        self.target_height = int(target_height)
+        self.width_buckets = [int(v) for v in width_buckets]
+        self.patch_multiple = int(patch_multiple)
+        self.max_width = int(max_width)
+        self.mean = torch.tensor([float(v) for v in mean[:3]], dtype=torch.float32).view(3, 1, 1)
+        self.std = torch.tensor([max(1e-6, float(v)) for v in std[:3]], dtype=torch.float32).view(3, 1, 1)
+        self.image_preprocess_pipeline = str(image_preprocess_pipeline or "none")
+        self.pb_preprocess_config = pb_preprocess_config
+        self.bdrc_preprocess_config = bdrc_preprocess_config
+
+    def __len__(self) -> int:
+        return len(self.records)
+
+    def __getitem__(self, idx: int) -> Dict[str, Any]:
+        rec = self.records[int(idx)]
+        with Image.open(rec.image_path) as im:
+            rgb = im.convert("RGB")
+        rgb = _apply_image_preprocess_pipeline(
+            image=rgb,
+            pipeline=self.image_preprocess_pipeline,
+            pb_config=self.pb_preprocess_config,
+            bdrc_config=self.bdrc_preprocess_config,
+        )
+        normalized = _normalize_for_vit(
+            image=rgb,
+            target_height=self.target_height,
+            width_buckets=self.width_buckets,
+            patch_multiple=self.patch_multiple,
+            max_width=self.max_width,
+        )
+        arr = np.asarray(normalized).astype(np.float32) / 255.0
+        ten = torch.from_numpy(arr).permute(2, 0, 1).contiguous().float()
+        ten = (ten - self.mean) / self.std
+        return {"index": int(idx), "pixel_values": ten}
+
+
+class _LineEvalDataset(Dataset):
+    def __init__(
+        self,
+        samples: Sequence[LineTextSample],
+        *,
+        target_height: int,
+        width_buckets: Sequence[int],
+        patch_multiple: int,
+        max_width: int,
+        mean: Sequence[float],
+        std: Sequence[float],
+        image_preprocess_pipeline: str = "none",
+        pb_preprocess_config: Optional[PBPreprocessConfig] = None,
+        bdrc_preprocess_config: Optional[BDRCPreprocessConfig] = None,
+    ):
+        self.samples = list(samples)
+        self.target_height = int(target_height)
+        self.width_buckets = [int(v) for v in width_buckets]
+        self.patch_multiple = int(patch_multiple)
+        self.max_width = int(max_width)
+        self.mean = torch.tensor([float(v) for v in mean[:3]], dtype=torch.float32).view(3, 1, 1)
+        self.std = torch.tensor([max(1e-6, float(v)) for v in std[:3]], dtype=torch.float32).view(3, 1, 1)
+        self.image_preprocess_pipeline = str(image_preprocess_pipeline or "none")
+        self.pb_preprocess_config = pb_preprocess_config
+        self.bdrc_preprocess_config = bdrc_preprocess_config
+
+    def __len__(self) -> int:
+        return len(self.samples)
+
+    def __getitem__(self, idx: int) -> Dict[str, Any]:
+        sample = self.samples[int(idx)]
+        with Image.open(sample.image_path) as im:
+            rgb = im.convert("RGB")
+        rgb = _apply_image_preprocess_pipeline(
+            image=rgb,
+            pipeline=self.image_preprocess_pipeline,
+            pb_config=self.pb_preprocess_config,
+            bdrc_config=self.bdrc_preprocess_config,
+        )
+        normalized = _normalize_for_vit(
+            image=rgb,
+            target_height=self.target_height,
+            width_buckets=self.width_buckets,
+            patch_multiple=self.patch_multiple,
+            max_width=self.max_width,
+        )
+        arr = np.asarray(normalized).astype(np.float32) / 255.0
+        ten = torch.from_numpy(arr).permute(2, 0, 1).contiguous().float()
+        ten = (ten - self.mean) / self.std
+        return {"index": int(idx), "pixel_values": ten}
+
+
+def _collate_eval_patches(batch: List[Dict[str, Any]], patch_multiple: int) -> Dict[str, Any]:
+    if not batch:
+        raise RuntimeError("Empty eval batch")
+    pm = max(1, int(patch_multiple))
+    widths = [int(row["pixel_values"].shape[-1]) for row in batch]
+    max_w = int(math.ceil(max(widths) / pm) * pm)
+    pixels = torch.stack([_pad_right_to_width(row["pixel_values"], max_w) for row in batch], dim=0)
+    idx = torch.tensor([int(row["index"]) for row in batch], dtype=torch.long)
+    return {"index": idx, "pixel_values": pixels}
+
+
+def _collate_eval_lines(batch: List[Dict[str, Any]], patch_multiple: int) -> Dict[str, Any]:
+    if not batch:
+        raise RuntimeError("Empty eval batch")
+    pm = max(1, int(patch_multiple))
+    widths = [int(row["pixel_values"].shape[-1]) for row in batch]
+    max_w = int(math.ceil(max(widths) / pm) * pm)
+    pixels = torch.stack([_pad_right_to_width(row["pixel_values"], max_w) for row in batch], dim=0)
+    idx = torch.tensor([int(row["index"]) for row in batch], dtype=torch.long)
+    return {"index": idx, "pixel_values": pixels}
+
+
+def _export_faiss_embeddings(
+    *,
+    accelerator: Accelerator,
+    backbone: nn.Module,
+    projection_head: nn.Module,
+    records: Sequence[PatchMeta],
+    output_dir: Path,
+    target_height: int,
+    width_buckets: Sequence[int],
+    patch_multiple: int,
+    max_width: int,
+    image_mean: Sequence[float],
+    image_std: Sequence[float],
+    batch_size: int,
+    num_workers: int,
+    image_preprocess_pipeline: str = "none",
+    pb_preprocess_config: Optional[PBPreprocessConfig] = None,
+    bdrc_preprocess_config: Optional[BDRCPreprocessConfig] = None,
+) -> Tuple[Path, Path]:
+    ds = _PatchEvalDataset(
+        records=records,
+        target_height=target_height,
+        width_buckets=width_buckets,
+        patch_multiple=patch_multiple,
+        max_width=max_width,
+        mean=image_mean,
+        std=image_std,
+        image_preprocess_pipeline=image_preprocess_pipeline,
+        pb_preprocess_config=pb_preprocess_config,
+        bdrc_preprocess_config=bdrc_preprocess_config,
+    )
+    dl = DataLoader(
+        ds,
+        batch_size=max(1, int(batch_size)),
+        shuffle=False,
+        num_workers=max(0, int(num_workers)),
+        pin_memory=True,
+        drop_last=False,
+        collate_fn=lambda b: _collate_eval_patches(b, patch_multiple=int(patch_multiple)),
+    )
+
+    embeddings: Dict[int, np.ndarray] = {}
+    ub = accelerator.unwrap_model(backbone).to(accelerator.device)
+    uh = accelerator.unwrap_model(projection_head).to(accelerator.device)
+    ub.eval()
+    uh.eval()
+    with torch.no_grad():
+        for batch in tqdm(dl, desc="export-faiss-embeddings", disable=not accelerator.is_local_main_process):
+            ids = batch["index"].tolist()
+            pix = batch["pixel_values"].to(accelerator.device, non_blocking=True)
+            emb = _pooled_image_embedding(ub, pix)
+            emb = uh(emb)
+            emb = F.normalize(emb, dim=-1)
+            arr = emb.detach().cpu().numpy().astype(np.float32, copy=False)
+            for i, ridx in enumerate(ids):
+                embeddings[int(ridx)] = arr[i]
+    if len(embeddings) != len(records):
+        missing = [i for i in range(len(records)) if i not in embeddings]
+        raise RuntimeError(f"Embedding export missing {len(missing)} records.")
+
+    mat = np.stack([embeddings[i] for i in range(len(records))], axis=0).astype(np.float32, copy=False)
+    emb_path = (output_dir / "faiss_embeddings.npy").resolve()
+    np.save(emb_path, mat)
+
+    meta_rows = []
+    for rec in records:
+        meta_rows.append(
+            {
+                "patch_id": int(rec.patch_id),
+                "doc_id": str(rec.doc_id),
+                "page_id": str(rec.page_id),
+                "line_id": int(rec.line_id),
+                "scale_w": int(rec.scale_w),
+                "k": int(rec.k),
+                "x0_norm": float(rec.x0_norm),
+                "x1_norm": float(rec.x1_norm),
+                "patch_image_path": str(rec.image_path),
+            }
+        )
+    meta_df = pd.DataFrame(meta_rows)
+    meta_path = (output_dir / "faiss_embeddings_meta.parquet").resolve()
+    meta_df.to_parquet(meta_path, index=False)
+    return emb_path, meta_path
+
+
+def _export_line_faiss_embeddings(
+    *,
+    accelerator: Accelerator,
+    backbone: nn.Module,
+    projection_head: nn.Module,
+    samples: Sequence[LineTextSample],
+    output_dir: Path,
+    target_height: int,
+    width_buckets: Sequence[int],
+    patch_multiple: int,
+    max_width: int,
+    image_mean: Sequence[float],
+    image_std: Sequence[float],
+    batch_size: int,
+    num_workers: int,
+    image_preprocess_pipeline: str = "none",
+    pb_preprocess_config: Optional[PBPreprocessConfig] = None,
+    bdrc_preprocess_config: Optional[BDRCPreprocessConfig] = None,
+) -> Tuple[Path, Path]:
+    ds = _LineEvalDataset(
+        samples=samples,
+        target_height=target_height,
+        width_buckets=width_buckets,
+        patch_multiple=patch_multiple,
+        max_width=max_width,
+        mean=image_mean,
+        std=image_std,
+        image_preprocess_pipeline=image_preprocess_pipeline,
+        pb_preprocess_config=pb_preprocess_config,
+        bdrc_preprocess_config=bdrc_preprocess_config,
+    )
+    dl = DataLoader(
+        ds,
+        batch_size=max(1, int(batch_size)),
+        shuffle=False,
+        num_workers=max(0, int(num_workers)),
+        pin_memory=True,
+        drop_last=False,
+        collate_fn=lambda b: _collate_eval_lines(b, patch_multiple=int(patch_multiple)),
+    )
+    embeddings: Dict[int, np.ndarray] = {}
+    ub = accelerator.unwrap_model(backbone).to(accelerator.device)
+    uh = accelerator.unwrap_model(projection_head).to(accelerator.device)
+    ub.eval()
+    uh.eval()
+    with torch.no_grad():
+        for batch in tqdm(dl, desc="export-faiss-line-embeddings", disable=not accelerator.is_local_main_process):
+            ids = batch["index"].tolist()
+            pix = batch["pixel_values"].to(accelerator.device, non_blocking=True)
+            emb = _pooled_image_embedding(ub, pix)
+            emb = uh(emb)
+            emb = F.normalize(emb, dim=-1)
+            arr = emb.detach().cpu().numpy().astype(np.float32, copy=False)
+            for i, ridx in enumerate(ids):
+                embeddings[int(ridx)] = arr[i]
+    if len(embeddings) != len(samples):
+        missing = [i for i in range(len(samples)) if i not in embeddings]
+        raise RuntimeError(f"Line embedding export missing {len(missing)} records.")
+    mat = np.stack([embeddings[i] for i in range(len(samples))], axis=0).astype(np.float32, copy=False)
+    emb_path = (output_dir / "faiss_embeddings.npy").resolve()
+    np.save(emb_path, mat)
+
+    rows = []
+    for s in samples:
+        rows.append(
+            {
+                "sample_id": str(s.sample_id),
+                "doc_id": str(s.doc_id),
+                "page_id": str(s.page_id),
+                "line_id": int(s.line_id),
+                "text": str(s.text),
+                "image_path": str(s.image_path),
+            }
+        )
+    meta_df = pd.DataFrame(rows)
+    meta_path = (output_dir / "faiss_embeddings_meta.parquet").resolve()
+    meta_df.to_parquet(meta_path, index=False)
+    return emb_path, meta_path
+
+
 @dataclass
 class TrainingArtifacts:
     backbone_dir: Path
@@ -350,6 +1554,7 @@ def _save_artifacts(
     effective_num_train_epochs: int,
     prefix: str = "",
     global_step: int = 0,
+    extra_config: Optional[Dict[str, Any]] = None,
 ) -> TrainingArtifacts:
     output_dir.mkdir(parents=True, exist_ok=True)
     suffix = f"{prefix}_" if prefix else ""
@@ -388,45 +1593,44 @@ def _save_artifacts(
         projection_head_path,
     )
 
+    config_payload: Dict[str, Any] = {
+        "task": "text_hierarchy_vit_retrieval",
+        "dataset_dir": str(Path(args.dataset_dir).expanduser().resolve()),
+        "model_name_or_path": args.model_name_or_path,
+        "groups": int(num_groups),
+        "assets": int(num_assets),
+        "include_line_images": bool(args.include_line_images),
+        "include_word_crops": bool(args.include_word_crops),
+        "include_number_crops": bool(args.include_number_crops),
+        "target_height": int(args.target_height),
+        "max_width": int(args.max_width),
+        "patch_multiple": int(args.patch_multiple),
+        "width_buckets": [int(v) for v in width_buckets],
+        "batch_size": int(args.batch_size),
+        "lr": float(args.lr),
+        "weight_decay": float(args.weight_decay),
+        "requested_num_train_epochs": int(args.num_train_epochs),
+        "requested_max_train_steps": int(args.max_train_steps),
+        "effective_num_train_epochs": int(effective_num_train_epochs),
+        "effective_max_train_steps": int(effective_max_train_steps),
+        "steps_per_epoch": int(steps_per_epoch),
+        "warmup_steps": int(args.warmup_steps),
+        "projection_dim": int(args.projection_dim),
+        "temperature": float(args.temperature),
+        "mixed_precision": args.mixed_precision,
+        "gradient_checkpointing": bool(args.gradient_checkpointing),
+        "freeze_backbone": bool(args.freeze_backbone),
+        "image_mean": [float(v) for v in image_mean[:3]],
+        "image_std": [float(v) for v in image_std[:3]],
+        "global_step": int(global_step),
+        "backbone_dir": str(backbone_dir),
+        "projection_head_path": str(projection_head_path),
+    }
+    if isinstance(extra_config, dict):
+        config_payload.update(extra_config)
+
     with config_path.open("w", encoding="utf-8") as f:
-        json.dump(
-            {
-                "task": "text_hierarchy_vit_retrieval",
-                "dataset_dir": str(Path(args.dataset_dir).expanduser().resolve()),
-                "model_name_or_path": args.model_name_or_path,
-                "groups": int(num_groups),
-                "assets": int(num_assets),
-                "include_line_images": bool(args.include_line_images),
-                "include_word_crops": bool(args.include_word_crops),
-                "include_number_crops": bool(args.include_number_crops),
-                "target_height": int(args.target_height),
-                "max_width": int(args.max_width),
-                "patch_multiple": int(args.patch_multiple),
-                "width_buckets": [int(v) for v in width_buckets],
-                "batch_size": int(args.batch_size),
-                "lr": float(args.lr),
-                "weight_decay": float(args.weight_decay),
-                "requested_num_train_epochs": int(args.num_train_epochs),
-                "requested_max_train_steps": int(args.max_train_steps),
-                "effective_num_train_epochs": int(effective_num_train_epochs),
-                "effective_max_train_steps": int(effective_max_train_steps),
-                "steps_per_epoch": int(steps_per_epoch),
-                "warmup_steps": int(args.warmup_steps),
-                "projection_dim": int(args.projection_dim),
-                "temperature": float(args.temperature),
-                "mixed_precision": args.mixed_precision,
-                "gradient_checkpointing": bool(args.gradient_checkpointing),
-                "freeze_backbone": bool(args.freeze_backbone),
-                "image_mean": [float(v) for v in image_mean[:3]],
-                "image_std": [float(v) for v in image_std[:3]],
-                "global_step": int(global_step),
-                "backbone_dir": str(backbone_dir),
-                "projection_head_path": str(projection_head_path),
-            },
-            f,
-            ensure_ascii=False,
-            indent=2,
-        )
+        json.dump(config_payload, f, ensure_ascii=False, indent=2)
 
     return TrainingArtifacts(
         backbone_dir=backbone_dir,
@@ -435,8 +1639,1339 @@ def _save_artifacts(
     )
 
 
+def _save_line_clip_text_artifacts(
+    *,
+    accelerator: Accelerator,
+    output_dir: Path,
+    text_encoder: nn.Module,
+    text_projection_head: nn.Module,
+    tokenizer: Any,
+    text_encoder_name_or_path: str,
+    global_step: int,
+    prefix: str = "",
+) -> Tuple[Path, Path]:
+    output_dir.mkdir(parents=True, exist_ok=True)
+    suffix = f"{prefix}_" if prefix else ""
+    text_encoder_dir = (output_dir / f"{suffix}text_hierarchy_clip_text_encoder").resolve()
+    text_head_path = (output_dir / f"{suffix}text_hierarchy_clip_text_projection_head.pt").resolve()
+
+    unwrapped_text_encoder = accelerator.unwrap_model(text_encoder)
+    unwrapped_text_head = accelerator.unwrap_model(text_projection_head)
+
+    text_encoder_dir.mkdir(parents=True, exist_ok=True)
+    unwrapped_text_encoder.save_pretrained(str(text_encoder_dir))
+    try:
+        tokenizer.save_pretrained(str(text_encoder_dir))
+    except Exception as exc:
+        LOGGER.warning("Could not save tokenizer to %s: %s", text_encoder_dir, exc)
+
+    torch.save(
+        {
+            "state_dict": unwrapped_text_head.state_dict(),
+            "input_dim": int(unwrapped_text_head.net[0].in_features),
+            "output_dim": int(unwrapped_text_head.net[-1].out_features),
+            "text_encoder_name_or_path": str(text_encoder_name_or_path or ""),
+            "global_step": int(global_step),
+        },
+        text_head_path,
+    )
+    return text_encoder_dir, text_head_path
+
+
+def _line_clip_val_suffix_for_checkpoint(last_val_metrics: Optional[Dict[str, Any]]) -> str:
+    if not isinstance(last_val_metrics, dict) or not last_val_metrics:
+        return ""
+
+    def _fmt(v: Any) -> str:
+        try:
+            x = float(v)
+        except Exception:
+            return "na"
+        # path-safe, compact decimal formatting
+        return f"{x:.4f}".replace(".", "p")
+
+    i2t1 = _fmt(last_val_metrics.get("val_i2t_r1"))
+    t2i1 = _fmt(last_val_metrics.get("val_t2i_r1"))
+    i2t5 = _fmt(last_val_metrics.get("val_i2t_r5"))
+    t2i5 = _fmt(last_val_metrics.get("val_t2i_r5"))
+    return f"_i2t1-{i2t1}_t2i1-{t2i1}_i2t5-{i2t5}_t2i5-{t2i5}"
+
+
+def _run_patch_clip_training(
+    *,
+    args,
+    accelerator: Accelerator,
+    dataset_dir: Path,
+    output_dir: Path,
+    width_buckets: Sequence[int],
+    image_mean: Sequence[float],
+    image_std: Sequence[float],
+    image_processor: Any,
+) -> Dict[str, Any]:
+    meta_path = Path(getattr(args, "patch_meta_parquet", "") or "").expanduser().resolve()
+    if not meta_path.exists() or not meta_path.is_file():
+        meta_path = (dataset_dir / "meta" / "patches.parquet").resolve()
+    if not meta_path.exists() or not meta_path.is_file():
+        raise FileNotFoundError(f"Patch metadata parquet not found: {meta_path}")
+    weak_ocr_path_raw = str(getattr(args, "weak_ocr_parquet", "") or "").strip()
+    weak_ocr_path = (
+        Path(weak_ocr_path_raw).expanduser().resolve()
+        if weak_ocr_path_raw
+        else (dataset_dir / "meta" / "weak_ocr.parquet").resolve()
+    )
+    if not weak_ocr_path.exists() or not weak_ocr_path.is_file():
+        raise FileNotFoundError(f"Weak OCR parquet required for patch_clip mode: {weak_ocr_path}")
+
+    records = load_patch_metadata(
+        dataset_dir=dataset_dir,
+        patch_meta_parquet=meta_path,
+        ink_ratio_min=float(getattr(args, "ink_ratio_min", 0.0)),
+        boundary_score_min=float(getattr(args, "boundary_score_min", 0.0)),
+    )
+    if not records:
+        raise RuntimeError("No patch metadata records available after filtering.")
+
+    clip_samples = _load_patch_text_samples_from_weak_ocr(
+        dataset_dir=dataset_dir,
+        records=records,
+        weak_ocr_path=weak_ocr_path,
+        min_confidence=float(getattr(args, "ocr_min_confidence", 0.2)),
+        min_chars=int(getattr(args, "ocr_min_chars", 2)),
+        require_no_error=bool(getattr(args, "ocr_require_no_error", True)),
+    )
+    if not clip_samples:
+        raise RuntimeError(
+            "patch_clip mode found no usable (patch,text) pairs from weak_ocr.parquet after filtering. "
+            "Relax OCR filters or regenerate weak OCR labels."
+        )
+    coverage = float(len(clip_samples)) / float(max(1, len(records)))
+    if accelerator.is_main_process:
+        LOGGER.info(
+            "Patch CLIP mode: patches=%d clip_pairs=%d coverage=%.4f weak_ocr=%s text_encoder=%s",
+            len(records),
+            len(clip_samples),
+            coverage,
+            str(weak_ocr_path),
+            str(getattr(args, "text_encoder_name_or_path", "")),
+        )
+
+    image_preproc_mode, pb_pre_cfg, bdrc_pre_cfg = _build_image_preprocess_configs(args)
+    if accelerator.is_main_process:
+        LOGGER.info("Patch CLIP image preprocessing pipeline: %s", image_preproc_mode)
+    transform = PatchSingleViewTransform(
+        target_height=int(args.target_height),
+        width_buckets=width_buckets,
+        patch_multiple=int(args.patch_multiple),
+        max_width=int(args.max_width),
+        mean=list(image_mean[:3]),
+        std=list(image_std[:3]),
+        image_preprocess_pipeline=image_preproc_mode,
+        pb_preprocess_config=pb_pre_cfg,
+        bdrc_preprocess_config=bdrc_pre_cfg,
+    )
+    dataset = PatchTextClipDataset(samples=clip_samples, transform=transform)
+
+    tokenizer = AutoTokenizer.from_pretrained(str(getattr(args, "text_encoder_name_or_path", "google/byt5-small")))
+    _ensure_tokenizer_pad_token(tokenizer)
+    dataloader = DataLoader(
+        dataset,
+        batch_size=max(1, int(args.batch_size)),
+        shuffle=True,
+        num_workers=max(0, int(args.num_workers)),
+        pin_memory=True,
+        drop_last=True,
+        collate_fn=lambda b: _collate_patch_text_clip(
+            b,
+            patch_multiple=int(args.patch_multiple),
+            tokenizer=tokenizer,
+            text_max_length=int(getattr(args, "text_max_length", 128)),
+        ),
+    )
+    if len(dataloader) == 0:
+        raise RuntimeError("patch_clip DataLoader has zero batches. Reduce batch_size or add more OCR pairs.")
+
+    backbone = AutoModel.from_pretrained(args.model_name_or_path)
+    text_encoder = AutoModel.from_pretrained(str(getattr(args, "text_encoder_name_or_path", "google/byt5-small")))
+    if bool(args.gradient_checkpointing):
+        if hasattr(backbone, "gradient_checkpointing_enable"):
+            backbone.gradient_checkpointing_enable()
+        if hasattr(text_encoder, "gradient_checkpointing_enable"):
+            try:
+                text_encoder.gradient_checkpointing_enable()
+            except Exception:
+                pass
+
+    img_hidden_size = getattr(backbone.config, "hidden_size", None)
+    if img_hidden_size is None:
+        raise RuntimeError("Vision backbone config has no hidden_size.")
+    txt_hidden_size = (
+        getattr(text_encoder.config, "hidden_size", None)
+        or getattr(text_encoder.config, "d_model", None)
+        or getattr(text_encoder.config, "dim", None)
+    )
+    if txt_hidden_size is None:
+        raise RuntimeError("Text encoder config has no hidden_size/d_model/dim.")
+
+    image_projection_head = ProjectionHead(in_dim=int(img_hidden_size), out_dim=int(args.projection_dim))
+    text_projection_head = ProjectionHead(in_dim=int(txt_hidden_size), out_dim=int(args.projection_dim))
+
+    trainable_params: List[nn.Parameter] = []
+    if bool(getattr(args, "freeze_backbone", False)):
+        backbone.requires_grad_(False)
+        backbone.eval()
+    else:
+        trainable_params.extend([p for p in backbone.parameters() if p.requires_grad])
+    if bool(getattr(args, "freeze_text_encoder", False)):
+        text_encoder.requires_grad_(False)
+        text_encoder.eval()
+    else:
+        trainable_params.extend([p for p in text_encoder.parameters() if p.requires_grad])
+    trainable_params.extend(list(image_projection_head.parameters()))
+    trainable_params.extend(list(text_projection_head.parameters()))
+
+    optimizer = torch.optim.AdamW(
+        trainable_params,
+        lr=float(args.lr),
+        weight_decay=float(args.weight_decay),
+    )
+
+    steps_per_epoch = len(dataloader)
+    max_train_steps = int(args.max_train_steps)
+    requested_num_train_epochs = int(args.num_train_epochs)
+    requested_max_train_steps = int(args.max_train_steps)
+    if max_train_steps <= 0:
+        max_train_steps = requested_num_train_epochs * steps_per_epoch
+    num_train_epochs = int(math.ceil(max_train_steps / max(1, steps_per_epoch)))
+
+    lr_scheduler = get_scheduler(
+        name="cosine",
+        optimizer=optimizer,
+        num_warmup_steps=int(args.warmup_steps),
+        num_training_steps=max_train_steps,
+    )
+
+    if val_dataloader is not None:
+        (
+            backbone,
+            text_encoder,
+            image_projection_head,
+            text_projection_head,
+            optimizer,
+            dataloader,
+            val_dataloader,
+            lr_scheduler,
+        ) = accelerator.prepare(
+            backbone, text_encoder, image_projection_head, text_projection_head, optimizer, dataloader, val_dataloader, lr_scheduler
+        )
+    else:
+        backbone, text_encoder, image_projection_head, text_projection_head, optimizer, dataloader, lr_scheduler = accelerator.prepare(
+            backbone, text_encoder, image_projection_head, text_projection_head, optimizer, dataloader, lr_scheduler
+        )
+
+    progress_bar = tqdm(total=max_train_steps, disable=not accelerator.is_local_main_process, desc="train-text-hierarchy-vit-clip")
+    global_step = 0
+    cumulative_loss = 0.0
+    acc_i2t_total = 0.0
+    acc_t2i_total = 0.0
+    stat_steps = 0
+    last_val_metrics: Dict[str, float] = {}
+    val_interval_steps = max(0, int(getattr(args, "checkpoint_every_steps", 0)))
+
+    for epoch in range(num_train_epochs):
+        if not bool(getattr(args, "freeze_backbone", False)):
+            backbone.train()
+        if not bool(getattr(args, "freeze_text_encoder", False)):
+            text_encoder.train()
+        image_projection_head.train()
+        text_projection_head.train()
+
+        for batch in dataloader:
+            if global_step >= max_train_steps:
+                break
+            pixel_values = batch["pixel_values"].to(accelerator.device, non_blocking=True)
+            input_ids = batch["input_ids"].to(accelerator.device, non_blocking=True)
+            attention_mask = batch["attention_mask"].to(accelerator.device, non_blocking=True)
+
+            if bool(getattr(args, "freeze_backbone", False)):
+                with torch.no_grad():
+                    img_emb = _pooled_image_embedding(backbone, pixel_values)
+            else:
+                img_emb = _pooled_image_embedding(backbone, pixel_values)
+            if bool(getattr(args, "freeze_text_encoder", False)):
+                with torch.no_grad():
+                    txt_emb = _pooled_text_embedding(text_encoder, input_ids, attention_mask)
+            else:
+                txt_emb = _pooled_text_embedding(text_encoder, input_ids, attention_mask)
+
+            img_z = image_projection_head(img_emb)
+            txt_z = text_projection_head(txt_emb)
+            loss, clip_stats = _clip_symmetric_loss(img_z, txt_z, float(args.temperature))
+
+            accelerator.backward(loss)
+            optimizer.step()
+            lr_scheduler.step()
+            optimizer.zero_grad(set_to_none=True)
+
+            global_step += 1
+            cumulative_loss += float(loss.detach().item())
+            acc_i2t_total += float(clip_stats.get("acc_i2t", 0.0))
+            acc_t2i_total += float(clip_stats.get("acc_t2i", 0.0))
+            stat_steps += 1
+            progress_bar.update(1)
+            postfix = {
+                "loss": f"{loss.detach().item():.4f}",
+                "i2t": f"{float(clip_stats.get('acc_i2t', 0.0)):.2f}",
+                "t2i": f"{float(clip_stats.get('acc_t2i', 0.0)):.2f}",
+                "lr": f"{lr_scheduler.get_last_lr()[0]:.2e}",
+            }
+            if last_val_metrics:
+                postfix["vi2t@1"] = f"{float(last_val_metrics.get('val_i2t_r1', 0.0)):.2f}"
+                postfix["vt2i@1"] = f"{float(last_val_metrics.get('val_t2i_r1', 0.0)):.2f}"
+            progress_bar.set_postfix(**postfix)
+
+            if val_dataloader is not None and val_interval_steps > 0 and global_step % val_interval_steps == 0:
+                val_metrics = _evaluate_line_clip_retrieval(
+                    accelerator=accelerator,
+                    backbone=backbone,
+                    text_encoder=text_encoder,
+                    image_projection_head=image_projection_head,
+                    text_projection_head=text_projection_head,
+                    val_dataloader=val_dataloader,
+                    freeze_backbone=bool(getattr(args, "freeze_backbone", False)),
+                    freeze_text_encoder=bool(getattr(args, "freeze_text_encoder", False)),
+                    temperature=float(args.temperature),
+                )
+                if accelerator.is_main_process and val_metrics:
+                    last_val_metrics = dict(val_metrics)
+                    LOGGER.info(
+                        "Line CLIP val @ step %d: n=%d i2t@1=%.4f t2i@1=%.4f i2t@5=%.4f t2i@5=%.4f",
+                        global_step,
+                        int(val_metrics.get("val_count", 0.0)),
+                        float(val_metrics.get("val_i2t_r1", 0.0)),
+                        float(val_metrics.get("val_t2i_r1", 0.0)),
+                        float(val_metrics.get("val_i2t_r5", 0.0)),
+                        float(val_metrics.get("val_t2i_r5", 0.0)),
+                    )
+                accelerator.wait_for_everyone()
+
+        if global_step >= max_train_steps:
+            break
+
+    accelerator.wait_for_everyone()
+    final_artifacts = None
+    emb_path = ""
+    emb_meta_path = ""
+    text_encoder_dir = ""
+    text_projection_head_path = ""
+    if accelerator.is_main_process:
+        extra_cfg = {
+            "mode": "patch_clip",
+            "loss_type": "clip_symmetric_infonce",
+            "clip_pairs": int(len(clip_samples)),
+            "clip_coverage_ratio": float(coverage),
+            "weak_ocr_path": str(weak_ocr_path),
+            "text_encoder_name_or_path": str(getattr(args, "text_encoder_name_or_path", "")),
+            "text_max_length": int(getattr(args, "text_max_length", 128)),
+            "freeze_text_encoder": bool(getattr(args, "freeze_text_encoder", False)),
+            "image_preprocess_pipeline": image_preproc_mode,
+            "image_preprocess_pb": (pb_pre_cfg.to_dict() if pb_pre_cfg is not None else None),
+            "image_preprocess_bdrc": (bdrc_pre_cfg.to_dict() if bdrc_pre_cfg is not None else None),
+            "avg_clip_i2t_top1": float(acc_i2t_total / max(1, stat_steps)),
+            "avg_clip_t2i_top1": float(acc_t2i_total / max(1, stat_steps)),
+            "last_val_metrics": last_val_metrics,
+        }
+        final_artifacts = _save_artifacts(
+            accelerator=accelerator,
+            output_dir=output_dir,
+            backbone=backbone,
+            projection_head=image_projection_head,
+            image_processor=image_processor,
+            args=args,
+            num_groups=len(clip_samples),
+            num_assets=len(clip_samples),
+            width_buckets=width_buckets,
+            steps_per_epoch=steps_per_epoch,
+            effective_max_train_steps=max_train_steps,
+            effective_num_train_epochs=num_train_epochs,
+            prefix="",
+            global_step=global_step,
+            extra_config=extra_cfg,
+        )
+        text_encoder_dir_p, text_head_path_p = _save_line_clip_text_artifacts(
+            accelerator=accelerator,
+            output_dir=output_dir,
+            text_encoder=text_encoder,
+            text_projection_head=text_projection_head,
+            tokenizer=tokenizer,
+            text_encoder_name_or_path=str(getattr(args, "text_encoder_name_or_path", "")),
+            global_step=global_step,
+            prefix="",
+        )
+        text_encoder_dir = str(text_encoder_dir_p)
+        text_projection_head_path = str(text_head_path_p)
+
+        emb_p, emb_meta_p = _export_faiss_embeddings(
+            accelerator=accelerator,
+            backbone=backbone,
+            projection_head=image_projection_head,
+            records=records,
+            output_dir=output_dir,
+            target_height=int(args.target_height),
+            width_buckets=width_buckets,
+            patch_multiple=int(args.patch_multiple),
+            max_width=int(args.max_width),
+            image_mean=image_mean[:3],
+            image_std=image_std[:3],
+            batch_size=max(1, int(args.batch_size)),
+            num_workers=max(0, int(args.num_workers)),
+            image_preprocess_pipeline=image_preproc_mode,
+            pb_preprocess_config=pb_pre_cfg,
+            bdrc_preprocess_config=bdrc_pre_cfg,
+        )
+        emb_path = str(emb_p)
+        emb_meta_path = str(emb_meta_p)
+
+        avg_loss = cumulative_loss / max(1, global_step)
+        LOGGER.info(
+            "Patch CLIP training finished: steps=%d avg_loss=%.6f avg_i2t_top1=%.4f avg_t2i_top1=%.4f",
+            global_step,
+            avg_loss,
+            float(acc_i2t_total / max(1, stat_steps)),
+            float(acc_t2i_total / max(1, stat_steps)),
+        )
+        LOGGER.info("Saved image backbone: %s", final_artifacts.backbone_dir if final_artifacts else "")
+        LOGGER.info("Saved image projection head: %s", final_artifacts.projection_head_path if final_artifacts else "")
+        LOGGER.info("Saved text encoder: %s", text_encoder_dir)
+        LOGGER.info("Saved text projection head: %s", text_projection_head_path)
+
+    return {
+        "mode": "patch_clip",
+        "global_step": int(global_step),
+        "patches_total": int(len(records)),
+        "clip_pairs": int(len(clip_samples)),
+        "coverage_ratio": float(coverage),
+        "output_dir": str(output_dir),
+        "backbone_dir": str(final_artifacts.backbone_dir) if final_artifacts else "",
+        "projection_head_path": str(final_artifacts.projection_head_path) if final_artifacts else "",
+        "text_encoder_dir": str(text_encoder_dir),
+        "text_projection_head_path": str(text_projection_head_path),
+        "config_path": str(final_artifacts.config_path) if final_artifacts else "",
+        "faiss_embeddings_path": emb_path,
+        "faiss_embeddings_meta_path": emb_meta_path,
+        "last_val_metrics": last_val_metrics,
+    }
+
+
+def _run_line_clip_training(
+    *,
+    args,
+    accelerator: Accelerator,
+    dataset_dir: Path,
+    output_dir: Path,
+    width_buckets: Sequence[int],
+    image_mean: Sequence[float],
+    image_std: Sequence[float],
+    image_processor: Any,
+) -> Dict[str, Any]:
+    if accelerator.is_main_process:
+        output_dir.mkdir(parents=True, exist_ok=True)
+    accelerator.wait_for_everyone()
+
+    train_manifest_raw = str(getattr(args, "train_manifest", "") or "").strip()
+    if train_manifest_raw:
+        train_manifest = Path(train_manifest_raw).expanduser().resolve()
+    else:
+        candidates = [
+            (dataset_dir / "train_manifest.jsonl").resolve(),
+            (dataset_dir / "ocr" / "train_manifest.jsonl").resolve(),
+            (dataset_dir / "train.jsonl").resolve(),
+        ]
+        train_manifest = next((p for p in candidates if p.exists() and p.is_file()), candidates[0])
+    if not train_manifest.exists() or not train_manifest.is_file():
+        raise FileNotFoundError(
+            f"line_clip mode requires --train_manifest (JSONL with image/text). Not found: {train_manifest}"
+        )
+    val_manifest_raw = str(getattr(args, "val_manifest", "") or "").strip()
+    val_manifest = Path(val_manifest_raw).expanduser().resolve() if val_manifest_raw else None
+
+    line_samples = _load_line_manifest_samples(
+        train_manifest,
+        min_chars=max(1, int(getattr(args, "ocr_min_chars", 1))),
+    )
+    if not line_samples:
+        raise RuntimeError(f"No usable line samples in manifest: {train_manifest}")
+    if accelerator.is_main_process:
+        LOGGER.info(
+            "Line CLIP mode: train_manifest=%s samples=%d text_encoder=%s",
+            str(train_manifest),
+            len(line_samples),
+            str(getattr(args, "text_encoder_name_or_path", "")),
+        )
+        if val_manifest is not None:
+            LOGGER.info("Line CLIP val_manifest (optional, currently metadata only): %s", str(val_manifest))
+
+    image_preproc_mode, pb_pre_cfg, bdrc_pre_cfg = _build_image_preprocess_configs(args)
+    if accelerator.is_main_process:
+        LOGGER.info("Line CLIP image preprocessing pipeline: %s", image_preproc_mode)
+    transform = PatchSingleViewTransform(
+        target_height=int(args.target_height),
+        width_buckets=width_buckets,
+        patch_multiple=int(args.patch_multiple),
+        max_width=int(args.max_width),
+        mean=list(image_mean[:3]),
+        std=list(image_std[:3]),
+        image_preprocess_pipeline=image_preproc_mode,
+        pb_preprocess_config=pb_pre_cfg,
+        bdrc_preprocess_config=bdrc_pre_cfg,
+    )
+    dataset = LineTextClipDataset(samples=line_samples, transform=transform)
+    tokenizer = AutoTokenizer.from_pretrained(str(getattr(args, "text_encoder_name_or_path", "google/byt5-small")))
+    _ensure_tokenizer_pad_token(tokenizer)
+    dataloader = DataLoader(
+        dataset,
+        batch_size=max(1, int(args.batch_size)),
+        shuffle=True,
+        num_workers=max(0, int(args.num_workers)),
+        pin_memory=True,
+        drop_last=True,
+        collate_fn=lambda b: _collate_line_text_clip(
+            b,
+            patch_multiple=int(args.patch_multiple),
+            tokenizer=tokenizer,
+            text_max_length=int(getattr(args, "text_max_length", 128)),
+        ),
+    )
+    val_samples: List[LineTextSample] = []
+    val_dataloader: Optional[DataLoader] = None
+    if val_manifest is not None and val_manifest.exists() and val_manifest.is_file():
+        val_samples = _load_line_manifest_samples(
+            val_manifest,
+            min_chars=max(1, int(getattr(args, "ocr_min_chars", 1))),
+        )
+        if val_samples:
+            val_dataset = LineTextClipDataset(samples=val_samples, transform=transform)
+            val_dataloader = DataLoader(
+                val_dataset,
+                batch_size=max(1, int(args.batch_size)),
+                shuffle=False,
+                num_workers=max(0, int(args.num_workers)),
+                pin_memory=True,
+                drop_last=False,
+                collate_fn=lambda b: _collate_line_text_clip(
+                    b,
+                    patch_multiple=int(args.patch_multiple),
+                    tokenizer=tokenizer,
+                    text_max_length=int(getattr(args, "text_max_length", 128)),
+                ),
+            )
+            if accelerator.is_main_process:
+                LOGGER.info("Line CLIP validation enabled: val_samples=%d", len(val_samples))
+        elif accelerator.is_main_process:
+            LOGGER.warning("Val manifest provided but no usable validation samples found: %s", str(val_manifest))
+    if len(dataloader) == 0:
+        raise RuntimeError("line_clip DataLoader has zero batches. Reduce batch_size.")
+
+    backbone = AutoModel.from_pretrained(args.model_name_or_path)
+    text_encoder = AutoModel.from_pretrained(str(getattr(args, "text_encoder_name_or_path", "google/byt5-small")))
+    if bool(args.gradient_checkpointing):
+        if hasattr(backbone, "gradient_checkpointing_enable"):
+            backbone.gradient_checkpointing_enable()
+        if hasattr(text_encoder, "gradient_checkpointing_enable"):
+            try:
+                text_encoder.gradient_checkpointing_enable()
+            except Exception:
+                pass
+
+    img_hidden_size = getattr(backbone.config, "hidden_size", None)
+    if img_hidden_size is None:
+        raise RuntimeError("Vision backbone config has no hidden_size.")
+    txt_hidden_size = (
+        getattr(text_encoder.config, "hidden_size", None)
+        or getattr(text_encoder.config, "d_model", None)
+        or getattr(text_encoder.config, "dim", None)
+    )
+    if txt_hidden_size is None:
+        raise RuntimeError("Text encoder config has no hidden_size/d_model/dim.")
+
+    image_projection_head = ProjectionHead(in_dim=int(img_hidden_size), out_dim=int(args.projection_dim))
+    text_projection_head = ProjectionHead(in_dim=int(txt_hidden_size), out_dim=int(args.projection_dim))
+
+    trainable_params: List[nn.Parameter] = []
+    if bool(getattr(args, "freeze_backbone", False)):
+        backbone.requires_grad_(False)
+        backbone.eval()
+    else:
+        trainable_params.extend([p for p in backbone.parameters() if p.requires_grad])
+    if bool(getattr(args, "freeze_text_encoder", False)):
+        text_encoder.requires_grad_(False)
+        text_encoder.eval()
+    else:
+        trainable_params.extend([p for p in text_encoder.parameters() if p.requires_grad])
+    trainable_params.extend(list(image_projection_head.parameters()))
+    trainable_params.extend(list(text_projection_head.parameters()))
+    optimizer = torch.optim.AdamW(
+        trainable_params,
+        lr=float(args.lr),
+        weight_decay=float(args.weight_decay),
+    )
+
+    steps_per_epoch = len(dataloader)
+    max_train_steps = int(args.max_train_steps)
+    requested_num_train_epochs = int(args.num_train_epochs)
+    requested_max_train_steps = int(args.max_train_steps)
+    if max_train_steps <= 0:
+        max_train_steps = requested_num_train_epochs * steps_per_epoch
+    num_train_epochs = int(math.ceil(max_train_steps / max(1, steps_per_epoch)))
+    lr_scheduler = get_scheduler(
+        name="cosine",
+        optimizer=optimizer,
+        num_warmup_steps=int(args.warmup_steps),
+        num_training_steps=max_train_steps,
+    )
+
+    if val_dataloader is not None:
+        (
+            backbone,
+            text_encoder,
+            image_projection_head,
+            text_projection_head,
+            optimizer,
+            dataloader,
+            val_dataloader,
+            lr_scheduler,
+        ) = accelerator.prepare(
+            backbone, text_encoder, image_projection_head, text_projection_head, optimizer, dataloader, val_dataloader, lr_scheduler
+        )
+    else:
+        backbone, text_encoder, image_projection_head, text_projection_head, optimizer, dataloader, lr_scheduler = accelerator.prepare(
+            backbone, text_encoder, image_projection_head, text_projection_head, optimizer, dataloader, lr_scheduler
+        )
+
+    progress_bar = tqdm(total=max_train_steps, disable=not accelerator.is_local_main_process, desc="train-line-clip")
+    global_step = 0
+    cumulative_loss = 0.0
+    acc_i2t_total = 0.0
+    acc_t2i_total = 0.0
+    stat_steps = 0
+    last_val_metrics: Dict[str, float] = {}
+    val_interval_steps = max(0, int(getattr(args, "checkpoint_every_steps", 0)))
+    for epoch in range(num_train_epochs):
+        if not bool(getattr(args, "freeze_backbone", False)):
+            backbone.train()
+        if not bool(getattr(args, "freeze_text_encoder", False)):
+            text_encoder.train()
+        image_projection_head.train()
+        text_projection_head.train()
+        for batch in dataloader:
+            if global_step >= max_train_steps:
+                break
+            pixel_values = batch["pixel_values"].to(accelerator.device, non_blocking=True)
+            input_ids = batch["input_ids"].to(accelerator.device, non_blocking=True)
+            attention_mask = batch["attention_mask"].to(accelerator.device, non_blocking=True)
+
+            if bool(getattr(args, "freeze_backbone", False)):
+                with torch.no_grad():
+                    img_emb = _pooled_image_embedding(backbone, pixel_values)
+            else:
+                img_emb = _pooled_image_embedding(backbone, pixel_values)
+            if bool(getattr(args, "freeze_text_encoder", False)):
+                with torch.no_grad():
+                    txt_emb = _pooled_text_embedding(text_encoder, input_ids, attention_mask)
+            else:
+                txt_emb = _pooled_text_embedding(text_encoder, input_ids, attention_mask)
+
+            img_z = image_projection_head(img_emb)
+            txt_z = text_projection_head(txt_emb)
+            loss, clip_stats = _clip_symmetric_loss(img_z, txt_z, float(args.temperature))
+
+            accelerator.backward(loss)
+            optimizer.step()
+            lr_scheduler.step()
+            optimizer.zero_grad(set_to_none=True)
+
+            global_step += 1
+            cumulative_loss += float(loss.detach().item())
+            acc_i2t_total += float(clip_stats.get("acc_i2t", 0.0))
+            acc_t2i_total += float(clip_stats.get("acc_t2i", 0.0))
+            stat_steps += 1
+            progress_bar.update(1)
+            postfix = {
+                "loss": f"{loss.detach().item():.4f}",
+                "i2t": f"{float(clip_stats.get('acc_i2t', 0.0)):.2f}",
+                "t2i": f"{float(clip_stats.get('acc_t2i', 0.0)):.2f}",
+                "lr": f"{lr_scheduler.get_last_lr()[0]:.2e}",
+            }
+            if last_val_metrics:
+                postfix["vi2t@1"] = f"{float(last_val_metrics.get('val_i2t_r1', 0.0)):.2f}"
+                postfix["vt2i@1"] = f"{float(last_val_metrics.get('val_t2i_r1', 0.0)):.2f}"
+            progress_bar.set_postfix(**postfix)
+
+            if val_dataloader is not None and val_interval_steps > 0 and global_step % val_interval_steps == 0:
+                val_metrics = _evaluate_line_clip_retrieval(
+                    accelerator=accelerator,
+                    backbone=backbone,
+                    text_encoder=text_encoder,
+                    image_projection_head=image_projection_head,
+                    text_projection_head=text_projection_head,
+                    val_dataloader=val_dataloader,
+                    freeze_backbone=bool(getattr(args, "freeze_backbone", False)),
+                    freeze_text_encoder=bool(getattr(args, "freeze_text_encoder", False)),
+                    temperature=float(args.temperature),
+                )
+                if accelerator.is_main_process and val_metrics:
+                    last_val_metrics = dict(val_metrics)
+                    LOGGER.info(
+                        "Line CLIP val @ step %d: n=%d i2t@1=%.4f t2i@1=%.4f i2t@5=%.4f t2i@5=%.4f",
+                        global_step,
+                        int(val_metrics.get("val_count", 0.0)),
+                        float(val_metrics.get("val_i2t_r1", 0.0)),
+                        float(val_metrics.get("val_t2i_r1", 0.0)),
+                        float(val_metrics.get("val_i2t_r5", 0.0)),
+                        float(val_metrics.get("val_t2i_r5", 0.0)),
+                    )
+                accelerator.wait_for_everyone()
+
+            if (
+                int(args.checkpoint_every_steps) > 0
+                and global_step % int(args.checkpoint_every_steps) == 0
+                and accelerator.is_main_process
+            ):
+                val_suffix = _line_clip_val_suffix_for_checkpoint(last_val_metrics)
+                prefix = f"checkpoint_step_{global_step:07d}{val_suffix}"
+                artifacts = _save_artifacts(
+                    accelerator=accelerator,
+                    output_dir=output_dir,
+                    backbone=backbone,
+                    projection_head=image_projection_head,
+                    image_processor=image_processor,
+                    args=args,
+                    num_groups=len(line_samples),
+                    num_assets=len(line_samples),
+                    width_buckets=width_buckets,
+                    steps_per_epoch=steps_per_epoch,
+                    effective_max_train_steps=max_train_steps,
+                    effective_num_train_epochs=num_train_epochs,
+                    prefix=prefix,
+                    global_step=global_step,
+                    extra_config={
+                        "mode": "line_clip",
+                        "loss_type": "clip_symmetric_infonce",
+                        "train_manifest": str(train_manifest),
+                        "val_manifest": (str(val_manifest) if val_manifest else ""),
+                        "line_samples": int(len(line_samples)),
+                        "text_encoder_name_or_path": str(getattr(args, "text_encoder_name_or_path", "")),
+                        "text_max_length": int(getattr(args, "text_max_length", 128)),
+                        "freeze_text_encoder": bool(getattr(args, "freeze_text_encoder", False)),
+                        "image_preprocess_pipeline": image_preproc_mode,
+                        "last_val_metrics": last_val_metrics,
+                    },
+                )
+                _save_line_clip_text_artifacts(
+                    accelerator=accelerator,
+                    output_dir=output_dir,
+                    text_encoder=text_encoder,
+                    text_projection_head=text_projection_head,
+                    tokenizer=tokenizer,
+                    text_encoder_name_or_path=str(getattr(args, "text_encoder_name_or_path", "")),
+                    global_step=global_step,
+                    prefix=prefix,
+                )
+                LOGGER.info("Saved line_clip checkpoint at step %d -> %s", global_step, artifacts.backbone_dir)
+        if global_step >= max_train_steps:
+            break
+
+    accelerator.wait_for_everyone()
+    final_artifacts = None
+    emb_path = ""
+    emb_meta_path = ""
+    text_encoder_dir = ""
+    text_projection_head_path = ""
+    if accelerator.is_main_process:
+        extra_cfg = {
+            "mode": "line_clip",
+            "loss_type": "clip_symmetric_infonce",
+            "train_manifest": str(train_manifest),
+            "val_manifest": (str(val_manifest) if val_manifest else ""),
+            "line_samples": int(len(line_samples)),
+            "text_encoder_name_or_path": str(getattr(args, "text_encoder_name_or_path", "")),
+            "text_max_length": int(getattr(args, "text_max_length", 128)),
+            "freeze_text_encoder": bool(getattr(args, "freeze_text_encoder", False)),
+            "image_preprocess_pipeline": image_preproc_mode,
+            "image_preprocess_pb": (pb_pre_cfg.to_dict() if pb_pre_cfg is not None else None),
+            "image_preprocess_bdrc": (bdrc_pre_cfg.to_dict() if bdrc_pre_cfg is not None else None),
+            "avg_clip_i2t_top1": float(acc_i2t_total / max(1, stat_steps)),
+            "avg_clip_t2i_top1": float(acc_t2i_total / max(1, stat_steps)),
+            "last_val_metrics": last_val_metrics,
+        }
+        final_artifacts = _save_artifacts(
+            accelerator=accelerator,
+            output_dir=output_dir,
+            backbone=backbone,
+            projection_head=image_projection_head,
+            image_processor=image_processor,
+            args=args,
+            num_groups=len(line_samples),
+            num_assets=len(line_samples),
+            width_buckets=width_buckets,
+            steps_per_epoch=steps_per_epoch,
+            effective_max_train_steps=max_train_steps,
+            effective_num_train_epochs=num_train_epochs,
+            prefix="",
+            global_step=global_step,
+            extra_config=extra_cfg,
+        )
+        unwrapped_text_encoder = accelerator.unwrap_model(text_encoder)
+        unwrapped_text_head = accelerator.unwrap_model(text_projection_head)
+        text_encoder_dir_p = (output_dir / "text_hierarchy_clip_text_encoder").resolve()
+        text_encoder_dir_p.mkdir(parents=True, exist_ok=True)
+        unwrapped_text_encoder.save_pretrained(str(text_encoder_dir_p))
+        try:
+            tokenizer.save_pretrained(str(text_encoder_dir_p))
+        except Exception as exc:
+            LOGGER.warning("Could not save tokenizer to %s: %s", text_encoder_dir_p, exc)
+        text_encoder_dir = str(text_encoder_dir_p)
+        text_head_path_p = (output_dir / "text_hierarchy_clip_text_projection_head.pt").resolve()
+        torch.save(
+            {
+                "state_dict": unwrapped_text_head.state_dict(),
+                "input_dim": int(unwrapped_text_head.net[0].in_features),
+                "output_dim": int(unwrapped_text_head.net[-1].out_features),
+                "text_encoder_name_or_path": str(getattr(args, "text_encoder_name_or_path", "")),
+                "global_step": int(global_step),
+            },
+            text_head_path_p,
+        )
+        text_projection_head_path = str(text_head_path_p)
+
+        emb_p, emb_meta_p = _export_line_faiss_embeddings(
+            accelerator=accelerator,
+            backbone=backbone,
+            projection_head=image_projection_head,
+            samples=line_samples,
+            output_dir=output_dir,
+            target_height=int(args.target_height),
+            width_buckets=width_buckets,
+            patch_multiple=int(args.patch_multiple),
+            max_width=int(args.max_width),
+            image_mean=image_mean[:3],
+            image_std=image_std[:3],
+            batch_size=max(1, int(args.batch_size)),
+            num_workers=max(0, int(args.num_workers)),
+            image_preprocess_pipeline=image_preproc_mode,
+            pb_preprocess_config=pb_pre_cfg,
+            bdrc_preprocess_config=bdrc_pre_cfg,
+        )
+        emb_path = str(emb_p)
+        emb_meta_path = str(emb_meta_p)
+
+        avg_loss = cumulative_loss / max(1, global_step)
+        LOGGER.info(
+            "Line CLIP training finished: steps=%d avg_loss=%.6f avg_i2t_top1=%.4f avg_t2i_top1=%.4f",
+            global_step,
+            avg_loss,
+            float(acc_i2t_total / max(1, stat_steps)),
+            float(acc_t2i_total / max(1, stat_steps)),
+        )
+
+    return {
+        "mode": "line_clip",
+        "global_step": int(global_step),
+        "line_samples": int(len(line_samples)),
+        "output_dir": str(output_dir),
+        "backbone_dir": str(final_artifacts.backbone_dir) if final_artifacts else "",
+        "projection_head_path": str(final_artifacts.projection_head_path) if final_artifacts else "",
+        "text_encoder_dir": str(text_encoder_dir),
+        "text_projection_head_path": str(text_projection_head_path),
+        "config_path": str(final_artifacts.config_path) if final_artifacts else "",
+        "faiss_embeddings_path": emb_path,
+        "faiss_embeddings_meta_path": emb_meta_path,
+    }
+
+
+def _run_patch_mpnce_training(
+    *,
+    args,
+    accelerator: Accelerator,
+    dataset_dir: Path,
+    output_dir: Path,
+    width_buckets: Sequence[int],
+    image_mean: Sequence[float],
+    image_std: Sequence[float],
+    image_processor: Any,
+) -> Dict[str, Any]:
+    meta_path = Path(getattr(args, "patch_meta_parquet", "") or "").expanduser().resolve()
+    if not meta_path.exists() or not meta_path.is_file():
+        meta_path = (dataset_dir / "meta" / "patches.parquet").resolve()
+    if not meta_path.exists() or not meta_path.is_file():
+        raise FileNotFoundError(f"Patch metadata parquet not found: {meta_path}")
+
+    pairs_path_raw = str(getattr(args, "pairs_parquet", "") or "").strip()
+    pairs_path = Path(pairs_path_raw).expanduser().resolve() if pairs_path_raw else (dataset_dir / "meta" / "mnn_pairs.parquet").resolve()
+    if not pairs_path.exists() or not pairs_path.is_file():
+        pairs_path = None
+    weak_ocr_path_raw = str(getattr(args, "weak_ocr_parquet", "") or "").strip()
+    weak_ocr_path = (
+        Path(weak_ocr_path_raw).expanduser().resolve()
+        if weak_ocr_path_raw
+        else (dataset_dir / "meta" / "weak_ocr.parquet").resolve()
+    )
+    if not weak_ocr_path.exists() or not weak_ocr_path.is_file():
+        # Fallback naming variants users may have used.
+        alt_candidates = [
+            (dataset_dir / "meta" / "weak_ocr_labels.parquet").resolve(),
+            (dataset_dir / "meta" / "ocr_weak_labels.parquet").resolve(),
+        ]
+        found_alt = next((p for p in alt_candidates if p.exists() and p.is_file()), None)
+        weak_ocr_path = found_alt if found_alt is not None else None
+
+    records = load_patch_metadata(
+        dataset_dir=dataset_dir,
+        patch_meta_parquet=meta_path,
+        ink_ratio_min=float(getattr(args, "ink_ratio_min", 0.0)),
+        boundary_score_min=float(getattr(args, "boundary_score_min", 0.0)),
+    )
+    if not records:
+        raise RuntimeError(f"No patch records found after filtering in {meta_path}")
+    pid_to_index = patch_id_to_index_map(records)
+    positive_sources = str(getattr(args, "positive_sources", "mnn") or "mnn").strip().lower()
+    if positive_sources not in {"mnn", "ocr", "both"}:
+        positive_sources = "mnn"
+    use_mnn = positive_sources in {"mnn", "both"}
+    use_ocr = positive_sources in {"ocr", "both"}
+
+    mnn_map_all = load_mnn_map(
+        pairs_parquet=pairs_path if use_mnn else None,
+        pair_min_sim=float(getattr(args, "pair_min_sim", 0.25)),
+        pair_min_stability_ratio=float(getattr(args, "pair_min_stability_ratio", 0.5)),
+        require_multi_scale_ok=bool(getattr(args, "pair_require_multi_scale_ok", False)),
+        weight_scale=float(getattr(args, "w_mnn_scale", 1.0)),
+        max_neighbors_per_anchor=int(getattr(args, "max_neighbors_per_anchor", 0)),
+    ) if use_mnn else {}
+    ocr_map_all = load_ocr_weak_map(
+        weak_ocr_parquet=weak_ocr_path if use_ocr else None,
+        pair_min_confidence=float(getattr(args, "ocr_min_confidence", 0.2)),
+        min_chars=int(getattr(args, "ocr_min_chars", 2)),
+        max_group_size=int(getattr(args, "ocr_max_group_size", 128)),
+        max_neighbors_per_anchor=int(getattr(args, "ocr_max_neighbors_per_anchor", 0)),
+        weight_scale=float(getattr(args, "w_ocr_scale", 1.0)),
+        require_no_error=bool(getattr(args, "ocr_require_no_error", True)),
+        patch_id_allowlist=set(pid_to_index.keys()),
+    ) if use_ocr else {}
+
+    mnn_map = mnn_map_all if use_mnn else {}
+    ocr_map = ocr_map_all if use_ocr else {}
+    sampler_positive_map = merge_positive_maps(mnn_map, ocr_map)
+
+    anchors_with_mnn = sum(1 for rec in records if int(rec.patch_id) in mnn_map and len(mnn_map[int(rec.patch_id)]) > 0)
+    anchors_with_ocr = sum(1 for rec in records if int(rec.patch_id) in ocr_map and len(ocr_map[int(rec.patch_id)]) > 0)
+    anchors_with_pairs = sum(
+        1 for rec in records if int(rec.patch_id) in sampler_positive_map and len(sampler_positive_map[int(rec.patch_id)]) > 0
+    )
+    coverage = float(anchors_with_pairs) / float(max(1, len(records)))
+    if accelerator.is_main_process:
+        LOGGER.info(
+            "Patch mode: patches=%d positive_sources=%s mnn_pairs_file=%s weak_ocr_file=%s anchors_any=%d coverage=%.4f anchors_mnn=%d anchors_ocr=%d",
+            len(records),
+            str(positive_sources),
+            str(pairs_path) if pairs_path else "none",
+            str(weak_ocr_path) if weak_ocr_path else "none",
+            anchors_with_pairs,
+            coverage,
+            anchors_with_mnn,
+            anchors_with_ocr,
+        )
+    if bool(getattr(args, "require_pairs", False)) and anchors_with_pairs <= 0:
+        raise RuntimeError("require_pairs=True but no anchors with selected positives (MNN/OCR) after filtering.")
+    if use_ocr and weak_ocr_path is None:
+        raise FileNotFoundError(
+            "positive_sources includes OCR but no weak OCR parquet was found. "
+            "Use --weak_ocr_parquet or generate dataset/meta/weak_ocr.parquet."
+        )
+
+    image_preproc_mode, pb_pre_cfg, bdrc_pre_cfg = _build_image_preprocess_configs(args)
+    if accelerator.is_main_process:
+        LOGGER.info("Patch mpNCE image preprocessing pipeline: %s", image_preproc_mode)
+
+    transform = HierarchyTwoViewTransform(
+        target_height=int(args.target_height),
+        width_buckets=width_buckets,
+        patch_multiple=int(args.patch_multiple),
+        max_width=int(args.max_width),
+        mean=list(image_mean[:3]),
+        std=list(image_std[:3]),
+        image_preprocess_pipeline=image_preproc_mode,
+        pb_preprocess_config=pb_pre_cfg,
+        bdrc_preprocess_config=bdrc_pre_cfg,
+    )
+    dataset = PatchTwoViewDataset(records=records, transform=transform)
+    pair_sampler = PairBatchSampler(
+        records=records,
+        patch_id_to_index=pid_to_index,
+        mnn_map=sampler_positive_map,
+        config=SamplerConfig(
+            batch_size=int(args.batch_size),
+            p_pair=float(getattr(args, "p_pair", 0.6)),
+            hard_negative_ratio=float(getattr(args, "hard_negative_ratio", 0.2)),
+            drop_last=True,
+            seed=int(getattr(args, "pair_sampling_seed", args.seed)),
+        ),
+    )
+    dataloader = DataLoader(
+        dataset,
+        batch_sampler=pair_sampler,
+        num_workers=max(0, int(args.num_workers)),
+        pin_memory=True,
+        collate_fn=lambda b: _collate_patch_pairs(b, patch_multiple=int(args.patch_multiple)),
+    )
+    if len(dataloader) == 0:
+        raise RuntimeError("Pair-aware DataLoader has zero batches.")
+
+    backbone = AutoModel.from_pretrained(args.model_name_or_path)
+    if bool(args.gradient_checkpointing) and hasattr(backbone, "gradient_checkpointing_enable"):
+        backbone.gradient_checkpointing_enable()
+    hidden_size = getattr(backbone.config, "hidden_size", None)
+    if hidden_size is None:
+        raise RuntimeError("Backbone config has no hidden_size.")
+    projection_head = ProjectionHead(in_dim=int(hidden_size), out_dim=int(args.projection_dim))
+
+    # Two-phase schedule.
+    phase1_epochs = max(0, int(getattr(args, "phase1_epochs", 0)))
+    phase2_epochs = max(0, int(getattr(args, "phase2_epochs", 0)))
+    if phase1_epochs <= 0 and phase2_epochs <= 0:
+        total_epochs = max(1, int(args.num_train_epochs))
+        phase1_epochs = max(1, int(math.ceil(total_epochs * 0.25)))
+        phase2_epochs = max(0, int(total_epochs - phase1_epochs))
+    total_sched_epochs = phase1_epochs + phase2_epochs
+
+    freeze_all = bool(args.freeze_backbone) or phase1_epochs > 0
+    if freeze_all:
+        _freeze_backbone(backbone)
+    if bool(args.freeze_backbone):
+        trainable_backbone = 0
+    else:
+        if phase1_epochs <= 0:
+            trainable_backbone = _unfreeze_last_n_blocks(backbone, int(getattr(args, "unfreeze_last_n_blocks", 2)))
+        else:
+            trainable_backbone = 0
+
+    if accelerator.is_main_process:
+        LOGGER.info(
+            "Phase schedule: phase1_epochs=%d phase2_epochs=%d trainable_backbone_params_now=%d",
+            phase1_epochs,
+            phase2_epochs,
+            trainable_backbone,
+        )
+
+    base_lr = float(args.lr)
+    wd = float(args.weight_decay)
+    optimizer = torch.optim.AdamW(
+        [
+            {"params": list(backbone.parameters()), "lr": 0.0 if freeze_all else base_lr},
+            {"params": list(projection_head.parameters()), "lr": base_lr},
+        ],
+        lr=base_lr,
+        weight_decay=wd,
+    )
+
+    steps_per_epoch = len(dataloader)
+    req_max_steps = int(args.max_train_steps)
+    if req_max_steps > 0:
+        max_train_steps = int(req_max_steps)
+        num_train_epochs = int(math.ceil(max_train_steps / max(1, steps_per_epoch)))
+    else:
+        num_train_epochs = int(max(1, total_sched_epochs))
+        max_train_steps = int(num_train_epochs * steps_per_epoch)
+
+    lr_scheduler = get_scheduler(
+        name="cosine",
+        optimizer=optimizer,
+        num_warmup_steps=int(args.warmup_steps),
+        num_training_steps=max_train_steps,
+    )
+
+    backbone, projection_head, optimizer, dataloader, lr_scheduler = accelerator.prepare(
+        backbone, projection_head, optimizer, dataloader, lr_scheduler
+    )
+
+    mp_cfg = MpNCEConfig(
+        tau=float(args.temperature),
+        w_ocr=float(getattr(args, "w_ocr", 0.5)),
+        w_overlap=float(getattr(args, "w_overlap", 0.3)),
+        w_multiscale=float(getattr(args, "w_multiscale", 0.2)),
+        t_iou=float(getattr(args, "t_iou", 0.6)),
+        eps_center=float(getattr(args, "eps_center", 0.06)),
+        min_positives_per_anchor=max(1, int(getattr(args, "min_positives_per_anchor", 1))),
+        allow_self_fallback=bool(getattr(args, "allow_self_fallback", True)),
+        use_mnn=bool(use_mnn),
+        use_ocr=bool(use_ocr),
+        exclude_same_page_in_denominator=bool(getattr(args, "exclude_same_page_in_denominator", False)),
+        lambda_smooth=float(getattr(args, "lambda_smooth", 0.05)),
+    )
+
+    progress_bar = tqdm(total=max_train_steps, disable=not accelerator.is_local_main_process, desc="train-text-hierarchy-vit-mp")
+    global_step = 0
+    cumulative_loss = 0.0
+    skipped_batches = 0
+    fallback_count_total = 0.0
+    mnn_pos_total = 0.0
+    ocr_pos_total = 0.0
+    overlap_pos_total = 0.0
+    multiscale_pos_total = 0.0
+    valid_anchor_total = 0.0
+    avg_pos_accum = 0.0
+    avg_pos_count = 0
+    epoch_phase2_switched = False
+    phase1_steps = int(max(0, phase1_epochs) * steps_per_epoch)
+
+    for epoch in range(num_train_epochs):
+        pair_sampler.set_epoch(epoch)
+        if not bool(args.freeze_backbone):
+            backbone.train()
+        projection_head.train()
+
+        # Phase transition.
+        if (not epoch_phase2_switched) and (not bool(args.freeze_backbone)) and phase2_epochs > 0 and global_step >= phase1_steps:
+            unwrapped_backbone = accelerator.unwrap_model(backbone)
+            _freeze_backbone(unwrapped_backbone)
+            trainable_now = _unfreeze_last_n_blocks(unwrapped_backbone, int(getattr(args, "unfreeze_last_n_blocks", 2)))
+            scale_lr = float(getattr(args, "phase2_lr_scale", 0.1))
+            for g in optimizer.param_groups:
+                g["lr"] = float(g["lr"]) * scale_lr
+            if hasattr(lr_scheduler, "base_lrs"):
+                try:
+                    lr_scheduler.base_lrs = [float(v) * scale_lr for v in lr_scheduler.base_lrs]  # type: ignore[attr-defined]
+                except Exception:
+                    pass
+            epoch_phase2_switched = True
+            if accelerator.is_main_process:
+                LOGGER.info("Switched to phase2: unfreeze_last_n_blocks=%s trainable_params=%d", str(getattr(args, "unfreeze_last_n_blocks", 2)), trainable_now)
+
+        for batch in dataloader:
+            if global_step >= max_train_steps:
+                break
+            view_one = batch["view_one"].to(accelerator.device, non_blocking=True)
+            view_two = batch["view_two"].to(accelerator.device, non_blocking=True)
+            meta_rows = batch["meta_rows"]
+
+            if bool(args.freeze_backbone) or (phase1_epochs > 0 and global_step < phase1_steps):
+                with torch.no_grad():
+                    emb_one = _pooled_image_embedding(backbone, view_one)
+                    emb_two = _pooled_image_embedding(backbone, view_two)
+            else:
+                emb_one = _pooled_image_embedding(backbone, view_one)
+                emb_two = _pooled_image_embedding(backbone, view_two)
+            proj_one = projection_head(emb_one)
+            proj_two = projection_head(emb_two)
+            z = torch.cat([proj_one, proj_two], dim=0)
+
+            # Duplicate metadata for the two views.
+            metas_a = [_patch_meta_from_batch_row(r) for r in meta_rows]
+            patch_ids_a = [int(r["patch_id"]) for r in meta_rows]
+            metas = metas_a + metas_a
+            patch_ids = patch_ids_a + patch_ids_a
+
+            loss, stats = multi_positive_infonce(
+                z=z,
+                metas=metas,
+                patch_ids=patch_ids,
+                mnn_map=mnn_map,
+                cfg=mp_cfg,
+                ocr_map=ocr_map,
+            )
+
+            valid_anchors = int(round(float(stats.get("valid_anchors", 0.0))))
+            min_valid = max(1, int(getattr(args, "min_valid_anchors_per_batch", 1)))
+            if valid_anchors < min_valid:
+                optimizer.zero_grad(set_to_none=True)
+                skipped_batches += 1
+                global_step += 1
+                progress_bar.update(1)
+                progress_bar.set_postfix(loss="skip", valid=valid_anchors, skip=skipped_batches)
+                continue
+
+            accelerator.backward(loss)
+            optimizer.step()
+            lr_scheduler.step()
+            optimizer.zero_grad(set_to_none=True)
+
+            global_step += 1
+            cumulative_loss += float(loss.detach().item())
+            valid_anchor_total += float(stats.get("valid_anchors", 0.0))
+            fallback_count_total += float(stats.get("fallback_pos", 0.0))
+            mnn_pos_total += float(stats.get("mnn_pos", 0.0))
+            ocr_pos_total += float(stats.get("ocr_pos", 0.0))
+            overlap_pos_total += float(stats.get("overlap_pos", 0.0))
+            multiscale_pos_total += float(stats.get("multiscale_pos", 0.0))
+            avg_pos_accum += float(stats.get("avg_positives", 0.0))
+            avg_pos_count += 1
+            progress_bar.update(1)
+            progress_bar.set_postfix(
+                loss=f"{loss.detach().item():.4f}",
+                valid=f"{valid_anchors}",
+                mnn=f"{int(stats.get('mnn_pos', 0.0))}",
+                ocr=f"{int(stats.get('ocr_pos', 0.0))}",
+            )
+
+            if (
+                int(args.checkpoint_every_steps) > 0
+                and global_step % int(args.checkpoint_every_steps) == 0
+                and accelerator.is_main_process
+            ):
+                prefix = f"checkpoint_step_{global_step:07d}"
+                _save_artifacts(
+                    accelerator=accelerator,
+                    output_dir=output_dir,
+                    backbone=backbone,
+                    projection_head=projection_head,
+                    image_processor=image_processor,
+                    args=args,
+                    num_groups=len(records),
+                    num_assets=len(records),
+                    width_buckets=width_buckets,
+                    steps_per_epoch=steps_per_epoch,
+                    effective_max_train_steps=max_train_steps,
+                    effective_num_train_epochs=num_train_epochs,
+                    prefix=prefix,
+                    global_step=global_step,
+                    extra_config={
+                        "task": "text_hierarchy_vit_mpnce_retrieval",
+                        "patch_meta_parquet": str(meta_path),
+                        "pairs_parquet": str(pairs_path) if pairs_path else "",
+                        "weak_ocr_parquet": str(weak_ocr_path) if weak_ocr_path else "",
+                        "positive_sources": positive_sources,
+                        "image_preprocess_pipeline": image_preproc_mode,
+                        "image_preprocess_pb": (pb_pre_cfg.to_dict() if pb_pre_cfg is not None else None),
+                        "image_preprocess_bdrc": (bdrc_pre_cfg.to_dict() if bdrc_pre_cfg is not None else None),
+                    },
+                )
+        if global_step >= max_train_steps:
+            break
+
+    accelerator.wait_for_everyone()
+    final_artifacts: Optional[TrainingArtifacts] = None
+    emb_path = ""
+    emb_meta_path = ""
+    if accelerator.is_main_process:
+        extra_cfg = {
+            "task": "text_hierarchy_vit_mpnce_retrieval",
+            "positive_sources": positive_sources,
+            "patch_meta_parquet": str(meta_path),
+            "pairs_parquet": str(pairs_path) if pairs_path else "",
+            "weak_ocr_parquet": str(weak_ocr_path) if weak_ocr_path else "",
+            "image_preprocess_pipeline": image_preproc_mode,
+            "image_preprocess_pb": (pb_pre_cfg.to_dict() if pb_pre_cfg is not None else None),
+            "image_preprocess_bdrc": (bdrc_pre_cfg.to_dict() if bdrc_pre_cfg is not None else None),
+            "pair_min_sim": float(getattr(args, "pair_min_sim", 0.25)),
+            "pair_min_stability_ratio": float(getattr(args, "pair_min_stability_ratio", 0.5)),
+            "pair_require_multi_scale_ok": bool(getattr(args, "pair_require_multi_scale_ok", False)),
+            "require_pairs": bool(getattr(args, "require_pairs", False)),
+            "allow_self_fallback": bool(getattr(args, "allow_self_fallback", True)),
+            "w_mnn_scale": float(getattr(args, "w_mnn_scale", 1.0)),
+            "w_ocr_scale": float(getattr(args, "w_ocr_scale", 1.0)),
+            "w_ocr": float(getattr(args, "w_ocr", 0.5)),
+            "ocr_min_confidence": float(getattr(args, "ocr_min_confidence", 0.2)),
+            "ocr_min_chars": int(getattr(args, "ocr_min_chars", 2)),
+            "ocr_max_group_size": int(getattr(args, "ocr_max_group_size", 128)),
+            "ocr_max_neighbors_per_anchor": int(getattr(args, "ocr_max_neighbors_per_anchor", 0)),
+            "w_overlap": float(getattr(args, "w_overlap", 0.3)),
+            "w_multiscale": float(getattr(args, "w_multiscale", 0.2)),
+            "t_iou": float(getattr(args, "t_iou", 0.6)),
+            "eps_center": float(getattr(args, "eps_center", 0.06)),
+            "lambda_smooth": float(getattr(args, "lambda_smooth", 0.05)),
+            "exclude_same_page_in_denominator": bool(getattr(args, "exclude_same_page_in_denominator", False)),
+            "phase1_epochs": int(phase1_epochs),
+            "phase2_epochs": int(phase2_epochs),
+            "unfreeze_last_n_blocks": int(getattr(args, "unfreeze_last_n_blocks", 2)),
+            "phase2_lr_scale": float(getattr(args, "phase2_lr_scale", 0.1)),
+            "sampler_p_pair": float(getattr(args, "p_pair", 0.6)),
+            "sampler_hard_negative_ratio": float(getattr(args, "hard_negative_ratio", 0.2)),
+            "anchors_with_mnn": int(anchors_with_mnn),
+            "anchors_with_ocr": int(anchors_with_ocr),
+            "anchors_with_pairs": int(anchors_with_pairs),
+            "coverage_ratio": float(coverage),
+            "stats_valid_anchors_total": float(valid_anchor_total),
+            "stats_mnn_pos_total": float(mnn_pos_total),
+            "stats_ocr_pos_total": float(ocr_pos_total),
+            "stats_overlap_pos_total": float(overlap_pos_total),
+            "stats_multiscale_pos_total": float(multiscale_pos_total),
+            "stats_fallback_pos_total": float(fallback_count_total),
+            "stats_avg_positives_per_anchor": float(avg_pos_accum / max(1, avg_pos_count)),
+            "stats_skipped_batches": int(skipped_batches),
+            "loss_type": "mp_infonce",
+        }
+        final_artifacts = _save_artifacts(
+            accelerator=accelerator,
+            output_dir=output_dir,
+            backbone=backbone,
+            projection_head=projection_head,
+            image_processor=image_processor,
+            args=args,
+            num_groups=len(records),
+            num_assets=len(records),
+            width_buckets=width_buckets,
+            steps_per_epoch=steps_per_epoch,
+            effective_max_train_steps=max_train_steps,
+            effective_num_train_epochs=num_train_epochs,
+            prefix="",
+            global_step=global_step,
+            extra_config=extra_cfg,
+        )
+        # FAISS-ready embedding export.
+        emb_p, emb_meta_p = _export_faiss_embeddings(
+            accelerator=accelerator,
+            backbone=backbone,
+            projection_head=projection_head,
+            records=records,
+            output_dir=output_dir,
+            target_height=int(args.target_height),
+            width_buckets=width_buckets,
+            patch_multiple=int(args.patch_multiple),
+            max_width=int(args.max_width),
+            image_mean=image_mean[:3],
+            image_std=image_std[:3],
+            batch_size=max(1, int(args.batch_size)),
+            num_workers=max(0, int(args.num_workers)),
+            image_preprocess_pipeline=image_preproc_mode,
+            pb_preprocess_config=pb_pre_cfg,
+            bdrc_preprocess_config=bdrc_pre_cfg,
+        )
+        emb_path = str(emb_p)
+        emb_meta_path = str(emb_meta_p)
+        avg_loss = cumulative_loss / max(1, global_step - skipped_batches)
+        LOGGER.info("mpNCE training finished: steps=%d skipped=%d avg_loss=%.6f", global_step, skipped_batches, avg_loss)
+        LOGGER.info("Average positives/anchor (batch-mean): %.4f", float(avg_pos_accum / max(1, avg_pos_count)))
+        LOGGER.info(
+            "Positive counts by source: mnn=%.0f ocr=%.0f overlap=%.0f multiscale=%.0f fallback=%.0f",
+            mnn_pos_total,
+            ocr_pos_total,
+            overlap_pos_total,
+            multiscale_pos_total,
+            fallback_count_total,
+        )
+        LOGGER.info("FAISS-ready embeddings: %s / %s", emb_path, emb_meta_path)
+
+    return {
+        "mode": "mpnce_patch",
+        "global_step": int(global_step),
+        "groups": int(len(records)),
+        "assets": int(len(records)),
+        "output_dir": str(output_dir),
+        "backbone_dir": str(final_artifacts.backbone_dir) if final_artifacts else "",
+        "projection_head_path": str(final_artifacts.projection_head_path) if final_artifacts else "",
+        "config_path": str(final_artifacts.config_path) if final_artifacts else "",
+        "faiss_embeddings_path": emb_path,
+        "faiss_embeddings_meta_path": emb_meta_path,
+        "anchors_with_pairs": int(anchors_with_pairs),
+        "anchors_with_mnn": int(anchors_with_mnn),
+        "anchors_with_ocr": int(anchors_with_ocr),
+        "coverage_ratio": float(coverage),
+        "skipped_batches": int(skipped_batches),
+    }
+
+
 def run(args) -> Dict[str, Any]:
-    accelerator = Accelerator(mixed_precision=args.mixed_precision)
+    ddp_kwargs = DistributedDataParallelKwargs(find_unused_parameters=True)
+    accelerator = Accelerator(mixed_precision=args.mixed_precision, kwargs_handlers=[ddp_kwargs])
     _configure_logging(accelerator.is_main_process)
     set_seed(int(args.seed))
 
@@ -450,19 +2985,6 @@ def run(args) -> Dict[str, Any]:
         patch_multiple=int(args.patch_multiple),
         max_width=int(args.max_width),
     )
-    groups = _discover_hierarchy_groups(
-        dataset_dir=dataset_dir,
-        include_line_images=bool(args.include_line_images),
-        include_word_crops=bool(args.include_word_crops),
-        include_number_crops=bool(args.include_number_crops),
-        min_assets_per_group=max(1, int(args.min_assets_per_group)),
-    )
-    if not groups:
-        raise RuntimeError(f"No hierarchy groups found in {dataset_dir}.")
-
-    total_assets = sum(len(g.assets) for g in groups)
-    if accelerator.is_main_process:
-        LOGGER.info("Found %d groups / %d assets for training", len(groups), total_assets)
 
     image_processor = None
     image_stats_source = "default(0.5)"
@@ -485,6 +3007,79 @@ def run(args) -> Dict[str, Any]:
     if accelerator.is_main_process:
         LOGGER.info("Image normalization stats source: %s (mean=%s std=%s)", image_stats_source, image_mean[:3], image_std[:3])
 
+    train_mode = str(getattr(args, "train_mode", "auto") or "auto").strip().lower()
+    if train_mode not in {"auto", "legacy", "patch_mpnce", "patch_clip", "line_clip"}:
+        train_mode = "auto"
+    patch_meta_arg = str(getattr(args, "patch_meta_parquet", "") or "").strip()
+    patch_meta_candidate = (
+        Path(patch_meta_arg).expanduser().resolve()
+        if patch_meta_arg
+        else (dataset_dir / "meta" / "patches.parquet").resolve()
+    )
+    patch_meta_exists = patch_meta_candidate.exists() and patch_meta_candidate.is_file()
+    use_patch_mpnce_mode = (train_mode == "patch_mpnce") or (train_mode == "auto" and patch_meta_exists)
+    use_patch_clip_mode = (train_mode == "patch_clip")
+    use_line_clip_mode = (train_mode == "line_clip")
+    if accelerator.is_main_process:
+        LOGGER.info(
+            "Training mode resolved: requested=%s resolved=%s patch_meta=%s exists=%s",
+            train_mode,
+            ("line_clip" if use_line_clip_mode else ("patch_clip" if use_patch_clip_mode else ("patch_mpnce" if use_patch_mpnce_mode else "legacy"))),
+            str(patch_meta_candidate),
+            str(patch_meta_exists),
+        )
+    if use_line_clip_mode:
+        return _run_line_clip_training(
+            args=args,
+            accelerator=accelerator,
+            dataset_dir=dataset_dir,
+            output_dir=output_dir,
+            width_buckets=width_buckets,
+            image_mean=image_mean,
+            image_std=image_std,
+            image_processor=image_processor,
+        )
+    if use_patch_clip_mode:
+        return _run_patch_clip_training(
+            args=args,
+            accelerator=accelerator,
+            dataset_dir=dataset_dir,
+            output_dir=output_dir,
+            width_buckets=width_buckets,
+            image_mean=image_mean,
+            image_std=image_std,
+            image_processor=image_processor,
+        )
+    if use_patch_mpnce_mode:
+        return _run_patch_mpnce_training(
+            args=args,
+            accelerator=accelerator,
+            dataset_dir=dataset_dir,
+            output_dir=output_dir,
+            width_buckets=width_buckets,
+            image_mean=image_mean,
+            image_std=image_std,
+            image_processor=image_processor,
+        )
+
+    groups = _discover_hierarchy_groups(
+        dataset_dir=dataset_dir,
+        include_line_images=bool(args.include_line_images),
+        include_word_crops=bool(args.include_word_crops),
+        include_number_crops=bool(args.include_number_crops),
+        min_assets_per_group=max(1, int(args.min_assets_per_group)),
+    )
+    if not groups:
+        raise RuntimeError(f"No hierarchy groups found in {dataset_dir}.")
+
+    total_assets = sum(len(g.assets) for g in groups)
+    if accelerator.is_main_process:
+        LOGGER.info("Found %d groups / %d assets for training", len(groups), total_assets)
+
+    image_preproc_mode, pb_pre_cfg, bdrc_pre_cfg = _build_image_preprocess_configs(args)
+    if accelerator.is_main_process:
+        LOGGER.info("Legacy/NT-Xent image preprocessing pipeline: %s", image_preproc_mode)
+
     transform = HierarchyTwoViewTransform(
         target_height=int(args.target_height),
         width_buckets=width_buckets,
@@ -492,6 +3087,9 @@ def run(args) -> Dict[str, Any]:
         max_width=int(args.max_width),
         mean=image_mean[:3],
         std=image_std[:3],
+        image_preprocess_pipeline=image_preproc_mode,
+        pb_preprocess_config=pb_pre_cfg,
+        bdrc_preprocess_config=bdrc_pre_cfg,
     )
     dataset = HierarchyPairDataset(groups=groups, transform=transform)
     dataloader = DataLoader(
@@ -662,6 +3260,7 @@ def run(args) -> Dict[str, Any]:
         LOGGER.info("Saved config: %s", final_artifacts.config_path)
 
     return {
+        "mode": "legacy",
         "global_step": int(global_step),
         "groups": int(len(groups)),
         "assets": int(total_assets),

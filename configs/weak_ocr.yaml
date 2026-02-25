@@ -1,0 +1,24 @@
+backend:
+  name: "tesseract"
+  tesseract_cmd: null
+  lang: "bod"
+  oem: 1
+  psm: 6
+  extra_config: ""
+
+preprocess:
+  grayscale: true
+  invert: "auto"
+  pad_px: 8
+  resize_height: 192
+  denoise: false
+  binarize: "otsu"
+  clahe: false
+
+output:
+  min_confidence: 0.0
+  store_raw: false
+
+performance:
+  batch_read: 256
+  num_workers: 8

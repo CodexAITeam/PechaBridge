@@ -1,0 +1,56 @@
+model:
+  backbone: "facebook/dinov2-base"
+  proj_dim: 256
+  checkpoint: ""
+  batch_size_embed: 128
+  device: "cuda"
+
+index:
+  faiss_factory: "Flat"
+  use_gpu: false
+  normalize: true
+
+mining:
+  topK: 200
+  mutual_topK: 200
+  max_pairs_per_src: 3
+  sim_min: 0.25
+  exclude_same_page: true
+  exclude_same_doc: false
+  exclude_same_line: true
+  exclude_nearby_lines: 1
+  exclude_nearby_k: 0
+
+stability:
+  enabled: true
+  n_trials: 8
+  require_ratio: 0.5
+  jitter:
+    translate_px: 3
+    scale_range: [0.98, 1.02]
+    brightness: 0.05
+    contrast: 0.05
+    blur_sigma: 0.3
+  deterministic_seed: 123
+
+multiscale:
+  enabled: true
+  scales: [256, 384, 512]
+  require_two_scales: true
+  center_eps: 0.06
+
+filtering:
+  ink_ratio_min: 0.02
+  boundary_score_min: 0.0
+  signature:
+    enabled: false
+    method: "hproj"
+    corr_min: 0.3
+
+performance:
+  shard_by_doc: true
+  max_patches: null
+  num_workers: 8
+  two_stage_verify: true
+  stage1_overfetch_factor: 8
+  stage1_candidates_per_src: 0  # 0 => max_pairs_per_src * stage1_overfetch_factor

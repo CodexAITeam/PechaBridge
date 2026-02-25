@@ -20,8 +20,11 @@ import shutil
 import subprocess
 import sys
 import tempfile
+import textwrap
 import time
 import zipfile
+import csv
+import hashlib
 from concurrent.futures import ThreadPoolExecutor, as_completed
 from functools import lru_cache
 from pathlib import Path
@@ -31,6 +34,16 @@ import gradio as gr
 import numpy as np
 from PIL import Image, ImageDraw, ImageFont
 import yaml
+
+try:
+    import pandas as pd
+except Exception:
+    pd = None
+
+try:
+    from tqdm.auto import tqdm as _tqdm
+except Exception:
+    _tqdm = None
 
 try:
     from scipy.signal import find_peaks
@@ -52,10 +65,23 @@ except Exception:
     torch_f = None
 
 try:
-    from transformers import AutoImageProcessor, AutoModel
+    from transformers import AutoImageProcessor, AutoModel, AutoTokenizer
 except Exception:
     AutoImageProcessor = None
     AutoModel = None
+    AutoTokenizer = None
+
+try:
+    from pechabridge.ocr.preprocess import PreprocessConfig as _PBPreprocessConfig, preprocess_patch_image as _pb_preprocess_patch_image
+except Exception:
+    _PBPreprocessConfig = None
+    _pb_preprocess_patch_image = None
+
+try:
+    from pechabridge.ocr.preprocess_bdrc import BDRCPreprocessConfig as _BDRCPreprocessConfig, preprocess_image_bdrc as _preprocess_image_bdrc
+except Exception:
+    _BDRCPreprocessConfig = None
+    _preprocess_image_bdrc = None
 
 
 ROOT = Path(__file__).resolve().parent
@@ -116,10 +142,15 @@ DEFAULT_LAYOUT_CLASS_NAMES: Dict[int, str] = {
 }
 LABEL_FONT_SIZE = 12
 TEXT_HIERARCHY_SUBSET_CHOICES = [
-    "TextHierarchy (line.png)",
-    "TextHierarchy (word crops)",
-    "NumberCrops (tibetan_number_word)",
-    "NumberCrops (chinese_number_word)",
+    "PatchDataset (debug)",
+    "PatchDataset (all)",
+    "PatchDataset (scale=256)",
+    "PatchDataset (scale=384)",
+    "PatchDataset (scale=512)",
+    "Legacy TextHierarchy (line.png)",
+    "Legacy TextHierarchy (word crops)",
+    "Legacy NumberCrops (tibetan_number_word)",
+    "Legacy NumberCrops (chinese_number_word)",
     "All Images",
 ]
 
@@ -2111,6 +2142,197 @@ def _read_json_file_pretty(path: Path) -> str:
         return "{}"
 
 
+def run_gen_patches_live(
+    config_path: str,
+    model_path: str,
+    input_dir: str,
+    output_dir: str,
+    conf: float,
+    imgsz: int,
+    device: str,
+    no_samples: int,
+    seed: int,
+    target_height: int,
+    widths: str,
+    overlap: float,
+    rmin: float,
+    prominence: float,
+    n_per_line_per_scale: int,
+    p_aligned: float,
+    debug_dump: int,
+):
+    cli_path = ROOT / "cli.py"
+    cfg = (config_path or "").strip()
+    model = Path(model_path).expanduser().resolve()
+    in_dir = Path(input_dir).expanduser().resolve()
+    out_dir = Path(output_dir).expanduser().resolve()
+    expected_meta = (out_dir / "meta" / "patches.parquet").resolve()
+
+    if not cli_path.exists():
+        msg = f"Failed: script not found: {cli_path}"
+        yield msg, str(out_dir), str(expected_meta)
+        return
+    if not model.exists() or not model.is_file():
+        msg = f"Failed: model path not found: {model}"
+        yield msg, str(out_dir), str(expected_meta)
+        return
+    if not in_dir.exists() or not in_dir.is_dir():
+        msg = f"Failed: input_dir does not exist: {in_dir}"
+        yield msg, str(out_dir), str(expected_meta)
+        return
+
+    out_dir.mkdir(parents=True, exist_ok=True)
+
+    cmd = [
+        sys.executable,
+        "-u",
+        str(cli_path),
+        "gen-patches",
+    ]
+    if cfg:
+        cmd.extend(["--config", str(Path(cfg).expanduser().resolve())])
+    cmd.extend(
+        [
+            "--model",
+            str(model),
+            "--input-dir",
+            str(in_dir),
+            "--output-dir",
+            str(out_dir),
+            "--conf",
+            str(float(conf)),
+            "--imgsz",
+            str(int(imgsz)),
+            "--device",
+            str((device or "").strip()),
+            "--no-samples",
+            str(int(no_samples)),
+            "--seed",
+            str(int(seed)),
+            "--target-height",
+            str(int(target_height)),
+            "--widths",
+            str((widths or "").strip()),
+            "--overlap",
+            str(float(overlap)),
+            "--rmin",
+            str(float(rmin)),
+            "--prominence",
+            str(float(prominence)),
+            "--n-per-line-per-scale",
+            str(int(n_per_line_per_scale)),
+            "--p-aligned",
+            str(float(p_aligned)),
+            "--debug-dump",
+            str(int(debug_dump)),
+        ]
+    )
+
+    try:
+        env = os.environ.copy()
+        env["PYTHONUNBUFFERED"] = "1"
+        proc = subprocess.Popen(
+            cmd,
+            cwd=str(ROOT),
+            env=env,
+            stdout=subprocess.PIPE,
+            stderr=subprocess.STDOUT,
+            text=False,
+            bufsize=0,
+        )
+    except Exception as exc:
+        msg = f"Failed\nOutput dir: {out_dir}\n\n{type(exc).__name__}: {exc}"
+        yield msg, str(out_dir), str(expected_meta)
+        return
+
+    if proc.stdout is not None:
+        try:
+            os.set_blocking(proc.stdout.fileno(), False)
+        except Exception:
+            pass
+
+    log_lines: List[str] = []
+    partial = ""
+    last_emit_ts = 0.0
+    stream_failed = False
+    stream_fail_msg = ""
+
+    yield (
+        "Generating patch dataset ...\n"
+        f"Model: {model}\n"
+        f"Input dir: {in_dir}\n"
+        f"Output dir: {out_dir}\n"
+        f"Expected metadata: {expected_meta}\n"
+        f"Command: {shlex.join(cmd)}\n",
+        str(out_dir),
+        str(expected_meta),
+    )
+
+    while True:
+        got_output = False
+        if (not stream_failed) and proc.stdout is not None:
+            try:
+                chunk = proc.stdout.read()
+            except BlockingIOError:
+                chunk = b""
+            except Exception as exc:
+                stream_failed = True
+                stream_fail_msg = f"stdout stream disabled ({type(exc).__name__}: {exc})"
+                chunk = b""
+
+            if chunk:
+                got_output = True
+                chunk_text = chunk.decode("utf-8", errors="replace") if isinstance(chunk, bytes) else str(chunk)
+                partial += chunk_text.replace("\r", "\n")
+                parts = partial.splitlines(keepends=True)
+                keep = ""
+                for piece in parts:
+                    if piece.endswith("\n"):
+                        log_lines.append(piece.rstrip("\n"))
+                    else:
+                        keep = piece
+                partial = keep
+
+        now = time.time()
+        if now - last_emit_ts >= 1.0:
+            tail = _tail_lines_newest_first(log_lines, 800)
+            if stream_failed and stream_fail_msg:
+                tail = f"{tail}\n[warning] {stream_fail_msg}" if tail else f"[warning] {stream_fail_msg}"
+            running_msg = (
+                "Generating patch dataset ...\n"
+                f"Model: {model}\n"
+                f"Input dir: {in_dir}\n"
+                f"Output dir: {out_dir}\n"
+                f"Expected metadata: {expected_meta}\n\n{tail}"
+            )
+            yield running_msg, str(out_dir), str(expected_meta)
+            last_emit_ts = now
+
+        if proc.poll() is not None:
+            break
+        if not got_output:
+            time.sleep(0.15)
+
+    if proc.stdout is not None:
+        try:
+            rest = proc.stdout.read()
+        except Exception:
+            rest = b""
+        if rest:
+            partial += rest.decode("utf-8", errors="replace").replace("\r", "\n") if isinstance(rest, bytes) else str(rest).replace("\r", "\n")
+        if partial:
+            log_lines.extend(partial.splitlines())
+
+    ok = proc.returncode == 0
+    status = "Success" if ok else "Failed"
+    final_msg = (
+        f"{status}\nModel: {model}\nInput dir: {in_dir}\nOutput dir: {out_dir}\n"
+        f"Metadata path: {expected_meta}\n\n"
+        + _tail_lines_newest_first(log_lines, 3000)
+    )
+    yield final_msg, str(out_dir), str(expected_meta)
+
+
 def run_eval_text_hierarchy_vit_live(
     dataset_dir: str,
     backbone_dir: str,
@@ -2703,8 +2925,8 @@ def run_donut_ocr_workflow_live(
     prepared_output_dir: str,
     model_output_dir: str,
     model_name_or_path: str,
-    train_tokenizer: bool,
-    tokenizer_vocab_size: int,
+    _unused_tokenizer_retrain_flag: bool,
+    _unused_tokenizer_retrain_vocab_size: int,
     per_device_train_batch_size: int,
     per_device_eval_batch_size: int,
     num_train_epochs: float,
@@ -2792,8 +3014,6 @@ def run_donut_ocr_workflow_live(
         str(model_output_path),
         "--model_name_or_path",
         (model_name_or_path or "microsoft/trocr-base-stage1").strip(),
-        "--tokenizer_vocab_size",
-        str(int(tokenizer_vocab_size)),
         "--per_device_train_batch_size",
         str(int(per_device_train_batch_size)),
         "--per_device_eval_batch_size",
@@ -2813,8 +3033,6 @@ def run_donut_ocr_workflow_live(
     prepared_output_clean = (prepared_output_dir or "").strip()
     if prepared_output_clean:
         cmd.extend(["--prepared_output_dir", str(Path(prepared_output_clean).expanduser())])
-    if train_tokenizer:
-        cmd.append("--train_tokenizer")
     if skip_generation:
         cmd.append("--skip_generation")
     if skip_prepare:
@@ -2984,6 +3202,1692 @@ def run_donut_ocr_workflow_live(
     yield final_msg, str(dataset_dir), str(prepared_dir), str(model_output_path), str(summary_path)
 
 
+def _resolve_donut_runtime_dirs(model_root_or_model_dir: str) -> Tuple[Optional[Path], Optional[Path], Optional[Path], str]:
+    raw = (model_root_or_model_dir or "").strip()
+    if not raw:
+        return None, None, None, "Empty model path."
+    root = Path(raw).expanduser().resolve()
+    if not root.exists():
+        return None, None, None, f"Path not found: {root}"
+
+    def _is_hf_model_dir(p: Path) -> bool:
+        if not p.exists() or not p.is_dir():
+            return False
+        if not (p / "config.json").exists():
+            return False
+        return (
+            (p / "pytorch_model.bin").exists()
+            or (p / "model.safetensors").exists()
+            or (p / "model.safetensors.index.json").exists()
+        )
+
+    # Accept either output root (`.../donut_openpecha_bdrc`) or direct model dir (`.../model`).
+    if _is_hf_model_dir(root):
+        model_dir = root
+        base_dir = root.parent
+    else:
+        model_dir = root / "model"
+        base_dir = root
+
+    tokenizer_dir = base_dir / "tokenizer"
+    image_processor_dir = base_dir / "image_processor"
+
+    if not _is_hf_model_dir(model_dir):
+        return None, None, None, f"Could not find DONUT/TroCR model dir at {model_dir}"
+    if not tokenizer_dir.exists():
+        tokenizer_dir = model_dir
+    if not image_processor_dir.exists():
+        image_processor_dir = model_dir
+    return model_dir, tokenizer_dir, image_processor_dir, ""
+
+
+@lru_cache(maxsize=8)
+def _load_donut_ocr_runtime_cached(model_dir_s: str, tokenizer_dir_s: str, image_processor_dir_s: str, device_pref: str):
+    if torch is None:
+        raise RuntimeError("PyTorch not available in UI environment.")
+    if AutoImageProcessor is None or AutoTokenizer is None:
+        raise RuntimeError("transformers not available in UI environment.")
+
+    device, device_msg = _resolve_torch_device_for_encoding(device_pref)
+    model_dir = Path(model_dir_s).expanduser().resolve()
+    tokenizer_dir = Path(tokenizer_dir_s).expanduser().resolve()
+    image_processor_dir = Path(image_processor_dir_s).expanduser().resolve()
+
+    from scripts.train_donut_ocr import (
+        _load_ved_model_robust,
+        _paired_end_token_for_start,
+        _strip_special_token_strings,
+    )  # reuse training-side HF/meta/token fixes
+
+    model = _load_ved_model_robust(str(model_dir))
+    tokenizer = AutoTokenizer.from_pretrained(str(tokenizer_dir), use_fast=True)
+    image_processor = AutoImageProcessor.from_pretrained(str(image_processor_dir))
+    # Align generation/model token IDs with the loaded tokenizer (same idea as training script).
+    try:
+        if tokenizer.pad_token_id is not None:
+            model.config.pad_token_id = int(tokenizer.pad_token_id)
+            model.generation_config.pad_token_id = int(tokenizer.pad_token_id)
+        decoder_start_id = getattr(model.config, "decoder_start_token_id", None)
+        if decoder_start_id is None or int(decoder_start_id) < 0:
+            for cand in (
+                getattr(tokenizer, "bos_token_id", None),
+                getattr(tokenizer, "cls_token_id", None),
+                getattr(tokenizer, "eos_token_id", None),
+            ):
+                if cand is not None and int(cand) >= 0:
+                    decoder_start_id = int(cand)
+                    break
+        if decoder_start_id is not None and int(decoder_start_id) >= 0:
+            model.config.decoder_start_token_id = int(decoder_start_id)
+            model.generation_config.decoder_start_token_id = int(decoder_start_id)
+        eos_id = getattr(model.config, "eos_token_id", None)
+        if eos_id is None or int(eos_id) < 0:
+            eos_candidate = None
+            try:
+                start_tok = tokenizer.convert_ids_to_tokens(int(decoder_start_id)) if decoder_start_id is not None else None
+                end_tok = _paired_end_token_for_start(str(start_tok or ""))
+                if end_tok:
+                    end_id = tokenizer.convert_tokens_to_ids(end_tok)
+                    unk_id = getattr(tokenizer, "unk_token_id", None)
+                    if (
+                        end_id is not None
+                        and int(end_id) >= 0
+                        and (unk_id is None or int(end_id) != int(unk_id))
+                    ):
+                        eos_candidate = int(end_id)
+            except Exception:
+                eos_candidate = None
+            if eos_candidate is None and tokenizer.eos_token_id is not None:
+                eos_candidate = int(tokenizer.eos_token_id)
+            if eos_candidate is not None:
+                model.config.eos_token_id = int(eos_candidate)
+                model.generation_config.eos_token_id = int(eos_candidate)
+    except Exception:
+        pass
+    model.eval()
+    model.to(device)
+    return {
+        "model": model,
+        "tokenizer": tokenizer,
+        "image_processor": image_processor,
+        "device": device,
+        "device_msg": device_msg,
+        "model_dir": str(model_dir),
+        "tokenizer_dir": str(tokenizer_dir),
+        "image_processor_dir": str(image_processor_dir),
+    }
+
+
+def _apply_donut_ui_preprocess(image: Image.Image, pipeline: str) -> Image.Image:
+    rgb = image.convert("RGB")
+    # Prefer the exact training-side preprocessing function to avoid UI/training mismatches.
+    try:
+        from scripts.train_donut_ocr import _apply_image_preprocess_pipeline as _apply_train_donut_preproc
+
+        return _apply_train_donut_preproc(rgb, str(pipeline or "none")).convert("RGB")
+    except Exception:
+        pass
+
+    mode = (pipeline or "none").strip().lower()
+    if mode == "pb" and _pb_preprocess_patch_image is not None and _PBPreprocessConfig is not None:
+        try:
+            return _pb_preprocess_patch_image(image=rgb, config=_PBPreprocessConfig()).convert("RGB")
+        except Exception:
+            return rgb
+    if mode == "bdrc" and _preprocess_image_bdrc is not None and _BDRCPreprocessConfig is not None:
+        try:
+            return _preprocess_image_bdrc(image=rgb, config=_BDRCPreprocessConfig.vit_defaults()).convert("RGB")
+        except Exception:
+            return rgb
+    return rgb
+
+
+def _apply_line_clip_ui_preprocess_from_runtime_cfg(image: Image.Image, runtime_cfg: Dict[str, Any]) -> Image.Image:
+    rgb = image.convert("RGB")
+    cfg_obj = runtime_cfg if isinstance(runtime_cfg, dict) else {}
+    mode = str(cfg_obj.get("image_preprocess_pipeline", "none") or "none").strip().lower()
+    if mode not in {"pb", "bdrc"}:
+        return rgb
+
+    if mode == "pb" and _pb_preprocess_patch_image is not None and _PBPreprocessConfig is not None:
+        try:
+            pb_payload = cfg_obj.get("image_preprocess_pb")
+            if isinstance(pb_payload, dict) and hasattr(_PBPreprocessConfig, "from_dict"):
+                pb_cfg = _PBPreprocessConfig.from_dict(pb_payload)
+            else:
+                pb_cfg = _PBPreprocessConfig()
+            return _pb_preprocess_patch_image(image=rgb, config=pb_cfg).convert("RGB")
+        except Exception:
+            return rgb
+
+    if mode == "bdrc" and _preprocess_image_bdrc is not None and _BDRCPreprocessConfig is not None:
+        try:
+            bdrc_payload = cfg_obj.get("image_preprocess_bdrc")
+            if isinstance(bdrc_payload, dict) and hasattr(_BDRCPreprocessConfig, "from_dict"):
+                bdrc_cfg = _BDRCPreprocessConfig.from_dict(bdrc_payload)
+            else:
+                bdrc_cfg = _BDRCPreprocessConfig.vit_defaults()
+            return _preprocess_image_bdrc(image=rgb, config=bdrc_cfg).convert("RGB")
+        except Exception:
+            return rgb
+
+    return rgb
+
+
+def run_donut_ocr_inference_ui(
+    image: Optional[np.ndarray],
+    model_root_or_model_dir: str,
+    image_preprocess_pipeline: str,
+    device_preference: str,
+    generation_max_length: int,
+    num_beams: int,
+):
+    if image is None:
+        return None, "", "{}"
+    model_dir, tokenizer_dir, image_processor_dir, err = _resolve_donut_runtime_dirs(model_root_or_model_dir)
+    if err:
+        return image, f"Failed: {err}", json.dumps({"ok": False, "error": err}, ensure_ascii=False, indent=2)
+
+    try:
+        runtime = _load_donut_ocr_runtime_cached(
+            str(model_dir),
+            str(tokenizer_dir),
+            str(image_processor_dir),
+            str(device_preference or "auto"),
+        )
+    except Exception as exc:
+        msg = f"Failed loading DONUT runtime: {type(exc).__name__}: {exc}"
+        return image, msg, json.dumps({"ok": False, "error": msg}, ensure_ascii=False, indent=2)
+
+    try:
+        pil = Image.fromarray(np.asarray(image).astype(np.uint8)).convert("RGB")
+        proc_pil = _apply_donut_ui_preprocess(pil, image_preprocess_pipeline)
+        image_processor = runtime["image_processor"]
+        tokenizer = runtime["tokenizer"]
+        model = runtime["model"]
+        device = runtime["device"]
+
+        pixel_values = image_processor(images=proc_pil, return_tensors="pt").pixel_values
+        pixel_values = pixel_values.to(device)
+        with torch.no_grad():
+            generated = model.generate(
+                pixel_values=pixel_values,
+                max_length=max(8, int(generation_max_length)),
+                num_beams=max(1, int(num_beams)),
+            )
+        text = tokenizer.batch_decode(generated, skip_special_tokens=True)[0] if len(generated) else ""
+        text = _strip_special_token_strings(str(text or ""), tokenizer)
+        gen_ids: List[int] = []
+        try:
+            if len(generated):
+                gen_ids = [int(x) for x in generated[0].detach().cpu().tolist()]
+        except Exception:
+            gen_ids = []
+
+        debug = {
+            "ok": True,
+            "model_dir": runtime["model_dir"],
+            "tokenizer_dir": runtime["tokenizer_dir"],
+            "image_processor_dir": runtime["image_processor_dir"],
+            "device": runtime["device"],
+            "device_msg": runtime.get("device_msg", ""),
+            "image_preprocess_pipeline": (image_preprocess_pipeline or "none"),
+            "generation_max_length": int(generation_max_length),
+            "num_beams": int(num_beams),
+            "decoder_start_token_id": getattr(model.config, "decoder_start_token_id", None),
+            "pad_token_id": getattr(model.config, "pad_token_id", None),
+            "eos_token_id": getattr(model.config, "eos_token_id", None),
+            "tokenizer_bos_token_id": getattr(tokenizer, "bos_token_id", None),
+            "tokenizer_pad_token_id": getattr(tokenizer, "pad_token_id", None),
+            "tokenizer_eos_token_id": getattr(tokenizer, "eos_token_id", None),
+            "generated_token_ids_head": gen_ids[:32],
+            "output_length_chars": len(text),
+        }
+        return np.array(proc_pil), text, json.dumps(debug, ensure_ascii=False, indent=2)
+    except Exception as exc:
+        msg = f"Failed DONUT OCR inference: {type(exc).__name__}: {exc}"
+        return image, msg, json.dumps({"ok": False, "error": msg}, ensure_ascii=False, indent=2)
+
+
+def run_donut_ocr_inference_with_gt_ui(
+    image: Optional[np.ndarray],
+    model_root_or_model_dir: str,
+    image_preprocess_pipeline: str,
+    device_preference: str,
+    generation_max_length: int,
+    num_beams: int,
+    ground_truth_text: str,
+):
+    preview, pred_text, debug_json = run_donut_ocr_inference_ui(
+        image=image,
+        model_root_or_model_dir=model_root_or_model_dir,
+        image_preprocess_pipeline=image_preprocess_pipeline,
+        device_preference=device_preference,
+        generation_max_length=generation_max_length,
+        num_beams=num_beams,
+    )
+    gt = str(ground_truth_text or "")
+    cer_text = ""
+    try:
+        debug_obj = json.loads(debug_json or "{}")
+    except Exception:
+        debug_obj = {"raw_debug": debug_json}
+    if isinstance(debug_obj, dict) and bool(debug_obj.get("ok")) and gt.strip():
+        cer = _cer_single_ui(pred_text or "", gt)
+        cer_text = f"{cer:.6f}"
+        debug_obj["ground_truth_length_chars"] = len(gt)
+        debug_obj["cer"] = cer
+        debug_json = json.dumps(debug_obj, ensure_ascii=False, indent=2)
+    return preview, pred_text, gt, cer_text, debug_json
+
+
+def scan_donut_ocr_models_ui(models_dir: str):
+    base = Path(models_dir).expanduser().resolve()
+    if not base.exists() or not base.is_dir():
+        return gr.update(choices=[], value=None), "", f"Directory not found: {base}"
+
+    def _is_hf_model_dir(p: Path) -> bool:
+        if not p.exists() or not p.is_dir():
+            return False
+        if not (p / "config.json").exists():
+            return False
+        return (
+            (p / "pytorch_model.bin").exists()
+            or (p / "model.safetensors").exists()
+            or (p / "model.safetensors.index.json").exists()
+        )
+
+    found_entries: List[str] = []
+
+    for p in sorted(base.rglob("*")):
+        if not p.is_dir():
+            continue
+
+        # Final train output root layout: <root>/model + tokenizer + image_processor
+        if p.name == "model" and _is_hf_model_dir(p):
+            parent = p.parent
+            tok = parent / "tokenizer"
+            imgp = parent / "image_processor"
+            if tok.exists() and imgp.exists():
+                found_entries.append(str(parent.resolve()))
+            continue
+
+        # In-training checkpoints: <root>/checkpoint-XXXX + tokenizer + image_processor in parent
+        if p.name.startswith("checkpoint-") and _is_hf_model_dir(p):
+            parent = p.parent
+            tok = parent / "tokenizer"
+            imgp = parent / "image_processor"
+            if tok.exists() and imgp.exists():
+                found_entries.append(str(p.resolve()))
+
+    found_entries = sorted(set(found_entries))
+    default = found_entries[0] if found_entries else ""
+    msg = (
+        f"Found {len(found_entries)} DONUT/TroCR model entries (final outputs and/or checkpoints) in {base}"
+    )
+    return gr.update(choices=found_entries, value=(default if default else None)), default, msg
+
+
+def _read_jsonl_rows_ui(path: Path) -> List[Dict[str, Any]]:
+    rows: List[Dict[str, Any]] = []
+    if not path.exists() or not path.is_file():
+        return rows
+    try:
+        with path.open("r", encoding="utf-8") as f:
+            for line in f:
+                raw = line.strip()
+                if not raw:
+                    continue
+                try:
+                    obj = json.loads(raw)
+                except Exception:
+                    continue
+                if isinstance(obj, dict):
+                    rows.append(obj)
+    except Exception:
+        return []
+    return rows
+
+
+def _resolve_ocr_manifest_image_path_ui(image_value: str, manifest_path: Path) -> Optional[Path]:
+    raw = (image_value or "").strip()
+    if not raw:
+        return None
+    p = Path(raw).expanduser()
+    if p.is_absolute():
+        return p if p.exists() and p.is_file() else None
+    candidates = [
+        (manifest_path.parent / p).resolve(),
+        (manifest_path.parent.parent / p).resolve(),
+        (manifest_path.parent.parent.parent / p).resolve(),
+        (ROOT / p).resolve(),
+    ]
+    for c in candidates:
+        if c.exists() and c.is_file():
+            return c
+    return None
+
+
+def _extract_ocr_manifest_row_fields_ui(row: Dict[str, Any]) -> Tuple[str, str]:
+    image_keys = ["line_path", "src__image", "image", "image_path", "line_image", "line_image_path", "path"]
+    text_keys = ["text", "src__label", "label", "transcription", "ocr_text", "line_text"]
+    img = ""
+    txt = ""
+    for k in image_keys:
+        v = row.get(k)
+        if isinstance(v, str) and v.strip():
+            img = v.strip()
+            break
+    for k in text_keys:
+        v = row.get(k)
+        if isinstance(v, str) and v.strip():
+            txt = v.strip()
+            break
+    return img, txt
+
+
+def scan_donut_ocr_datasets_ui(datasets_dir: str):
+    base = Path(datasets_dir).expanduser().resolve()
+    if not base.exists() or not base.is_dir():
+        empty = gr.update(choices=[], value=None)
+        return empty, gr.update(choices=[], value=None), "", f"Directory not found: {base}"
+
+    dataset_roots: List[str] = []
+    split_map: Dict[str, List[str]] = {}
+    for p in sorted(base.rglob("meta/lines.jsonl")):
+        split_dir = p.parent.parent  # <root>/<split>/meta/lines.jsonl
+        root_dir = split_dir.parent
+        split_name = split_dir.name
+        if split_name not in {"train", "val", "eval", "test"}:
+            continue
+        key = str(root_dir.resolve())
+        split_map.setdefault(key, [])
+        split_map[key].append(split_name)
+    for k in sorted(split_map.keys()):
+        split_map[k] = sorted(set(split_map[k]), key=lambda s: {"train": 0, "val": 1, "eval": 2, "test": 3}.get(s, 9))
+        dataset_roots.append(k)
+
+    default_dataset = dataset_roots[0] if dataset_roots else ""
+    default_splits = split_map.get(default_dataset, [])
+    default_split = default_splits[0] if default_splits else None
+    state_json = json.dumps(split_map, ensure_ascii=False)
+    msg = f"Found {len(dataset_roots)} OCR dataset root(s) with manifests in {base}"
+    return (
+        gr.update(choices=dataset_roots, value=(default_dataset if default_dataset else None)),
+        gr.update(choices=default_splits, value=default_split),
+        state_json,
+        msg,
+    )
+
+
+def on_donut_ocr_dataset_change_ui(dataset_root: str, split_map_json: str):
+    root = (dataset_root or "").strip()
+    try:
+        split_map = json.loads(split_map_json or "{}")
+    except Exception:
+        split_map = {}
+    splits = split_map.get(root, []) if isinstance(split_map, dict) else []
+    default_split = splits[0] if splits else None
+    return gr.update(choices=splits, value=default_split)
+
+
+def _levenshtein_ui(a: str, b: str) -> int:
+    if a == b:
+        return 0
+    if not a:
+        return len(b)
+    if not b:
+        return len(a)
+    prev = list(range(len(b) + 1))
+    for i, ca in enumerate(a, start=1):
+        curr = [i]
+        for j, cb in enumerate(b, start=1):
+            curr.append(min(
+                curr[j - 1] + 1,
+                prev[j] + 1,
+                prev[j - 1] + (0 if ca == cb else 1),
+            ))
+        prev = curr
+    return prev[-1]
+
+
+def _cer_single_ui(pred: str, ref: str) -> float:
+    denom = max(1, len(ref or ""))
+    return float(_levenshtein_ui(pred or "", ref or "") / denom)
+
+
+def load_random_donut_ocr_dataset_sample_ui(dataset_root: str, split_name: str, seed: float):
+    root = Path((dataset_root or "").strip()).expanduser().resolve()
+    split = (split_name or "").strip()
+    if not root.exists():
+        return None, "", "{}", ""
+    manifest = root / split / "meta" / "lines.jsonl"
+    rows = _read_jsonl_rows_ui(manifest)
+    if not rows:
+        msg = f"No rows found in {manifest}"
+        return None, "", json.dumps({"ok": False, "error": msg}, ensure_ascii=False, indent=2), ""
+    try:
+        seed_i = int(float(seed))
+    except Exception:
+        seed_i = int(time.time())
+    rng = np.random.default_rng(seed_i)
+    order = rng.permutation(len(rows)).tolist()
+    chosen_row = None
+    chosen_img_path: Optional[Path] = None
+    for idx in order:
+        row = rows[int(idx)]
+        img_raw, txt = _extract_ocr_manifest_row_fields_ui(row)
+        img_path = _resolve_ocr_manifest_image_path_ui(img_raw, manifest)
+        if img_path is None or not txt:
+            continue
+        chosen_row = row
+        chosen_img_path = img_path
+        break
+    if chosen_row is None or chosen_img_path is None:
+        msg = f"No usable image/text row found in {manifest}"
+        return None, "", json.dumps({"ok": False, "error": msg}, ensure_ascii=False, indent=2), ""
+    with Image.open(chosen_img_path) as im:
+        rgb = im.convert("RGB")
+    _, gt = _extract_ocr_manifest_row_fields_ui(chosen_row)
+    debug = {
+        "ok": True,
+        "dataset_root": str(root),
+        "split": split,
+        "manifest": str(manifest),
+        "image_path": str(chosen_img_path),
+        "line_id": chosen_row.get("line_id"),
+        "page_id": chosen_row.get("page_id"),
+        "doc_id": chosen_row.get("doc_id"),
+    }
+    return np.array(rgb), str(gt), json.dumps(debug, ensure_ascii=False, indent=2), str(chosen_img_path)
+
+
+def scan_line_clip_dual_models_ui(models_dir: str):
+    base = Path(models_dir).expanduser().resolve()
+    if not base.exists() or not base.is_dir():
+        empty = gr.update(choices=[], value=None)
+        return empty, "", "", "", "", "{}", f"Directory not found: {base}"
+
+    bundles: Dict[str, Dict[str, str]] = {}
+    bundle_rows: List[Dict[str, Any]] = []
+
+    def _parse_ckpt_sort_fields(name: str) -> Tuple[int, float, float]:
+        low = str(name or "").lower()
+        step = -1
+        i2t1 = -1.0
+        t2i1 = -1.0
+        m_step = re.search(r"checkpoint_step_(\d+)", low)
+        if m_step:
+            try:
+                step = int(m_step.group(1))
+            except Exception:
+                step = -1
+        m_i2t1 = re.search(r"_i2t1-([0-9]+p[0-9]+|na)", low)
+        if m_i2t1:
+            tok = m_i2t1.group(1)
+            if tok != "na":
+                try:
+                    i2t1 = float(tok.replace("p", "."))
+                except Exception:
+                    i2t1 = -1.0
+        m_t2i1 = re.search(r"_t2i1-([0-9]+p[0-9]+|na)", low)
+        if m_t2i1:
+            tok = m_t2i1.group(1)
+            if tok != "na":
+                try:
+                    t2i1 = float(tok.replace("p", "."))
+                except Exception:
+                    t2i1 = -1.0
+        return step, i2t1, t2i1
+
+    def _to_f(raw: Any, default: float = -1.0) -> float:
+        try:
+            val = float(raw)
+            if math.isfinite(val):
+                return float(val)
+        except Exception:
+            pass
+        return float(default)
+
+    def _fmt_metric(v: float) -> str:
+        if not math.isfinite(float(v)) or float(v) < 0.0:
+            return "na"
+        return f"{float(v):.4f}"
+
+    for cfg_path in sorted(base.rglob("*training_config.json")):
+        try:
+            data = json.loads(cfg_path.read_text(encoding="utf-8"))
+        except Exception:
+            continue
+        if not isinstance(data, dict):
+            continue
+        if str(data.get("mode", "")).strip().lower() != "line_clip":
+            continue
+        root = cfg_path.parent.resolve()
+        stem = cfg_path.stem
+        prefix = ""
+        if stem.endswith("_training_config"):
+            prefix = stem[: -len("_training_config")]
+        elif stem != "training_config":
+            prefix = stem
+        pfx = f"{prefix}_" if prefix else ""
+
+        img_backbone = root / f"{pfx}text_hierarchy_vit_backbone"
+        img_head = root / f"{pfx}text_hierarchy_projection_head.pt"
+        txt_encoder = root / f"{pfx}text_hierarchy_clip_text_encoder"
+        txt_head = root / f"{pfx}text_hierarchy_clip_text_projection_head.pt"
+        if not (img_backbone.exists() and img_head.exists() and txt_encoder.exists() and txt_head.exists()):
+            continue
+        key = str(root if not prefix else (root / prefix))
+        last_val = data.get("last_val_metrics") if isinstance(data.get("last_val_metrics"), dict) else {}
+        cfg_i2t1 = _to_f(last_val.get("val_i2t_r1", -1.0))
+        cfg_t2i1 = _to_f(last_val.get("val_t2i_r1", -1.0))
+        cfg_i2t5 = _to_f(last_val.get("val_i2t_r5", -1.0))
+        cfg_t2i5 = _to_f(last_val.get("val_t2i_r5", -1.0))
+        cfg_n = int(_to_int(last_val.get("val_count", 0), 0))
+        cfg_step = int(_to_int(data.get("global_step", -1), -1))
+        name_step, name_i2t1, name_t2i1 = _parse_ckpt_sort_fields(Path(key).name)
+        # Prefer explicit config metrics; fallback to checkpoint suffix parsing.
+        sort_i2t1 = cfg_i2t1 if cfg_i2t1 >= 0.0 else name_i2t1
+        sort_t2i1 = cfg_t2i1 if cfg_t2i1 >= 0.0 else name_t2i1
+        sort_step = max(cfg_step, name_step)
+        score_primary = ((sort_i2t1 if sort_i2t1 >= 0 else -1.0) + (sort_t2i1 if sort_t2i1 >= 0 else -1.0)) / 2.0
+
+        bundle_name = Path(key).name
+        metrics_label = (
+            f"i2t@1={_fmt_metric(cfg_i2t1 if cfg_i2t1 >= 0 else name_i2t1)} "
+            f"t2i@1={_fmt_metric(cfg_t2i1 if cfg_t2i1 >= 0 else name_t2i1)} "
+            f"i2t@5={_fmt_metric(cfg_i2t5)} t2i@5={_fmt_metric(cfg_t2i5)}"
+        )
+        extra_label = f"step={sort_step if sort_step >= 0 else 'na'} n={cfg_n if cfg_n > 0 else 'na'}"
+        dropdown_label = f"{bundle_name} | {metrics_label} | {extra_label}"
+        bundles[key] = {
+            "image_backbone": str(img_backbone.resolve()),
+            "image_head": str(img_head.resolve()),
+            "text_encoder": str(txt_encoder.resolve()),
+            "text_head": str(txt_head.resolve()),
+            "bundle_root": str(Path(key).resolve()),
+            "config_path": str(cfg_path.resolve()),
+            "display_label": dropdown_label,
+            "sort_score_primary": f"{float(score_primary):.6f}",
+            "sort_i2t1": f"{float(sort_i2t1):.6f}",
+            "sort_t2i1": f"{float(sort_t2i1):.6f}",
+            "sort_step": str(int(sort_step)),
+            "val_count": str(int(cfg_n)),
+        }
+        bundle_rows.append(
+            {
+                "key": key,
+                "label": dropdown_label,
+                "score_primary": float(score_primary),
+                "i2t1": float(sort_i2t1),
+                "t2i1": float(sort_t2i1),
+                "step": int(sort_step),
+            }
+        )
+
+    # Prefer strongest validation performance first, then step.
+    bundle_rows = sorted(
+        bundle_rows,
+        key=lambda p: (
+            float(p.get("score_primary", -1.0)),
+            float(p.get("i2t1", -1.0)),
+            float(p.get("t2i1", -1.0)),
+            int(p.get("step", -1)),
+            str(p.get("key", "")),
+        ),
+        reverse=True,
+    )
+    found_roots = [str(r.get("key", "")) for r in bundle_rows if str(r.get("key", ""))]
+    choice_tuples = [(str(r.get("label", r.get("key", ""))), str(r.get("key", ""))) for r in bundle_rows]
+    default_root = found_roots[0] if found_roots else ""
+    default_bundle = bundles.get(default_root, {}) if default_root else {}
+    state_json = json.dumps(bundles, ensure_ascii=False)
+    msg = f"Found {len(found_roots)} line_clip model bundle(s) in {base} (sorted by val retrieval performance, then step)"
+    return (
+        gr.update(choices=choice_tuples, value=(default_root if default_root else None)),
+        default_bundle.get("image_backbone", ""),
+        default_bundle.get("image_head", ""),
+        default_bundle.get("text_encoder", ""),
+        default_bundle.get("text_head", ""),
+        state_json,
+        msg,
+    )
+
+
+def on_line_clip_bundle_change_ui(bundle_root: str, bundle_state_json: str):
+    root = str(bundle_root or "").strip()
+    bundles: Dict[str, Dict[str, str]] = {}
+    try:
+        bundles = json.loads(str(bundle_state_json or "{}"))
+    except Exception:
+        bundles = {}
+    rec = bundles.get(root, {}) if isinstance(bundles, dict) else {}
+    return (
+        str(rec.get("image_backbone", "") or ""),
+        str(rec.get("image_head", "") or ""),
+        str(rec.get("text_encoder", "") or ""),
+        str(rec.get("text_head", "") or ""),
+    )
+
+
+def _load_ui_projection_head_from_file(projection_head_path: str, in_dim_hint: int) -> Optional[Any]:
+    if torch is None or nn is None:
+        return None
+    ppath_raw = (projection_head_path or "").strip()
+    if not ppath_raw:
+        return None
+    ppath = Path(ppath_raw).expanduser().resolve()
+    if not ppath.exists() or not ppath.is_file():
+        return None
+    payload = torch.load(str(ppath), map_location="cpu")
+    if isinstance(payload, dict) and "state_dict" in payload:
+        state_dict = payload.get("state_dict", {})
+        in_dim = _to_int(payload.get("input_dim", 0), 0)
+        out_dim = _to_int(payload.get("output_dim", 0), 0)
+    else:
+        state_dict = payload
+        in_dim = 0
+        out_dim = 0
+    if in_dim <= 0:
+        in_dim = int(in_dim_hint)
+    if out_dim <= 0:
+        out_dim = int(in_dim)
+    if in_dim <= 0 or out_dim <= 0:
+        return None
+    head = _UIProjectionHead(in_dim=int(in_dim), out_dim=int(out_dim))
+    head.load_state_dict(state_dict, strict=False)
+    head.eval()
+    return head
+
+
+def _pooled_text_embedding_for_ui(text_encoder: Any, input_ids: Any, attention_mask: Any):
+    kwargs: Dict[str, Any] = {"input_ids": input_ids, "return_dict": True}
+    if attention_mask is not None:
+        kwargs["attention_mask"] = attention_mask
+    model_for_forward = text_encoder
+    base_model = text_encoder
+    seen_ids = set()
+    while hasattr(base_model, "module") and id(base_model) not in seen_ids:
+        seen_ids.add(id(base_model))
+        try:
+            base_model = getattr(base_model, "module")
+        except Exception:
+            break
+    cfg = getattr(base_model, "config", None)
+    if bool(getattr(cfg, "is_encoder_decoder", False)) and hasattr(base_model, "get_encoder"):
+        try:
+            model_for_forward = base_model.get_encoder()
+        except Exception:
+            model_for_forward = text_encoder
+    outputs = model_for_forward(**kwargs)
+    pooler = getattr(outputs, "pooler_output", None)
+    if pooler is not None:
+        return pooler
+    hidden = getattr(outputs, "last_hidden_state", None)
+    if hidden is None:
+        raise RuntimeError("Text encoder output has no pooler_output/last_hidden_state")
+    if hidden.ndim != 3:
+        return hidden
+    if attention_mask is None:
+        return hidden.mean(dim=1)
+    mask = attention_mask.to(hidden.device).float().unsqueeze(-1)
+    denom = mask.sum(dim=1).clamp(min=1.0)
+    return (hidden * mask).sum(dim=1) / denom
+
+
+@lru_cache(maxsize=4)
+def _load_line_clip_dual_runtime_cached(
+    image_backbone_path: str,
+    image_head_path: str,
+    text_encoder_dir: str,
+    text_head_path: str,
+    device_pref: str,
+):
+    if torch is None or AutoModel is None or AutoTokenizer is None or nn is None:
+        raise RuntimeError("line_clip debug requires torch + transformers.")
+    image_processor, image_backbone, image_head = _load_hierarchy_vit_encoder_bundle(image_backbone_path, image_head_path)
+    txt_dir = Path((text_encoder_dir or "").strip()).expanduser().resolve()
+    if not txt_dir.exists() or not txt_dir.is_dir():
+        raise FileNotFoundError(f"text encoder dir not found: {txt_dir}")
+    text_tokenizer = AutoTokenizer.from_pretrained(str(txt_dir), use_fast=True)
+    text_encoder = AutoModel.from_pretrained(str(txt_dir))
+    txt_hidden = _to_int(getattr(getattr(text_encoder, "config", None), "hidden_size", 0), 0)
+    if txt_hidden <= 0:
+        txt_hidden = _to_int(getattr(getattr(text_encoder, "config", None), "d_model", 0), 0)
+    text_head = _load_ui_projection_head_from_file(text_head_path, in_dim_hint=txt_hidden)
+    if text_head is None:
+        raise RuntimeError(f"Could not load text projection head: {text_head_path}")
+
+    resolved_device, device_note = _resolve_torch_device_for_encoding(device_pref)
+    image_backbone = image_backbone.to(resolved_device).eval()
+    text_encoder = text_encoder.to(resolved_device).eval()
+    if image_head is not None:
+        image_head = image_head.to(resolved_device).eval()
+    text_head = text_head.to(resolved_device).eval()
+    runtime_cfg = _load_hierarchy_encoder_runtime_config(image_backbone_path, image_head_path)
+    return {
+        "image_processor": image_processor,
+        "image_backbone": image_backbone,
+        "image_head": image_head,
+        "text_tokenizer": text_tokenizer,
+        "text_encoder": text_encoder,
+        "text_head": text_head,
+        "runtime_cfg": runtime_cfg,
+        "device": resolved_device,
+        "device_msg": device_note,
+    }
+
+
+def _collect_ocr_split_rows_ui(dataset_root: str, split_name: str) -> List[Dict[str, Any]]:
+    root = Path((dataset_root or "").strip()).expanduser().resolve()
+    split = str(split_name or "").strip()
+    manifest = root / split / "meta" / "lines.jsonl"
+    rows = _read_jsonl_rows_ui(manifest)
+    usable: List[Dict[str, Any]] = []
+    for i, row in enumerate(rows):
+        if not isinstance(row, dict):
+            continue
+        img_raw, txt = _extract_ocr_manifest_row_fields_ui(row)
+        img_path = _resolve_ocr_manifest_image_path_ui(img_raw, manifest)
+        if img_path is None:
+            continue
+        rec = dict(row)
+        rec["_image_path_resolved"] = str(img_path)
+        rec["_text_resolved"] = str(txt or "")
+        rec["_sample_index"] = int(i)
+        usable.append(rec)
+    return usable
+
+
+def _prepare_line_clip_image_tensor_ui(
+    image_path: str,
+    runtime_cfg: Dict[str, Any],
+    width_buckets: List[int],
+    target_height: int,
+    patch_multiple: int,
+    max_width: int,
+):
+    if torch is None:
+        raise RuntimeError("PyTorch not available")
+    cfg_obj = runtime_cfg if isinstance(runtime_cfg, dict) else {}
+    with Image.open(str(image_path)) as im:
+        rgb = im.convert("RGB")
+    rgb = _apply_line_clip_ui_preprocess_from_runtime_cfg(rgb, cfg_obj)
+    norm_img = _normalize_for_vit_encoding(
+        image=rgb,
+        target_height=int(target_height),
+        width_buckets=width_buckets,
+        patch_multiple=int(patch_multiple),
+        max_width=int(max_width),
+    )
+    arr = np.asarray(norm_img).astype(np.float32, copy=False) / 255.0
+    return torch.from_numpy(arr).permute(2, 0, 1).contiguous()
+
+
+def _encode_line_clip_image_crops_ui(
+    runtime: Dict[str, Any],
+    image_paths: List[str],
+    batch_size: int,
+    l2_normalize: bool,
+    progress_label: str = "",
+    progress_every_batches: int = 0,
+    image_preproc_workers: int = 0,
+    tqdm_progress: bool = False,
+) -> np.ndarray:
+    if torch is None:
+        raise RuntimeError("PyTorch not available")
+    image_backbone = runtime["image_backbone"]
+    image_head = runtime["image_head"]
+    image_processor = runtime["image_processor"]
+    runtime_cfg = runtime.get("runtime_cfg") or {}
+    runtime_cfg_dict = runtime_cfg if isinstance(runtime_cfg, dict) else {}
+    device = runtime["device"]
+    target_height = _to_int(runtime_cfg_dict.get("target_height", 64), 64)
+    patch_multiple = _to_int(runtime_cfg_dict.get("patch_multiple", 16), 16)
+    max_width_cfg = _to_int(runtime_cfg_dict.get("max_width", 1024), 1024)
+    width_buckets = _parse_width_buckets_for_encoding(
+        raw=runtime_cfg_dict.get("width_buckets", [256, 384, 512, 768]),
+        patch_multiple=patch_multiple,
+        max_width=max_width_cfg,
+    )
+    mean = list(getattr(image_processor, "image_mean", [0.5, 0.5, 0.5]))
+    std = list(getattr(image_processor, "image_std", [0.5, 0.5, 0.5]))
+    if len(mean) == 1:
+        mean = mean * 3
+    if len(std) == 1:
+        std = std * 3
+    mean_t = torch.tensor([float(v) for v in mean[:3]], dtype=torch.float32).view(1, 3, 1, 1).to(device)
+    std_t = torch.tensor([max(1e-6, float(v)) for v in std[:3]], dtype=torch.float32).view(1, 3, 1, 1).to(device)
+
+    bs = max(1, int(batch_size))
+    total = int(len(image_paths))
+    if total <= 0:
+        return np.zeros((0, 1), dtype=np.float32)
+    out_arr: Optional[np.ndarray] = None
+    use_non_blocking = str(device).startswith("cuda")
+    max_workers = max(0, int(image_preproc_workers or 0))
+    executor: Optional[ThreadPoolExecutor] = None
+    if max_workers > 1:
+        executor = ThreadPoolExecutor(max_workers=max_workers)
+    inference_ctx = getattr(torch, "inference_mode", torch.no_grad)
+    pbar = None
+
+    def _prep_path(p: str):
+        return _prepare_line_clip_image_tensor_ui(
+            image_path=p,
+            runtime_cfg=runtime_cfg_dict,
+            width_buckets=width_buckets,
+            target_height=target_height,
+            patch_multiple=patch_multiple,
+            max_width=max_width_cfg,
+        )
+
+    try:
+        with inference_ctx():
+            total_batches = int(math.ceil(total / max(1, bs))) if total > 0 else 0
+            if bool(tqdm_progress) and _tqdm is not None and total_batches > 0:
+                pbar = _tqdm(
+                    total=total_batches,
+                    desc=str(progress_label or "line_clip image encode"),
+                    unit="batch",
+                    leave=False,
+                )
+            for batch_idx, start in enumerate(range(0, len(image_paths), bs), start=1):
+                chunk = image_paths[start : start + bs]
+                if executor is not None:
+                    tensors = list(executor.map(_prep_path, chunk))
+                else:
+                    tensors = [_prep_path(p) for p in chunk]
+                max_w = max(int(t.shape[-1]) for t in tensors)
+                pm = max(1, int(patch_multiple))
+                max_w = int(math.ceil(max_w / pm) * pm)
+                padded = []
+                for t in tensors:
+                    if int(t.shape[-1]) < max_w:
+                        t = torch_f.pad(t, (0, max_w - int(t.shape[-1]), 0, 0), mode="replicate")
+                    elif int(t.shape[-1]) > max_w:
+                        t = t[:, :, :max_w]
+                    padded.append(t)
+                px = torch.stack(padded, dim=0)
+                px = px.to(device, non_blocking=use_non_blocking)
+                px = (px - mean_t) / std_t
+                emb = _pooled_image_embedding_for_ui(image_backbone, px)
+                if image_head is not None:
+                    emb = image_head(emb)
+                if bool(l2_normalize) and torch_f is not None:
+                    emb = torch_f.normalize(emb, dim=-1)
+                emb_np = emb.detach().cpu().float().numpy()
+                if out_arr is None:
+                    if emb_np.ndim != 2:
+                        raise RuntimeError("Image embedding output must be rank-2.")
+                    out_arr = np.empty((total, int(emb_np.shape[1])), dtype=np.float32)
+                out_arr[start : start + emb_np.shape[0]] = emb_np
+                if pbar is not None:
+                    pbar.update(1)
+                if (not bool(tqdm_progress)) and int(progress_every_batches or 0) > 0 and (
+                    batch_idx % int(progress_every_batches) == 0 or batch_idx == total_batches
+                ):
+                    label = str(progress_label or "line_clip image encode")
+                    LOGGER.info(
+                        "%s progress: batch %d/%d samples %d/%d",
+                        label,
+                        int(batch_idx),
+                        int(total_batches),
+                        int(min(start + len(chunk), total)),
+                        int(total),
+                    )
+    finally:
+        if pbar is not None:
+            pbar.close()
+        if executor is not None:
+            executor.shutdown(wait=True)
+    return out_arr if out_arr is not None else np.zeros((0, 1), dtype=np.float32)
+
+
+def _encode_line_clip_texts_ui(
+    runtime: Dict[str, Any],
+    texts: List[str],
+    batch_size: int,
+    l2_normalize: bool,
+    text_max_length: int,
+    progress_label: str = "",
+    progress_every_batches: int = 0,
+    tqdm_progress: bool = False,
+) -> np.ndarray:
+    if torch is None:
+        raise RuntimeError("PyTorch not available")
+    tokenizer = runtime["text_tokenizer"]
+    text_encoder = runtime["text_encoder"]
+    text_head = runtime["text_head"]
+    device = runtime["device"]
+    bs = max(1, int(batch_size))
+    total = int(len(texts))
+    if total <= 0:
+        return np.zeros((0, 1), dtype=np.float32)
+    out_arr: Optional[np.ndarray] = None
+    use_non_blocking = str(device).startswith("cuda")
+    inference_ctx = getattr(torch, "inference_mode", torch.no_grad)
+    pbar = None
+    try:
+        with inference_ctx():
+            total_batches = int(math.ceil(total / max(1, bs))) if total > 0 else 0
+            if bool(tqdm_progress) and _tqdm is not None and total_batches > 0:
+                pbar = _tqdm(
+                    total=total_batches,
+                    desc=str(progress_label or "line_clip text encode"),
+                    unit="batch",
+                    leave=False,
+                )
+            for batch_idx, start in enumerate(range(0, len(texts), bs), start=1):
+                chunk = [str(t or "") for t in texts[start : start + bs]]
+                tok_kwargs: Dict[str, Any] = {
+                    "padding": True,
+                    "truncation": True,
+                    "max_length": max(8, int(text_max_length)),
+                    "return_tensors": "pt",
+                }
+                if use_non_blocking:
+                    tok_kwargs["pad_to_multiple_of"] = 8
+                tok = tokenizer(chunk, **tok_kwargs)
+                input_ids = tok["input_ids"].to(device, non_blocking=use_non_blocking)
+                attn = tok.get("attention_mask")
+                if attn is not None:
+                    attn = attn.to(device, non_blocking=use_non_blocking)
+                txt_emb = _pooled_text_embedding_for_ui(text_encoder, input_ids, attn)
+                txt_z = text_head(txt_emb)
+                if bool(l2_normalize) and torch_f is not None:
+                    txt_z = torch_f.normalize(txt_z, dim=-1)
+                txt_np = txt_z.detach().cpu().float().numpy()
+                if out_arr is None:
+                    if txt_np.ndim != 2:
+                        raise RuntimeError("Text embedding output must be rank-2.")
+                    out_arr = np.empty((total, int(txt_np.shape[1])), dtype=np.float32)
+                out_arr[start : start + txt_np.shape[0]] = txt_np
+                if pbar is not None:
+                    pbar.update(1)
+                if (not bool(tqdm_progress)) and int(progress_every_batches or 0) > 0 and (
+                    batch_idx % int(progress_every_batches) == 0 or batch_idx == total_batches
+                ):
+                    label = str(progress_label or "line_clip text encode")
+                    LOGGER.info(
+                        "%s progress: batch %d/%d samples %d/%d",
+                        label,
+                        int(batch_idx),
+                        int(total_batches),
+                        int(min(start + len(chunk), total)),
+                        int(total),
+                    )
+    finally:
+        if pbar is not None:
+            pbar.close()
+    return out_arr if out_arr is not None else np.zeros((0, 1), dtype=np.float32)
+
+
+_LINE_CLIP_DEBUG_CACHE: Dict[str, Dict[str, Any]] = {}
+
+
+def _line_clip_debug_disk_cache_root_ui() -> Path:
+    return (Path(tempfile.gettempdir()) / "pechabridge_ui" / "line_clip_corpus_cache").resolve()
+
+
+def _line_clip_debug_disk_cache_id_ui(key: str) -> str:
+    raw = str(key or "")
+    return hashlib.sha256(raw.encode("utf-8", errors="replace")).hexdigest()[:24]
+
+
+def _line_clip_debug_disk_cache_dir_ui(key: str) -> Path:
+    return (_line_clip_debug_disk_cache_root_ui() / _line_clip_debug_disk_cache_id_ui(key)).resolve()
+
+
+def _load_line_clip_debug_corpus_from_disk_ui(key: str) -> Optional[Dict[str, Any]]:
+    cache_dir = _line_clip_debug_disk_cache_dir_ui(key)
+    meta_path = (cache_dir / "meta.json").resolve()
+    rows_path = (cache_dir / "rows.json").resolve()
+    img_path = (cache_dir / "image_embeddings.npy").resolve()
+    txt_path = (cache_dir / "text_embeddings.npy").resolve()
+    if not (cache_dir.exists() and meta_path.exists() and rows_path.exists()):
+        return None
+    try:
+        meta = json.loads(meta_path.read_text(encoding="utf-8"))
+        if not isinstance(meta, dict):
+            return None
+        if str(meta.get("key", "") or "") != str(key):
+            return None
+        rows = json.loads(rows_path.read_text(encoding="utf-8"))
+        if not isinstance(rows, list):
+            return None
+        image_emb = None
+        text_emb = None
+        has_image = bool(img_path.exists())
+        has_text = bool(txt_path.exists())
+        if not (has_image or has_text):
+            return None
+        if has_image:
+            _img = np.load(str(img_path))
+            if _img.ndim != 2 or int(_img.shape[0]) != len(rows):
+                return None
+            image_emb = np.asarray(_img, dtype=np.float32)
+        if has_text:
+            _txt = np.load(str(txt_path))
+            if _txt.ndim != 2 or int(_txt.shape[0]) != len(rows):
+                return None
+            text_emb = np.asarray(_txt, dtype=np.float32)
+        available_banks = []
+        if image_emb is not None:
+            available_banks.append("image")
+        if text_emb is not None:
+            available_banks.append("text")
+        return {
+            "rows": rows,
+            "image_embeddings": image_emb,
+            "text_embeddings": text_emb,
+            "device": "",
+            "device_msg": "Loaded corpus embeddings from disk cache.",
+            "count": int(len(rows)),
+            "cache_source": "disk",
+            "disk_cache_dir": str(cache_dir),
+            "available_banks": available_banks,
+        }
+    except Exception:
+        return None
+
+
+def _save_line_clip_debug_corpus_to_disk_ui(key: str, corpus: Dict[str, Any]) -> str:
+    cache_dir = _line_clip_debug_disk_cache_dir_ui(key)
+    cache_dir.mkdir(parents=True, exist_ok=True)
+    rows = list(corpus.get("rows") or [])
+    image_raw = corpus.get("image_embeddings", None)
+    text_raw = corpus.get("text_embeddings", None)
+    image_emb = None if image_raw is None else np.asarray(image_raw, dtype=np.float32)
+    text_emb = None if text_raw is None else np.asarray(text_raw, dtype=np.float32)
+    rows_path = (cache_dir / "rows.json").resolve()
+    img_path = (cache_dir / "image_embeddings.npy").resolve()
+    txt_path = (cache_dir / "text_embeddings.npy").resolve()
+    meta_path = (cache_dir / "meta.json").resolve()
+    rows_path.write_text(json.dumps(rows, ensure_ascii=False), encoding="utf-8")
+    if image_emb is not None:
+        np.save(str(img_path), image_emb.astype(np.float32, copy=False))
+    if text_emb is not None:
+        np.save(str(txt_path), text_emb.astype(np.float32, copy=False))
+    meta = {
+        "key": str(key),
+        "created_at_unix": float(time.time()),
+        "rows_count": int(len(rows)),
+        "has_image_embeddings": bool(image_emb is not None or img_path.exists()),
+        "has_text_embeddings": bool(text_emb is not None or txt_path.exists()),
+        "image_shape": ([int(v) for v in image_emb.shape] if image_emb is not None else None),
+        "text_shape": ([int(v) for v in text_emb.shape] if text_emb is not None else None),
+    }
+    meta_path.write_text(json.dumps(meta, ensure_ascii=False, indent=2), encoding="utf-8")
+    return str(cache_dir)
+
+
+def _line_clip_debug_cache_key(
+    dataset_root: str,
+    split_name: str,
+    image_backbone_path: str,
+    image_head_path: str,
+    text_encoder_dir: str,
+    text_head_path: str,
+    text_max_length: int,
+    l2_normalize: bool,
+) -> str:
+    return "||".join([
+        str(Path(dataset_root).expanduser().resolve()),
+        str(split_name or ""),
+        str(Path(image_backbone_path).expanduser().resolve()),
+        str(Path(image_head_path).expanduser().resolve()) if (image_head_path or "").strip() else "",
+        str(Path(text_encoder_dir).expanduser().resolve()),
+        str(Path(text_head_path).expanduser().resolve()),
+        str(int(text_max_length)),
+        "1" if bool(l2_normalize) else "0",
+    ])
+
+
+def _get_or_build_line_clip_debug_corpus_ui(
+    dataset_root: str,
+    split_name: str,
+    image_backbone_path: str,
+    image_head_path: str,
+    text_encoder_dir: str,
+    text_head_path: str,
+    device_pref: str,
+    batch_size: int,
+    text_max_length: int,
+    l2_normalize: bool,
+    required_banks: str = "both",
+    progress_every_batches: int = 0,
+    image_batch_size: Optional[int] = None,
+    text_batch_size: Optional[int] = None,
+    image_preproc_workers: int = 0,
+    tqdm_progress: bool = False,
+) -> Dict[str, Any]:
+    required_banks_norm = str(required_banks or "both").strip().lower()
+    if required_banks_norm not in {"both", "image", "text"}:
+        required_banks_norm = "both"
+    need_image = required_banks_norm in {"both", "image"}
+    need_text = required_banks_norm in {"both", "text"}
+    t_start = time.time()
+    key = _line_clip_debug_cache_key(
+        dataset_root=dataset_root,
+        split_name=split_name,
+        image_backbone_path=image_backbone_path,
+        image_head_path=image_head_path,
+        text_encoder_dir=text_encoder_dir,
+        text_head_path=text_head_path,
+        text_max_length=text_max_length,
+        l2_normalize=l2_normalize,
+    )
+    cached = _LINE_CLIP_DEBUG_CACHE.get(key)
+    if cached is not None:
+        cached_has_img = bool(isinstance(cached, dict) and cached.get("image_embeddings") is not None)
+        cached_has_txt = bool(isinstance(cached, dict) and cached.get("text_embeddings") is not None)
+        if ((not need_image or cached_has_img) and (not need_text or cached_has_txt)):
+            if isinstance(cached, dict):
+                cached.setdefault("available_banks", [b for b, ok in (("image", cached_has_img), ("text", cached_has_txt)) if ok])
+                cached["requested_banks"] = required_banks_norm
+                cached["built_banks"] = list(cached.get("built_banks") or [])
+                cached.setdefault("timing", {})
+                cached["timing"]["cache_lookup_s"] = round(float(time.time() - t_start), 4)
+                cached["timing"]["cache_hit_tier"] = "memory"
+            return cached
+        if isinstance(cached, dict):
+            cached.setdefault("timing", {})
+            cached["timing"]["cache_lookup_s"] = round(float(time.time() - t_start), 4)
+    t_disk_load0 = time.time()
+    disk_cached = _load_line_clip_debug_corpus_from_disk_ui(key)
+    if disk_cached is not None:
+        disk_has_img = bool(disk_cached.get("image_embeddings") is not None)
+        disk_has_txt = bool(disk_cached.get("text_embeddings") is not None)
+        resolved_device, device_note = _resolve_torch_device_for_encoding(device_pref)
+        disk_cached["device"] = str(resolved_device)
+        cache_msg = str(disk_cached.get("device_msg", "") or "")
+        if device_note:
+            cache_msg = (cache_msg + " " + str(device_note)).strip()
+        disk_cached["device_msg"] = cache_msg
+        disk_cached["timing"] = {
+            "cache_hit_tier": "disk",
+            "disk_load_s": round(float(time.time() - t_disk_load0), 4),
+            "cache_lookup_s": round(float(time.time() - t_start), 4),
+        }
+        disk_cached["perf"] = {
+            "rows_per_s_total": (
+                round(float(disk_cached.get("count", 0)) / max(1e-9, float(time.time() - t_start)), 2)
+                if int(disk_cached.get("count", 0)) > 0 else 0.0
+            ),
+        }
+        disk_cached["requested_banks"] = required_banks_norm
+        if ((not need_image or disk_has_img) and (not need_text or disk_has_txt)):
+            _LINE_CLIP_DEBUG_CACHE[key] = disk_cached
+            return disk_cached
+        rows = list(disk_cached.get("rows") or [])
+        rows_collect_s = 0.0
+    else:
+        t_rows0 = time.time()
+        rows = _collect_ocr_split_rows_ui(dataset_root, split_name)
+        rows_collect_s = float(time.time() - t_rows0)
+    if not rows:
+        raise RuntimeError("No usable OCR rows found for selected dataset/split.")
+
+    existing_image_emb = None
+    existing_text_emb = None
+    if isinstance(cached, dict):
+        if cached.get("image_embeddings") is not None:
+            existing_image_emb = np.asarray(cached.get("image_embeddings"), dtype=np.float32)
+        if cached.get("text_embeddings") is not None:
+            existing_text_emb = np.asarray(cached.get("text_embeddings"), dtype=np.float32)
+    if disk_cached is not None:
+        if existing_image_emb is None and disk_cached.get("image_embeddings") is not None:
+            existing_image_emb = np.asarray(disk_cached.get("image_embeddings"), dtype=np.float32)
+        if existing_text_emb is None and disk_cached.get("text_embeddings") is not None:
+            existing_text_emb = np.asarray(disk_cached.get("text_embeddings"), dtype=np.float32)
+    built_banks: List[str] = []
+    need_build_image = bool(need_image and existing_image_emb is None)
+    need_build_text = bool(need_text and existing_text_emb is None)
+    image_bs = max(1, int(image_batch_size if image_batch_size is not None else batch_size))
+    text_bs = max(1, int(text_batch_size if text_batch_size is not None else batch_size))
+    image_preproc_workers = max(0, int(image_preproc_workers or 0))
+
+    t_runtime0 = time.time()
+    runtime = _load_line_clip_dual_runtime_cached(
+        image_backbone_path,
+        image_head_path,
+        text_encoder_dir,
+        text_head_path,
+        device_pref,
+    )
+    runtime_load_s = float(time.time() - t_runtime0)
+    image_paths = [str(r.get("_image_path_resolved", "")) for r in rows]
+    texts = [str(r.get("_text_resolved", "")) for r in rows]
+    image_encode_s = 0.0
+    text_encode_s = 0.0
+    image_emb = existing_image_emb
+    text_emb = existing_text_emb
+    if need_build_image:
+        t_img0 = time.time()
+        image_emb = _encode_line_clip_image_crops_ui(
+            runtime,
+            image_paths=image_paths,
+            batch_size=image_bs,
+            l2_normalize=l2_normalize,
+            progress_label=f"line_clip cache build [{split_name}] image",
+            progress_every_batches=int(progress_every_batches or 0),
+            image_preproc_workers=image_preproc_workers,
+            tqdm_progress=bool(tqdm_progress),
+        )
+        image_encode_s = float(time.time() - t_img0)
+        built_banks.append("image")
+    if need_build_text:
+        t_txt0 = time.time()
+        text_emb = _encode_line_clip_texts_ui(
+            runtime,
+            texts=texts,
+            batch_size=text_bs,
+            l2_normalize=l2_normalize,
+            text_max_length=text_max_length,
+            progress_label=f"line_clip cache build [{split_name}] text",
+            progress_every_batches=int(progress_every_batches or 0),
+            tqdm_progress=bool(tqdm_progress),
+        )
+        text_encode_s = float(time.time() - t_txt0)
+        built_banks.append("text")
+    count_rows = int(len(rows))
+    total_build_before_save_s = float(time.time() - t_start)
+    image_shape = [int(v) for v in image_emb.shape] if image_emb is not None and getattr(image_emb, "ndim", 0) == 2 else []
+    text_shape = [int(v) for v in text_emb.shape] if text_emb is not None and getattr(text_emb, "ndim", 0) == 2 else []
+    image_bytes = int(getattr(image_emb, "nbytes", 0)) if image_emb is not None else 0
+    text_bytes = int(getattr(text_emb, "nbytes", 0)) if text_emb is not None else 0
+    available_banks = []
+    if image_emb is not None:
+        available_banks.append("image")
+    if text_emb is not None:
+        available_banks.append("text")
+    corpus = {
+        "rows": rows,
+        "image_embeddings": (image_emb.astype(np.float32, copy=False) if image_emb is not None else None),
+        "text_embeddings": (text_emb.astype(np.float32, copy=False) if text_emb is not None else None),
+        "device": str(runtime.get("device", "")),
+        "device_msg": str(runtime.get("device_msg", "")),
+        "count": count_rows,
+        "cache_source": "built",
+        "requested_banks": required_banks_norm,
+        "available_banks": available_banks,
+        "built_banks": built_banks,
+        "timing": {
+            "cache_hit_tier": "miss_build",
+            "rows_collect_s": round(rows_collect_s, 4),
+            "runtime_load_s": round(runtime_load_s, 4),
+            "image_encode_s": round(image_encode_s, 4),
+            "text_encode_s": round(text_encode_s, 4),
+            "build_before_save_s": round(total_build_before_save_s, 4),
+        },
+        "perf": {
+            "image_shape": image_shape,
+            "text_shape": text_shape,
+            "image_bytes": image_bytes,
+            "text_bytes": text_bytes,
+            "rows_per_s_image_encode": round(count_rows / max(image_encode_s, 1e-9), 2),
+            "rows_per_s_text_encode": round(count_rows / max(text_encode_s, 1e-9), 2),
+            "rows_per_s_build_before_save": round(count_rows / max(total_build_before_save_s, 1e-9), 2),
+            "image_batch_size": int(image_bs),
+            "text_batch_size": int(text_bs),
+            "image_preproc_workers": int(image_preproc_workers),
+        },
+    }
+    t_save0 = time.time()
+    try:
+        disk_cache_dir = _save_line_clip_debug_corpus_to_disk_ui(key, corpus)
+        corpus["disk_cache_dir"] = str(disk_cache_dir)
+    except Exception as exc:
+        corpus["disk_cache_write_error"] = f"{type(exc).__name__}: {exc}"
+    disk_save_s = float(time.time() - t_save0)
+    total_elapsed_s = float(time.time() - t_start)
+    timing = corpus.get("timing") if isinstance(corpus.get("timing"), dict) else {}
+    timing["disk_save_s"] = round(disk_save_s, 4)
+    timing["total_elapsed_s"] = round(total_elapsed_s, 4)
+    corpus["timing"] = timing
+    perf = corpus.get("perf") if isinstance(corpus.get("perf"), dict) else {}
+    perf["rows_per_s_total"] = round(count_rows / max(total_elapsed_s, 1e-9), 2)
+    corpus["perf"] = perf
+    _LINE_CLIP_DEBUG_CACHE[key] = corpus
+    if len(_LINE_CLIP_DEBUG_CACHE) > 3:
+        for k in list(_LINE_CLIP_DEBUG_CACHE.keys())[:-3]:
+            _LINE_CLIP_DEBUG_CACHE.pop(k, None)
+    return corpus
+
+
+def load_random_line_clip_debug_sample_ui(dataset_root: str, split_name: str, seed: float):
+    image_arr, gt_text, meta_json, img_path = load_random_donut_ocr_dataset_sample_ui(dataset_root, split_name, seed)
+    sample_state = {}
+    try:
+        meta = json.loads(meta_json or "{}")
+    except Exception:
+        meta = {}
+    if isinstance(meta, dict) and bool(meta.get("ok")):
+        sample_state = {
+            "dataset_root": str(meta.get("dataset_root", dataset_root)),
+            "split": str(meta.get("split", split_name)),
+            "image_path": str(meta.get("image_path", img_path)),
+            "ground_truth": str(gt_text or ""),
+            "doc_id": str(meta.get("doc_id", "")),
+            "page_id": str(meta.get("page_id", "")),
+            "line_id": _to_int(meta.get("line_id", -1), -1),
+        }
+    return image_arr, gt_text, gt_text, meta_json, img_path, sample_state
+
+
+def _line_clip_debug_find_ground_truth_index(rows: List[Dict[str, Any]], sample_state: Dict[str, Any]) -> int:
+    img_path = str(sample_state.get("image_path", "") or "")
+    if img_path:
+        for i, r in enumerate(rows):
+            if str(r.get("_image_path_resolved", "") or "") == img_path:
+                return int(i)
+    gt = str(sample_state.get("ground_truth", "") or "")
+    page_id = str(sample_state.get("page_id", "") or "")
+    line_id = _to_int(sample_state.get("line_id", -1), -1)
+    for i, r in enumerate(rows):
+        if page_id and str(r.get("page_id", "") or "") != page_id:
+            continue
+        if line_id >= 0 and _to_int(r.get("line_id", -1), -1) != line_id:
+            continue
+        if gt and str(r.get("_text_resolved", "") or "") == gt:
+            return int(i)
+    return -1
+
+
+def _load_image_as_rgb_np_ui(path: str) -> np.ndarray:
+    with Image.open(path) as im:
+        return np.asarray(im.convert("RGB")).astype(np.uint8, copy=False)
+
+
+def _write_line_clip_debug_results_csv_ui(
+    *,
+    rows: List[Dict[str, Any]],
+    order: np.ndarray,
+    sims: np.ndarray,
+    top_k: int,
+    gt_idx: int,
+    query_desc: Dict[str, Any],
+    extra_metrics_by_index: Optional[Dict[int, Dict[str, Any]]] = None,
+) -> str:
+    out_dir = (Path(tempfile.gettempdir()) / "pechabridge_ui" / "line_clip_debug_exports").resolve()
+    out_dir.mkdir(parents=True, exist_ok=True)
+    ts = time.strftime("%Y%m%d_%H%M%S")
+    mode = str(query_desc.get("mode", "retrieval") or "retrieval")
+    safe_mode = re.sub(r"[^a-zA-Z0-9_.-]+", "_", mode).strip("_") or "retrieval"
+    out_path = (out_dir / f"{safe_mode}_{ts}.csv").resolve()
+    k = max(1, min(int(top_k), int(len(order))))
+    with out_path.open("w", encoding="utf-8", newline="") as f:
+        writer = csv.DictWriter(
+            f,
+            fieldnames=[
+                "rank",
+                "score",
+                "sample_index",
+                "doc_id",
+                "page_id",
+                "line_id",
+                "image_path",
+                "text",
+                "is_ground_truth",
+                "query_mode",
+                    "query_text",
+                    "query_image_path",
+                    "cer_vs_gt_text",
+                    "sem_text_vs_gt_text",
+                    "sem_image_vs_gt_image",
+                ],
+        )
+        writer.writeheader()
+        for rank, idx in enumerate(order[:k].tolist(), start=1):
+            rec = rows[int(idx)]
+            extra = (extra_metrics_by_index or {}).get(int(idx), {})
+            writer.writerow(
+                {
+                    "rank": int(rank),
+                    "score": float(sims[int(idx)]),
+                    "sample_index": int(rec.get("_sample_index", idx)),
+                    "doc_id": str(rec.get("doc_id", "") or ""),
+                    "page_id": str(rec.get("page_id", "") or ""),
+                    "line_id": _to_int(rec.get("line_id", -1), -1),
+                    "image_path": str(rec.get("_image_path_resolved", "") or ""),
+                    "text": str(rec.get("_text_resolved", "") or ""),
+                    "is_ground_truth": bool(int(idx) == int(gt_idx) and gt_idx >= 0),
+                    "query_mode": str(query_desc.get("mode", "") or ""),
+                    "query_text": str(query_desc.get("query_text", "") or ""),
+                    "query_image_path": str(query_desc.get("query_image_path", "") or ""),
+                    "cer_vs_gt_text": (extra.get("cer_vs_gt_text") if "cer_vs_gt_text" in extra else None),
+                    "sem_text_vs_gt_text": (extra.get("sem_text_vs_gt_text") if "sem_text_vs_gt_text" in extra else None),
+                    "sem_image_vs_gt_image": (extra.get("sem_image_vs_gt_image") if "sem_image_vs_gt_image" in extra else None),
+                }
+            )
+    return str(out_path)
+
+
+def _cosine_sim_np_ui(a: np.ndarray, b: np.ndarray) -> float:
+    va = np.asarray(a, dtype=np.float32).reshape(-1)
+    vb = np.asarray(b, dtype=np.float32).reshape(-1)
+    if va.size == 0 or vb.size == 0 or va.shape[0] != vb.shape[0]:
+        return float("nan")
+    na = float(np.linalg.norm(va))
+    nb = float(np.linalg.norm(vb))
+    if na <= 0.0 or nb <= 0.0:
+        return float("nan")
+    return float(np.dot(va, vb) / (na * nb))
+
+
+def run_line_clip_dataset_debug_retrieval_ui(
+    sample_image: Optional[np.ndarray],
+    sample_ground_truth: str,
+    query_text: str,
+    query_mode: str,
+    dataset_root: str,
+    split_name: str,
+    image_backbone_path: str,
+    image_head_path: str,
+    text_encoder_dir: str,
+    text_head_path: str,
+    device_pref: str,
+    batch_size: int,
+    text_max_length: int,
+    l2_normalize: bool,
+    top_k: int,
+    sample_state: Dict[str, Any],
+):
+    gt_placeholder = _line_profile_placeholder("Load a random OCR sample or upload one.")
+    if not (dataset_root or "").strip() or not (split_name or "").strip():
+        return gt_placeholder, [], "{}", "", "Please scan/select an OCR dataset + split.", sample_state
+    if not (image_backbone_path or "").strip() or not (text_encoder_dir or "").strip() or not (text_head_path or "").strip():
+        return gt_placeholder, [], "{}", "", "Please select a complete line_clip model (image backbone/head + text encoder/head).", sample_state
+    qmode = str(query_mode or "Text -> Image").strip().lower()
+    use_text_query = qmode.startswith("text")
+    use_image_to_text = (not use_text_query) and ("text" in qmode)
+    if use_text_query and not str(query_text or "").strip():
+        return gt_placeholder, [], "{}", "", "Text query is empty.", sample_state
+    if (not use_text_query) and sample_image is None:
+        return gt_placeholder, [], "{}", "", "No sample image available for image query.", sample_state
+
+    try:
+        corpus = _get_or_build_line_clip_debug_corpus_ui(
+            dataset_root=dataset_root,
+            split_name=split_name,
+            image_backbone_path=image_backbone_path,
+            image_head_path=image_head_path,
+            text_encoder_dir=text_encoder_dir,
+            text_head_path=text_head_path,
+            device_pref=device_pref,
+            batch_size=max(1, int(batch_size)),
+            text_max_length=max(8, int(text_max_length)),
+            l2_normalize=bool(l2_normalize),
+        )
+        rows = corpus["rows"]
+        img_emb = np.asarray(corpus["image_embeddings"], dtype=np.float32)
+        txt_emb = np.asarray(corpus.get("text_embeddings", np.zeros((0, 1), dtype=np.float32)), dtype=np.float32)
+        runtime = _load_line_clip_dual_runtime_cached(
+            image_backbone_path,
+            image_head_path,
+            text_encoder_dir,
+            text_head_path,
+            device_pref,
+        )
+        if img_emb.ndim != 2 or img_emb.shape[0] != len(rows):
+            raise RuntimeError("Cached image embeddings are invalid.")
+        if txt_emb.ndim != 2 or txt_emb.shape[0] != len(rows):
+            raise RuntimeError("Cached text embeddings are invalid.")
+
+        if use_text_query:
+            qtxt = str(query_text or "")
+            q_vec = _encode_line_clip_texts_ui(
+                runtime,
+                texts=[qtxt],
+                batch_size=1,
+                l2_normalize=bool(l2_normalize),
+                text_max_length=max(8, int(text_max_length)),
+            )[0]
+            query_desc = {"mode": "text_to_image", "query_text": qtxt}
+            bank = img_emb
+        else:
+            q_img = np.asarray(sample_image).astype(np.uint8)
+            tmp_path = _persist_faiss_ui_query_crop(q_img)
+            if not tmp_path:
+                raise RuntimeError("Could not persist temporary query image.")
+            q_vec = _encode_line_clip_image_crops_ui(
+                runtime,
+                image_paths=[tmp_path],
+                batch_size=1,
+                l2_normalize=bool(l2_normalize),
+            )[0]
+            query_desc = {
+                "mode": ("image_to_text" if use_image_to_text else "image_to_image"),
+                "query_image_path": tmp_path,
+            }
+            bank = txt_emb if use_image_to_text else img_emb
+
+        sims = np.matmul(bank, np.asarray(q_vec, dtype=np.float32))
+        order = np.argsort(-sims)
+        k = max(1, min(int(top_k), 50))
+        top_idx = [int(i) for i in order[:k].tolist()]
+
+        gt_idx = _line_clip_debug_find_ground_truth_index(rows, sample_state if isinstance(sample_state, dict) else {})
+        gt_image_path = ""
+        gt_image = gt_placeholder
+        if gt_idx >= 0:
+            gt_image_path = str(rows[gt_idx].get("_image_path_resolved", "") or "")
+        elif isinstance(sample_state, dict):
+            gt_image_path = str(sample_state.get("image_path", "") or "")
+        if gt_image_path:
+            try:
+                gt_image = _load_image_as_rgb_np_ui(gt_image_path)
+            except Exception:
+                gt_image = gt_placeholder
+
+        gallery_items: List[Tuple[np.ndarray, str]] = []
+        rank_of_gt = -1
+        topk_extra_metrics_by_index: Dict[int, Dict[str, Any]] = {}
+        gt_text_ref = str(sample_ground_truth or "")
+        gt_img_vec: Optional[np.ndarray] = None
+        gt_txt_vec: Optional[np.ndarray] = None
+        for rank, idx in enumerate(order.tolist(), start=1):
+            if int(idx) == int(gt_idx):
+                rank_of_gt = int(rank)
+                break
+        if gt_idx >= 0 and gt_idx < len(rows):
+            try:
+                gt_img_vec = np.asarray(img_emb[int(gt_idx)], dtype=np.float32)
+            except Exception:
+                gt_img_vec = None
+            try:
+                gt_txt_vec = np.asarray(txt_emb[int(gt_idx)], dtype=np.float32)
+            except Exception:
+                gt_txt_vec = None
+        elif use_text_query and gt_text_ref.strip():
+            try:
+                gt_txt_vec = _encode_line_clip_texts_ui(
+                    runtime,
+                    texts=[gt_text_ref],
+                    batch_size=1,
+                    l2_normalize=bool(l2_normalize),
+                    text_max_length=max(8, int(text_max_length)),
+                )[0]
+            except Exception:
+                gt_txt_vec = None
+        for rank, idx in enumerate(top_idx, start=1):
+            rec = rows[idx]
+            p = str(rec.get("_image_path_resolved", "") or "")
+            try:
+                img_np = _load_image_as_rgb_np_ui(p)
+            except Exception:
+                img_np = _line_profile_placeholder("Could not load result image.")
+            txt = str(rec.get("_text_resolved", "") or "")
+            is_gt = (idx == gt_idx and gt_idx >= 0)
+            extra_lines: List[str] = []
+            if use_text_query:
+                extra: Dict[str, Any] = {}
+                if gt_text_ref:
+                    cer_val = _cer_single_ui(txt, gt_text_ref)
+                    extra["cer_vs_gt_text"] = float(cer_val)
+                    extra_lines.append(f"CERvsGT={cer_val:.4f}")
+                if gt_txt_vec is not None and idx < len(txt_emb):
+                    sem_txt = _cosine_sim_np_ui(np.asarray(txt_emb[idx], dtype=np.float32), gt_txt_vec)
+                    if math.isfinite(sem_txt):
+                        extra["sem_text_vs_gt_text"] = float(sem_txt)
+                        extra_lines.append(f"txt~GTtxt={sem_txt:.4f}")
+                if gt_img_vec is not None and idx < len(img_emb):
+                    sem_img = _cosine_sim_np_ui(np.asarray(img_emb[idx], dtype=np.float32), gt_img_vec)
+                    if math.isfinite(sem_img):
+                        extra["sem_image_vs_gt_image"] = float(sem_img)
+                        extra_lines.append(f"img~GTimg={sem_img:.4f}")
+                if extra:
+                    topk_extra_metrics_by_index[int(idx)] = extra
+            caption = (
+                f"#{rank} sim={float(sims[idx]):.4f}"
+                + (" [GT]" if is_gt else "")
+                + f"\npage={str(rec.get('page_id', ''))} line={_to_int(rec.get('line_id', -1), -1)}"
+                + (f"\n{' | '.join(extra_lines)}" if extra_lines else "")
+                + (f"\n{textwrap.shorten(txt, width=120, placeholder='...')}" if 'textwrap' in globals() else f"\n{txt[:120]}")
+            )
+            gallery_items.append((img_np, caption))
+
+        export_csv_path = _write_line_clip_debug_results_csv_ui(
+            rows=rows,
+            order=order,
+            sims=np.asarray(sims, dtype=np.float32),
+            top_k=k,
+            gt_idx=gt_idx,
+            query_desc=query_desc,
+            extra_metrics_by_index=topk_extra_metrics_by_index,
+        )
+        debug = {
+            "ok": True,
+            "query": query_desc,
+            "dataset_root": str(Path(dataset_root).expanduser().resolve()),
+            "split": str(split_name),
+            "corpus_count": int(len(rows)),
+            "top_k": int(k),
+            "ground_truth_index": int(gt_idx),
+            "ground_truth_rank_in_full_retrieval": int(rank_of_gt),
+            "ground_truth_image_path": gt_image_path,
+            "ground_truth_text_length": len(str(sample_ground_truth or "")),
+            "device": str(corpus.get("device", "")),
+            "device_msg": str(corpus.get("device_msg", "")),
+            "cache_source": str(corpus.get("cache_source", "")),
+            "disk_cache_dir": str(corpus.get("disk_cache_dir", "")),
+            "results_csv_path": export_csv_path,
+            "topk_text_to_image_metrics": (topk_extra_metrics_by_index if use_text_query else {}),
+        }
+        status = (
+            f"line_clip debug retrieval ({'Text->Image' if use_text_query else ('Image->Text' if use_image_to_text else 'Image->Image')}) "
+            f"on split={split_name}: corpus={len(rows)} topk={k} "
+            f"| GT rank={rank_of_gt if rank_of_gt > 0 else 'not found'}"
+            f" | CSV={export_csv_path}"
+        )
+        return gt_image, gallery_items, json.dumps(debug, ensure_ascii=False, indent=2), export_csv_path, status, sample_state
+    except Exception as exc:
+        msg = f"Line CLIP debug retrieval failed: {type(exc).__name__}: {exc}"
+        return gt_placeholder, [], json.dumps({"ok": False, "error": msg}, ensure_ascii=False, indent=2), "", msg, sample_state
+
+
 def refresh_image_list(dataset_dir: str, split: str):
     split_images = Path(dataset_dir).expanduser().resolve() / split / "images"
     images = _list_images(split_images)
@@ -3023,13 +4927,27 @@ def _list_text_hierarchy_assets(root: Path, subset: str) -> List[Path]:
     subset_name = (subset or "").strip()
     if not root.exists():
         return []
-    if subset_name == "TextHierarchy (line.png)":
+    def _sorted_by_mtime_desc(paths: List[Path]) -> List[Path]:
+        return sorted(
+            paths,
+            key=lambda p: float(p.stat().st_mtime) if p.exists() else 0.0,
+            reverse=True,
+        )
+    if subset_name == "PatchDataset (all)":
+        return sorted((root / "patches").rglob("patch_*.png"))
+    if subset_name.startswith("PatchDataset (scale=") and subset_name.endswith(")"):
+        wanted = subset_name[len("PatchDataset (scale=") : -1].strip()
+        if wanted:
+            return sorted((root / "patches").rglob(f"scale={wanted}/patch_*.png"))
+    if subset_name == "PatchDataset (debug)":
+        return _sorted_by_mtime_desc(list((root / "debug").rglob("*.png")))
+    if subset_name == "Legacy TextHierarchy (line.png)":
         return sorted((root / "TextHierarchy").rglob("line_*/line.png"))
-    if subset_name == "TextHierarchy (word crops)":
+    if subset_name == "Legacy TextHierarchy (word crops)":
         return sorted((root / "TextHierarchy").rglob("line_*/level_*/word_*.png"))
-    if subset_name == "NumberCrops (tibetan_number_word)":
+    if subset_name == "Legacy NumberCrops (tibetan_number_word)":
         return sorted((root / "NumberCrops" / "tibetan_number_word").rglob("*"))
-    if subset_name == "NumberCrops (chinese_number_word)":
+    if subset_name == "Legacy NumberCrops (chinese_number_word)":
         return sorted((root / "NumberCrops" / "chinese_number_word").rglob("*"))
     return _list_images_recursive(root)
 
@@ -3049,6 +4967,564 @@ def scan_text_hierarchy_assets(root_dir: str, subset: str):
 
     msg = f"Found {len(rels)} asset(s) in {root} for subset '{subset}'."
     return gr.update(choices=rels, value=(rels[0] if rels else None)), msg
+
+
+def _sanitize_patch_id(value: Any) -> str:
+    txt = str(value or "").strip()
+    if not txt:
+        return "unknown"
+    out: List[str] = []
+    for ch in txt:
+        if ch.isalnum() or ch in {"-", "_", "."}:
+            out.append(ch)
+        else:
+            out.append("_")
+    return "".join(out).strip("_") or "unknown"
+
+
+def _resolve_patch_meta_path(root: Path) -> Optional[Path]:
+    meta = root / "meta" / "patches.parquet"
+    if meta.exists() and meta.is_file():
+        return meta
+    return None
+
+
+def _resolve_patch_path_from_meta(root: Path, row: Dict[str, Any]) -> Optional[Path]:
+    for path_col in ("patch_path", "patch_image_path"):
+        raw = str(row.get(path_col, "") or "").strip()
+        if raw:
+            p = Path(raw).expanduser()
+            if p.is_absolute():
+                resolved_abs = p.resolve()
+                if resolved_abs.exists():
+                    return resolved_abs
+            else:
+                resolved_rel = (root / p).resolve()
+                if resolved_rel.exists():
+                    return resolved_rel
+    try:
+        patch_id = int(row.get("patch_id", -1))
+        line_id = int(row.get("line_id", -1))
+        scale_w = int(row.get("scale_w", -1))
+        doc = _sanitize_patch_id(row.get("doc_id", ""))
+        page = _sanitize_patch_id(row.get("page_id", ""))
+    except Exception:
+        return None
+    if patch_id < 0 or line_id < 0 or scale_w <= 0:
+        return None
+    return (
+        root
+        / "patches"
+        / f"doc={doc}"
+        / f"page={page}"
+        / f"line={line_id}"
+        / f"scale={scale_w}"
+        / f"patch_{patch_id}.png"
+    ).resolve()
+
+
+@lru_cache(maxsize=6)
+def _load_patch_meta_lookup_cached(meta_path: str, root_dir: str, mtime_ns: int) -> Dict[str, Dict[str, Any]]:
+    _ = mtime_ns
+    if pd is None:
+        return {}
+    root = Path(root_dir).expanduser().resolve()
+    mp = Path(meta_path).expanduser().resolve()
+    if not mp.exists() or not mp.is_file():
+        return {}
+    try:
+        df = pd.read_parquet(mp)
+    except Exception:
+        return {}
+    if df is None or getattr(df, "empty", True):
+        return {}
+
+    keep_cols = [
+        "patch_id",
+        "doc_id",
+        "page_id",
+        "line_id",
+        "scale_w",
+        "k",
+        "x0_norm",
+        "x1_norm",
+        "line_h_px",
+        "line_w_px",
+        "boundary_score",
+        "ink_ratio",
+        "source_img_path",
+        "line_x0",
+        "line_y0",
+        "line_x1",
+        "line_y1",
+        "x0_px",
+        "x1_px",
+        "tag",
+        "patch_path",
+        "patch_image_path",
+    ]
+    cols = [c for c in keep_cols if c in df.columns]
+    if cols:
+        df = df[cols]
+
+    lookup: Dict[str, Dict[str, Any]] = {}
+    for row in df.to_dict(orient="records"):
+        resolved = _resolve_patch_path_from_meta(root, row)
+        if resolved is None:
+            continue
+        rec: Dict[str, Any] = {}
+        for k, v in row.items():
+            if pd.isna(v):
+                rec[k] = None
+            elif isinstance(v, (np.generic,)):
+                rec[k] = v.item()
+            else:
+                rec[k] = v
+        rec["resolved_patch_path"] = str(resolved)
+        lookup[str(resolved)] = rec
+    return lookup
+
+
+def _lookup_patch_meta_record(root: Path, asset_path: Path) -> Optional[Dict[str, Any]]:
+    meta_path = _resolve_patch_meta_path(root)
+    if meta_path is None:
+        return None
+    try:
+        mtime_ns = int(meta_path.stat().st_mtime_ns)
+    except Exception:
+        mtime_ns = 0
+    lookup = _load_patch_meta_lookup_cached(str(meta_path), str(root), int(mtime_ns))
+    return lookup.get(str(asset_path.resolve()))
+
+
+def _resolve_mnn_pairs_meta_path(root: Path) -> Optional[Path]:
+    p = (root / "meta" / "mnn_pairs.parquet").resolve()
+    if p.exists() and p.is_file():
+        return p
+    return None
+
+
+@lru_cache(maxsize=4)
+def _load_mnn_patch_match_index_cached(
+    root_dir: str,
+    patch_meta_path: str,
+    patch_meta_mtime_ns: int,
+    mnn_pairs_path: str,
+    mnn_pairs_mtime_ns: int,
+) -> Dict[str, Any]:
+    _ = patch_meta_mtime_ns, mnn_pairs_mtime_ns
+    if pd is None:
+        return {"patches": {}, "neighbors": {}, "rows": [], "error": "pandas not installed"}
+
+    root = Path(root_dir).expanduser().resolve()
+    patch_meta = Path(patch_meta_path).expanduser().resolve()
+    mnn_pairs = Path(mnn_pairs_path).expanduser().resolve()
+    if not patch_meta.exists() or not patch_meta.is_file():
+        return {"patches": {}, "neighbors": {}, "rows": [], "error": f"patches parquet not found: {patch_meta}"}
+    if not mnn_pairs.exists() or not mnn_pairs.is_file():
+        return {"patches": {}, "neighbors": {}, "rows": [], "error": f"mnn pairs parquet not found: {mnn_pairs}"}
+
+    try:
+        patch_df = pd.read_parquet(patch_meta)
+    except Exception as exc:
+        return {"patches": {}, "neighbors": {}, "rows": [], "error": f"Failed to read patches parquet: {type(exc).__name__}: {exc}"}
+    try:
+        pairs_df = pd.read_parquet(mnn_pairs)
+    except Exception as exc:
+        return {"patches": {}, "neighbors": {}, "rows": [], "error": f"Failed to read mnn pairs parquet: {type(exc).__name__}: {exc}"}
+
+    if patch_df is None or getattr(patch_df, "empty", True):
+        return {"patches": {}, "neighbors": {}, "rows": [], "error": "patches parquet is empty"}
+    if pairs_df is None or getattr(pairs_df, "empty", True):
+        return {"patches": {}, "neighbors": {}, "rows": [], "error": "mnn pairs parquet is empty"}
+
+    patch_cols_keep = [
+        "patch_id",
+        "doc_id",
+        "page_id",
+        "line_id",
+        "scale_w",
+        "k",
+        "x0_norm",
+        "x1_norm",
+        "ink_ratio",
+        "boundary_score",
+        "patch_path",
+        "patch_image_path",
+    ]
+    pair_cols_keep = [
+        "src_patch_id",
+        "dst_patch_id",
+        "sim",
+        "stability_ratio",
+        "multi_scale_ok",
+        "rank_src_to_dst",
+        "rank_dst_to_src",
+        "src_doc_id",
+        "src_page_id",
+        "src_line_id",
+        "src_scale_w",
+        "dst_doc_id",
+        "dst_page_id",
+        "dst_line_id",
+        "dst_scale_w",
+    ]
+    patch_cols = [c for c in patch_cols_keep if c in patch_df.columns]
+    if patch_cols:
+        patch_df = patch_df[patch_cols]
+    pair_cols = [c for c in pair_cols_keep if c in pairs_df.columns]
+    if pair_cols:
+        pairs_df = pairs_df[pair_cols]
+
+    patches: Dict[int, Dict[str, Any]] = {}
+    for row in patch_df.to_dict(orient="records"):
+        try:
+            pid = int(row.get("patch_id", -1))
+        except Exception:
+            continue
+        if pid < 0:
+            continue
+        resolved_path = _resolve_patch_path_from_meta(root, row)
+        rec: Dict[str, Any] = {}
+        for k, v in row.items():
+            try:
+                is_na = bool(pd.isna(v))
+            except Exception:
+                is_na = False
+            if is_na:
+                rec[k] = None
+            elif isinstance(v, np.generic):
+                rec[k] = v.item()
+            else:
+                rec[k] = v
+        rec["patch_id"] = int(pid)
+        rec["resolved_patch_path"] = str(resolved_path) if resolved_path is not None else ""
+        # Prefer a record with a resolvable patch image path.
+        prev = patches.get(pid)
+        if prev is None or (not str(prev.get("resolved_patch_path", "")).strip() and rec["resolved_patch_path"]):
+            patches[pid] = rec
+
+    neighbors_map: Dict[int, Dict[int, Dict[str, Any]]] = {}
+
+    def _safe_float(x: Any, default: float = 0.0) -> float:
+        try:
+            y = float(x)
+            return y if math.isfinite(y) else float(default)
+        except Exception:
+            return float(default)
+
+    def _safe_int_or_none(x: Any) -> Optional[int]:
+        try:
+            return int(x)
+        except Exception:
+            return None
+
+    def _coerce_scalar(v: Any) -> Any:
+        if isinstance(v, np.generic):
+            return v.item()
+        try:
+            if pd.isna(v):
+                return None
+        except Exception:
+            pass
+        if isinstance(v, (str, int, float, bool)) or v is None:
+            return v
+        return str(v)
+
+    for row in pairs_df.to_dict(orient="records"):
+        try:
+            src = int(row.get("src_patch_id", -1))
+            dst = int(row.get("dst_patch_id", -1))
+        except Exception:
+            continue
+        if src < 0 or dst < 0 or src == dst:
+            continue
+        sim = _safe_float(row.get("sim", 0.0), 0.0)
+        stability = _safe_float(row.get("stability_ratio", 0.0), 0.0)
+        rank_sd = _safe_int_or_none(row.get("rank_src_to_dst"))
+        rank_ds = _safe_int_or_none(row.get("rank_dst_to_src"))
+        multi_ok = bool(row.get("multi_scale_ok", False))
+
+        shared = {
+            "sim": float(sim),
+            "stability_ratio": float(stability),
+            "multi_scale_ok": bool(multi_ok),
+            "rank_src_to_dst": rank_sd,
+            "rank_dst_to_src": rank_ds,
+        }
+
+        rec_fwd = dict(shared)
+        rec_fwd.update(
+            {
+                "src_patch_id": int(src),
+                "dst_patch_id": int(dst),
+                "direction": "src_to_dst",
+                "src_doc_id": _coerce_scalar(row.get("src_doc_id")),
+                "src_page_id": _coerce_scalar(row.get("src_page_id")),
+                "src_line_id": _safe_int_or_none(row.get("src_line_id")),
+                "src_scale_w": _safe_int_or_none(row.get("src_scale_w")),
+                "dst_doc_id": _coerce_scalar(row.get("dst_doc_id")),
+                "dst_page_id": _coerce_scalar(row.get("dst_page_id")),
+                "dst_line_id": _safe_int_or_none(row.get("dst_line_id")),
+                "dst_scale_w": _safe_int_or_none(row.get("dst_scale_w")),
+            }
+        )
+        rec_rev = dict(shared)
+        rec_rev.update(
+            {
+                "src_patch_id": int(dst),
+                "dst_patch_id": int(src),
+                "direction": "dst_to_src",
+                "src_doc_id": _coerce_scalar(row.get("dst_doc_id")),
+                "src_page_id": _coerce_scalar(row.get("dst_page_id")),
+                "src_line_id": _safe_int_or_none(row.get("dst_line_id")),
+                "src_scale_w": _safe_int_or_none(row.get("dst_scale_w")),
+                "dst_doc_id": _coerce_scalar(row.get("src_doc_id")),
+                "dst_page_id": _coerce_scalar(row.get("src_page_id")),
+                "dst_line_id": _safe_int_or_none(row.get("src_line_id")),
+                "dst_scale_w": _safe_int_or_none(row.get("src_scale_w")),
+                "rank_src_to_dst": rank_ds,
+                "rank_dst_to_src": rank_sd,
+            }
+        )
+
+        for a, b, rec in ((src, dst, rec_fwd), (dst, src, rec_rev)):
+            bucket = neighbors_map.setdefault(int(a), {})
+            prev = bucket.get(int(b))
+            if prev is None:
+                bucket[int(b)] = rec
+                continue
+            prev_score = (_safe_float(prev.get("sim", 0.0)), _safe_float(prev.get("stability_ratio", 0.0)))
+            new_score = (_safe_float(rec.get("sim", 0.0)), _safe_float(rec.get("stability_ratio", 0.0)))
+            if new_score > prev_score:
+                bucket[int(b)] = rec
+
+    neighbors: Dict[int, List[Dict[str, Any]]] = {}
+    rows: List[Dict[str, Any]] = []
+    for src_pid in sorted(neighbors_map.keys()):
+        items = list(neighbors_map[src_pid].values())
+        items_sorted = sorted(
+            items,
+            key=lambda r: (
+                float(_safe_float(r.get("sim", 0.0))),
+                float(_safe_float(r.get("stability_ratio", 0.0))),
+                -int(_safe_int_or_none(r.get("rank_src_to_dst")) or 999999),
+            ),
+            reverse=True,
+        )
+        neighbors[src_pid] = items_sorted
+        patch_rec = patches.get(int(src_pid), {})
+        rows.append(
+            {
+                "patch_id": int(src_pid),
+                "match_count": int(len(items_sorted)),
+                "doc_id": patch_rec.get("doc_id", ""),
+                "page_id": patch_rec.get("page_id", ""),
+                "line_id": patch_rec.get("line_id", None),
+                "scale_w": patch_rec.get("scale_w", None),
+                "k": patch_rec.get("k", None),
+                "ink_ratio": patch_rec.get("ink_ratio", None),
+                "boundary_score": patch_rec.get("boundary_score", None),
+                "patch_path": patch_rec.get("resolved_patch_path", ""),
+            }
+        )
+
+    rows_sorted = sorted(
+        rows,
+        key=lambda r: (
+            int(r.get("match_count", 0)),
+            float(_safe_float(r.get("ink_ratio", 0.0))),
+            int(r.get("patch_id", -1)),
+        ),
+        reverse=True,
+    )
+    return {"patches": patches, "neighbors": neighbors, "rows": rows_sorted, "error": ""}
+
+
+def _load_mnn_patch_match_index(root_dir: str, patch_meta_path: str, mnn_pairs_path: str) -> Dict[str, Any]:
+    root = Path(root_dir).expanduser().resolve()
+    patch_meta = Path(patch_meta_path).expanduser().resolve()
+    mnn_pairs = Path(mnn_pairs_path).expanduser().resolve()
+    pm_mtime = int(patch_meta.stat().st_mtime_ns) if patch_meta.exists() else 0
+    mp_mtime = int(mnn_pairs.stat().st_mtime_ns) if mnn_pairs.exists() else 0
+    return _load_mnn_patch_match_index_cached(str(root), str(patch_meta), pm_mtime, str(mnn_pairs), mp_mtime)
+
+
+def scan_mnn_patch_matches_ui(root_dir: str, patch_meta_path: str, mnn_pairs_path: str, min_match_count: float, max_list_rows: float):
+    root = Path(root_dir or "").expanduser().resolve() if str(root_dir or "").strip() else None
+    if root is None or not root.exists() or not root.is_dir():
+        return (
+            gr.update(choices=[], value=None),
+            [],
+            f"Dataset root not found: {root}",
+            "{}",
+        )
+    if pd is None:
+        return gr.update(choices=[], value=None), [], "pandas is not installed.", "{}"
+
+    patch_meta = Path(patch_meta_path).expanduser().resolve() if str(patch_meta_path or "").strip() else (_resolve_patch_meta_path(root) or Path(""))
+    mnn_pairs = Path(mnn_pairs_path).expanduser().resolve() if str(mnn_pairs_path or "").strip() else (_resolve_mnn_pairs_meta_path(root) or Path(""))
+
+    if not patch_meta.exists():
+        return gr.update(choices=[], value=None), [], f"patches.parquet not found: {patch_meta}", "{}"
+    if not mnn_pairs.exists():
+        return gr.update(choices=[], value=None), [], f"mnn_pairs.parquet not found: {mnn_pairs}", "{}"
+
+    payload = _load_mnn_patch_match_index(str(root), str(patch_meta), str(mnn_pairs))
+    err = str(payload.get("error", "") or "").strip()
+    if err:
+        return gr.update(choices=[], value=None), [], err, "{}"
+
+    rows_all = list(payload.get("rows", []))
+    min_count = max(0, int(min_match_count or 0))
+    rows_filtered = [r for r in rows_all if int(r.get("match_count", 0)) >= min_count]
+    limit = max(1, int(max_list_rows or 200))
+    rows_show = rows_filtered[:limit]
+
+    choices: List[str] = []
+    for r in rows_show:
+        choices.append(
+            f"patch_id={int(r.get('patch_id', -1))} | matches={int(r.get('match_count', 0))} | "
+            f"doc={r.get('doc_id', '')} | page={r.get('page_id', '')} | line={r.get('line_id', '')} | "
+            f"scale={r.get('scale_w', '')} | k={r.get('k', '')}"
+        )
+
+    df_rows = []
+    for r in rows_show:
+        df_rows.append(
+            [
+                int(r.get("patch_id", -1)),
+                int(r.get("match_count", 0)),
+                str(r.get("doc_id", "")),
+                str(r.get("page_id", "")),
+                ("" if r.get("line_id", None) is None else int(r.get("line_id"))),
+                ("" if r.get("scale_w", None) is None else int(r.get("scale_w"))),
+                ("" if r.get("k", None) is None else int(r.get("k"))),
+                ("" if r.get("ink_ratio", None) is None else round(float(r.get("ink_ratio")), 4)),
+                ("" if r.get("boundary_score", None) is None else round(float(r.get("boundary_score")), 4)),
+            ]
+        )
+
+    summary = {
+        "dataset_root": str(root),
+        "patch_meta_path": str(patch_meta),
+        "mnn_pairs_path": str(mnn_pairs),
+        "rows_total_with_matches": int(len(rows_all)),
+        "rows_after_min_match_count": int(len(rows_filtered)),
+        "rows_shown": int(len(rows_show)),
+        "min_match_count": int(min_count),
+    }
+    status = (
+        f"Loaded MNN viewer index: {len(rows_all)} source patches with matches. "
+        f"Showing {len(rows_show)} (min_match_count={min_count}, max_list_rows={limit})."
+    )
+    return gr.update(choices=choices, value=(choices[0] if choices else None)), df_rows, status, json.dumps(summary, ensure_ascii=False, indent=2)
+
+
+def preview_mnn_patch_matches_ui(root_dir: str, patch_meta_path: str, mnn_pairs_path: str, patch_choice: str, max_matches: float):
+    if not root_dir or not patch_choice:
+        return [], "Select dataset root and patch first.", "{}"
+    m = re.search(r"patch_id=(\d+)", str(patch_choice))
+    if m is None:
+        return [], f"Could not parse patch_id from selection: {patch_choice}", "{}"
+    patch_id = int(m.group(1))
+
+    root = Path(root_dir).expanduser().resolve()
+    patch_meta = Path(patch_meta_path).expanduser().resolve() if str(patch_meta_path or "").strip() else (_resolve_patch_meta_path(root) or Path(""))
+    mnn_pairs = Path(mnn_pairs_path).expanduser().resolve() if str(mnn_pairs_path or "").strip() else (_resolve_mnn_pairs_meta_path(root) or Path(""))
+    payload = _load_mnn_patch_match_index(str(root), str(patch_meta), str(mnn_pairs))
+    err = str(payload.get("error", "") or "").strip()
+    if err:
+        return [], err, "{}"
+
+    patches = payload.get("patches", {}) or {}
+    neighbors = payload.get("neighbors", {}) or {}
+    src_rec = patches.get(int(patch_id))
+    if src_rec is None:
+        return [], f"Patch {patch_id} not found in patches.parquet.", "{}"
+
+    src_path = Path(str(src_rec.get("resolved_patch_path", "") or "")).expanduser()
+    if not src_path.exists() or not src_path.is_file():
+        return [], f"Source patch image not found for patch_id={patch_id}.", "{}"
+
+    try:
+        with Image.open(src_path) as im:
+            src_img = np.array(im.convert("RGB"))
+    except Exception as exc:
+        return [], f"Failed to load source patch image: {type(exc).__name__}: {exc}", "{}"
+
+    gallery_items: List[Tuple[np.ndarray, str]] = []
+    gallery_items.append((src_img, f"SRC patch_id={patch_id}"))
+
+    neigh_list = list(neighbors.get(int(patch_id), []))
+    limit = max(0, int(max_matches or 0))
+    if limit > 0:
+        neigh_list = neigh_list[:limit]
+
+    shown_neighbors: List[Dict[str, Any]] = []
+    missing_count = 0
+    for rec in neigh_list:
+        dst_pid = int(rec.get("dst_patch_id", -1))
+        dst_meta = patches.get(dst_pid)
+        if dst_meta is None:
+            missing_count += 1
+            continue
+        dst_path = Path(str(dst_meta.get("resolved_patch_path", "") or "")).expanduser()
+        if not dst_path.exists() or not dst_path.is_file():
+            missing_count += 1
+            continue
+        try:
+            with Image.open(dst_path) as im:
+                dst_img = np.array(im.convert("RGB"))
+        except Exception:
+            missing_count += 1
+            continue
+
+        sim = rec.get("sim", None)
+        stability = rec.get("stability_ratio", None)
+        caption = (
+            f"dst={dst_pid} | sim={float(sim):.3f} | stab={float(stability):.2f}"
+            if sim is not None and stability is not None
+            else f"dst={dst_pid}"
+        )
+        gallery_items.append((dst_img, caption))
+        shown_neighbors.append(
+            {
+                "dst_patch_id": int(dst_pid),
+                "sim": (None if sim is None else float(sim)),
+                "stability_ratio": (None if stability is None else float(stability)),
+                "multi_scale_ok": bool(rec.get("multi_scale_ok", False)),
+                "rank_src_to_dst": rec.get("rank_src_to_dst"),
+                "rank_dst_to_src": rec.get("rank_dst_to_src"),
+                "dst_doc_id": dst_meta.get("doc_id", rec.get("dst_doc_id")),
+                "dst_page_id": dst_meta.get("page_id", rec.get("dst_page_id")),
+                "dst_line_id": dst_meta.get("line_id", rec.get("dst_line_id")),
+                "dst_scale_w": dst_meta.get("scale_w", rec.get("dst_scale_w")),
+                "dst_k": dst_meta.get("k", None),
+                "dst_patch_path": str(dst_path),
+            }
+        )
+
+    status = (
+        f"patch_id={patch_id}: showing {len(shown_neighbors)} MNN matches"
+        f"{f' (requested limit={limit})' if limit > 0 else ''}"
+        f"{f', missing/unreadable={missing_count}' if missing_count > 0 else ''}."
+    )
+    meta_json = {
+        "source_patch": {
+            "patch_id": int(patch_id),
+            "doc_id": src_rec.get("doc_id"),
+            "page_id": src_rec.get("page_id"),
+            "line_id": src_rec.get("line_id"),
+            "scale_w": src_rec.get("scale_w"),
+            "k": src_rec.get("k"),
+            "patch_path": str(src_path),
+        },
+        "match_count_total": int(len(neighbors.get(int(patch_id), []))),
+        "match_count_shown": int(len(shown_neighbors)),
+        "matches": shown_neighbors,
+    }
+    return gallery_items, status, json.dumps(meta_json, ensure_ascii=False, indent=2)
 
 
 def _extract_first_int_suffix(name: str, prefix: str) -> Optional[int]:
@@ -3129,43 +5605,60 @@ def preview_text_hierarchy_asset(root_dir: str, asset_rel_path: str):
         info_lines.append(f"word_index: {word_idx}")
         payload["word_index"] = int(word_idx)
 
-    meta_path = _find_text_hierarchy_meta_path(root, asset_path)
-    if meta_path is not None:
-        try:
-            meta_data = json.loads(meta_path.read_text(encoding="utf-8"))
-            try:
-                payload["meta_path"] = str(meta_path.relative_to(root))
-            except Exception:
-                payload["meta_path"] = str(meta_path)
-            payload["meta"] = meta_data
-            lines = meta_data.get("lines") if isinstance(meta_data, dict) else None
-            if isinstance(lines, list) and line_idx is not None:
-                line_record = next(
-                    (x for x in lines if int(x.get("line_index", -1)) == int(line_idx) and isinstance(x, dict)),
-                    None,
-                )
-                if line_record is not None:
-                    payload["line_record"] = line_record
-                    info_lines.append("line_record: found")
-                    if level_target is not None:
-                        levels = ((line_record.get("hierarchy") or {}).get("levels") or [])
-                        level_record = next(
-                            (
-                                lv
-                                for lv in levels
-                                if isinstance(lv, dict)
-                                and int(lv.get("target_count", lv.get("count", -1))) == int(level_target)
-                            ),
-                            None,
-                        )
-                        if level_record is not None:
-                            payload["level_record"] = level_record
-                            info_lines.append("level_record: found")
-        except Exception as exc:
-            info_lines.append(f"meta parse failed: {type(exc).__name__}")
-            payload["meta_error"] = f"{type(exc).__name__}: {exc}"
+    patch_record = _lookup_patch_meta_record(root=root, asset_path=asset_path)
+    if patch_record is not None:
+        payload["patch_meta"] = patch_record
+        info_lines.extend(
+            [
+                f"doc_id: {patch_record.get('doc_id', '')}",
+                f"page_id: {patch_record.get('page_id', '')}",
+                f"line_id: {patch_record.get('line_id', '')}",
+                f"scale_w: {patch_record.get('scale_w', '')}",
+                f"k: {patch_record.get('k', '')}",
+                f"tag: {patch_record.get('tag', '')}",
+                f"ink_ratio: {patch_record.get('ink_ratio', '')}",
+                f"boundary_score: {patch_record.get('boundary_score', '')}",
+            ]
+        )
+        payload["meta_source"] = "meta/patches.parquet"
     else:
-        info_lines.append("meta.json: not found (ok for NumberCrops)")
+        meta_path = _find_text_hierarchy_meta_path(root, asset_path)
+        if meta_path is not None:
+            try:
+                meta_data = json.loads(meta_path.read_text(encoding="utf-8"))
+                try:
+                    payload["meta_path"] = str(meta_path.relative_to(root))
+                except Exception:
+                    payload["meta_path"] = str(meta_path)
+                payload["meta"] = meta_data
+                lines = meta_data.get("lines") if isinstance(meta_data, dict) else None
+                if isinstance(lines, list) and line_idx is not None:
+                    line_record = next(
+                        (x for x in lines if int(x.get("line_index", -1)) == int(line_idx) and isinstance(x, dict)),
+                        None,
+                    )
+                    if line_record is not None:
+                        payload["line_record"] = line_record
+                        info_lines.append("line_record: found")
+                        if level_target is not None:
+                            levels = ((line_record.get("hierarchy") or {}).get("levels") or [])
+                            level_record = next(
+                                (
+                                    lv
+                                    for lv in levels
+                                    if isinstance(lv, dict)
+                                    and int(lv.get("target_count", lv.get("count", -1))) == int(level_target)
+                                ),
+                                None,
+                            )
+                            if level_record is not None:
+                                payload["level_record"] = level_record
+                                info_lines.append("level_record: found")
+            except Exception as exc:
+                info_lines.append(f"meta parse failed: {type(exc).__name__}")
+                payload["meta_error"] = f"{type(exc).__name__}: {exc}"
+        else:
+            info_lines.append("metadata: not found (ok for loose image folders)")
 
     return image_np, "\n".join(info_lines), json.dumps(payload, ensure_ascii=False, indent=2)
 
@@ -4813,6 +7306,9 @@ def _load_hierarchy_encoder_runtime_config(backbone_path: str, projection_head_p
         "max_width": 1024,
         "patch_multiple": 16,
         "width_buckets": [256, 384, 512, 768],
+        "image_preprocess_pipeline": "none",
+        "image_preprocess_pb": None,
+        "image_preprocess_bdrc": None,
         "source": "defaults",
     }
     bpath = Path(backbone_path).expanduser().resolve() if (backbone_path or "").strip() else None
@@ -4855,6 +7351,11 @@ def _load_hierarchy_encoder_runtime_config(backbone_path: str, projection_head_p
             patch_multiple=out["patch_multiple"],
             max_width=out["max_width"],
         )
+        out["image_preprocess_pipeline"] = str(data.get("image_preprocess_pipeline", "none") or "none").strip().lower()
+        out["image_preprocess_pb"] = data.get("image_preprocess_pb") if isinstance(data.get("image_preprocess_pb"), dict) else None
+        out["image_preprocess_bdrc"] = (
+            data.get("image_preprocess_bdrc") if isinstance(data.get("image_preprocess_bdrc"), dict) else None
+        )
         out["source"] = str(cfg_path)
         return out
     return defaults
@@ -4879,7 +7380,10 @@ def _suggest_projection_head_for_backbone(backbone_path: str) -> str:
         except Exception:
             pass
 
-    local = sorted(bpath.parent.glob("*projection_head*.pt"))
+    local = [
+        p for p in sorted(bpath.parent.glob("*projection_head*.pt"))
+        if "clip_text_projection_head" not in p.name.lower()
+    ]
     if local:
         return str(local[0].resolve())
     return ""
@@ -4905,6 +7409,12 @@ def scan_models_for_line_and_encoder_ui(models_dir: str):
             if "lora" in lname:
                 continue
             if "projection_head" in lname:
+                # Keep only image-side projection heads in this dropdown.
+                # `line_clip` training additionally saves a text projection head
+                # (`...clip_text_projection_head.pt`) which is not compatible
+                # with the image encoder UI flows.
+                if "clip_text_projection_head" in lname:
+                    continue
                 projection_heads.append(str(p.resolve()))
                 continue
             yolo_models.append(str(p.resolve()))
@@ -7387,12 +9897,7 @@ def build_ui() -> gr.Blocks:
     default_texture_output_dir = str((workspace_root / "datasets" / "tibetan-yolo-ui-textured").resolve())
     default_texture_real_pages_dir = str((workspace_root / "sbb_images").resolve())
     default_sbb_grid_dir = str((workspace_root / "sbb_images").resolve())
-    text_hierarchy_candidate = (workspace_root / "datasets" / "text_hierarchy").resolve()
-    if not text_hierarchy_candidate.exists():
-        typo_candidate = (workspace_root / "datasets" / "text_hiarchy").resolve()
-        if typo_candidate.exists():
-            text_hierarchy_candidate = typo_candidate
-    default_text_hierarchy_dir = str(text_hierarchy_candidate)
+    default_text_hierarchy_dir = str((workspace_root / "datasets" / "text_patches").resolve())
     default_texture_lora_dataset_dir = str((workspace_root / "datasets" / "texture-lora-dataset").resolve())
     default_texture_lora_output_dir = str((workspace_root / "models" / "texture-lora-sdxl").resolve())
     default_image_encoder_input_dir = str((workspace_root / "sbb_images").resolve())
@@ -7401,7 +9906,7 @@ def build_ui() -> gr.Blocks:
     default_text_hierarchy_projection_head = str((workspace_root / "models" / "text_hierarchy_vit" / "text_hierarchy_projection_head.pt").resolve())
     default_text_hierarchy_eval_dir = str((workspace_root / "models" / "text_hierarchy_vit" / "eval").resolve())
     default_text_hierarchy_faiss_dir = str((workspace_root / "models" / "text_hierarchy_vit" / "faiss_search").resolve())
-    default_text_hierarchy_faiss_index = str((workspace_root / "models" / "text_hierarchy_vit" / "faiss_search" / "text_hierarchy.faiss").resolve())
+    default_text_hierarchy_faiss_index = str((workspace_root / "models" / "text_hierarchy_vit" / "faiss_search" / "text_patches.faiss").resolve())
     default_prompt = (
         "Extract page layout blocks and OCR text. "
         "Return strict JSON with key 'detections' containing a list of objects with: "
@@ -7429,7 +9934,7 @@ def build_ui() -> gr.Blocks:
             gr.Markdown(
                 "Use the tabs left-to-right. A practical flow is: Synthetic Data -> Diffusion + LoRA (texture) -> "
                 "Donut OCR Workflow -> Retrieval Encoders -> Batch VLM Layout (SBB) -> Dataset Preview -> Ultralytics Training -> Model Inference -> "
-                "Tibetan Line Split (CV) -> Text Hierarchy Preview -> Hierarchy Encode Preview -> VLM Layout (single image) -> Label Studio Export."
+                "Tibetan Line Split (CV) -> Patch Dataset (gen-patches) -> Hierarchy Encode Preview -> VLM Layout (single image) -> Label Studio Export."
             )
             gr.Markdown("### Tabs")
             gr.Markdown(
@@ -7440,7 +9945,7 @@ def build_ui() -> gr.Blocks:
                 "5. Ultralytics Training: Train YOLO models.\n"
                 "6. Model Inference: Run inference with trained models.\n"
                 "6b. Tibetan Line Split (CV): Detect `tibetan_text` boxes, split into lines, and optionally detect red text boxes per line.\n"
-                "6c. Text Hierarchy Preview: Browse exported `TextHierarchy` and `NumberCrops` assets.\n"
+                "6c. Patch Dataset Debug View: Generate and browse `datasets/text_patches` (`patches/`, `meta/patches.parquet`, `debug/`).\n"
                 "6d. Hierarchy Encode Preview: Detect lines, build 2/4/8 hierarchy, click a block, and output latent vector.\n"
                 "7. VLM Layout: Run transformer-based layout parsing on a single image.\n"
                 "8. Label Studio Export: Convert YOLO split folders to Label Studio tasks and launch Label Studio.\n"
@@ -7990,18 +10495,53 @@ def build_ui() -> gr.Blocks:
                 outputs=[line_model],
             )
 
-        # 6c) Preview exported text hierarchy dataset
-        with gr.Tab("6c. Text Hierarchy Preview"):
+        # 6c) Generate + preview patch dataset
+        with gr.Tab("6c. Patch Dataset Debug View"):
             gr.Markdown(
-                "Browse assets produced by `cli.py export-text-hierarchy`: "
-                "`TextHierarchy` lines/word crops and `NumberCrops` snippets."
+                "Generate and inspect the new patch dataset from `cli.py gen-patches` "
+                "(`datasets/text_patches`: line patches + `meta/patches.parquet` + `debug/` overlays)."
             )
+            with gr.Accordion("Generate Patch Dataset", open=False):
+                with gr.Row():
+                    with gr.Column(scale=1):
+                        th_gen_config = gr.Textbox(label="config (optional)", value=str((ROOT / "configs" / "patch_gen.yaml").resolve()))
+                        th_gen_model = gr.Textbox(
+                            label="model_path",
+                            value=str((ROOT / "runs" / "detect" / "train" / "weights" / "best.pt").resolve()),
+                        )
+                        th_gen_input_dir = gr.Textbox(label="input_dir", value=str((workspace_root / "sbb_images").resolve()))
+                        th_gen_output_dir = gr.Textbox(label="output_dir", value=default_text_hierarchy_dir)
+                    with gr.Column(scale=1):
+                        with gr.Row():
+                            th_gen_conf = gr.Slider(0.01, 0.99, value=0.25, step=0.01, label="conf")
+                            th_gen_imgsz = gr.Number(label="imgsz", value=1024, precision=0)
+                        with gr.Row():
+                            th_gen_device = gr.Textbox(label="device", value="")
+                            th_gen_samples = gr.Number(label="no_samples (0=all)", value=0, precision=0)
+                        with gr.Row():
+                            th_gen_seed = gr.Number(label="seed", value=42, precision=0)
+                            th_gen_target_h = gr.Number(label="target_height", value=112, precision=0)
+                        with gr.Row():
+                            th_gen_widths = gr.Textbox(label="widths", value="256,384,512")
+                            th_gen_overlap = gr.Slider(0.0, 0.9, value=0.5, step=0.05, label="overlap")
+                        with gr.Row():
+                            th_gen_rmin = gr.Number(label="rmin", value=0.01, precision=3)
+                            th_gen_prominence = gr.Number(label="prominence", value=0.08, precision=3)
+                        with gr.Row():
+                            th_gen_n = gr.Number(label="n_per_line_per_scale", value=12, precision=0)
+                            th_gen_p_aligned = gr.Slider(0.0, 1.0, value=0.6, step=0.05, label="p_aligned")
+                        with gr.Row():
+                            th_gen_debug = gr.Number(label="debug_dump", value=0, precision=0)
+                            th_gen_btn = gr.Button("Run gen-patches", variant="primary")
+                th_gen_log = gr.Textbox(label="Generation Log", lines=10, interactive=False)
+                th_meta_path = gr.Textbox(label="metadata_path", interactive=False)
+
             with gr.Row():
-                th_root_dir = gr.Textbox(label="text_hierarchy_root_dir", value=default_text_hierarchy_dir)
+                th_root_dir = gr.Textbox(label="patch_dataset_root_dir", value=default_text_hierarchy_dir)
                 th_subset = gr.Dropdown(
                     label="Subset",
                     choices=TEXT_HIERARCHY_SUBSET_CHOICES,
-                    value=TEXT_HIERARCHY_SUBSET_CHOICES[0],
+                    value="PatchDataset (debug)",
                 )
                 th_scan_btn = gr.Button("Scan Assets")
             with gr.Row():
@@ -8017,6 +10557,34 @@ def build_ui() -> gr.Blocks:
                     th_image = gr.Image(type="numpy", label="Asset Preview")
                     th_json = gr.Code(label="Asset Metadata JSON", language="json")
 
+            th_gen_btn.click(
+                fn=run_gen_patches_live,
+                inputs=[
+                    th_gen_config,
+                    th_gen_model,
+                    th_gen_input_dir,
+                    th_gen_output_dir,
+                    th_gen_conf,
+                    th_gen_imgsz,
+                    th_gen_device,
+                    th_gen_samples,
+                    th_gen_seed,
+                    th_gen_target_h,
+                    th_gen_widths,
+                    th_gen_overlap,
+                    th_gen_rmin,
+                    th_gen_prominence,
+                    th_gen_n,
+                    th_gen_p_aligned,
+                    th_gen_debug,
+                ],
+                outputs=[th_gen_log, th_root_dir, th_meta_path],
+            )
+            th_root_dir.change(
+                fn=lambda x: x or "",
+                inputs=[th_root_dir],
+                outputs=[th_gen_output_dir],
+            )
             th_scan_btn.click(
                 fn=scan_text_hierarchy_assets,
                 inputs=[th_root_dir, th_subset],
@@ -8046,6 +10614,72 @@ def build_ui() -> gr.Blocks:
                 fn=lambda root, subset, cur: preview_adjacent_text_hierarchy_asset(root, subset, cur, 1),
                 inputs=[th_root_dir, th_subset, th_asset_select],
                 outputs=[th_asset_select, th_image, th_info, th_json],
+            )
+
+        # 6c2) Inspect MNN matches for individual patches in a patch dataset
+        with gr.Tab("6c2. MNN Patch Match Viewer"):
+            gr.Markdown(
+                "Browse `meta/mnn_pairs.parquet` for a patch dataset. "
+                "Scan patches with their MNN match counts, select a patch, then preview source + MNN matches side-by-side."
+            )
+            with gr.Row():
+                with gr.Column(scale=1):
+                    mnn_view_root_dir = gr.Textbox(label="patch_dataset_root_dir", value=default_text_hierarchy_dir)
+                    mnn_view_patch_meta = gr.Textbox(
+                        label="patches_parquet (optional)",
+                        value=str((Path(default_text_hierarchy_dir) / "meta" / "patches.parquet").resolve()),
+                    )
+                    mnn_view_pairs_meta = gr.Textbox(
+                        label="mnn_pairs_parquet (optional)",
+                        value=str((Path(default_text_hierarchy_dir) / "meta" / "mnn_pairs.parquet").resolve()),
+                    )
+                    with gr.Row():
+                        mnn_view_min_matches = gr.Number(label="min_match_count", value=1, precision=0)
+                        mnn_view_max_rows = gr.Number(label="max_list_rows", value=200, precision=0)
+                    with gr.Row():
+                        mnn_view_scan_btn = gr.Button("Scan MNN Patches", variant="primary")
+                        mnn_view_preview_btn = gr.Button("Preview Selected Patch")
+                    mnn_view_patch_select = gr.Dropdown(label="Patch (with MNN count)", choices=[], allow_custom_value=False)
+                    mnn_view_status = gr.Textbox(label="Status", interactive=False)
+                with gr.Column(scale=1):
+                    mnn_view_list = gr.Dataframe(
+                        headers=["patch_id", "match_count", "doc_id", "page_id", "line_id", "scale_w", "k", "ink_ratio", "boundary_score"],
+                        label="Patches with MNN match counts",
+                        interactive=False,
+                        wrap=True,
+                    )
+            with gr.Row():
+                mnn_view_max_matches = gr.Number(label="max_matches_to_render (0=all)", value=24, precision=0)
+            mnn_view_gallery = gr.Gallery(
+                label="",
+                columns=4,
+                height="auto",
+                object_fit="contain",
+            )
+            mnn_view_json = gr.Code(label="Selected Patch + MNN Match Metadata JSON", language="json")
+
+            mnn_view_scan_btn.click(
+                fn=scan_mnn_patch_matches_ui,
+                inputs=[mnn_view_root_dir, mnn_view_patch_meta, mnn_view_pairs_meta, mnn_view_min_matches, mnn_view_max_rows],
+                outputs=[mnn_view_patch_select, mnn_view_list, mnn_view_status, mnn_view_json],
+            )
+            mnn_view_root_dir.change(
+                fn=lambda x: (
+                    str((Path(x or "").expanduser().resolve() / "meta" / "patches.parquet").resolve()) if str(x or "").strip() else "",
+                    str((Path(x or "").expanduser().resolve() / "meta" / "mnn_pairs.parquet").resolve()) if str(x or "").strip() else "",
+                ),
+                inputs=[mnn_view_root_dir],
+                outputs=[mnn_view_patch_meta, mnn_view_pairs_meta],
+            )
+            mnn_view_preview_btn.click(
+                fn=preview_mnn_patch_matches_ui,
+                inputs=[mnn_view_root_dir, mnn_view_patch_meta, mnn_view_pairs_meta, mnn_view_patch_select, mnn_view_max_matches],
+                outputs=[mnn_view_gallery, mnn_view_status, mnn_view_json],
+            )
+            mnn_view_patch_select.change(
+                fn=preview_mnn_patch_matches_ui,
+                inputs=[mnn_view_root_dir, mnn_view_patch_meta, mnn_view_pairs_meta, mnn_view_patch_select, mnn_view_max_matches],
+                outputs=[mnn_view_gallery, mnn_view_status, mnn_view_json],
             )
 
         # 6d) Interactive hierarchy + embedding preview on uploaded image
@@ -8845,170 +11479,308 @@ def build_ui() -> gr.Blocks:
                 outputs=[diff_lora_path],
             )
 
-        # 12) Donut OCR workflow
-        with gr.Tab("12. Donut OCR Workflow"):
+        # 12) Donut OCR inference / evaluation
+        with gr.Tab("12. Donut OCR Inference"):
             gr.Markdown(
-                "Run label-1 Donut-style OCR training end-to-end "
-                "(synthetic generation -> OCR manifest prep -> Vision Transformer encoder + autoregressive decoder training)."
+                "Test trained DONUT/TroCR OCR checkpoints or final model outputs on uploaded line images or "
+                "random samples from OCR datasets. Displays OCR output, ground truth, and CER."
             )
             with gr.Row():
                 with gr.Column(scale=1):
-                    donut_dataset_name = gr.Textbox(label="dataset_name", value=default_donut_dataset_name)
-                    donut_dataset_output_dir = gr.Textbox(label="dataset_output_dir", value=default_donut_dataset_output_dir)
-                    donut_prepared_output_dir = gr.Textbox(
-                        label="prepared_output_dir (optional)",
-                        value="",
-                        placeholder="Leave empty for <dataset>/donut_ocr_label1",
-                    )
-                    donut_model_output_dir = gr.Textbox(label="model_output_dir", value=default_donut_model_output_dir)
-                    donut_model_name = gr.Textbox(
-                        label="model_name_or_path",
-                        value="microsoft/trocr-base-stage1",
+                    donut_test_models_dir = gr.Textbox(
+                        label="Scan models dir",
+                        value=str((workspace_root / "models").resolve()),
                     )
                     with gr.Row():
-                        donut_train_samples = gr.Number(label="train_samples", value=2000, precision=0)
-                        donut_val_samples = gr.Number(label="val_samples", value=200, precision=0)
+                        donut_test_scan_btn = gr.Button("Scan DONUT Models")
+                        donut_test_scan_msg = gr.Textbox(label="Scan Status", interactive=False)
+                    donut_test_model_select = gr.Dropdown(
+                        choices=[],
+                        value=None,
+                        label="Detected DONUT/TroCR model outputs / checkpoints",
+                    )
+                    donut_test_model_dir = gr.Textbox(
+                        label="Trained model output dir (or checkpoint / direct model dir)",
+                        value=default_donut_model_output_dir,
+                        placeholder="/path/to/models/donut_openpecha_bdrc/checkpoint-4000",
+                    )
                     with gr.Row():
-                        donut_font_tibetan = gr.Textbox(label="font_path_tibetan", value=default_donut_font_tibetan)
-                        donut_font_chinese = gr.Textbox(label="font_path_chinese", value=default_donut_font_chinese)
-                    with gr.Row():
-                        donut_augmentation = gr.Dropdown(
-                            choices=["rotate", "noise", "none"],
-                            value="noise",
-                            label="augmentation",
+                        donut_test_preproc = gr.Dropdown(
+                            choices=["none", "pb", "bdrc"],
+                            value="bdrc",
+                            label="image_preprocess_pipeline",
                         )
-                        donut_newline_token = gr.Dropdown(
-                            choices=["<NL>", "\\n"],
-                            value="<NL>",
-                            label="target_newline_token",
+                        donut_test_device = gr.Dropdown(
+                            choices=["auto", "cuda:0", "cuda:1", "cuda:2", "cuda:3", "cpu"],
+                            value="auto",
+                            label="device",
                         )
                     with gr.Row():
-                        donut_train_batch = gr.Number(label="per_device_train_batch_size", value=4, precision=0)
-                        donut_eval_batch = gr.Number(label="per_device_eval_batch_size", value=4, precision=0)
-                    with gr.Row():
-                        donut_epochs = gr.Number(label="num_train_epochs", value=8.0)
-                        donut_lr = gr.Number(label="learning_rate", value=5e-5)
-                    with gr.Row():
-                        donut_max_target_length = gr.Number(label="max_target_length", value=512, precision=0)
-                        donut_image_size = gr.Number(label="image_size", value=384, precision=0)
-                    with gr.Row():
-                        donut_seed = gr.Number(label="seed", value=42, precision=0)
-                        donut_tokenizer_vocab_size = gr.Number(label="tokenizer_vocab_size", value=16000, precision=0)
-                    with gr.Row():
-                        donut_train_tokenizer = gr.Checkbox(label="train_tokenizer", value=True)
-                        donut_skip_generation = gr.Checkbox(label="skip_generation", value=False)
-                        donut_skip_prepare = gr.Checkbox(label="skip_prepare", value=False)
-                        donut_skip_train = gr.Checkbox(label="skip_train", value=False)
-
-                    with gr.Accordion("Optional LoRA augmentation during generation", open=False):
-                        donut_lora_path = gr.Textbox(
-                            label="lora_augment_path",
-                            value="",
-                            placeholder="Optional path to LoRA .safetensors or folder",
+                        donut_test_max_len = gr.Number(label="generation_max_length", value=512, precision=0)
+                        donut_test_beams = gr.Number(label="num_beams", value=1, precision=0)
+                    with gr.Accordion("Load Random OCR Sample From Dataset", open=False):
+                        donut_test_datasets_dir = gr.Textbox(
+                            label="Scan datasets dir",
+                            value=str((workspace_root / "datasets").resolve()),
                         )
                         with gr.Row():
-                            donut_lora_family = gr.Dropdown(
-                                choices=["sdxl", "sd21"],
-                                value="sdxl",
-                                label="lora_augment_model_family",
+                            donut_test_dataset_scan_btn = gr.Button("Scan OCR Datasets")
+                            donut_test_dataset_scan_msg = gr.Textbox(label="Dataset Scan Status", interactive=False)
+                        donut_test_dataset_split_map_state = gr.State("{}")
+                        with gr.Row():
+                            donut_test_dataset_root = gr.Dropdown(
+                                choices=[],
+                                value=None,
+                                label="Detected OCR dataset roots",
+                                allow_custom_value=True,
                             )
-                            donut_lora_targets = gr.Dropdown(
-                                choices=["images", "images_and_ocr_crops"],
-                                value="images_and_ocr_crops",
-                                label="lora_augment_targets",
+                            donut_test_dataset_split = gr.Dropdown(
+                                choices=[],
+                                value=None,
+                                label="Split",
                             )
-                        donut_lora_prompt = gr.Textbox(
-                            label="lora_augment_prompt",
-                            value=DEFAULT_TEXTURE_PROMPT,
-                            lines=2,
-                        )
                         with gr.Row():
-                            donut_lora_splits = gr.Textbox(label="lora_augment_splits", value="train")
-                            donut_lora_seed = gr.Number(label="lora_augment_seed (-1=unset)", value=-1, precision=0)
-                        with gr.Row():
-                            donut_lora_scale = gr.Slider(0.0, 2.0, value=0.8, step=0.05, label="lora_augment_scale")
-                            donut_lora_strength = gr.Slider(0.0, 0.25, value=0.2, step=0.01, label="lora_augment_strength")
-                            donut_lora_steps = gr.Number(label="lora_augment_steps", value=28, precision=0)
-                        with gr.Row():
-                            donut_lora_guidance = gr.Slider(0.0, 4.0, value=1.0, step=0.1, label="lora_augment_guidance_scale")
-                            donut_lora_controlnet = gr.Slider(0.5, 3.0, value=2.0, step=0.1, label="lora_augment_controlnet_scale")
-                        with gr.Row():
-                            donut_lora_canny_low = gr.Number(label="lora_augment_canny_low", value=100, precision=0)
-                            donut_lora_canny_high = gr.Number(label="lora_augment_canny_high", value=200, precision=0)
-                        donut_lora_base_model = gr.Textbox(
-                            label="lora_augment_base_model_id",
-                            value="stabilityai/stable-diffusion-xl-base-1.0",
-                        )
-                        donut_lora_controlnet_model = gr.Textbox(
-                            label="lora_augment_controlnet_model_id",
-                            value="diffusers/controlnet-canny-sdxl-1.0",
-                        )
-
-                    donut_run_btn = gr.Button("Run Donut OCR Workflow", variant="primary")
+                            donut_test_dataset_seed = gr.Number(label="random_seed", value=42, precision=0)
+                            donut_test_dataset_sample_btn = gr.Button("Load Random Sample")
+                        donut_test_dataset_sample_path = gr.Textbox(label="Selected sample image path", interactive=False)
+                        donut_test_dataset_sample_meta = gr.Textbox(label="Sample Metadata JSON", lines=8, interactive=False)
+                    donut_test_image = gr.Image(label="Line Image (upload / dataset sample)", type="numpy")
+                    donut_test_btn = gr.Button("Run DONUT OCR Inference", variant="primary")
                 with gr.Column(scale=1):
-                    donut_log = gr.Textbox(label="Workflow Log", lines=24, interactive=False)
-                    donut_dataset_dir = gr.Textbox(label="Dataset Dir", interactive=False)
-                    donut_prepared_dir = gr.Textbox(label="Prepared Manifest Dir", interactive=False)
-                    donut_model_dir = gr.Textbox(label="Model Output Dir", interactive=False)
-                    donut_summary_path = gr.Textbox(label="Workflow Summary Path", interactive=False)
+                    donut_test_preview = gr.Image(label="Preprocessed Image", type="numpy")
+                    with gr.Row():
+                        donut_test_text = gr.Textbox(label="OCR Output", lines=8)
+                        donut_test_gt = gr.Textbox(label="Ground Truth", lines=8)
+                    donut_test_cer = gr.Textbox(label="CER (vs Ground Truth)", lines=1)
+                    donut_test_debug = gr.Textbox(label="Runtime / Debug JSON", lines=14)
 
-            donut_run_btn.click(
-                fn=run_donut_ocr_workflow_live,
+            donut_test_btn.click(
+                fn=run_donut_ocr_inference_with_gt_ui,
                 inputs=[
-                    donut_dataset_name,
-                    donut_dataset_output_dir,
-                    donut_train_samples,
-                    donut_val_samples,
-                    donut_font_tibetan,
-                    donut_font_chinese,
-                    donut_augmentation,
-                    donut_newline_token,
-                    donut_prepared_output_dir,
-                    donut_model_output_dir,
-                    donut_model_name,
-                    donut_train_tokenizer,
-                    donut_tokenizer_vocab_size,
-                    donut_train_batch,
-                    donut_eval_batch,
-                    donut_epochs,
-                    donut_lr,
-                    donut_max_target_length,
-                    donut_image_size,
-                    donut_seed,
-                    donut_skip_generation,
-                    donut_skip_prepare,
-                    donut_skip_train,
-                    donut_lora_path,
-                    donut_lora_family,
-                    donut_lora_base_model,
-                    donut_lora_controlnet_model,
-                    donut_lora_prompt,
-                    donut_lora_scale,
-                    donut_lora_strength,
-                    donut_lora_steps,
-                    donut_lora_guidance,
-                    donut_lora_controlnet,
-                    donut_lora_seed,
-                    donut_lora_splits,
-                    donut_lora_targets,
-                    donut_lora_canny_low,
-                    donut_lora_canny_high,
+                    donut_test_image,
+                    donut_test_model_dir,
+                    donut_test_preproc,
+                    donut_test_device,
+                    donut_test_max_len,
+                    donut_test_beams,
+                    donut_test_gt,
                 ],
                 outputs=[
-                    donut_log,
-                    donut_dataset_dir,
-                    donut_prepared_dir,
-                    donut_model_dir,
-                    donut_summary_path,
+                    donut_test_preview,
+                    donut_test_text,
+                    donut_test_gt,
+                    donut_test_cer,
+                    donut_test_debug,
+                ],
+            )
+            donut_test_scan_btn.click(
+                fn=scan_donut_ocr_models_ui,
+                inputs=[donut_test_models_dir],
+                outputs=[donut_test_model_select, donut_test_model_dir, donut_test_scan_msg],
+            )
+            donut_test_model_select.change(
+                fn=lambda x: x or "",
+                inputs=[donut_test_model_select],
+                outputs=[donut_test_model_dir],
+            )
+            donut_test_dataset_scan_btn.click(
+                fn=scan_donut_ocr_datasets_ui,
+                inputs=[donut_test_datasets_dir],
+                outputs=[
+                    donut_test_dataset_root,
+                    donut_test_dataset_split,
+                    donut_test_dataset_split_map_state,
+                    donut_test_dataset_scan_msg,
+                ],
+            )
+            donut_test_dataset_root.change(
+                fn=on_donut_ocr_dataset_change_ui,
+                inputs=[donut_test_dataset_root, donut_test_dataset_split_map_state],
+                outputs=[donut_test_dataset_split],
+            )
+            donut_test_dataset_sample_btn.click(
+                fn=load_random_donut_ocr_dataset_sample_ui,
+                inputs=[
+                    donut_test_dataset_root,
+                    donut_test_dataset_split,
+                    donut_test_dataset_seed,
+                ],
+                outputs=[
+                    donut_test_image,
+                    donut_test_gt,
+                    donut_test_dataset_sample_meta,
+                    donut_test_dataset_sample_path,
                 ],
             )
 
-        # 13) Retrieval encoders + evaluation + FAISS search
-        with gr.Tab("13. Retrieval Encoders"):
+        # 13) Pretrained line_clip workbench
+        with gr.Tab("13. line_clip Workbench"):
             gr.Markdown(
-                "Train and evaluate retrieval components for Tibetan n-gram search: "
-                "A) image encoder training, "
-                "B) TextHierarchy ViT evaluation, C) FAISS similarity search."
+                "Experiment with a pretrained line_clip dual encoder only. "
+                "Scan model bundles automatically (sorted by validation retrieval performance), "
+                "load a sample line, and run Text->Image / Image->Image / Image->Text retrieval."
+            )
+            lineclip_dbg_sample_state = gr.State({})
+            lineclip_dbg_bundle_state = gr.State("{}")
+            with gr.Row():
+                with gr.Column(scale=1):
+                    with gr.Row():
+                        lineclip_dbg_models_dir = gr.Textbox(label="models_dir (line_clip scan)", value=str((workspace_root / "models").resolve()))
+                        lineclip_dbg_scan_models_btn = gr.Button("Scan line_clip Models")
+                    lineclip_dbg_model_scan_status = gr.Textbox(label="line_clip Model Scan Status", interactive=False)
+                    lineclip_dbg_bundle_select = gr.Dropdown(
+                        label="Detected line_clip bundles (auto-scanned, sorted by val retrieval performance)",
+                        choices=[],
+                        value=None,
+                        allow_custom_value=True,
+                    )
+                    with gr.Row():
+                        lineclip_dbg_datasets_dir = gr.Textbox(label="datasets_dir (OCR manifests)", value=str((workspace_root / "datasets").resolve()))
+                        lineclip_dbg_scan_datasets_btn = gr.Button("Scan OCR Datasets")
+                    lineclip_dbg_dataset_scan_status = gr.Textbox(label="OCR Dataset Scan Status", interactive=False)
+                    lineclip_dbg_dataset_split_state = gr.State("{}")
+                    with gr.Row():
+                        lineclip_dbg_dataset_root = gr.Dropdown(
+                            label="OCR dataset root",
+                            choices=[],
+                            value=None,
+                            allow_custom_value=True,
+                        )
+                        lineclip_dbg_split = gr.Dropdown(label="Split", choices=[], value=None)
+                    with gr.Row():
+                        lineclip_dbg_seed = gr.Number(label="random_seed", value=42, precision=0)
+                        lineclip_dbg_load_sample_btn = gr.Button("Load Random Sample")
+                    lineclip_dbg_sample_path = gr.Textbox(label="Sample image path", interactive=False)
+                    lineclip_dbg_sample_meta = gr.Textbox(label="Sample metadata JSON", lines=7, interactive=False)
+                    lineclip_dbg_sample_image = gr.Image(label="Query/GT line image", type="numpy")
+                    with gr.Accordion("Advanced: Detected Artifact Paths", open=False):
+                        with gr.Row():
+                            lineclip_dbg_img_backbone = gr.Textbox(label="image_backbone_dir")
+                            lineclip_dbg_img_head = gr.Textbox(label="image_projection_head")
+                        with gr.Row():
+                            lineclip_dbg_txt_encoder = gr.Textbox(label="text_encoder_dir")
+                            lineclip_dbg_txt_head = gr.Textbox(label="text_projection_head")
+                with gr.Column(scale=1):
+                    with gr.Row():
+                        lineclip_dbg_query_mode = gr.Radio(
+                            choices=["Text -> Image", "Image -> Image", "Image -> Text"],
+                            value="Text -> Image",
+                            label="Query mode",
+                        )
+                        lineclip_dbg_device = gr.Dropdown(
+                            choices=["auto", "cuda", "cuda:0", "cuda:1", "cuda:2", "cuda:3", "cpu", "mps"],
+                            value="auto",
+                            label="Inference Device",
+                        )
+                    lineclip_dbg_gt_text = gr.Textbox(label="Ground-truth text", lines=4)
+                    lineclip_dbg_query_text = gr.Textbox(label="Text query (used for Text -> Image)", lines=4)
+                    lineclip_dbg_topk = gr.Number(label="top_k", value=5, precision=0)
+                    lineclip_dbg_run_btn = gr.Button("Run line_clip Debug Retrieval", variant="primary")
+                    lineclip_dbg_export_csv = gr.Textbox(label="Results CSV Export Path", interactive=False)
+                    lineclip_dbg_status = gr.Textbox(label="Debug Retrieval Status", interactive=False)
+                    lineclip_dbg_debug_json = gr.Code(label="Debug JSON", language="json")
+                    with gr.Accordion("Advanced Retrieval Settings", open=False):
+                        lineclip_dbg_l2 = gr.Checkbox(label="l2_normalize_embeddings", value=True)
+                        with gr.Row():
+                            lineclip_dbg_batch = gr.Number(label="embedding_batch_size", value=32, precision=0)
+                            lineclip_dbg_text_max_len = gr.Number(label="text_max_length", value=256, precision=0)
+            with gr.Row():
+                with gr.Column(scale=1):
+                    lineclip_dbg_gt_image = gr.Image(label="Ground Truth Line (reference)", type="numpy")
+                with gr.Column(scale=2):
+                    lineclip_dbg_results_gallery = gr.Gallery(
+                        label="Top-K Retrieval Results (side-by-side vs ground truth)",
+                        columns=5,
+                        rows=1,
+                        object_fit="contain",
+                        height=280,
+                    )
+
+            lineclip_dbg_scan_models_btn.click(
+                fn=scan_line_clip_dual_models_ui,
+                inputs=[lineclip_dbg_models_dir],
+                outputs=[
+                    lineclip_dbg_bundle_select,
+                    lineclip_dbg_img_backbone,
+                    lineclip_dbg_img_head,
+                    lineclip_dbg_txt_encoder,
+                    lineclip_dbg_txt_head,
+                    lineclip_dbg_bundle_state,
+                    lineclip_dbg_model_scan_status,
+                ],
+            )
+            lineclip_dbg_bundle_select.change(
+                fn=on_line_clip_bundle_change_ui,
+                inputs=[lineclip_dbg_bundle_select, lineclip_dbg_bundle_state],
+                outputs=[
+                    lineclip_dbg_img_backbone,
+                    lineclip_dbg_img_head,
+                    lineclip_dbg_txt_encoder,
+                    lineclip_dbg_txt_head,
+                ],
+            )
+            lineclip_dbg_scan_datasets_btn.click(
+                fn=scan_donut_ocr_datasets_ui,
+                inputs=[lineclip_dbg_datasets_dir],
+                outputs=[
+                    lineclip_dbg_dataset_root,
+                    lineclip_dbg_split,
+                    lineclip_dbg_dataset_split_state,
+                    lineclip_dbg_dataset_scan_status,
+                ],
+            )
+            lineclip_dbg_dataset_root.change(
+                fn=on_donut_ocr_dataset_change_ui,
+                inputs=[lineclip_dbg_dataset_root, lineclip_dbg_dataset_split_state],
+                outputs=[lineclip_dbg_split],
+            )
+            lineclip_dbg_load_sample_btn.click(
+                fn=load_random_line_clip_debug_sample_ui,
+                inputs=[lineclip_dbg_dataset_root, lineclip_dbg_split, lineclip_dbg_seed],
+                outputs=[
+                    lineclip_dbg_sample_image,
+                    lineclip_dbg_gt_text,
+                    lineclip_dbg_query_text,
+                    lineclip_dbg_sample_meta,
+                    lineclip_dbg_sample_path,
+                    lineclip_dbg_sample_state,
+                ],
+            )
+            lineclip_dbg_run_btn.click(
+                fn=run_line_clip_dataset_debug_retrieval_ui,
+                inputs=[
+                    lineclip_dbg_sample_image,
+                    lineclip_dbg_gt_text,
+                    lineclip_dbg_query_text,
+                    lineclip_dbg_query_mode,
+                    lineclip_dbg_dataset_root,
+                    lineclip_dbg_split,
+                    lineclip_dbg_img_backbone,
+                    lineclip_dbg_img_head,
+                    lineclip_dbg_txt_encoder,
+                    lineclip_dbg_txt_head,
+                    lineclip_dbg_device,
+                    lineclip_dbg_batch,
+                    lineclip_dbg_text_max_len,
+                    lineclip_dbg_l2,
+                    lineclip_dbg_topk,
+                    lineclip_dbg_sample_state,
+                ],
+                outputs=[
+                    lineclip_dbg_gt_image,
+                    lineclip_dbg_results_gallery,
+                    lineclip_dbg_debug_json,
+                    lineclip_dbg_export_csv,
+                    lineclip_dbg_status,
+                    lineclip_dbg_sample_state,
+                ],
+            )
+
+        # 14) Retrieval advanced tools (training / eval / FAISS)
+        with gr.Tab("14. Retrieval Advanced"):
+            gr.Markdown(
+                "Advanced retrieval tools: training, evaluation, and FAISS search for Tibetan n-gram retrieval. "
+                "Use the dedicated `line_clip Workbench` tab for pretrained line_clip experiments."
             )
 
             gr.Markdown("### Shared Artifact Scan (Backbone / Projection / FAISS)")
@@ -9069,10 +11841,10 @@ def build_ui() -> gr.Blocks:
                     image_enc_head_path = gr.Textbox(label="Projection Head Path", interactive=False)
                     image_enc_cfg_path = gr.Textbox(label="Training Config Path", interactive=False)
 
-            gr.Markdown("### B) Evaluate TextHierarchy ViT (Recall@K / MRR)")
+            gr.Markdown("### B) Evaluate Patch/Hierarchy ViT (Recall@K / MRR)")
             with gr.Row():
                 with gr.Column(scale=1):
-                    eval_th_dataset_dir = gr.Textbox(label="dataset_dir", value=default_text_hierarchy_dir)
+                    eval_th_dataset_dir = gr.Textbox(label="dataset_dir (patch dataset root)", value=default_text_hierarchy_dir)
                     eval_th_output_dir = gr.Textbox(label="output_dir", value=default_text_hierarchy_eval_dir)
                     eval_th_config_path = gr.Textbox(label="config_path (optional)", value="")
                     with gr.Row():
@@ -9157,7 +11929,7 @@ def build_ui() -> gr.Blocks:
                     faiss_output_dir = gr.Textbox(label="output_dir", value=default_text_hierarchy_faiss_dir)
                     faiss_index_path = gr.Textbox(label="index_path", value=default_text_hierarchy_faiss_index)
                     faiss_meta_path = gr.Textbox(label="meta_path (optional)", value=f"{default_text_hierarchy_faiss_index}.meta.json")
-                    faiss_dataset_dir = gr.Textbox(label="dataset_dir (for build mode)", value=default_text_hierarchy_dir)
+                    faiss_dataset_dir = gr.Textbox(label="dataset_dir (patch dataset, build mode)", value=default_text_hierarchy_dir)
                     faiss_save_index_path = gr.Textbox(label="save_index_path (for build mode)", value=default_text_hierarchy_faiss_index)
                     with gr.Row():
                         faiss_metric = gr.Dropdown(choices=["cosine", "l2"], value="cosine", label="metric")
