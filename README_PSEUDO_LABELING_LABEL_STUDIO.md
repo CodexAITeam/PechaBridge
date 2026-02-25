@@ -58,7 +58,7 @@ python pseudo_label_from_vlm.py \
   --min-confidence 0.2
 ```
 
-Alternative parsers: `qwen25vl`, `granite_docling`, `deepseek_ocr`, `mineru25`.
+Alternative parsers (depending on your local setup): `legacy`, `mineru25`, `qwen25vl`, `qwen3_vl`, `granite_docling`, `deepseek_ocr`, `florence2`, `groundingdino`.
 
 ### 2) Apply layout rules
 

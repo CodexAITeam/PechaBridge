@@ -16,7 +16,6 @@ if str(REPO_ROOT) not in sys.path:
     sys.path.insert(0, str(REPO_ROOT))
 
 from scripts.prepare_donut_ocr_dataset import run as run_prepare_donut_ocr_dataset
-from scripts.train_donut_ocr import run as run_train_donut_ocr
 from tibetan_utils.arg_utils import create_run_donut_ocr_workflow_parser
 
 LOGGER = logging.getLogger("run_donut_ocr_workflow")
@@ -151,19 +150,20 @@ def run(args) -> Dict[str, object]:
         LOGGER.warning("Validation manifest not found, training will run without eval: %s", val_manifest)
 
     if not args.skip_train:
+        from scripts.train_donut_ocr import run as run_train_donut_ocr
+
         train_args = argparse.Namespace(
             train_manifest=str(train_manifest),
             val_manifest=str(val_manifest) if val_manifest.exists() else "",
             output_dir=str(model_output_dir),
             model_name_or_path=str(args.model_name_or_path),
             image_processor_path="",
-            tokenizer_path="",
-            train_tokenizer=bool(args.train_tokenizer),
-            tokenizer_vocab_size=int(args.tokenizer_vocab_size),
+            tokenizer_path=str(args.tokenizer_path),
             tokenizer_output_dir="",
             extra_special_tokens="<NL>,<s_ocr>,</s_ocr>,<s_cls1>",
             decoder_start_token="<s_ocr>",
             image_size=int(args.image_size),
+            image_preprocess_pipeline=str(getattr(args, "image_preprocess_pipeline", "none") or "none"),
             max_target_length=int(args.max_target_length),
             generation_max_length=int(args.max_target_length),
             per_device_train_batch_size=int(args.per_device_train_batch_size),

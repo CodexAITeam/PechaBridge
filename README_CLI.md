@@ -38,9 +38,19 @@ Available subcommands:
 - `texture-augment`
 - `train-image-encoder`
 - `train-text-encoder`
+- `export-text-hierarchy`
+- `gen-patches`
+- `weak-ocr-label`
+- `mine-mnn-pairs`
+- `train-text-hierarchy-vit`
+- `eval-text-hierarchy-vit`
+- `faiss-text-hierarchy-search`
+- `eval-faiss-crosspage`
 - `prepare-donut-ocr-dataset`
+- `eval-ocr-tokenizer`
 - `train-donut-ocr`
 - `run-donut-ocr-workflow`
+- `download-openpecha-ocr-lines`
 
 ## Example CLI Workflow
 
@@ -106,8 +116,11 @@ Transformer parser examples:
 ```bash
 python ocr_on_detections.py --source image.jpg --parser paddleocr_vl
 python ocr_on_detections.py --source image.jpg --parser qwen25vl
+python ocr_on_detections.py --source image.jpg --parser qwen3_vl
 python ocr_on_detections.py --source image.jpg --parser granite_docling
 python ocr_on_detections.py --source image.jpg --parser deepseek_ocr
+python ocr_on_detections.py --source image.jpg --parser florence2
+python ocr_on_detections.py --source image.jpg --parser groundingdino
 ```
 
 ### 5) Donut-style OCR workflow (Label 1 only)
@@ -168,7 +181,150 @@ python cli.py train-donut-ocr \
   --val_manifest ./datasets/tibetan-donut-ocr-label1/donut_ocr_label1/val_manifest.jsonl \
   --output_dir ./models/donut-ocr-label1 \
   --model_name_or_path microsoft/trocr-base-stage1 \
-  --train_tokenizer
+```
+
+Recommended for OpenPecha OCR line datasets (`BoSentencePiece`, no tokenizer retraining):
+
+```bash
+# A) Download and merge OpenPecha OCR HF datasets into train/test/eval line format
+python cli.py download-openpecha-ocr-lines \
+  --output-dir ./datasets/openpecha_ocr_lines
+
+# B) Prepare Donut manifests from line metadata (val auto-maps to eval)
+python cli.py prepare-donut-ocr-dataset \
+  --dataset_dir ./datasets/openpecha_ocr_lines \
+  --output_dir ./datasets/openpecha_ocr_lines/donut_manifests \
+  --splits train,val \
+  --text_field text
+
+# C) Compare BoSentencePiece vs baselines before training
+python cli.py eval-ocr-tokenizer \
+  --manifests-dir ./datasets/openpecha_ocr_lines/donut_manifests \
+  --tokenizer openpecha/BoSentencePiece \
+  --with-baselines \
+  --output-json ./datasets/openpecha_ocr_lines/donut_manifests/tokenizer_compare.json
+
+# D) Train Donut OCR with the same tokenizer used in evaluation
+python cli.py train-donut-ocr \
+  --train_manifest ./datasets/openpecha_ocr_lines/donut_manifests/train_manifest.jsonl \
+  --val_manifest ./datasets/openpecha_ocr_lines/donut_manifests/val_manifest.jsonl \
+  --output_dir ./models/donut-openpecha-ocr \
+  --model_name_or_path microsoft/trocr-base-stage1 \
+  --tokenizer_path openpecha/BoSentencePiece
+```
+
+Note: The Donut OCR training flow now always reuses the configured tokenizer path directly (no tokenizer retraining flag).
+
+### 6) Patch Retrieval Dataset + mp-InfoNCE ViT Training (current)
+
+Generate the patch dataset (`patches/` + `meta/patches.parquet`) from page images:
+
+```bash
+python cli.py gen-patches \
+  --model ./models/layoutModels/layout_model.pt \
+  --input-dir ./sbb_images \
+  --output-dir ./datasets/text_patches \
+  --no-samples 100 \
+  --debug-dump 10
+```
+
+Optional: generate weak OCR labels:
+
+```bash
+python cli.py weak-ocr-label \
+  --dataset ./datasets/text_patches \
+  --meta ./datasets/text_patches/meta/patches.parquet \
+  --out ./datasets/text_patches/meta/weak_ocr.parquet \
+  --num_workers 8 \
+  --resume
+```
+
+Mine robust cross-page MNN positives:
+
+```bash
+python cli.py mine-mnn-pairs \
+  --dataset ./datasets/text_patches \
+  --meta ./datasets/text_patches/meta/patches.parquet \
+  --out ./datasets/text_patches/meta/mnn_pairs.parquet \
+  --config ./configs/mnn_mining.yaml \
+  --num-workers 8 \
+  --debug-dump 20
+```
+
+Train a pretrained ViT/DINOv2 retrieval encoder with mp-InfoNCE using `mnn`, `ocr`, or `both` weak positive sources:
+
+```bash
+python cli.py train-text-hierarchy-vit \
+  --dataset-dir ./datasets/text_patches \
+  --output-dir ./models/text_hierarchy_vit_mpnce \
+  --model-name-or-path facebook/dinov2-base \
+  --train-mode patch_mpnce \
+  --positive-sources both \
+  --pairs-parquet ./datasets/text_patches/meta/mnn_pairs.parquet \
+  --weak-ocr-parquet ./datasets/text_patches/meta/weak_ocr.parquet \
+  --phase1-epochs 2 \
+  --phase2-epochs 8 \
+  --unfreeze-last-n-blocks 2
+```
+
+Cross-page FAISS evaluation from exported embeddings (same-page results excluded):
+
+```bash
+python cli.py eval-faiss-crosspage \
+  --embeddings-npy ./models/text_hierarchy_vit_mpnce/faiss_embeddings.npy \
+  --embeddings-meta ./models/text_hierarchy_vit_mpnce/faiss_embeddings_meta.parquet \
+  --mnn-pairs ./datasets/text_patches/meta/mnn_pairs.parquet \
+  --output-dir ./models/text_hierarchy_vit_mpnce/eval_crosspage \
+  --recall-ks 1,5,10 \
+  --exclude-same-page
+```
+
+FAISS similarity search on a query crop (interactive inspection):
+
+```bash
+python cli.py faiss-text-hierarchy-search \
+  --query-image ./some_query.png \
+  --dataset-dir ./datasets/text_patches \
+  --backbone-dir ./models/text_hierarchy_vit_mpnce/text_hierarchy_vit_backbone \
+  --projection-head-path ./models/text_hierarchy_vit_mpnce/text_hierarchy_projection_head.pt \
+  --output-dir ./models/text_hierarchy_vit_mpnce/faiss_search \
+  --top-k 10
+```
+
+### 7) Legacy TextHierarchy export + ViT retrieval training (still supported)
+
+Export line/word hierarchy crops from page images:
+
+```bash
+python cli.py export-text-hierarchy \
+  --model ./models/layoutModels/layout_model.pt \
+  --input-dir ./sbb_images \
+  --output-dir ./datasets/text_hierarchy \
+  --no_samples 100
+```
+
+Train on the legacy hierarchy layout:
+
+```bash
+python cli.py train-text-hierarchy-vit \
+  --dataset-dir ./datasets/text_hierarchy \
+  --output-dir ./models/text_hierarchy_vit \
+  --train-mode legacy \
+  --model-name-or-path facebook/dinov2-base \
+  --target-height 64 \
+  --width-buckets 256,384,512,768 \
+  --max-width 1024
+```
+
+Evaluate legacy hierarchy retrieval quality:
+
+```bash
+python cli.py eval-text-hierarchy-vit \
+  --dataset-dir ./datasets/text_hierarchy \
+  --backbone-dir ./models/text_hierarchy_vit/text_hierarchy_vit_backbone \
+  --projection-head-path ./models/text_hierarchy_vit/text_hierarchy_projection_head.pt \
+  --output-dir ./models/text_hierarchy_vit/eval \
+  --recall-ks 1,5,10
 ```
 
 ## Label Studio (CLI)
@@ -193,5 +349,9 @@ label-studio
 ## Additional Docs
 
 - Pseudo-labeling and Label Studio import details: [README_PSEUDO_LABELING_LABEL_STUDIO.md](README_PSEUDO_LABELING_LABEL_STUDIO.md)
+- Patch dataset generation: [docs/dataset_generation.md](docs/dataset_generation.md)
+- MNN mining (cross-page positives): [docs/mnn_mining.md](docs/mnn_mining.md)
+- Retrieval training (mp-InfoNCE + MNN/OCR): [docs/retrieval_mpnce_training.md](docs/retrieval_mpnce_training.md)
+- Weak OCR labeling: [docs/weak_ocr.md](docs/weak_ocr.md)
 - Diffusion + LoRA details: [docs/texture_augmentation.md](docs/texture_augmentation.md)
 - Retrieval roadmap: [docs/tibetan_ngram_retrieval_plan.md](docs/tibetan_ngram_retrieval_plan.md)

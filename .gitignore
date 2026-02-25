@@ -6,10 +6,16 @@ __pycache__/
 
 datasets/
 sbb_images/
+output/
+models/
 
 # C extensions
 *.so
 *.yaml
+!configs/
+!configs/patch_gen.yaml
+!configs/mnn_mining.yaml
+!configs/weak_ocr.yaml
 
 ls-tasks.json
 ls-tasks.label_config.xml

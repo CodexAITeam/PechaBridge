@@ -1,0 +1,42 @@
+model_path: "models/layoutModels/layout_combined-layout-labelstudio_yolo26n.pt_lr0.01_ep100_bs16_sz1024_pat50_train-ui_20260216-190312.pt"
+input_dir: "sbb_images"
+output_dir: "datasets/pecha_line_patches"
+
+conf: 0.25
+imgsz: 1024
+device: ""
+seed: 42
+no_samples: 0
+debug_dump: 8
+
+target_height: 112
+widths: [256, 384, 512]
+overlap: 0.5
+
+jitter_enabled: true
+jitter_frac: 0.04
+
+rmin: 0.01
+rmax: 1.0
+
+sigma_profile: 2.0
+min_dist_frac: 0.25
+min_dist_px: 0
+prominence: 0.08
+sigma_frac: 0.15
+
+n_per_line_per_scale: 12
+p_aligned: 0.6
+
+line_min_height: 10
+line_projection_smooth: 9
+line_projection_threshold_rel: 0.20
+line_merge_gap_px: 5
+
+use_clahe: false
+clahe_clip_limit: 2.0
+clahe_tile_grid_size: 8
+binarize_ink: false
+binarize_mode: "otsu"
+fixed_threshold: 0.5
+

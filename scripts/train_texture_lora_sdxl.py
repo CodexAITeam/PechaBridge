@@ -267,6 +267,46 @@ def _save_epoch_checkpoint(
     return ckpt_path, ckpt_state_path
 
 
+def _save_step_checkpoint(
+    accelerator: Accelerator,
+    args,
+    unet,
+    text_encoder_one,
+    text_encoder_two,
+    *,
+    global_step: int,
+    base_model_id: str,
+    num_train_epochs: int,
+) -> tuple[Path, Path]:
+    output_dir = Path(args.output_dir)
+    output_dir.mkdir(parents=True, exist_ok=True)
+
+    ckpt_weight_name = f"texture_lora_checkpoint_step_{global_step:07d}.safetensors"
+    ckpt_state_name = f"checkpoint_state_step_{global_step:07d}.json"
+
+    ckpt_path = _save_lora_weights(
+        accelerator=accelerator,
+        args=args,
+        unet=unet,
+        text_encoder_one=text_encoder_one,
+        text_encoder_two=text_encoder_two,
+        weight_name=ckpt_weight_name,
+    )
+
+    ckpt_state = {
+        "global_step": int(global_step),
+        "num_train_epochs": int(num_train_epochs),
+        "model_family": args.model_family,
+        "base_model_id": base_model_id,
+        "checkpoint_weights": str(ckpt_path),
+        "dataset_dir": str(Path(args.dataset_dir).expanduser().resolve()),
+    }
+    ckpt_state_path = output_dir / ckpt_state_name
+    with ckpt_state_path.open("w", encoding="utf-8") as f:
+        json.dump(ckpt_state, f, indent=2, ensure_ascii=True)
+    return ckpt_path, ckpt_state_path
+
+
 def run(args) -> dict:
     accelerator = Accelerator(mixed_precision=args.mixed_precision)
     _configure_logging(accelerator.is_main_process)
@@ -285,11 +325,14 @@ def run(args) -> dict:
         raise ValueError("batch_size must be > 0")
     if args.rank <= 0:
         raise ValueError("rank must be > 0")
+    if int(args.checkpoint_every_steps) < 0:
+        raise ValueError("checkpoint_every_steps must be >= 0")
     if int(args.checkpoint_every_epochs) < 0:
         raise ValueError("checkpoint_every_epochs must be >= 0")
 
     base_model_id = _resolve_base_model_id(args)
     LOGGER.info("Training family=%s base_model=%s", args.model_family, base_model_id)
+    LOGGER.info("ControlNet usage: disabled (default for this LoRA training script).")
 
     set_seed(args.seed)
 
@@ -551,6 +594,26 @@ def run(args) -> dict:
                     epoch=str(epoch + 1),
                 )
 
+                if int(args.checkpoint_every_steps) > 0 and global_step % int(args.checkpoint_every_steps) == 0:
+                    accelerator.wait_for_everyone()
+                    if accelerator.is_main_process:
+                        ckpt_path, ckpt_state_path = _save_step_checkpoint(
+                            accelerator=accelerator,
+                            args=args,
+                            unet=unet,
+                            text_encoder_one=text_encoder_one,
+                            text_encoder_two=text_encoder_two,
+                            global_step=global_step,
+                            base_model_id=base_model_id,
+                            num_train_epochs=num_train_epochs,
+                        )
+                        LOGGER.info(
+                            "Saved step checkpoint at step=%d to %s (state: %s)",
+                            global_step,
+                            ckpt_path,
+                            ckpt_state_path,
+                        )
+
         if global_step >= args.max_train_steps:
             break
 
@@ -603,6 +666,8 @@ def run(args) -> dict:
             "batch_size": args.batch_size,
             "lr": args.lr,
             "max_train_steps": args.max_train_steps,
+            "checkpoint_every_steps": args.checkpoint_every_steps,
+            "checkpoint_every_epochs": args.checkpoint_every_epochs,
             "rank": args.rank,
             "lora_alpha": args.lora_alpha,
             "mixed_precision": args.mixed_precision,
