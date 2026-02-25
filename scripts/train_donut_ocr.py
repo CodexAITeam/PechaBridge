@@ -20,7 +20,7 @@ import numpy as np
 import torch
 import torch.nn as nn
 from PIL import Image
-from torch.utils.data import Dataset
+from torch.utils.data import Dataset, Subset
 from transformers import (
     AutoImageProcessor,
     AutoTokenizer,
@@ -1723,6 +1723,32 @@ def run(args) -> Dict[str, object]:
         model=model,
         output_dir=output_dir,
     )
+
+    resume_ckpt = str(getattr(args, "resume_from_checkpoint", "") or "").strip()
+    resume_probe_n = max(0, int(getattr(args, "resume_probe_eval_samples", 5) or 0))
+    if resume_ckpt and has_eval and resume_probe_n > 0:
+        try:
+            ckpt_path = Path(resume_ckpt).expanduser().resolve()
+            if not ckpt_path.exists():
+                LOGGER.warning("resume checkpoint probe skipped: checkpoint not found: %s", ckpt_path)
+            elif not hasattr(trainer, "_load_from_checkpoint"):
+                LOGGER.warning("resume checkpoint probe skipped: trainer has no _load_from_checkpoint() in this transformers version")
+            else:
+                LOGGER.info(
+                    "Running resume checkpoint probe before training: checkpoint=%s n_val_samples=%d",
+                    ckpt_path,
+                    int(resume_probe_n),
+                )
+                trainer._load_from_checkpoint(str(ckpt_path))  # type: ignore[attr-defined]
+                probe_count = min(int(resume_probe_n), len(val_dataset) if val_dataset is not None else 0)
+                if probe_count > 0 and val_dataset is not None:
+                    probe_ds = Subset(val_dataset, list(range(probe_count)))
+                    probe_metrics = trainer.evaluate(eval_dataset=probe_ds, metric_key_prefix="resume_probe")
+                    LOGGER.warning("Resume checkpoint probe metrics: %s", json.dumps(probe_metrics, ensure_ascii=False, default=str))
+                else:
+                    LOGGER.warning("resume checkpoint probe skipped: no validation samples available")
+        except Exception as exc:
+            LOGGER.warning("Resume checkpoint probe failed (continuing with training): %s", exc)
 
     train_result = trainer.train(resume_from_checkpoint=args.resume_from_checkpoint or None)
     trainer.save_model(str(output_dir / "model"))

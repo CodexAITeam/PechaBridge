@@ -3313,6 +3313,38 @@ def _apply_donut_ui_preprocess(image: Image.Image, pipeline: str) -> Image.Image
     return rgb
 
 
+def _apply_line_clip_ui_preprocess_from_runtime_cfg(image: Image.Image, runtime_cfg: Dict[str, Any]) -> Image.Image:
+    rgb = image.convert("RGB")
+    cfg_obj = runtime_cfg if isinstance(runtime_cfg, dict) else {}
+    mode = str(cfg_obj.get("image_preprocess_pipeline", "none") or "none").strip().lower()
+    if mode not in {"pb", "bdrc"}:
+        return rgb
+
+    if mode == "pb" and _pb_preprocess_patch_image is not None and _PBPreprocessConfig is not None:
+        try:
+            pb_payload = cfg_obj.get("image_preprocess_pb")
+            if isinstance(pb_payload, dict) and hasattr(_PBPreprocessConfig, "from_dict"):
+                pb_cfg = _PBPreprocessConfig.from_dict(pb_payload)
+            else:
+                pb_cfg = _PBPreprocessConfig()
+            return _pb_preprocess_patch_image(image=rgb, config=pb_cfg).convert("RGB")
+        except Exception:
+            return rgb
+
+    if mode == "bdrc" and _preprocess_image_bdrc is not None and _BDRCPreprocessConfig is not None:
+        try:
+            bdrc_payload = cfg_obj.get("image_preprocess_bdrc")
+            if isinstance(bdrc_payload, dict) and hasattr(_BDRCPreprocessConfig, "from_dict"):
+                bdrc_cfg = _BDRCPreprocessConfig.from_dict(bdrc_payload)
+            else:
+                bdrc_cfg = _BDRCPreprocessConfig.vit_defaults()
+            return _preprocess_image_bdrc(image=rgb, config=bdrc_cfg).convert("RGB")
+        except Exception:
+            return rgb
+
+    return rgb
+
+
 def run_donut_ocr_inference_ui(
     image: Optional[np.ndarray],
     model_root_or_model_dir: str,
@@ -3974,6 +4006,10 @@ def _encode_line_clip_image_crops_ui(
             for p in chunk:
                 with Image.open(p) as im:
                     rgb = im.convert("RGB")
+                rgb = _apply_line_clip_ui_preprocess_from_runtime_cfg(
+                    rgb,
+                    runtime_cfg if isinstance(runtime_cfg, dict) else {},
+                )
                 norm_img = _normalize_for_vit_encoding(
                     image=rgb,
                     target_height=_to_int(runtime_cfg.get("target_height", 64), 64),
@@ -6876,6 +6912,9 @@ def _load_hierarchy_encoder_runtime_config(backbone_path: str, projection_head_p
         "max_width": 1024,
         "patch_multiple": 16,
         "width_buckets": [256, 384, 512, 768],
+        "image_preprocess_pipeline": "none",
+        "image_preprocess_pb": None,
+        "image_preprocess_bdrc": None,
         "source": "defaults",
     }
     bpath = Path(backbone_path).expanduser().resolve() if (backbone_path or "").strip() else None
@@ -6917,6 +6956,11 @@ def _load_hierarchy_encoder_runtime_config(backbone_path: str, projection_head_p
             raw=raw_buckets,
             patch_multiple=out["patch_multiple"],
             max_width=out["max_width"],
+        )
+        out["image_preprocess_pipeline"] = str(data.get("image_preprocess_pipeline", "none") or "none").strip().lower()
+        out["image_preprocess_pb"] = data.get("image_preprocess_pb") if isinstance(data.get("image_preprocess_pb"), dict) else None
+        out["image_preprocess_bdrc"] = (
+            data.get("image_preprocess_bdrc") if isinstance(data.get("image_preprocess_bdrc"), dict) else None
         )
         out["source"] = str(cfg_path)
         return out
