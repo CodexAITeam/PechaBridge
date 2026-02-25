@@ -25,6 +25,9 @@ import time
 import zipfile
 import csv
 import hashlib
+import base64
+import html
+import io
 from concurrent.futures import ThreadPoolExecutor, as_completed
 from functools import lru_cache
 from pathlib import Path
@@ -3479,6 +3482,397 @@ def run_donut_ocr_inference_with_gt_ui(
         debug_obj["cer"] = cer
         debug_json = json.dumps(debug_obj, ensure_ascii=False, indent=2)
     return preview, pred_text, gt, cer_text, debug_json
+
+
+def _image_np_to_data_uri_png_ui(image: Optional[np.ndarray], max_width_px: int = 320) -> str:
+    if image is None:
+        return ""
+    try:
+        arr = np.asarray(image)
+    except Exception:
+        return ""
+    if arr.size == 0:
+        return ""
+    if arr.ndim == 2:
+        arr = np.stack([arr, arr, arr], axis=-1)
+    if arr.ndim != 3:
+        return ""
+    if arr.shape[2] == 1:
+        arr = np.repeat(arr, 3, axis=2)
+    elif arr.shape[2] >= 4:
+        arr = arr[:, :, :3]
+    arr = arr.astype(np.uint8, copy=False)
+    pil = Image.fromarray(arr).convert("RGB")
+    if int(max_width_px) > 0 and pil.width > int(max_width_px):
+        scale = float(max_width_px) / float(max(1, pil.width))
+        new_h = max(1, int(round(pil.height * scale)))
+        resampling_ns = getattr(Image, "Resampling", Image)
+        pil = pil.resize((int(max_width_px), int(new_h)), resample=resampling_ns.LANCZOS)
+    buf = io.BytesIO()
+    pil.save(buf, format="PNG")
+    b64 = base64.b64encode(buf.getvalue()).decode("ascii")
+    return f"data:image/png;base64,{b64}"
+
+
+def _render_line_ocr_cards_html_ui(rows: List[Dict[str, Any]], note: str = "") -> str:
+    safe_note = html.escape(str(note or ""))
+    header = (
+        f"<div style='margin:0 0 10px 0;color:#475569;font-size:12px;'>{safe_note}</div>"
+        if safe_note
+        else ""
+    )
+    if not rows:
+        return (
+            "<div style='font-family: ui-sans-serif, system-ui, -apple-system, Segoe UI, sans-serif;'>"
+            f"{header}"
+            "<div style='border:1px solid #e2e8f0;border-radius:12px;padding:14px;background:#f8fafc;color:#64748b;'>"
+            "Noch keine Zeilen-Ergebnisse. Bild hochladen und Workflow starten."
+            "</div>"
+            "</div>"
+        )
+
+    cards: List[str] = []
+    for rec in rows:
+        line_no = int(rec.get("line_no", 0))
+        line_id = int(rec.get("line_id", 0))
+        line_box = rec.get("line_box") or [0, 0, 0, 0]
+        line_box_txt = html.escape(str([int(v) for v in line_box[:4]]))
+        text_val = str(rec.get("text", "") or "")
+        text_html = (
+            html.escape(text_val)
+            if text_val.strip()
+            else "<span style='color:#94a3b8;font-style:italic;'>(leer)</span>"
+        )
+        img_uri = str(rec.get("image_uri", "") or "")
+        status_badge = ""
+        if not bool(rec.get("ok", True)):
+            err = html.escape(str(rec.get("error", "OCR fehlgeschlagen")))
+            status_badge = (
+                "<div style='margin-top:6px;color:#b91c1c;font-size:12px;'>"
+                f"{err}</div>"
+            )
+        cards.append(
+            "<div style='display:grid;grid-template-columns:minmax(110px,180px) 1fr;gap:12px;"
+            "align-items:start;border:1px solid #e2e8f0;border-radius:14px;padding:10px;"
+            "background:#ffffff;box-shadow:0 1px 2px rgba(15,23,42,0.05);margin-bottom:10px;'>"
+            "<div>"
+            f"<img src='{img_uri}' alt='line {line_no}' "
+            "style='width:100%;height:auto;display:block;border-radius:10px;border:1px solid #e2e8f0;background:#f8fafc;' />"
+            "</div>"
+            "<div>"
+            "<div style='display:flex;gap:8px;align-items:center;flex-wrap:wrap;margin-bottom:6px;'>"
+            f"<span style='background:#0f172a;color:#fff;border-radius:999px;padding:2px 8px;font-size:11px;'>Zeile {line_no}</span>"
+            f"<span style='background:#e2e8f0;color:#334155;border-radius:999px;padding:2px 8px;font-size:11px;'>line_id {line_id}</span>"
+            f"<span style='color:#64748b;font-size:11px;'>bbox {line_box_txt}</span>"
+            "</div>"
+            "<div style='white-space:pre-wrap;line-height:1.35;font-size:14px;color:#0f172a;"
+            "background:#f8fafc;border:1px solid #e2e8f0;border-radius:10px;padding:8px;'>"
+            f"{text_html}</div>"
+            f"{status_badge}"
+            "</div>"
+            "</div>"
+        )
+
+    return (
+        "<div style='font-family: ui-sans-serif, system-ui, -apple-system, Segoe UI, sans-serif;'>"
+        f"{header}"
+        + "".join(cards)
+        + "</div>"
+    )
+
+
+def run_page_line_donut_ocr_preview_ui(
+    input_mode: str,
+    image: Optional[np.ndarray],
+    direct_line_image: Optional[np.ndarray],
+    line_model_path: str,
+    line_conf: float,
+    line_imgsz: int,
+    line_device: str,
+    line_min_height: int,
+    line_projection_smooth: int,
+    line_projection_threshold_rel: float,
+    line_merge_gap_px: int,
+    donut_model_dir: str,
+    donut_preproc: str,
+    donut_device: str,
+    donut_max_len: int,
+    donut_num_beams: int,
+    max_lines: int,
+):
+    empty_html = _render_line_ocr_cards_html_ui(
+        [],
+        note="Minimaler Quick-OCR-Workflow: Seite -> Lines -> DONUT oder direktes Line-Image -> DONUT.",
+    )
+    mode = str(input_mode or "Page -> Lines -> DONUT").strip()
+    requested_preproc = str(donut_preproc or "bdrc").strip().lower()
+    # Quick tab is opinionated: use BDRC preprocessing, while the lower-level helper still prefers
+    # the train-script preprocessing implementation when importable.
+    effective_preproc = "bdrc"
+
+    if mode == "Single Line -> DONUT":
+        line_img = direct_line_image if direct_line_image is not None else image
+        if line_img is None:
+            debug = {
+                "ok": False,
+                "mode": mode,
+                "error": "Please upload a line image (or provide an image in the fallback page slot).",
+            }
+            return None, "Please upload a line image.", "", empty_html, json.dumps(debug, ensure_ascii=False, indent=2)
+
+        preview, pred_text, debug_json = run_donut_ocr_inference_ui(
+            image=line_img,
+            model_root_or_model_dir=donut_model_dir,
+            image_preprocess_pipeline=effective_preproc,
+            device_preference=donut_device,
+            generation_max_length=donut_max_len,
+            num_beams=donut_num_beams,
+        )
+        try:
+            debug_obj = json.loads(debug_json or "{}")
+        except Exception:
+            debug_obj = {"raw_debug": debug_json}
+        ok = bool(isinstance(debug_obj, dict) and debug_obj.get("ok"))
+        line_arr = np.asarray(line_img).astype(np.uint8, copy=False)
+        h = int(line_arr.shape[0]) if line_arr.ndim >= 2 else 0
+        w = int(line_arr.shape[1]) if line_arr.ndim >= 2 else 0
+        text_out = str(pred_text or "")
+        err_text = "" if ok else str((debug_obj.get("error") if isinstance(debug_obj, dict) else "") or "DONUT OCR failed.")
+        html_out = _render_line_ocr_cards_html_ui(
+            [
+                {
+                    "line_no": 1,
+                    "line_id": 1,
+                    "line_box": [0, 0, w, h],
+                    "text": text_out if ok else "",
+                    "ok": ok,
+                    "error": err_text,
+                    "image_uri": _image_np_to_data_uri_png_ui(line_arr, max_width_px=420),
+                }
+            ],
+            note="Direkter Zeilenmodus. Nur BDRC-Vorverarbeitung + DONUT OCR (UI nutzt Train-Script-Preprocessing-Helper, falls verfügbar).",
+        )
+        debug = {
+            "ok": ok,
+            "mode": mode,
+            "requested_donut_preprocess": requested_preproc,
+            "effective_donut_preprocess": effective_preproc,
+            "line_image_size": {"width": w, "height": h},
+            "ocr": debug_obj,
+        }
+        status = "Single line mode: BDRC preprocess + DONUT OCR."
+        if not ok:
+            status += f" Error: {err_text}"
+        overlay_out = preview if preview is not None else line_arr
+        return overlay_out, status, text_out, html_out, json.dumps(debug, ensure_ascii=False, indent=2)
+
+    if image is None:
+        debug = {"ok": False, "mode": mode, "error": "Please upload a page image."}
+        return None, "Please upload a page image.", "", empty_html, json.dumps(debug, ensure_ascii=False, indent=2)
+
+    split_out = run_tibetan_text_line_split_classical(
+        image=image,
+        model_path=line_model_path,
+        conf=line_conf,
+        imgsz=line_imgsz,
+        device=line_device,
+        min_line_height=line_min_height,
+        projection_smooth=line_projection_smooth,
+        projection_threshold_rel=line_projection_threshold_rel,
+        merge_gap_px=line_merge_gap_px,
+        draw_parent_boxes=True,
+        detect_red_text=False,
+        red_min_redness=26,
+        red_min_saturation=35,
+        red_column_fill_rel=0.07,
+        red_merge_gap_px=14,
+        red_min_width_px=18,
+        draw_red_boxes=False,
+    )
+    (
+        overlay,
+        split_status,
+        split_json,
+        _line_profile,
+        _selected_line_view,
+        _hierarchy_view,
+        _selected_line_profile,
+        _click_status,
+        click_state,
+    ) = split_out
+
+    line_records_raw = []
+    source_image = None
+    if isinstance(click_state, dict):
+        line_records_raw = click_state.get("line_boxes") or []
+        source_image = click_state.get("image")
+    if source_image is None:
+        source_image = image
+
+    try:
+        src = np.asarray(source_image).astype(np.uint8, copy=False)
+    except Exception:
+        src = np.asarray(image).astype(np.uint8, copy=False)
+
+    if src.size == 0 or src.ndim < 2:
+        debug = {
+            "ok": False,
+            "stage": "line_split",
+            "split_status": split_status,
+            "error": "Source image unavailable after line split.",
+        }
+        return overlay, split_status, "", empty_html, json.dumps(debug, ensure_ascii=False, indent=2)
+
+    h, w = src.shape[:2]
+    parsed_lines: List[Dict[str, Any]] = []
+    for rec in line_records_raw:
+        if not isinstance(rec, dict):
+            continue
+        box = rec.get("line_box") or []
+        if not isinstance(box, (list, tuple)) or len(box) != 4:
+            continue
+        try:
+            x1, y1, x2, y2 = [int(v) for v in box]
+        except Exception:
+            continue
+        x1 = max(0, min(w - 1, x1))
+        y1 = max(0, min(h - 1, y1))
+        x2 = max(0, min(w, x2))
+        y2 = max(0, min(h, y2))
+        if x2 <= x1 or y2 <= y1:
+            continue
+        parsed_lines.append(
+            {
+                "line_id": int(rec.get("line_id", len(parsed_lines) + 1)),
+                "line_box": [x1, y1, x2, y2],
+            }
+        )
+
+    parsed_lines = sorted(parsed_lines, key=lambda r: (int(r["line_box"][1]), int(r["line_box"][0]), int(r["line_id"])))
+    total_detected_lines = len(parsed_lines)
+    line_limit = max(0, int(max_lines))
+    truncated = False
+    if line_limit > 0 and len(parsed_lines) > line_limit:
+        parsed_lines = parsed_lines[:line_limit]
+        truncated = True
+
+    if not parsed_lines:
+        note = "Keine Zeilen erkannt. Prüfe YOLO-Modellpfad/Klassen oder das Bild."
+        html_out = _render_line_ocr_cards_html_ui([], note=note)
+        debug = {
+            "ok": False,
+            "stage": "line_split",
+            "split_status": split_status,
+            "total_detected_lines": int(total_detected_lines),
+            "split_json": json.loads(split_json) if (split_json or "").strip().startswith("{") else split_json,
+        }
+        return overlay, split_status, "", html_out, json.dumps(debug, ensure_ascii=False, indent=2)
+
+    html_rows: List[Dict[str, Any]] = []
+    copy_lines: List[str] = []
+    ocr_debug_rows: List[Dict[str, Any]] = []
+    ocr_failures = 0
+
+    for line_no, rec in enumerate(parsed_lines, start=1):
+        x1, y1, x2, y2 = [int(v) for v in rec["line_box"]]
+        crop = src[y1:y2, x1:x2]
+        if crop.size == 0:
+            ocr_failures += 1
+            html_rows.append(
+                {
+                    "line_no": int(line_no),
+                    "line_id": int(rec["line_id"]),
+                    "line_box": [x1, y1, x2, y2],
+                    "text": "",
+                    "ok": False,
+                    "error": "Leerer Crop",
+                    "image_uri": _image_np_to_data_uri_png_ui(crop),
+                }
+            )
+            copy_lines.append(f"[{line_no:02d}] ")
+            ocr_debug_rows.append(
+                {
+                    "line_no": int(line_no),
+                    "line_id": int(rec["line_id"]),
+                    "line_box": [x1, y1, x2, y2],
+                    "ok": False,
+                    "error": "empty_crop",
+                }
+            )
+            continue
+
+        _, pred_text, debug_json = run_donut_ocr_inference_ui(
+            image=crop,
+            model_root_or_model_dir=donut_model_dir,
+            image_preprocess_pipeline=effective_preproc,
+            device_preference=donut_device,
+            generation_max_length=donut_max_len,
+            num_beams=donut_num_beams,
+        )
+        try:
+            debug_obj = json.loads(debug_json or "{}")
+        except Exception:
+            debug_obj = {"raw_debug": debug_json}
+        ok = bool(isinstance(debug_obj, dict) and debug_obj.get("ok"))
+        if not ok:
+            ocr_failures += 1
+        text_out = str(pred_text or "")
+        err_text = ""
+        if not ok:
+            err_text = str((debug_obj.get("error") if isinstance(debug_obj, dict) else "") or "DONUT OCR failed.")
+        html_rows.append(
+            {
+                "line_no": int(line_no),
+                "line_id": int(rec["line_id"]),
+                "line_box": [x1, y1, x2, y2],
+                "text": text_out if ok else "",
+                "ok": ok,
+                "error": err_text,
+                "image_uri": _image_np_to_data_uri_png_ui(crop, max_width_px=360),
+            }
+        )
+        copy_lines.append(f"[{line_no:02d}] {text_out if ok else ''}")
+        ocr_debug_rows.append(
+            {
+                "line_no": int(line_no),
+                "line_id": int(rec["line_id"]),
+                "line_box": [x1, y1, x2, y2],
+                "ok": ok,
+                "text": (text_out if ok else ""),
+                "error": err_text,
+                "debug": debug_obj,
+            }
+        )
+
+    note = f"Erkannte Zeilen: {total_detected_lines}. DONUT ausgeführt auf {len(parsed_lines)} Zeile(n)."
+    if truncated:
+        note += f" Anzeige/Verarbeitung auf max_lines={line_limit} begrenzt."
+    if ocr_failures:
+        note += f" OCR-Fehler: {ocr_failures}."
+    html_out = _render_line_ocr_cards_html_ui(html_rows, note=note)
+
+    split_json_obj: Any
+    try:
+        split_json_obj = json.loads(split_json or "{}")
+    except Exception:
+        split_json_obj = split_json
+    debug = {
+        "ok": ocr_failures == 0,
+        "mode": mode,
+        "requested_donut_preprocess": requested_preproc,
+        "effective_donut_preprocess": effective_preproc,
+        "split_status": split_status,
+        "ocr_status": note,
+        "total_detected_lines": int(total_detected_lines),
+        "processed_lines": int(len(parsed_lines)),
+        "ocr_failures": int(ocr_failures),
+        "truncated": bool(truncated),
+        "split_json": split_json_obj,
+        "ocr_lines": ocr_debug_rows,
+    }
+    final_status = split_status + " " + note + " DONUT preprocess=bdrc (train-script helper preferred)."
+    copy_text = "\n".join(copy_lines)
+    return overlay, final_status.strip(), copy_text, html_out, json.dumps(debug, ensure_ascii=False, indent=2)
 
 
 def scan_donut_ocr_models_ui(models_dir: str):
@@ -9927,6 +10321,161 @@ def build_ui() -> gr.Blocks:
         def _scan_train_datasets(base: str):
             choices = _list_dataset_names(base)
             return gr.update(choices=choices, value=(choices[0] if choices else None))
+
+        # 12b) Minimal end-to-end page -> lines -> DONUT OCR preview
+        with gr.Tab("12b. Page -> Lines -> DONUT OCR"):
+            gr.Markdown(
+                "Minimal workflow: entweder Seite hochladen (Textbox-Erkennung + Line-Segmentierung + DONUT OCR) "
+                "oder direkt ein einzelnes Line-Image hochladen (nur BDRC-Vorverarbeitung + DONUT OCR). "
+                "Die Vorverarbeitung orientiert sich am DONUT-Train-Script (`bdrc`, Helper wird bevorzugt)."
+            )
+            with gr.Row():
+                with gr.Column(scale=1):
+                    lineocr_input_mode = gr.Radio(
+                        choices=["Page -> Lines -> DONUT", "Single Line -> DONUT"],
+                        value="Page -> Lines -> DONUT",
+                        label="Input Mode",
+                    )
+                    lineocr_image = gr.Image(type="numpy", label="Page Image (for page mode)", sources=["upload", "clipboard"])
+                    lineocr_direct_line_image = gr.Image(
+                        type="numpy",
+                        label="Direct Line Image (for single-line mode)",
+                        sources=["upload", "clipboard"],
+                    )
+                    with gr.Accordion("Model Selection", open=True):
+                        lineocr_line_models_dir = gr.Textbox(
+                            label="Scan line models dir",
+                            value=str((workspace_root / "models").resolve()),
+                        )
+                        with gr.Row():
+                            lineocr_line_scan_btn = gr.Button("Scan Line Models")
+                            lineocr_line_scan_status = gr.Textbox(label="Line Scan Status", interactive=False)
+                        lineocr_line_model_select = gr.Dropdown(
+                            choices=[],
+                            value=None,
+                            label="Detected Ultralytics line/text model",
+                            allow_custom_value=True,
+                        )
+                        lineocr_line_model = gr.Textbox(
+                            label="line_model_path",
+                            value=str((ROOT / "runs" / "detect" / "train" / "weights" / "best.pt").resolve()),
+                        )
+
+                        lineocr_donut_models_dir = gr.Textbox(
+                            label="Scan DONUT models dir",
+                            value=str((workspace_root / "models").resolve()),
+                        )
+                        with gr.Row():
+                            lineocr_donut_scan_btn = gr.Button("Scan DONUT Models")
+                            lineocr_donut_scan_status = gr.Textbox(label="DONUT Scan Status", interactive=False)
+                        lineocr_donut_model_select = gr.Dropdown(
+                            choices=[],
+                            value=None,
+                            label="Detected DONUT/TroCR model",
+                            allow_custom_value=True,
+                        )
+                        lineocr_donut_model_dir = gr.Textbox(
+                            label="donut_model_dir",
+                            value=default_donut_model_output_dir,
+                        )
+
+                    with gr.Accordion("Advanced (optional)", open=False):
+                        with gr.Row():
+                            lineocr_line_conf = gr.Slider(0.01, 0.99, value=0.25, step=0.01, label="line_conf")
+                            lineocr_line_imgsz = gr.Number(label="line_imgsz", value=1024, precision=0)
+                        lineocr_line_device = gr.Textbox(label="line_device", value="")
+                        with gr.Row():
+                            lineocr_min_line_height = gr.Number(label="min_line_height_px", value=10, precision=0)
+                            lineocr_merge_gap = gr.Number(label="line_merge_gap_px", value=5, precision=0)
+                        with gr.Row():
+                            lineocr_proj_smooth = gr.Number(label="projection_smooth_rows", value=9, precision=0)
+                            lineocr_proj_thresh = gr.Slider(
+                                0.05,
+                                0.80,
+                                value=0.20,
+                                step=0.01,
+                                label="projection_threshold_rel",
+                            )
+                        with gr.Row():
+                            lineocr_donut_preproc = gr.Textbox(
+                                label="donut_preprocess (fixed in Quick tab)",
+                                value="bdrc",
+                                interactive=False,
+                            )
+                            lineocr_donut_device = gr.Dropdown(
+                                choices=["auto", "cuda:0", "cuda:1", "cuda:2", "cuda:3", "cpu"],
+                                value="auto",
+                                label="donut_device",
+                            )
+                        with gr.Row():
+                            lineocr_donut_max_len = gr.Number(label="generation_max_length", value=512, precision=0)
+                            lineocr_donut_beams = gr.Number(label="num_beams", value=1, precision=0)
+                        lineocr_max_lines = gr.Number(label="max_lines (0=all)", value=0, precision=0)
+
+                    lineocr_run_btn = gr.Button("Run Quick OCR (Page/Line)", variant="primary")
+
+                with gr.Column(scale=1):
+                    lineocr_overlay = gr.Image(type="numpy", label="Preview (Page Overlay or Preprocessed Line)")
+                    lineocr_status = gr.Textbox(label="Status", lines=3, interactive=False)
+                    lineocr_copy_text = gr.Textbox(label="Line Text (Copy/Paste)", lines=10)
+                    lineocr_cards_html = gr.HTML(
+                        value=_render_line_ocr_cards_html_ui(
+                            [],
+                            note="Noch nicht ausgeführt.",
+                        )
+                    )
+                    with gr.Accordion("Debug JSON", open=False):
+                        lineocr_debug_json = gr.Code(label="Workflow Debug JSON", language="json")
+
+            lineocr_line_scan_btn.click(
+                fn=scan_ultralytics_inference_models,
+                inputs=[lineocr_line_models_dir],
+                outputs=[lineocr_line_model_select, lineocr_line_scan_status],
+            )
+            lineocr_line_model_select.change(
+                fn=lambda x: x or "",
+                inputs=[lineocr_line_model_select],
+                outputs=[lineocr_line_model],
+            )
+            lineocr_donut_scan_btn.click(
+                fn=scan_donut_ocr_models_ui,
+                inputs=[lineocr_donut_models_dir],
+                outputs=[lineocr_donut_model_select, lineocr_donut_model_dir, lineocr_donut_scan_status],
+            )
+            lineocr_donut_model_select.change(
+                fn=lambda x: x or "",
+                inputs=[lineocr_donut_model_select],
+                outputs=[lineocr_donut_model_dir],
+            )
+            lineocr_run_btn.click(
+                fn=run_page_line_donut_ocr_preview_ui,
+                inputs=[
+                    lineocr_input_mode,
+                    lineocr_image,
+                    lineocr_direct_line_image,
+                    lineocr_line_model,
+                    lineocr_line_conf,
+                    lineocr_line_imgsz,
+                    lineocr_line_device,
+                    lineocr_min_line_height,
+                    lineocr_proj_smooth,
+                    lineocr_proj_thresh,
+                    lineocr_merge_gap,
+                    lineocr_donut_model_dir,
+                    lineocr_donut_preproc,
+                    lineocr_donut_device,
+                    lineocr_donut_max_len,
+                    lineocr_donut_beams,
+                    lineocr_max_lines,
+                ],
+                outputs=[
+                    lineocr_overlay,
+                    lineocr_status,
+                    lineocr_copy_text,
+                    lineocr_cards_html,
+                    lineocr_debug_json,
+                ],
+            )
 
         # 1) Hello / workflow overview
         with gr.Tab("1. Hello"):
