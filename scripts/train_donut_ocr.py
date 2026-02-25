@@ -1543,6 +1543,7 @@ def run(args) -> Dict[str, object]:
     collator = OCRDataCollator(tokenizer)
     zero_cer_debug_count = {"n": 0}
     high_cer_debug_count = {"n": 0}
+    collapse_warn_count = {"n": 0}
 
     def _compute_metrics(eval_pred):
         predictions, labels = eval_pred
@@ -1563,6 +1564,34 @@ def run(args) -> Dict[str, object]:
             if not p:
                 empty_pred_count += 1
             valid_pairs.append((p, r))
+        if (
+            valid_pairs
+            and empty_pred_count >= len(valid_pairs)
+            and collapse_warn_count["n"] < 10
+        ):
+            collapse_warn_count["n"] += 1
+            LOGGER.error("=" * 120)
+            LOGGER.error(
+                "GENERATION COLLAPSE DETECTED: all predictions are empty after decoding on eval set "
+                "(valid_n=%d, empty_pred=%d, empty_ref=%d). CER will read as 1.0 (100%%) but is not a useful quality signal.",
+                int(len(valid_pairs)),
+                int(empty_pred_count),
+                int(empty_ref_count),
+            )
+            LOGGER.error(
+                "Typical cause: model generates immediate task-end/EOS (e.g. <s_ocr></s_ocr>). "
+                "Try earlier checkpoint, higher --generation_min_new_tokens, and inspect resume probe metrics."
+            )
+            for i, (pred, ref) in enumerate(valid_pairs[:3], start=1):
+                LOGGER.error(
+                    "collapse sample %d | REF_len=%d PRD_len=%d | REF=%r | PRD=%r",
+                    i,
+                    len(ref),
+                    len(pred),
+                    ref[:180],
+                    pred[:180],
+                )
+            LOGGER.error("=" * 120)
         if valid_pairs:
             cer = _char_error_rate(
                 [p for p, _ in valid_pairs],
