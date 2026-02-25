@@ -1745,9 +1745,28 @@ def run(args) -> Dict[str, object]:
                     probe_ds = Subset(val_dataset, list(range(probe_count)))
                     probe_metrics = trainer.evaluate(eval_dataset=probe_ds, metric_key_prefix="resume_probe")
                     LOGGER.warning("Resume checkpoint probe metrics: %s", json.dumps(probe_metrics, ensure_ascii=False, default=str))
+                    try:
+                        valid_n = int(probe_metrics.get("resume_probe_cer_valid_n", 0) or 0)
+                        empty_pred_n = int(probe_metrics.get("resume_probe_cer_empty_pred_count", 0) or 0)
+                        if (
+                            valid_n > 0
+                            and empty_pred_n >= valid_n
+                            and not bool(getattr(args, "allow_resume_probe_empty_pred", False))
+                        ):
+                            raise RuntimeError(
+                                "Resume checkpoint probe detected generation collapse: "
+                                f"empty predictions for all {empty_pred_n}/{valid_n} probe samples. "
+                                "Choose an earlier checkpoint or override with --allow_resume_probe_empty_pred."
+                            )
+                    except RuntimeError:
+                        raise
+                    except Exception as exc:
+                        LOGGER.warning("Could not validate resume checkpoint probe metrics: %s", exc)
                 else:
                     LOGGER.warning("resume checkpoint probe skipped: no validation samples available")
         except Exception as exc:
+            if isinstance(exc, RuntimeError) and "generation collapse" in str(exc):
+                raise
             LOGGER.warning("Resume checkpoint probe failed (continuing with training): %s", exc)
 
     train_result = trainer.train(resume_from_checkpoint=args.resume_from_checkpoint or None)

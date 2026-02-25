@@ -11267,11 +11267,17 @@ def build_ui() -> gr.Blocks:
                             lineclip_dbg_txt_encoder = gr.Textbox(label="text_encoder_dir")
                             lineclip_dbg_txt_head = gr.Textbox(label="text_projection_head")
                 with gr.Column(scale=1):
-                    lineclip_dbg_query_mode = gr.Radio(
-                        choices=["Text -> Image", "Image -> Image", "Image -> Text"],
-                        value="Text -> Image",
-                        label="Query mode",
-                    )
+                    with gr.Row():
+                        lineclip_dbg_query_mode = gr.Radio(
+                            choices=["Text -> Image", "Image -> Image", "Image -> Text"],
+                            value="Text -> Image",
+                            label="Query mode",
+                        )
+                        lineclip_dbg_device = gr.Dropdown(
+                            choices=["auto", "cuda", "cuda:0", "cuda:1", "cuda:2", "cuda:3", "cpu", "mps"],
+                            value="auto",
+                            label="Inference Device",
+                        )
                     lineclip_dbg_gt_text = gr.Textbox(label="Ground-truth text", lines=4)
                     lineclip_dbg_query_text = gr.Textbox(label="Text query (used for Text -> Image)", lines=4)
                     lineclip_dbg_topk = gr.Number(label="top_k", value=5, precision=0)
@@ -11280,13 +11286,7 @@ def build_ui() -> gr.Blocks:
                     lineclip_dbg_status = gr.Textbox(label="Debug Retrieval Status", interactive=False)
                     lineclip_dbg_debug_json = gr.Code(label="Debug JSON", language="json")
                     with gr.Accordion("Advanced Retrieval Settings", open=False):
-                        with gr.Row():
-                            lineclip_dbg_device = gr.Dropdown(
-                                choices=["auto", "cuda", "cuda:0", "cuda:1", "cuda:2", "cuda:3", "cpu", "mps"],
-                                value="auto",
-                                label="device",
-                            )
-                            lineclip_dbg_l2 = gr.Checkbox(label="l2_normalize_embeddings", value=True)
+                        lineclip_dbg_l2 = gr.Checkbox(label="l2_normalize_embeddings", value=True)
                         with gr.Row():
                             lineclip_dbg_batch = gr.Number(label="embedding_batch_size", value=32, precision=0)
                             lineclip_dbg_text_max_len = gr.Number(label="text_max_length", value=256, precision=0)

@@ -1024,6 +1024,8 @@ def add_train_donut_ocr_arguments(parser):
                        help='Randomly sample at most N validation rows for eval/CER during training (0 = use all)')
     parser.add_argument('--resume_probe_eval_samples', '--resume-probe-eval-samples', dest='resume_probe_eval_samples', type=int, default=5,
                        help='If resuming from checkpoint, run a quick pre-train eval on N val samples to detect generation collapse (0 disables)')
+    parser.add_argument('--allow_resume_probe_empty_pred', '--allow-resume-probe-empty-pred', dest='allow_resume_probe_empty_pred', action='store_true',
+                       help='Do not abort training when the resume checkpoint probe predicts empty strings for all probe validation samples')
     parser.add_argument('--output_dir', type=str, required=True,
                        help='Output directory for checkpoints and final model')
     parser.add_argument('--model_name_or_path', type=str, default='microsoft/trocr-base-stage1',
