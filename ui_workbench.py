@@ -3248,7 +3248,11 @@ def _load_donut_ocr_runtime_cached(model_dir_s: str, tokenizer_dir_s: str, image
     tokenizer_dir = Path(tokenizer_dir_s).expanduser().resolve()
     image_processor_dir = Path(image_processor_dir_s).expanduser().resolve()
 
-    from scripts.train_donut_ocr import _load_ved_model_robust  # reuse training-side HF/meta fixes
+    from scripts.train_donut_ocr import (
+        _load_ved_model_robust,
+        _paired_end_token_for_start,
+        _strip_special_token_strings,
+    )  # reuse training-side HF/meta/token fixes
 
     model = _load_ved_model_robust(str(model_dir))
     tokenizer = AutoTokenizer.from_pretrained(str(tokenizer_dir), use_fast=True)
@@ -3258,9 +3262,6 @@ def _load_donut_ocr_runtime_cached(model_dir_s: str, tokenizer_dir_s: str, image
         if tokenizer.pad_token_id is not None:
             model.config.pad_token_id = int(tokenizer.pad_token_id)
             model.generation_config.pad_token_id = int(tokenizer.pad_token_id)
-        if tokenizer.eos_token_id is not None:
-            model.config.eos_token_id = int(tokenizer.eos_token_id)
-            model.generation_config.eos_token_id = int(tokenizer.eos_token_id)
         decoder_start_id = getattr(model.config, "decoder_start_token_id", None)
         if decoder_start_id is None or int(decoder_start_id) < 0:
             for cand in (
@@ -3274,6 +3275,28 @@ def _load_donut_ocr_runtime_cached(model_dir_s: str, tokenizer_dir_s: str, image
         if decoder_start_id is not None and int(decoder_start_id) >= 0:
             model.config.decoder_start_token_id = int(decoder_start_id)
             model.generation_config.decoder_start_token_id = int(decoder_start_id)
+        eos_id = getattr(model.config, "eos_token_id", None)
+        if eos_id is None or int(eos_id) < 0:
+            eos_candidate = None
+            try:
+                start_tok = tokenizer.convert_ids_to_tokens(int(decoder_start_id)) if decoder_start_id is not None else None
+                end_tok = _paired_end_token_for_start(str(start_tok or ""))
+                if end_tok:
+                    end_id = tokenizer.convert_tokens_to_ids(end_tok)
+                    unk_id = getattr(tokenizer, "unk_token_id", None)
+                    if (
+                        end_id is not None
+                        and int(end_id) >= 0
+                        and (unk_id is None or int(end_id) != int(unk_id))
+                    ):
+                        eos_candidate = int(end_id)
+            except Exception:
+                eos_candidate = None
+            if eos_candidate is None and tokenizer.eos_token_id is not None:
+                eos_candidate = int(tokenizer.eos_token_id)
+            if eos_candidate is not None:
+                model.config.eos_token_id = int(eos_candidate)
+                model.generation_config.eos_token_id = int(eos_candidate)
     except Exception:
         pass
     model.eval()
@@ -3388,6 +3411,7 @@ def run_donut_ocr_inference_ui(
                 num_beams=max(1, int(num_beams)),
             )
         text = tokenizer.batch_decode(generated, skip_special_tokens=True)[0] if len(generated) else ""
+        text = _strip_special_token_strings(str(text or ""), tokenizer)
         gen_ids: List[int] = []
         try:
             if len(generated):

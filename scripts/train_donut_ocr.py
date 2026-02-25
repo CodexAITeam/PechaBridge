@@ -68,6 +68,42 @@ def _format_ocr_target_text(raw_text: str, *, start_token: str, end_token: str) 
     return f"{st}{text}{et}"
 
 
+def _encode_target_ids_with_terminal_preservation(
+    tokenizer,
+    target_text: str,
+    *,
+    max_target_length: int,
+    terminal_token: str = "",
+) -> List[int]:
+    """Encode labels and keep the terminal token when truncation happens.
+
+    Losing the task-end token (`</s_ocr>`) during truncation weakens stop-token
+    supervision and can produce repetition loops during generation.
+    """
+    ids = tokenizer(
+        target_text,
+        truncation=False,
+        add_special_tokens=False,
+    )["input_ids"]
+    max_len = int(max_target_length or 0)
+    if max_len > 0 and len(ids) > max_len:
+        ids = list(ids[:max_len])
+        term = str(terminal_token or "").strip()
+        if term and ids:
+            try:
+                term_id = tokenizer.convert_tokens_to_ids(term)
+                unk_id = getattr(tokenizer, "unk_token_id", None)
+                if (
+                    term_id is not None
+                    and int(term_id) >= 0
+                    and (unk_id is None or int(term_id) != int(unk_id))
+                ):
+                    ids[-1] = int(term_id)
+            except Exception:
+                pass
+    return [int(x) for x in ids]
+
+
 def _strip_special_token_strings(text: str, tokenizer) -> str:
     out = str(text or "")
     try:
@@ -104,6 +140,35 @@ def _configure_logging() -> None:
         logging.disable(logging.CRITICAL)
         return
     LOGGER.info("Logging enabled on primary process only (RANK=%d LOCAL_RANK=%d)", rank, local_rank)
+
+
+def _dist_is_initialized() -> bool:
+    try:
+        return bool(torch.distributed.is_available() and torch.distributed.is_initialized())
+    except Exception:
+        return False
+
+
+def _dist_rank() -> int:
+    if not _dist_is_initialized():
+        return 0
+    try:
+        return int(torch.distributed.get_rank())
+    except Exception:
+        return 0
+
+
+def _is_primary_process_runtime() -> bool:
+    return _dist_rank() == 0
+
+
+def _dist_barrier() -> None:
+    if not _dist_is_initialized():
+        return
+    try:
+        torch.distributed.barrier()
+    except Exception:
+        pass
 
 
 class DonutProgressCallback(ProgressCallback):
@@ -1256,6 +1321,7 @@ class OCRManifestDataset(Dataset):
         self.image_preprocess_pipeline = str(image_preprocess_pipeline or "none")
         self.target_start_token = str(target_start_token or "")
         self.target_end_token = str(target_end_token or "")
+        self._truncation_warned = False
 
     def __len__(self) -> int:
         return len(self.samples)
@@ -1273,10 +1339,23 @@ class OCRManifestDataset(Dataset):
         )
         labels = self.tokenizer(
             target_text,
-            truncation=True,
-            max_length=self.max_target_length,
+            truncation=False,
             add_special_tokens=False,
         )["input_ids"]
+        if self.max_target_length > 0 and len(labels) > self.max_target_length:
+            labels = _encode_target_ids_with_terminal_preservation(
+                self.tokenizer,
+                target_text,
+                max_target_length=self.max_target_length,
+                terminal_token=self.target_end_token,
+            )
+            if (not self._truncation_warned) and self.target_end_token:
+                self._truncation_warned = True
+                LOGGER.warning(
+                    "Target truncation detected (dataset idx=%d). Preserving terminal token %r in the final label position to keep EOS supervision.",
+                    int(idx),
+                    self.target_end_token,
+                )
         return {
             "pixel_values": pixel_values,
             "labels": labels,
@@ -1296,7 +1375,11 @@ class OCRDataCollator:
             padding=True,
             return_tensors="pt",
         )["input_ids"]
-        padded[padded == self.tokenizer.pad_token_id] = -100
+        lengths = torch.tensor([len(x) for x in label_inputs], dtype=torch.long)
+        pos = torch.arange(padded.shape[1], dtype=torch.long).unsqueeze(0)
+        pad_mask = pos >= lengths.unsqueeze(1)
+        padded = padded.clone()
+        padded[pad_mask] = -100
         if not self._sanity_logged:
             self._sanity_logged = True
             try:
@@ -1307,6 +1390,13 @@ class OCRDataCollator:
                 pad_id = int(getattr(self.tokenizer, "pad_token_id", 0) or 0)
                 sample0[sample0 == -100] = pad_id
                 sample0_text = self.tokenizer.decode(sample0.tolist(), skip_special_tokens=False)
+                eos_id = getattr(self.tokenizer, "eos_token_id", None)
+                if eos_id is not None and getattr(self.tokenizer, "pad_token_id", None) is not None:
+                    if int(eos_id) == int(self.tokenizer.pad_token_id):
+                        LOGGER.warning(
+                            "Tokenizer has pad_token_id == eos_token_id (%d). Collator masks by sequence length (safe), but generation stop behavior may still be fragile.",
+                            int(eos_id),
+                        )
                 LOGGER.info(
                     "label_sanity batch0 | masked_ratio=%.4f non_ignored[min=%d max=%d mean=%.1f] sample0_decoded_head=%r",
                     (masked / total) if total > 0 else 0.0,
@@ -1370,6 +1460,33 @@ def _sample_cer(pred: str, ref: str) -> float:
     return float(_levenshtein(pred, ref) / denom)
 
 
+def _looks_repetitive_prediction(text: str) -> bool:
+    s = str(text or "")
+    if not s:
+        return False
+    if len(s) >= 8 and len(set(s)) <= 2:
+        return True
+    max_run = 1
+    cur_run = 1
+    prev = None
+    for ch in s:
+        if ch == prev:
+            cur_run += 1
+            if cur_run > max_run:
+                max_run = cur_run
+        else:
+            cur_run = 1
+            prev = ch
+    if len(s) >= 12 and max_run >= max(6, int(0.5 * len(s))):
+        return True
+    token_like = [t for t in re.split(r"\s+", s) if t]
+    if len(token_like) >= 6:
+        reps = sum(int(token_like[i] == token_like[i - 1]) for i in range(1, len(token_like)))
+        if reps / max(1, len(token_like) - 1) >= 0.7:
+            return True
+    return False
+
+
 def _char_error_rate(preds: Sequence[str], refs: Sequence[str], newline_token: str) -> float:
     total_dist = 0
     total_chars = 0
@@ -1384,6 +1501,8 @@ def _char_error_rate(preds: Sequence[str], refs: Sequence[str], newline_token: s
 def run(args) -> Dict[str, object]:
     _configure_logging()
     set_seed(int(args.seed))
+    if bool(getattr(args, "fp16", False)) and bool(getattr(args, "bf16", False)):
+        raise ValueError("Only one of --fp16 / --bf16 can be enabled.")
 
     train_manifest = Path(args.train_manifest).expanduser().resolve()
     val_manifest = _resolve_val_manifest_path(train_manifest, str(getattr(args, "val_manifest", "") or ""))
@@ -1411,8 +1530,10 @@ def run(args) -> Dict[str, object]:
     tokenizer = _load_or_build_tokenizer(args, train_rows)
     tokenizer_save_dir = Path(args.tokenizer_output_dir).expanduser().resolve() if args.tokenizer_output_dir else (output_dir / "tokenizer")
     tokenizer_save_dir.mkdir(parents=True, exist_ok=True)
-    tokenizer.save_pretrained(str(tokenizer_save_dir))
-    LOGGER.info("Tokenizer saved to %s", tokenizer_save_dir)
+    if _is_primary_process_runtime():
+        tokenizer.save_pretrained(str(tokenizer_save_dir))
+        LOGGER.info("Tokenizer saved to %s", tokenizer_save_dir)
+    _dist_barrier()
 
     image_processor_source = args.image_processor_path or args.model_name_or_path
     image_processor = AutoImageProcessor.from_pretrained(image_processor_source)
@@ -1420,7 +1541,9 @@ def run(args) -> Dict[str, object]:
     image_preproc_mode = _image_preprocess_pipeline_name(args)
     LOGGER.info("Donut OCR image preprocessing pipeline: %s", image_preproc_mode)
     image_processor_dir = output_dir / "image_processor"
-    image_processor.save_pretrained(str(image_processor_dir))
+    if _is_primary_process_runtime():
+        image_processor.save_pretrained(str(image_processor_dir))
+    _dist_barrier()
 
     model = _load_ved_model_robust(args.model_name_or_path)
     model.decoder.resize_token_embeddings(len(tokenizer))
@@ -1484,10 +1607,22 @@ def run(args) -> Dict[str, object]:
                     task_end_id = int(_candidate)
         except Exception:
             task_end_id = None
+        if task_end_id is None:
+            raise ValueError(
+                f"Paired task end token could not be resolved in tokenizer: start={args.decoder_start_token!r} end={task_end_token!r}. "
+                "This breaks EOS supervision and often causes repetition loops / max-length decoding."
+            )
 
     effective_eos_id = int(task_end_id) if task_end_id is not None else (
         int(tokenizer.eos_token_id) if tokenizer.eos_token_id is not None else None
     )
+    if tokenizer.pad_token_id is None:
+        raise ValueError("Tokenizer pad_token_id is None after setup; label padding/masking would be invalid.")
+    if effective_eos_id is not None and int(decoder_start_id) == int(effective_eos_id):
+        raise ValueError(
+            f"decoder_start_token_id ({int(decoder_start_id)}) == eos_token_id ({int(effective_eos_id)}). "
+            "This causes immediate-empty generation collapse."
+        )
 
     model.config.decoder_start_token_id = int(decoder_start_id)
     model.config.pad_token_id = int(tokenizer.pad_token_id)
@@ -1565,6 +1700,14 @@ def run(args) -> Dict[str, object]:
         predictions, labels = eval_pred
         if isinstance(predictions, tuple):
             predictions = predictions[0]
+        try:
+            predictions_arr = np.asarray(predictions)
+        except Exception:
+            predictions_arr = predictions
+        if isinstance(predictions_arr, np.ndarray):
+            predictions = predictions_arr
+            if predictions.dtype != object and predictions.ndim >= 2:
+                predictions = np.where(predictions < 0, tokenizer.pad_token_id, predictions)
         labels = np.where(labels == -100, tokenizer.pad_token_id, labels)
         pred_texts = _decode_for_metric(tokenizer, predictions, newline_token=args.metric_newline_token)
         ref_texts = _decode_for_metric(tokenizer, labels, newline_token=args.metric_newline_token)
@@ -1580,6 +1723,9 @@ def run(args) -> Dict[str, object]:
             if not p:
                 empty_pred_count += 1
             valid_pairs.append((p, r))
+        repetitive_pred_count = sum(int(_looks_repetitive_prediction(p)) for p in pred_norms if p)
+        avg_pred_len = float(sum(len(p) for p in pred_norms) / max(1, len(pred_norms)))
+        avg_ref_len = float(sum(len(r) for r in ref_norms) / max(1, len(ref_norms)))
         if (
             valid_pairs
             and empty_pred_count >= len(valid_pairs)
@@ -1671,6 +1817,11 @@ def run(args) -> Dict[str, object]:
             "cer_valid_n": int(len(valid_pairs)),
             "cer_empty_ref_count": int(empty_ref_count),
             "cer_empty_pred_count": int(empty_pred_count),
+            "cer_empty_pred_ratio": float(empty_pred_count / max(1, len(valid_pairs))) if valid_pairs else 1.0,
+            "pred_repetitive_count": int(repetitive_pred_count),
+            "pred_repetitive_ratio": float(repetitive_pred_count / max(1, len(pred_norms))),
+            "pred_avg_len": float(avg_pred_len),
+            "ref_avg_len": float(avg_ref_len),
         }
 
     has_eval = val_dataset is not None and len(val_dataset) > 0
@@ -1760,14 +1911,15 @@ def run(args) -> Dict[str, object]:
     except Exception as exc:
         LOGGER.warning("Could not replace default ProgressCallback: %s", exc)
 
-    _log_pretrain_device_report(
-        train_dataset=train_dataset,
-        collator=collator,
-        image_processor=image_processor,
-        tokenizer=tokenizer,
-        model=model,
-        output_dir=output_dir,
-    )
+    if _is_primary_process_runtime():
+        _log_pretrain_device_report(
+            train_dataset=train_dataset,
+            collator=collator,
+            image_processor=image_processor,
+            tokenizer=tokenizer,
+            model=model,
+            output_dir=output_dir,
+        )
 
     resume_ckpt = str(getattr(args, "resume_from_checkpoint", "") or "").strip()
     resume_probe_n = max(0, int(getattr(args, "resume_probe_eval_samples", 5) or 0))
@@ -1816,8 +1968,9 @@ def run(args) -> Dict[str, object]:
 
     train_result = trainer.train(resume_from_checkpoint=args.resume_from_checkpoint or None)
     trainer.save_model(str(output_dir / "model"))
-    tokenizer.save_pretrained(str(output_dir / "tokenizer"))
-    image_processor.save_pretrained(str(output_dir / "image_processor"))
+    if _is_primary_process_runtime():
+        tokenizer.save_pretrained(str(output_dir / "tokenizer"))
+        image_processor.save_pretrained(str(output_dir / "image_processor"))
 
     metrics: Dict[str, object] = dict(train_result.metrics or {})
     if has_eval:
@@ -1836,8 +1989,9 @@ def run(args) -> Dict[str, object]:
         "metrics": metrics,
     }
     summary_path = output_dir / "train_summary.json"
-    summary_path.write_text(json.dumps(summary, ensure_ascii=False, indent=2), encoding="utf-8")
-    LOGGER.info("Wrote training summary to %s", summary_path)
+    if _is_primary_process_runtime():
+        summary_path.write_text(json.dumps(summary, ensure_ascii=False, indent=2), encoding="utf-8")
+        LOGGER.info("Wrote training summary to %s", summary_path)
     return summary
 
 
