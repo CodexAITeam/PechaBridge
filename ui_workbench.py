@@ -4181,6 +4181,7 @@ def _write_line_clip_debug_results_csv_ui(
     top_k: int,
     gt_idx: int,
     query_desc: Dict[str, Any],
+    extra_metrics_by_index: Optional[Dict[int, Dict[str, Any]]] = None,
 ) -> str:
     out_dir = (Path(tempfile.gettempdir()) / "pechabridge_ui" / "line_clip_debug_exports").resolve()
     out_dir.mkdir(parents=True, exist_ok=True)
@@ -4203,13 +4204,17 @@ def _write_line_clip_debug_results_csv_ui(
                 "text",
                 "is_ground_truth",
                 "query_mode",
-                "query_text",
-                "query_image_path",
-            ],
+                    "query_text",
+                    "query_image_path",
+                    "cer_vs_gt_text",
+                    "sem_text_vs_gt_text",
+                    "sem_image_vs_gt_image",
+                ],
         )
         writer.writeheader()
         for rank, idx in enumerate(order[:k].tolist(), start=1):
             rec = rows[int(idx)]
+            extra = (extra_metrics_by_index or {}).get(int(idx), {})
             writer.writerow(
                 {
                     "rank": int(rank),
@@ -4224,9 +4229,24 @@ def _write_line_clip_debug_results_csv_ui(
                     "query_mode": str(query_desc.get("mode", "") or ""),
                     "query_text": str(query_desc.get("query_text", "") or ""),
                     "query_image_path": str(query_desc.get("query_image_path", "") or ""),
+                    "cer_vs_gt_text": (extra.get("cer_vs_gt_text") if "cer_vs_gt_text" in extra else None),
+                    "sem_text_vs_gt_text": (extra.get("sem_text_vs_gt_text") if "sem_text_vs_gt_text" in extra else None),
+                    "sem_image_vs_gt_image": (extra.get("sem_image_vs_gt_image") if "sem_image_vs_gt_image" in extra else None),
                 }
             )
     return str(out_path)
+
+
+def _cosine_sim_np_ui(a: np.ndarray, b: np.ndarray) -> float:
+    va = np.asarray(a, dtype=np.float32).reshape(-1)
+    vb = np.asarray(b, dtype=np.float32).reshape(-1)
+    if va.size == 0 or vb.size == 0 or va.shape[0] != vb.shape[0]:
+        return float("nan")
+    na = float(np.linalg.norm(va))
+    nb = float(np.linalg.norm(vb))
+    if na <= 0.0 or nb <= 0.0:
+        return float("nan")
+    return float(np.dot(va, vb) / (na * nb))
 
 
 def run_line_clip_dataset_debug_retrieval_ui(
@@ -4336,10 +4356,34 @@ def run_line_clip_dataset_debug_retrieval_ui(
 
         gallery_items: List[Tuple[np.ndarray, str]] = []
         rank_of_gt = -1
+        topk_extra_metrics_by_index: Dict[int, Dict[str, Any]] = {}
+        gt_text_ref = str(sample_ground_truth or "")
+        gt_img_vec: Optional[np.ndarray] = None
+        gt_txt_vec: Optional[np.ndarray] = None
         for rank, idx in enumerate(order.tolist(), start=1):
             if int(idx) == int(gt_idx):
                 rank_of_gt = int(rank)
                 break
+        if gt_idx >= 0 and gt_idx < len(rows):
+            try:
+                gt_img_vec = np.asarray(img_emb[int(gt_idx)], dtype=np.float32)
+            except Exception:
+                gt_img_vec = None
+            try:
+                gt_txt_vec = np.asarray(txt_emb[int(gt_idx)], dtype=np.float32)
+            except Exception:
+                gt_txt_vec = None
+        elif use_text_query and gt_text_ref.strip():
+            try:
+                gt_txt_vec = _encode_line_clip_texts_ui(
+                    runtime,
+                    texts=[gt_text_ref],
+                    batch_size=1,
+                    l2_normalize=bool(l2_normalize),
+                    text_max_length=max(8, int(text_max_length)),
+                )[0]
+            except Exception:
+                gt_txt_vec = None
         for rank, idx in enumerate(top_idx, start=1):
             rec = rows[idx]
             p = str(rec.get("_image_path_resolved", "") or "")
@@ -4349,10 +4393,30 @@ def run_line_clip_dataset_debug_retrieval_ui(
                 img_np = _line_profile_placeholder("Could not load result image.")
             txt = str(rec.get("_text_resolved", "") or "")
             is_gt = (idx == gt_idx and gt_idx >= 0)
+            extra_lines: List[str] = []
+            if use_text_query:
+                extra: Dict[str, Any] = {}
+                if gt_text_ref:
+                    cer_val = _cer_single_ui(txt, gt_text_ref)
+                    extra["cer_vs_gt_text"] = float(cer_val)
+                    extra_lines.append(f"CERvsGT={cer_val:.4f}")
+                if gt_txt_vec is not None and idx < len(txt_emb):
+                    sem_txt = _cosine_sim_np_ui(np.asarray(txt_emb[idx], dtype=np.float32), gt_txt_vec)
+                    if math.isfinite(sem_txt):
+                        extra["sem_text_vs_gt_text"] = float(sem_txt)
+                        extra_lines.append(f"txt~GTtxt={sem_txt:.4f}")
+                if gt_img_vec is not None and idx < len(img_emb):
+                    sem_img = _cosine_sim_np_ui(np.asarray(img_emb[idx], dtype=np.float32), gt_img_vec)
+                    if math.isfinite(sem_img):
+                        extra["sem_image_vs_gt_image"] = float(sem_img)
+                        extra_lines.append(f"img~GTimg={sem_img:.4f}")
+                if extra:
+                    topk_extra_metrics_by_index[int(idx)] = extra
             caption = (
                 f"#{rank} sim={float(sims[idx]):.4f}"
                 + (" [GT]" if is_gt else "")
                 + f"\npage={str(rec.get('page_id', ''))} line={_to_int(rec.get('line_id', -1), -1)}"
+                + (f"\n{' | '.join(extra_lines)}" if extra_lines else "")
                 + (f"\n{textwrap.shorten(txt, width=120, placeholder='...')}" if 'textwrap' in globals() else f"\n{txt[:120]}")
             )
             gallery_items.append((img_np, caption))
@@ -4364,6 +4428,7 @@ def run_line_clip_dataset_debug_retrieval_ui(
             top_k=k,
             gt_idx=gt_idx,
             query_desc=query_desc,
+            extra_metrics_by_index=topk_extra_metrics_by_index,
         )
         debug = {
             "ok": True,
@@ -4379,6 +4444,7 @@ def run_line_clip_dataset_debug_retrieval_ui(
             "device": str(corpus.get("device", "")),
             "device_msg": str(corpus.get("device_msg", "")),
             "results_csv_path": export_csv_path,
+            "topk_text_to_image_metrics": (topk_extra_metrics_by_index if use_text_query else {}),
         }
         status = (
             f"line_clip debug retrieval ({'Text->Image' if use_text_query else ('Image->Text' if use_image_to_text else 'Image->Image')}) "
