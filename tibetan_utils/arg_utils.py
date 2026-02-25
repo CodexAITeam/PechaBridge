@@ -1046,6 +1046,8 @@ def add_train_donut_ocr_arguments(parser):
                        help='Maximum target token length for training labels')
     parser.add_argument('--generation_max_length', type=int, default=512,
                        help='Maximum generated token length during eval')
+    parser.add_argument('--generation_min_new_tokens', '--generation-min-new-tokens', dest='generation_min_new_tokens', type=int, default=0,
+                       help='Minimum number of new tokens to generate during eval before EOS is allowed (0 disables)')
     parser.add_argument('--per_device_train_batch_size', type=int, default=4,
                        help='Train batch size per device')
     parser.add_argument('--per_device_eval_batch_size', type=int, default=4,

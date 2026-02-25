@@ -1485,12 +1485,23 @@ def run(args) -> Dict[str, object]:
         model.generation_config.eos_token_id = int(effective_eos_id)
     model.generation_config.max_length = int(args.generation_max_length)
     model.generation_config.num_beams = 1
+    gen_min_new_tokens = max(0, int(getattr(args, "generation_min_new_tokens", 0) or 0))
+    if gen_min_new_tokens > 0:
+        model.generation_config.min_new_tokens = int(gen_min_new_tokens)
+    else:
+        try:
+            model.generation_config.min_new_tokens = 0
+        except Exception:
+            pass
     LOGGER.info(
-        "Donut target formatting: start=%r end=%r eos_id=%s tokenizer_eos_id=%s",
+        "Donut target formatting: start=%r end=%r eos_id=%s tokenizer_eos_id=%s gen_max_len=%d gen_min_new=%d beams=%d",
         str(args.decoder_start_token),
         task_end_token,
         str(effective_eos_id),
         str(getattr(tokenizer, "eos_token_id", None)),
+        int(args.generation_max_length),
+        int(gen_min_new_tokens),
+        int(getattr(model.generation_config, "num_beams", 1) or 1),
     )
 
     train_dataset = OCRManifestDataset(
