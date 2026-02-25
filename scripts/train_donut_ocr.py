@@ -84,10 +84,26 @@ def _strip_special_token_strings(text: str, tokenizer) -> str:
 
 
 def _configure_logging() -> None:
+    rank_raw = os.environ.get("RANK", "")
+    local_rank_raw = os.environ.get("LOCAL_RANK", "")
+    try:
+        rank = int(rank_raw) if str(rank_raw).strip() != "" else 0
+    except Exception:
+        rank = 0
+    try:
+        local_rank = int(local_rank_raw) if str(local_rank_raw).strip() != "" else rank
+    except Exception:
+        local_rank = rank
+    is_primary = (rank == 0)
     logging.basicConfig(
         level=logging.INFO,
         format="%(asctime)s | %(levelname)s | %(name)s | %(message)s",
     )
+    if not is_primary:
+        # Suppress duplicate logs from non-zero ranks in torchrun/DDP.
+        logging.disable(logging.CRITICAL)
+        return
+    LOGGER.info("Logging enabled on primary process only (RANK=%d LOCAL_RANK=%d)", rank, local_rank)
 
 
 class DonutProgressCallback(ProgressCallback):
