@@ -24,6 +24,7 @@ import textwrap
 import time
 import zipfile
 import csv
+import hashlib
 from concurrent.futures import ThreadPoolExecutor, as_completed
 from functools import lru_cache
 from pathlib import Path
@@ -4081,6 +4082,80 @@ def _encode_line_clip_texts_ui(
 _LINE_CLIP_DEBUG_CACHE: Dict[str, Dict[str, Any]] = {}
 
 
+def _line_clip_debug_disk_cache_root_ui() -> Path:
+    return (Path(tempfile.gettempdir()) / "pechabridge_ui" / "line_clip_corpus_cache").resolve()
+
+
+def _line_clip_debug_disk_cache_id_ui(key: str) -> str:
+    raw = str(key or "")
+    return hashlib.sha256(raw.encode("utf-8", errors="replace")).hexdigest()[:24]
+
+
+def _line_clip_debug_disk_cache_dir_ui(key: str) -> Path:
+    return (_line_clip_debug_disk_cache_root_ui() / _line_clip_debug_disk_cache_id_ui(key)).resolve()
+
+
+def _load_line_clip_debug_corpus_from_disk_ui(key: str) -> Optional[Dict[str, Any]]:
+    cache_dir = _line_clip_debug_disk_cache_dir_ui(key)
+    meta_path = (cache_dir / "meta.json").resolve()
+    rows_path = (cache_dir / "rows.json").resolve()
+    img_path = (cache_dir / "image_embeddings.npy").resolve()
+    txt_path = (cache_dir / "text_embeddings.npy").resolve()
+    if not (cache_dir.exists() and meta_path.exists() and rows_path.exists() and img_path.exists() and txt_path.exists()):
+        return None
+    try:
+        meta = json.loads(meta_path.read_text(encoding="utf-8"))
+        if not isinstance(meta, dict):
+            return None
+        if str(meta.get("key", "") or "") != str(key):
+            return None
+        rows = json.loads(rows_path.read_text(encoding="utf-8"))
+        if not isinstance(rows, list):
+            return None
+        image_emb = np.load(str(img_path))
+        text_emb = np.load(str(txt_path))
+        if image_emb.ndim != 2 or text_emb.ndim != 2:
+            return None
+        if int(image_emb.shape[0]) != len(rows) or int(text_emb.shape[0]) != len(rows):
+            return None
+        return {
+            "rows": rows,
+            "image_embeddings": np.asarray(image_emb, dtype=np.float32),
+            "text_embeddings": np.asarray(text_emb, dtype=np.float32),
+            "device": "",
+            "device_msg": "Loaded corpus embeddings from disk cache.",
+            "count": int(len(rows)),
+            "cache_source": "disk",
+            "disk_cache_dir": str(cache_dir),
+        }
+    except Exception:
+        return None
+
+
+def _save_line_clip_debug_corpus_to_disk_ui(key: str, corpus: Dict[str, Any]) -> str:
+    cache_dir = _line_clip_debug_disk_cache_dir_ui(key)
+    cache_dir.mkdir(parents=True, exist_ok=True)
+    rows = list(corpus.get("rows") or [])
+    image_emb = np.asarray(corpus.get("image_embeddings"), dtype=np.float32)
+    text_emb = np.asarray(corpus.get("text_embeddings"), dtype=np.float32)
+    rows_path = (cache_dir / "rows.json").resolve()
+    img_path = (cache_dir / "image_embeddings.npy").resolve()
+    txt_path = (cache_dir / "text_embeddings.npy").resolve()
+    meta_path = (cache_dir / "meta.json").resolve()
+    rows_path.write_text(json.dumps(rows, ensure_ascii=False), encoding="utf-8")
+    np.save(str(img_path), image_emb.astype(np.float32, copy=False))
+    np.save(str(txt_path), text_emb.astype(np.float32, copy=False))
+    meta = {
+        "key": str(key),
+        "created_at_unix": float(time.time()),
+        "rows_count": int(len(rows)),
+        "image_shape": [int(v) for v in image_emb.shape],
+        "text_shape": [int(v) for v in text_emb.shape],
+    }
+    meta_path.write_text(json.dumps(meta, ensure_ascii=False, indent=2), encoding="utf-8")
+    return str(cache_dir)
+
+
 def _line_clip_debug_cache_key(
     dataset_root: str,
     split_name: str,
@@ -4128,6 +4203,16 @@ def _get_or_build_line_clip_debug_corpus_ui(
     cached = _LINE_CLIP_DEBUG_CACHE.get(key)
     if cached is not None:
         return cached
+    disk_cached = _load_line_clip_debug_corpus_from_disk_ui(key)
+    if disk_cached is not None:
+        resolved_device, device_note = _resolve_torch_device_for_encoding(device_pref)
+        disk_cached["device"] = str(resolved_device)
+        cache_msg = str(disk_cached.get("device_msg", "") or "")
+        if device_note:
+            cache_msg = (cache_msg + " " + str(device_note)).strip()
+        disk_cached["device_msg"] = cache_msg
+        _LINE_CLIP_DEBUG_CACHE[key] = disk_cached
+        return disk_cached
 
     rows = _collect_ocr_split_rows_ui(dataset_root, split_name)
     if not rows:
@@ -4157,7 +4242,13 @@ def _get_or_build_line_clip_debug_corpus_ui(
         "device": str(runtime.get("device", "")),
         "device_msg": str(runtime.get("device_msg", "")),
         "count": int(len(rows)),
+        "cache_source": "built",
     }
+    try:
+        disk_cache_dir = _save_line_clip_debug_corpus_to_disk_ui(key, corpus)
+        corpus["disk_cache_dir"] = str(disk_cache_dir)
+    except Exception as exc:
+        corpus["disk_cache_write_error"] = f"{type(exc).__name__}: {exc}"
     _LINE_CLIP_DEBUG_CACHE[key] = corpus
     if len(_LINE_CLIP_DEBUG_CACHE) > 3:
         for k in list(_LINE_CLIP_DEBUG_CACHE.keys())[:-3]:
@@ -4479,6 +4570,8 @@ def run_line_clip_dataset_debug_retrieval_ui(
             "ground_truth_text_length": len(str(sample_ground_truth or "")),
             "device": str(corpus.get("device", "")),
             "device_msg": str(corpus.get("device_msg", "")),
+            "cache_source": str(corpus.get("cache_source", "")),
+            "disk_cache_dir": str(corpus.get("disk_cache_dir", "")),
             "results_csv_path": export_csv_path,
             "topk_text_to_image_metrics": (topk_extra_metrics_by_index if use_text_query else {}),
         }

@@ -31,6 +31,9 @@ from scripts.download_bosentencepiece_tokenizer import (
     create_parser as create_download_bosentencepiece_tokenizer_parser,
 )
 from scripts.eval_ocr_tokenizer import create_parser as create_eval_ocr_tokenizer_parser
+from scripts.warm_line_clip_workbench_cache import (
+    create_parser as create_warm_line_clip_workbench_cache_parser,
+)
 
 LOGGER = logging.getLogger("pechabridge_cli")
 
@@ -238,6 +241,15 @@ def _build_root_parser() -> argparse.ArgumentParser:
     )
     eval_cross_parser.set_defaults(handler=_run_eval_faiss_crosspage)
 
+    warm_line_clip_cache_parent = create_warm_line_clip_workbench_cache_parser(add_help=False)
+    warm_line_clip_cache_parser = subparsers.add_parser(
+        "warm-line-clip-workbench-cache",
+        parents=[warm_line_clip_cache_parent],
+        help="Build/persist line_clip Workbench corpus embeddings for all available OCR splits using the best line_clip model",
+        description=warm_line_clip_cache_parent.description,
+    )
+    warm_line_clip_cache_parser.set_defaults(handler=_run_warm_line_clip_workbench_cache)
+
     return parser
 
 
@@ -363,6 +375,12 @@ def _run_mine_mnn_pairs(args: argparse.Namespace) -> int:
 def _run_eval_faiss_crosspage(args: argparse.Namespace) -> int:
     run_eval_faiss_crosspage(args)
     return 0
+
+
+def _run_warm_line_clip_workbench_cache(args: argparse.Namespace) -> int:
+    from scripts.warm_line_clip_workbench_cache import run
+
+    return int(run(args))
 
 
 def main(argv: list[str] | None = None) -> int:
