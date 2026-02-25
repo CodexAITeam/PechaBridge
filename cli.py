@@ -34,6 +34,9 @@ from scripts.eval_ocr_tokenizer import create_parser as create_eval_ocr_tokenize
 from scripts.warm_line_clip_workbench_cache import (
     create_parser as create_warm_line_clip_workbench_cache_parser,
 )
+from scripts.probe_line_clip_workbench_random_samples import (
+    create_parser as create_probe_line_clip_workbench_random_samples_parser,
+)
 
 LOGGER = logging.getLogger("pechabridge_cli")
 
@@ -250,6 +253,15 @@ def _build_root_parser() -> argparse.ArgumentParser:
     )
     warm_line_clip_cache_parser.set_defaults(handler=_run_warm_line_clip_workbench_cache)
 
+    probe_line_clip_parent = create_probe_line_clip_workbench_random_samples_parser(add_help=False)
+    probe_line_clip_parser = subparsers.add_parser(
+        "probe-line-clip-workbench-random-samples",
+        parents=[probe_line_clip_parent],
+        help="Probe best line_clip Workbench retrieval on random in-corpus samples across splits",
+        description=probe_line_clip_parent.description,
+    )
+    probe_line_clip_parser.set_defaults(handler=_run_probe_line_clip_workbench_random_samples)
+
     return parser
 
 
@@ -379,6 +391,12 @@ def _run_eval_faiss_crosspage(args: argparse.Namespace) -> int:
 
 def _run_warm_line_clip_workbench_cache(args: argparse.Namespace) -> int:
     from scripts.warm_line_clip_workbench_cache import run
+
+    return int(run(args))
+
+
+def _run_probe_line_clip_workbench_random_samples(args: argparse.Namespace) -> int:
+    from scripts.probe_line_clip_workbench_random_samples import run
 
     return int(run(args))
 

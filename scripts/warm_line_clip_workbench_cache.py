@@ -6,9 +6,15 @@ from __future__ import annotations
 import argparse
 import json
 import logging
+import sys
 import time
 from pathlib import Path
 from typing import Any, Dict, List
+
+try:
+    from tqdm.auto import tqdm
+except Exception:
+    tqdm = None
 
 from ui_workbench import (
     _get_or_build_line_clip_debug_corpus_ui,
@@ -46,13 +52,48 @@ def create_parser(add_help: bool = True) -> argparse.ArgumentParser:
     )
     p.add_argument("--device", type=str, default="auto", help="Encoding device (auto/cuda/cuda:0/cpu/mps)")
     p.add_argument("--batch-size", type=int, default=32, help="Encoding batch size for image/text embedding generation")
+    p.add_argument(
+        "--image-batch-size",
+        type=int,
+        default=0,
+        help="Image embedding batch size override (0 uses --batch-size)",
+    )
+    p.add_argument(
+        "--text-batch-size",
+        type=int,
+        default=0,
+        help="Text embedding batch size override (0 uses --batch-size)",
+    )
+    p.add_argument(
+        "--image-preproc-workers",
+        type=int,
+        default=0,
+        help="Optional CPU worker threads for image decode/preprocess per batch (0/1 disables)",
+    )
     p.add_argument("--text-max-length", type=int, default=256, help="Tokenizer max length for text embeddings")
     p.add_argument("--no-l2-normalize", action="store_true", help="Disable L2 normalization before storing embeddings")
+    p.add_argument(
+        "--only",
+        type=str,
+        default="both",
+        choices=["both", "image", "text"],
+        help="Warm only image bank, only text bank, or both (default: both)",
+    )
+    p.add_argument(
+        "--progress-every-batches",
+        type=int,
+        default=50,
+        help="Log progress during embedding generation every N batches (0 disables progress logs)",
+    )
     p.add_argument(
         "--fail-fast",
         action="store_true",
         help="Exit immediately if one split fails (default: continue and report all results)",
     )
+    p.set_defaults(tqdm=None)
+    tqdm_group = p.add_mutually_exclusive_group()
+    tqdm_group.add_argument("--tqdm", dest="tqdm", action="store_true", help="Enable tqdm progress bars for CLI runs")
+    tqdm_group.add_argument("--no-tqdm", dest="tqdm", action="store_false", help="Disable tqdm progress bars")
     return p
 
 
@@ -135,9 +176,23 @@ def run(args: argparse.Namespace) -> int:
     results: List[Dict[str, Any]] = []
     l2_normalize = not bool(getattr(args, "no_l2_normalize", False))
     batch_size = max(1, int(getattr(args, "batch_size", 32)))
+    image_batch_size = max(0, int(getattr(args, "image_batch_size", 0) or 0))
+    text_batch_size = max(0, int(getattr(args, "text_batch_size", 0) or 0))
+    image_preproc_workers = max(0, int(getattr(args, "image_preproc_workers", 0) or 0))
     text_max_length = max(8, int(getattr(args, "text_max_length", 256)))
+    only = str(getattr(args, "only", "both") or "both").strip().lower()
+    if only not in {"both", "image", "text"}:
+        only = "both"
+    progress_every_batches = max(0, int(getattr(args, "progress_every_batches", 0) or 0))
+    tqdm_arg = getattr(args, "tqdm", None)
+    use_tqdm = bool(tqdm_arg) if tqdm_arg is not None else bool(tqdm is not None and sys.stderr.isatty())
+    split_iter = splits
+    split_pbar = None
+    if use_tqdm and tqdm is not None:
+        split_pbar = tqdm(splits, desc="warm-line-clip-cache", unit="split")
+        split_iter = split_pbar
 
-    for split in splits:
+    for split in split_iter:
         t0 = time.time()
         rec: Dict[str, Any] = {"split": split}
         try:
@@ -152,12 +207,21 @@ def run(args: argparse.Namespace) -> int:
                 batch_size=batch_size,
                 text_max_length=text_max_length,
                 l2_normalize=l2_normalize,
+                required_banks=only,
+                progress_every_batches=progress_every_batches,
+                image_batch_size=(image_batch_size or None),
+                text_batch_size=(text_batch_size or None),
+                image_preproc_workers=image_preproc_workers,
+                tqdm_progress=use_tqdm,
             )
             rec.update(
                 {
                     "ok": True,
                     "count": int(corpus.get("count", 0)),
                     "cache_source": str(corpus.get("cache_source", "")),
+                    "requested_banks": str(corpus.get("requested_banks", only)),
+                    "available_banks": list(corpus.get("available_banks") or []),
+                    "built_banks": list(corpus.get("built_banks") or []),
                     "disk_cache_dir": str(corpus.get("disk_cache_dir", "")),
                     "device": str(corpus.get("device", "")),
                     "device_msg": str(corpus.get("device_msg", "")),
@@ -176,6 +240,8 @@ def run(args: argparse.Namespace) -> int:
             )
             if bool(getattr(args, "fail_fast", False)):
                 results.append(rec)
+                if split_pbar is not None:
+                    split_pbar.close()
                 print(json.dumps(
                     {
                         "ok": False,
@@ -190,11 +256,14 @@ def run(args: argparse.Namespace) -> int:
                 ))
                 return 1
         LOGGER.info(
-            "split=%s ok=%s count=%s cache=%s hit=%s elapsed=%.1fs rows/s=%.1f img_s=%s txt_s=%s save_s=%s",
+            "split=%s ok=%s count=%s cache=%s req=%s avail=%s built=%s hit=%s elapsed=%.1fs rows/s=%.1f img_s=%s txt_s=%s save_s=%s",
             rec.get("split"),
             rec.get("ok"),
             rec.get("count", "na"),
             rec.get("cache_source", "na"),
+            rec.get("requested_banks", "na"),
+            ",".join([str(x) for x in (rec.get("available_banks") or [])]) or "-",
+            ",".join([str(x) for x in (rec.get("built_banks") or [])]) or "-",
             str((rec.get("timing") or {}).get("cache_hit_tier", "na")),
             float(rec.get("elapsed_s", 0.0)),
             float((rec.get("perf") or {}).get("rows_per_s_total", 0.0) or 0.0),
@@ -202,7 +271,20 @@ def run(args: argparse.Namespace) -> int:
             str((rec.get("timing") or {}).get("text_encode_s", "na")),
             str((rec.get("timing") or {}).get("disk_save_s", "na")),
         )
+        if split_pbar is not None:
+            try:
+                split_pbar.set_postfix(
+                    split=str(split),
+                    ok=str(bool(rec.get("ok"))),
+                    rows=int(rec.get("count", 0) or 0),
+                    rps=float((rec.get("perf") or {}).get("rows_per_s_total", 0.0) or 0.0),
+                )
+            except Exception:
+                pass
         results.append(rec)
+
+    if split_pbar is not None:
+        split_pbar.close()
 
     payload = {
         "ok": all(bool(r.get("ok")) for r in results),
@@ -215,8 +297,14 @@ def run(args: argparse.Namespace) -> int:
         "settings": {
             "device": str(getattr(args, "device", "auto") or "auto"),
             "batch_size": int(batch_size),
+            "image_batch_size": int(image_batch_size or 0),
+            "text_batch_size": int(text_batch_size or 0),
+            "image_preproc_workers": int(image_preproc_workers),
             "text_max_length": int(text_max_length),
             "l2_normalize": bool(l2_normalize),
+            "only": str(only),
+            "progress_every_batches": int(progress_every_batches),
+            "tqdm": bool(use_tqdm),
         },
         "results": results,
         "total_elapsed_s": round(float(time.time() - t0_all), 3),

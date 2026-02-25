@@ -41,6 +41,11 @@ except Exception:
     pd = None
 
 try:
+    from tqdm.auto import tqdm as _tqdm
+except Exception:
+    _tqdm = None
+
+try:
     from scipy.signal import find_peaks
 except Exception:
     find_peaks = None
@@ -3995,11 +4000,40 @@ def _collect_ocr_split_rows_ui(dataset_root: str, split_name: str) -> List[Dict[
     return usable
 
 
+def _prepare_line_clip_image_tensor_ui(
+    image_path: str,
+    runtime_cfg: Dict[str, Any],
+    width_buckets: List[int],
+    target_height: int,
+    patch_multiple: int,
+    max_width: int,
+):
+    if torch is None:
+        raise RuntimeError("PyTorch not available")
+    cfg_obj = runtime_cfg if isinstance(runtime_cfg, dict) else {}
+    with Image.open(str(image_path)) as im:
+        rgb = im.convert("RGB")
+    rgb = _apply_line_clip_ui_preprocess_from_runtime_cfg(rgb, cfg_obj)
+    norm_img = _normalize_for_vit_encoding(
+        image=rgb,
+        target_height=int(target_height),
+        width_buckets=width_buckets,
+        patch_multiple=int(patch_multiple),
+        max_width=int(max_width),
+    )
+    arr = np.asarray(norm_img).astype(np.float32, copy=False) / 255.0
+    return torch.from_numpy(arr).permute(2, 0, 1).contiguous()
+
+
 def _encode_line_clip_image_crops_ui(
     runtime: Dict[str, Any],
     image_paths: List[str],
     batch_size: int,
     l2_normalize: bool,
+    progress_label: str = "",
+    progress_every_batches: int = 0,
+    image_preproc_workers: int = 0,
+    tqdm_progress: bool = False,
 ) -> np.ndarray:
     if torch is None:
         raise RuntimeError("PyTorch not available")
@@ -4007,11 +4041,15 @@ def _encode_line_clip_image_crops_ui(
     image_head = runtime["image_head"]
     image_processor = runtime["image_processor"]
     runtime_cfg = runtime.get("runtime_cfg") or {}
+    runtime_cfg_dict = runtime_cfg if isinstance(runtime_cfg, dict) else {}
     device = runtime["device"]
+    target_height = _to_int(runtime_cfg_dict.get("target_height", 64), 64)
+    patch_multiple = _to_int(runtime_cfg_dict.get("patch_multiple", 16), 16)
+    max_width_cfg = _to_int(runtime_cfg_dict.get("max_width", 1024), 1024)
     width_buckets = _parse_width_buckets_for_encoding(
-        raw=runtime_cfg.get("width_buckets", [256, 384, 512, 768]),
-        patch_multiple=_to_int(runtime_cfg.get("patch_multiple", 16), 16),
-        max_width=_to_int(runtime_cfg.get("max_width", 1024), 1024),
+        raw=runtime_cfg_dict.get("width_buckets", [256, 384, 512, 768]),
+        patch_multiple=patch_multiple,
+        max_width=max_width_cfg,
     )
     mean = list(getattr(image_processor, "image_mean", [0.5, 0.5, 0.5]))
     std = list(getattr(image_processor, "image_std", [0.5, 0.5, 0.5]))
@@ -4019,51 +4057,92 @@ def _encode_line_clip_image_crops_ui(
         mean = mean * 3
     if len(std) == 1:
         std = std * 3
-    mean_t = torch.tensor([float(v) for v in mean[:3]], dtype=torch.float32).view(1, 3, 1, 1)
-    std_t = torch.tensor([max(1e-6, float(v)) for v in std[:3]], dtype=torch.float32).view(1, 3, 1, 1)
+    mean_t = torch.tensor([float(v) for v in mean[:3]], dtype=torch.float32).view(1, 3, 1, 1).to(device)
+    std_t = torch.tensor([max(1e-6, float(v)) for v in std[:3]], dtype=torch.float32).view(1, 3, 1, 1).to(device)
 
-    out_batches: List[np.ndarray] = []
     bs = max(1, int(batch_size))
-    with torch.no_grad():
-        for start in range(0, len(image_paths), bs):
-            chunk = image_paths[start : start + bs]
-            tensors: List[Any] = []
-            for p in chunk:
-                with Image.open(p) as im:
-                    rgb = im.convert("RGB")
-                rgb = _apply_line_clip_ui_preprocess_from_runtime_cfg(
-                    rgb,
-                    runtime_cfg if isinstance(runtime_cfg, dict) else {},
+    total = int(len(image_paths))
+    if total <= 0:
+        return np.zeros((0, 1), dtype=np.float32)
+    out_arr: Optional[np.ndarray] = None
+    use_non_blocking = str(device).startswith("cuda")
+    max_workers = max(0, int(image_preproc_workers or 0))
+    executor: Optional[ThreadPoolExecutor] = None
+    if max_workers > 1:
+        executor = ThreadPoolExecutor(max_workers=max_workers)
+    inference_ctx = getattr(torch, "inference_mode", torch.no_grad)
+    pbar = None
+
+    def _prep_path(p: str):
+        return _prepare_line_clip_image_tensor_ui(
+            image_path=p,
+            runtime_cfg=runtime_cfg_dict,
+            width_buckets=width_buckets,
+            target_height=target_height,
+            patch_multiple=patch_multiple,
+            max_width=max_width_cfg,
+        )
+
+    try:
+        with inference_ctx():
+            total_batches = int(math.ceil(total / max(1, bs))) if total > 0 else 0
+            if bool(tqdm_progress) and _tqdm is not None and total_batches > 0:
+                pbar = _tqdm(
+                    total=total_batches,
+                    desc=str(progress_label or "line_clip image encode"),
+                    unit="batch",
+                    leave=False,
                 )
-                norm_img = _normalize_for_vit_encoding(
-                    image=rgb,
-                    target_height=_to_int(runtime_cfg.get("target_height", 64), 64),
-                    width_buckets=width_buckets,
-                    patch_multiple=_to_int(runtime_cfg.get("patch_multiple", 16), 16),
-                    max_width=_to_int(runtime_cfg.get("max_width", 1024), 1024),
-                )
-                arr = np.asarray(norm_img).astype(np.float32) / 255.0
-                ten = torch.from_numpy(arr).permute(2, 0, 1).contiguous().float()
-                tensors.append(ten)
-            max_w = max(int(t.shape[-1]) for t in tensors)
-            pm = max(1, _to_int(runtime_cfg.get("patch_multiple", 16), 16))
-            max_w = int(math.ceil(max_w / pm) * pm)
-            padded = []
-            for t in tensors:
-                if int(t.shape[-1]) < max_w:
-                    t = torch_f.pad(t, (0, max_w - int(t.shape[-1]), 0, 0), mode="replicate")
-                elif int(t.shape[-1]) > max_w:
-                    t = t[:, :, :max_w]
-                padded.append(t)
-            px = torch.stack(padded, dim=0)
-            px = ((px - mean_t) / std_t).to(device)
-            emb = _pooled_image_embedding_for_ui(image_backbone, px)
-            if image_head is not None:
-                emb = image_head(emb)
-            if bool(l2_normalize) and torch_f is not None:
-                emb = torch_f.normalize(emb, dim=-1)
-            out_batches.append(emb.detach().cpu().float().numpy())
-    return np.concatenate(out_batches, axis=0) if out_batches else np.zeros((0, 1), dtype=np.float32)
+            for batch_idx, start in enumerate(range(0, len(image_paths), bs), start=1):
+                chunk = image_paths[start : start + bs]
+                if executor is not None:
+                    tensors = list(executor.map(_prep_path, chunk))
+                else:
+                    tensors = [_prep_path(p) for p in chunk]
+                max_w = max(int(t.shape[-1]) for t in tensors)
+                pm = max(1, int(patch_multiple))
+                max_w = int(math.ceil(max_w / pm) * pm)
+                padded = []
+                for t in tensors:
+                    if int(t.shape[-1]) < max_w:
+                        t = torch_f.pad(t, (0, max_w - int(t.shape[-1]), 0, 0), mode="replicate")
+                    elif int(t.shape[-1]) > max_w:
+                        t = t[:, :, :max_w]
+                    padded.append(t)
+                px = torch.stack(padded, dim=0)
+                px = px.to(device, non_blocking=use_non_blocking)
+                px = (px - mean_t) / std_t
+                emb = _pooled_image_embedding_for_ui(image_backbone, px)
+                if image_head is not None:
+                    emb = image_head(emb)
+                if bool(l2_normalize) and torch_f is not None:
+                    emb = torch_f.normalize(emb, dim=-1)
+                emb_np = emb.detach().cpu().float().numpy()
+                if out_arr is None:
+                    if emb_np.ndim != 2:
+                        raise RuntimeError("Image embedding output must be rank-2.")
+                    out_arr = np.empty((total, int(emb_np.shape[1])), dtype=np.float32)
+                out_arr[start : start + emb_np.shape[0]] = emb_np
+                if pbar is not None:
+                    pbar.update(1)
+                if (not bool(tqdm_progress)) and int(progress_every_batches or 0) > 0 and (
+                    batch_idx % int(progress_every_batches) == 0 or batch_idx == total_batches
+                ):
+                    label = str(progress_label or "line_clip image encode")
+                    LOGGER.info(
+                        "%s progress: batch %d/%d samples %d/%d",
+                        label,
+                        int(batch_idx),
+                        int(total_batches),
+                        int(min(start + len(chunk), total)),
+                        int(total),
+                    )
+    finally:
+        if pbar is not None:
+            pbar.close()
+        if executor is not None:
+            executor.shutdown(wait=True)
+    return out_arr if out_arr is not None else np.zeros((0, 1), dtype=np.float32)
 
 
 def _encode_line_clip_texts_ui(
@@ -4072,6 +4151,9 @@ def _encode_line_clip_texts_ui(
     batch_size: int,
     l2_normalize: bool,
     text_max_length: int,
+    progress_label: str = "",
+    progress_every_batches: int = 0,
+    tqdm_progress: bool = False,
 ) -> np.ndarray:
     if torch is None:
         raise RuntimeError("PyTorch not available")
@@ -4080,27 +4162,66 @@ def _encode_line_clip_texts_ui(
     text_head = runtime["text_head"]
     device = runtime["device"]
     bs = max(1, int(batch_size))
-    out_batches: List[np.ndarray] = []
-    with torch.no_grad():
-        for start in range(0, len(texts), bs):
-            chunk = [str(t or "") for t in texts[start : start + bs]]
-            tok = tokenizer(
-                chunk,
-                padding=True,
-                truncation=True,
-                max_length=max(8, int(text_max_length)),
-                return_tensors="pt",
-            )
-            input_ids = tok["input_ids"].to(device)
-            attn = tok.get("attention_mask")
-            if attn is not None:
-                attn = attn.to(device)
-            txt_emb = _pooled_text_embedding_for_ui(text_encoder, input_ids, attn)
-            txt_z = text_head(txt_emb)
-            if bool(l2_normalize) and torch_f is not None:
-                txt_z = torch_f.normalize(txt_z, dim=-1)
-            out_batches.append(txt_z.detach().cpu().float().numpy())
-    return np.concatenate(out_batches, axis=0) if out_batches else np.zeros((0, 1), dtype=np.float32)
+    total = int(len(texts))
+    if total <= 0:
+        return np.zeros((0, 1), dtype=np.float32)
+    out_arr: Optional[np.ndarray] = None
+    use_non_blocking = str(device).startswith("cuda")
+    inference_ctx = getattr(torch, "inference_mode", torch.no_grad)
+    pbar = None
+    try:
+        with inference_ctx():
+            total_batches = int(math.ceil(total / max(1, bs))) if total > 0 else 0
+            if bool(tqdm_progress) and _tqdm is not None and total_batches > 0:
+                pbar = _tqdm(
+                    total=total_batches,
+                    desc=str(progress_label or "line_clip text encode"),
+                    unit="batch",
+                    leave=False,
+                )
+            for batch_idx, start in enumerate(range(0, len(texts), bs), start=1):
+                chunk = [str(t or "") for t in texts[start : start + bs]]
+                tok_kwargs: Dict[str, Any] = {
+                    "padding": True,
+                    "truncation": True,
+                    "max_length": max(8, int(text_max_length)),
+                    "return_tensors": "pt",
+                }
+                if use_non_blocking:
+                    tok_kwargs["pad_to_multiple_of"] = 8
+                tok = tokenizer(chunk, **tok_kwargs)
+                input_ids = tok["input_ids"].to(device, non_blocking=use_non_blocking)
+                attn = tok.get("attention_mask")
+                if attn is not None:
+                    attn = attn.to(device, non_blocking=use_non_blocking)
+                txt_emb = _pooled_text_embedding_for_ui(text_encoder, input_ids, attn)
+                txt_z = text_head(txt_emb)
+                if bool(l2_normalize) and torch_f is not None:
+                    txt_z = torch_f.normalize(txt_z, dim=-1)
+                txt_np = txt_z.detach().cpu().float().numpy()
+                if out_arr is None:
+                    if txt_np.ndim != 2:
+                        raise RuntimeError("Text embedding output must be rank-2.")
+                    out_arr = np.empty((total, int(txt_np.shape[1])), dtype=np.float32)
+                out_arr[start : start + txt_np.shape[0]] = txt_np
+                if pbar is not None:
+                    pbar.update(1)
+                if (not bool(tqdm_progress)) and int(progress_every_batches or 0) > 0 and (
+                    batch_idx % int(progress_every_batches) == 0 or batch_idx == total_batches
+                ):
+                    label = str(progress_label or "line_clip text encode")
+                    LOGGER.info(
+                        "%s progress: batch %d/%d samples %d/%d",
+                        label,
+                        int(batch_idx),
+                        int(total_batches),
+                        int(min(start + len(chunk), total)),
+                        int(total),
+                    )
+    finally:
+        if pbar is not None:
+            pbar.close()
+    return out_arr if out_arr is not None else np.zeros((0, 1), dtype=np.float32)
 
 
 _LINE_CLIP_DEBUG_CACHE: Dict[str, Dict[str, Any]] = {}
@@ -4125,7 +4246,7 @@ def _load_line_clip_debug_corpus_from_disk_ui(key: str) -> Optional[Dict[str, An
     rows_path = (cache_dir / "rows.json").resolve()
     img_path = (cache_dir / "image_embeddings.npy").resolve()
     txt_path = (cache_dir / "text_embeddings.npy").resolve()
-    if not (cache_dir.exists() and meta_path.exists() and rows_path.exists() and img_path.exists() and txt_path.exists()):
+    if not (cache_dir.exists() and meta_path.exists() and rows_path.exists()):
         return None
     try:
         meta = json.loads(meta_path.read_text(encoding="utf-8"))
@@ -4136,21 +4257,37 @@ def _load_line_clip_debug_corpus_from_disk_ui(key: str) -> Optional[Dict[str, An
         rows = json.loads(rows_path.read_text(encoding="utf-8"))
         if not isinstance(rows, list):
             return None
-        image_emb = np.load(str(img_path))
-        text_emb = np.load(str(txt_path))
-        if image_emb.ndim != 2 or text_emb.ndim != 2:
+        image_emb = None
+        text_emb = None
+        has_image = bool(img_path.exists())
+        has_text = bool(txt_path.exists())
+        if not (has_image or has_text):
             return None
-        if int(image_emb.shape[0]) != len(rows) or int(text_emb.shape[0]) != len(rows):
-            return None
+        if has_image:
+            _img = np.load(str(img_path))
+            if _img.ndim != 2 or int(_img.shape[0]) != len(rows):
+                return None
+            image_emb = np.asarray(_img, dtype=np.float32)
+        if has_text:
+            _txt = np.load(str(txt_path))
+            if _txt.ndim != 2 or int(_txt.shape[0]) != len(rows):
+                return None
+            text_emb = np.asarray(_txt, dtype=np.float32)
+        available_banks = []
+        if image_emb is not None:
+            available_banks.append("image")
+        if text_emb is not None:
+            available_banks.append("text")
         return {
             "rows": rows,
-            "image_embeddings": np.asarray(image_emb, dtype=np.float32),
-            "text_embeddings": np.asarray(text_emb, dtype=np.float32),
+            "image_embeddings": image_emb,
+            "text_embeddings": text_emb,
             "device": "",
             "device_msg": "Loaded corpus embeddings from disk cache.",
             "count": int(len(rows)),
             "cache_source": "disk",
             "disk_cache_dir": str(cache_dir),
+            "available_banks": available_banks,
         }
     except Exception:
         return None
@@ -4160,21 +4297,27 @@ def _save_line_clip_debug_corpus_to_disk_ui(key: str, corpus: Dict[str, Any]) ->
     cache_dir = _line_clip_debug_disk_cache_dir_ui(key)
     cache_dir.mkdir(parents=True, exist_ok=True)
     rows = list(corpus.get("rows") or [])
-    image_emb = np.asarray(corpus.get("image_embeddings"), dtype=np.float32)
-    text_emb = np.asarray(corpus.get("text_embeddings"), dtype=np.float32)
+    image_raw = corpus.get("image_embeddings", None)
+    text_raw = corpus.get("text_embeddings", None)
+    image_emb = None if image_raw is None else np.asarray(image_raw, dtype=np.float32)
+    text_emb = None if text_raw is None else np.asarray(text_raw, dtype=np.float32)
     rows_path = (cache_dir / "rows.json").resolve()
     img_path = (cache_dir / "image_embeddings.npy").resolve()
     txt_path = (cache_dir / "text_embeddings.npy").resolve()
     meta_path = (cache_dir / "meta.json").resolve()
     rows_path.write_text(json.dumps(rows, ensure_ascii=False), encoding="utf-8")
-    np.save(str(img_path), image_emb.astype(np.float32, copy=False))
-    np.save(str(txt_path), text_emb.astype(np.float32, copy=False))
+    if image_emb is not None:
+        np.save(str(img_path), image_emb.astype(np.float32, copy=False))
+    if text_emb is not None:
+        np.save(str(txt_path), text_emb.astype(np.float32, copy=False))
     meta = {
         "key": str(key),
         "created_at_unix": float(time.time()),
         "rows_count": int(len(rows)),
-        "image_shape": [int(v) for v in image_emb.shape],
-        "text_shape": [int(v) for v in text_emb.shape],
+        "has_image_embeddings": bool(image_emb is not None or img_path.exists()),
+        "has_text_embeddings": bool(text_emb is not None or txt_path.exists()),
+        "image_shape": ([int(v) for v in image_emb.shape] if image_emb is not None else None),
+        "text_shape": ([int(v) for v in text_emb.shape] if text_emb is not None else None),
     }
     meta_path.write_text(json.dumps(meta, ensure_ascii=False, indent=2), encoding="utf-8")
     return str(cache_dir)
@@ -4213,7 +4356,18 @@ def _get_or_build_line_clip_debug_corpus_ui(
     batch_size: int,
     text_max_length: int,
     l2_normalize: bool,
+    required_banks: str = "both",
+    progress_every_batches: int = 0,
+    image_batch_size: Optional[int] = None,
+    text_batch_size: Optional[int] = None,
+    image_preproc_workers: int = 0,
+    tqdm_progress: bool = False,
 ) -> Dict[str, Any]:
+    required_banks_norm = str(required_banks or "both").strip().lower()
+    if required_banks_norm not in {"both", "image", "text"}:
+        required_banks_norm = "both"
+    need_image = required_banks_norm in {"both", "image"}
+    need_text = required_banks_norm in {"both", "text"}
     t_start = time.time()
     key = _line_clip_debug_cache_key(
         dataset_root=dataset_root,
@@ -4227,14 +4381,25 @@ def _get_or_build_line_clip_debug_corpus_ui(
     )
     cached = _LINE_CLIP_DEBUG_CACHE.get(key)
     if cached is not None:
+        cached_has_img = bool(isinstance(cached, dict) and cached.get("image_embeddings") is not None)
+        cached_has_txt = bool(isinstance(cached, dict) and cached.get("text_embeddings") is not None)
+        if ((not need_image or cached_has_img) and (not need_text or cached_has_txt)):
+            if isinstance(cached, dict):
+                cached.setdefault("available_banks", [b for b, ok in (("image", cached_has_img), ("text", cached_has_txt)) if ok])
+                cached["requested_banks"] = required_banks_norm
+                cached["built_banks"] = list(cached.get("built_banks") or [])
+                cached.setdefault("timing", {})
+                cached["timing"]["cache_lookup_s"] = round(float(time.time() - t_start), 4)
+                cached["timing"]["cache_hit_tier"] = "memory"
+            return cached
         if isinstance(cached, dict):
             cached.setdefault("timing", {})
             cached["timing"]["cache_lookup_s"] = round(float(time.time() - t_start), 4)
-            cached["timing"]["cache_hit_tier"] = "memory"
-        return cached
     t_disk_load0 = time.time()
     disk_cached = _load_line_clip_debug_corpus_from_disk_ui(key)
     if disk_cached is not None:
+        disk_has_img = bool(disk_cached.get("image_embeddings") is not None)
+        disk_has_txt = bool(disk_cached.get("text_embeddings") is not None)
         resolved_device, device_note = _resolve_torch_device_for_encoding(device_pref)
         disk_cached["device"] = str(resolved_device)
         cache_msg = str(disk_cached.get("device_msg", "") or "")
@@ -4252,14 +4417,37 @@ def _get_or_build_line_clip_debug_corpus_ui(
                 if int(disk_cached.get("count", 0)) > 0 else 0.0
             ),
         }
-        _LINE_CLIP_DEBUG_CACHE[key] = disk_cached
-        return disk_cached
-
-    t_rows0 = time.time()
-    rows = _collect_ocr_split_rows_ui(dataset_root, split_name)
-    rows_collect_s = float(time.time() - t_rows0)
+        disk_cached["requested_banks"] = required_banks_norm
+        if ((not need_image or disk_has_img) and (not need_text or disk_has_txt)):
+            _LINE_CLIP_DEBUG_CACHE[key] = disk_cached
+            return disk_cached
+        rows = list(disk_cached.get("rows") or [])
+        rows_collect_s = 0.0
+    else:
+        t_rows0 = time.time()
+        rows = _collect_ocr_split_rows_ui(dataset_root, split_name)
+        rows_collect_s = float(time.time() - t_rows0)
     if not rows:
         raise RuntimeError("No usable OCR rows found for selected dataset/split.")
+
+    existing_image_emb = None
+    existing_text_emb = None
+    if isinstance(cached, dict):
+        if cached.get("image_embeddings") is not None:
+            existing_image_emb = np.asarray(cached.get("image_embeddings"), dtype=np.float32)
+        if cached.get("text_embeddings") is not None:
+            existing_text_emb = np.asarray(cached.get("text_embeddings"), dtype=np.float32)
+    if disk_cached is not None:
+        if existing_image_emb is None and disk_cached.get("image_embeddings") is not None:
+            existing_image_emb = np.asarray(disk_cached.get("image_embeddings"), dtype=np.float32)
+        if existing_text_emb is None and disk_cached.get("text_embeddings") is not None:
+            existing_text_emb = np.asarray(disk_cached.get("text_embeddings"), dtype=np.float32)
+    built_banks: List[str] = []
+    need_build_image = bool(need_image and existing_image_emb is None)
+    need_build_text = bool(need_text and existing_text_emb is None)
+    image_bs = max(1, int(image_batch_size if image_batch_size is not None else batch_size))
+    text_bs = max(1, int(text_batch_size if text_batch_size is not None else batch_size))
+    image_preproc_workers = max(0, int(image_preproc_workers or 0))
 
     t_runtime0 = time.time()
     runtime = _load_line_clip_dual_runtime_cached(
@@ -4272,32 +4460,60 @@ def _get_or_build_line_clip_debug_corpus_ui(
     runtime_load_s = float(time.time() - t_runtime0)
     image_paths = [str(r.get("_image_path_resolved", "")) for r in rows]
     texts = [str(r.get("_text_resolved", "")) for r in rows]
-    t_img0 = time.time()
-    image_emb = _encode_line_clip_image_crops_ui(runtime, image_paths=image_paths, batch_size=batch_size, l2_normalize=l2_normalize)
-    image_encode_s = float(time.time() - t_img0)
-    t_txt0 = time.time()
-    text_emb = _encode_line_clip_texts_ui(
-        runtime,
-        texts=texts,
-        batch_size=batch_size,
-        l2_normalize=l2_normalize,
-        text_max_length=text_max_length,
-    )
-    text_encode_s = float(time.time() - t_txt0)
+    image_encode_s = 0.0
+    text_encode_s = 0.0
+    image_emb = existing_image_emb
+    text_emb = existing_text_emb
+    if need_build_image:
+        t_img0 = time.time()
+        image_emb = _encode_line_clip_image_crops_ui(
+            runtime,
+            image_paths=image_paths,
+            batch_size=image_bs,
+            l2_normalize=l2_normalize,
+            progress_label=f"line_clip cache build [{split_name}] image",
+            progress_every_batches=int(progress_every_batches or 0),
+            image_preproc_workers=image_preproc_workers,
+            tqdm_progress=bool(tqdm_progress),
+        )
+        image_encode_s = float(time.time() - t_img0)
+        built_banks.append("image")
+    if need_build_text:
+        t_txt0 = time.time()
+        text_emb = _encode_line_clip_texts_ui(
+            runtime,
+            texts=texts,
+            batch_size=text_bs,
+            l2_normalize=l2_normalize,
+            text_max_length=text_max_length,
+            progress_label=f"line_clip cache build [{split_name}] text",
+            progress_every_batches=int(progress_every_batches or 0),
+            tqdm_progress=bool(tqdm_progress),
+        )
+        text_encode_s = float(time.time() - t_txt0)
+        built_banks.append("text")
     count_rows = int(len(rows))
     total_build_before_save_s = float(time.time() - t_start)
-    image_shape = [int(v) for v in image_emb.shape] if getattr(image_emb, "ndim", 0) == 2 else []
-    text_shape = [int(v) for v in text_emb.shape] if getattr(text_emb, "ndim", 0) == 2 else []
-    image_bytes = int(getattr(image_emb, "nbytes", 0))
-    text_bytes = int(getattr(text_emb, "nbytes", 0))
+    image_shape = [int(v) for v in image_emb.shape] if image_emb is not None and getattr(image_emb, "ndim", 0) == 2 else []
+    text_shape = [int(v) for v in text_emb.shape] if text_emb is not None and getattr(text_emb, "ndim", 0) == 2 else []
+    image_bytes = int(getattr(image_emb, "nbytes", 0)) if image_emb is not None else 0
+    text_bytes = int(getattr(text_emb, "nbytes", 0)) if text_emb is not None else 0
+    available_banks = []
+    if image_emb is not None:
+        available_banks.append("image")
+    if text_emb is not None:
+        available_banks.append("text")
     corpus = {
         "rows": rows,
-        "image_embeddings": image_emb.astype(np.float32, copy=False),
-        "text_embeddings": text_emb.astype(np.float32, copy=False),
+        "image_embeddings": (image_emb.astype(np.float32, copy=False) if image_emb is not None else None),
+        "text_embeddings": (text_emb.astype(np.float32, copy=False) if text_emb is not None else None),
         "device": str(runtime.get("device", "")),
         "device_msg": str(runtime.get("device_msg", "")),
         "count": count_rows,
         "cache_source": "built",
+        "requested_banks": required_banks_norm,
+        "available_banks": available_banks,
+        "built_banks": built_banks,
         "timing": {
             "cache_hit_tier": "miss_build",
             "rows_collect_s": round(rows_collect_s, 4),
@@ -4314,6 +4530,9 @@ def _get_or_build_line_clip_debug_corpus_ui(
             "rows_per_s_image_encode": round(count_rows / max(image_encode_s, 1e-9), 2),
             "rows_per_s_text_encode": round(count_rows / max(text_encode_s, 1e-9), 2),
             "rows_per_s_build_before_save": round(count_rows / max(total_build_before_save_s, 1e-9), 2),
+            "image_batch_size": int(image_bs),
+            "text_batch_size": int(text_bs),
+            "image_preproc_workers": int(image_preproc_workers),
         },
     }
     t_save0 = time.time()
