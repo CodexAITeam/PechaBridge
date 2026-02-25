@@ -4190,6 +4190,7 @@ def _get_or_build_line_clip_debug_corpus_ui(
     text_max_length: int,
     l2_normalize: bool,
 ) -> Dict[str, Any]:
+    t_start = time.time()
     key = _line_clip_debug_cache_key(
         dataset_root=dataset_root,
         split_name=split_name,
@@ -4202,7 +4203,12 @@ def _get_or_build_line_clip_debug_corpus_ui(
     )
     cached = _LINE_CLIP_DEBUG_CACHE.get(key)
     if cached is not None:
+        if isinstance(cached, dict):
+            cached.setdefault("timing", {})
+            cached["timing"]["cache_lookup_s"] = round(float(time.time() - t_start), 4)
+            cached["timing"]["cache_hit_tier"] = "memory"
         return cached
+    t_disk_load0 = time.time()
     disk_cached = _load_line_clip_debug_corpus_from_disk_ui(key)
     if disk_cached is not None:
         resolved_device, device_note = _resolve_torch_device_for_encoding(device_pref)
@@ -4211,13 +4217,27 @@ def _get_or_build_line_clip_debug_corpus_ui(
         if device_note:
             cache_msg = (cache_msg + " " + str(device_note)).strip()
         disk_cached["device_msg"] = cache_msg
+        disk_cached["timing"] = {
+            "cache_hit_tier": "disk",
+            "disk_load_s": round(float(time.time() - t_disk_load0), 4),
+            "cache_lookup_s": round(float(time.time() - t_start), 4),
+        }
+        disk_cached["perf"] = {
+            "rows_per_s_total": (
+                round(float(disk_cached.get("count", 0)) / max(1e-9, float(time.time() - t_start)), 2)
+                if int(disk_cached.get("count", 0)) > 0 else 0.0
+            ),
+        }
         _LINE_CLIP_DEBUG_CACHE[key] = disk_cached
         return disk_cached
 
+    t_rows0 = time.time()
     rows = _collect_ocr_split_rows_ui(dataset_root, split_name)
+    rows_collect_s = float(time.time() - t_rows0)
     if not rows:
         raise RuntimeError("No usable OCR rows found for selected dataset/split.")
 
+    t_runtime0 = time.time()
     runtime = _load_line_clip_dual_runtime_cached(
         image_backbone_path,
         image_head_path,
@@ -4225,9 +4245,13 @@ def _get_or_build_line_clip_debug_corpus_ui(
         text_head_path,
         device_pref,
     )
+    runtime_load_s = float(time.time() - t_runtime0)
     image_paths = [str(r.get("_image_path_resolved", "")) for r in rows]
     texts = [str(r.get("_text_resolved", "")) for r in rows]
+    t_img0 = time.time()
     image_emb = _encode_line_clip_image_crops_ui(runtime, image_paths=image_paths, batch_size=batch_size, l2_normalize=l2_normalize)
+    image_encode_s = float(time.time() - t_img0)
+    t_txt0 = time.time()
     text_emb = _encode_line_clip_texts_ui(
         runtime,
         texts=texts,
@@ -4235,20 +4259,54 @@ def _get_or_build_line_clip_debug_corpus_ui(
         l2_normalize=l2_normalize,
         text_max_length=text_max_length,
     )
+    text_encode_s = float(time.time() - t_txt0)
+    count_rows = int(len(rows))
+    total_build_before_save_s = float(time.time() - t_start)
+    image_shape = [int(v) for v in image_emb.shape] if getattr(image_emb, "ndim", 0) == 2 else []
+    text_shape = [int(v) for v in text_emb.shape] if getattr(text_emb, "ndim", 0) == 2 else []
+    image_bytes = int(getattr(image_emb, "nbytes", 0))
+    text_bytes = int(getattr(text_emb, "nbytes", 0))
     corpus = {
         "rows": rows,
         "image_embeddings": image_emb.astype(np.float32, copy=False),
         "text_embeddings": text_emb.astype(np.float32, copy=False),
         "device": str(runtime.get("device", "")),
         "device_msg": str(runtime.get("device_msg", "")),
-        "count": int(len(rows)),
+        "count": count_rows,
         "cache_source": "built",
+        "timing": {
+            "cache_hit_tier": "miss_build",
+            "rows_collect_s": round(rows_collect_s, 4),
+            "runtime_load_s": round(runtime_load_s, 4),
+            "image_encode_s": round(image_encode_s, 4),
+            "text_encode_s": round(text_encode_s, 4),
+            "build_before_save_s": round(total_build_before_save_s, 4),
+        },
+        "perf": {
+            "image_shape": image_shape,
+            "text_shape": text_shape,
+            "image_bytes": image_bytes,
+            "text_bytes": text_bytes,
+            "rows_per_s_image_encode": round(count_rows / max(image_encode_s, 1e-9), 2),
+            "rows_per_s_text_encode": round(count_rows / max(text_encode_s, 1e-9), 2),
+            "rows_per_s_build_before_save": round(count_rows / max(total_build_before_save_s, 1e-9), 2),
+        },
     }
+    t_save0 = time.time()
     try:
         disk_cache_dir = _save_line_clip_debug_corpus_to_disk_ui(key, corpus)
         corpus["disk_cache_dir"] = str(disk_cache_dir)
     except Exception as exc:
         corpus["disk_cache_write_error"] = f"{type(exc).__name__}: {exc}"
+    disk_save_s = float(time.time() - t_save0)
+    total_elapsed_s = float(time.time() - t_start)
+    timing = corpus.get("timing") if isinstance(corpus.get("timing"), dict) else {}
+    timing["disk_save_s"] = round(disk_save_s, 4)
+    timing["total_elapsed_s"] = round(total_elapsed_s, 4)
+    corpus["timing"] = timing
+    perf = corpus.get("perf") if isinstance(corpus.get("perf"), dict) else {}
+    perf["rows_per_s_total"] = round(count_rows / max(total_elapsed_s, 1e-9), 2)
+    corpus["perf"] = perf
     _LINE_CLIP_DEBUG_CACHE[key] = corpus
     if len(_LINE_CLIP_DEBUG_CACHE) > 3:
         for k in list(_LINE_CLIP_DEBUG_CACHE.keys())[:-3]:

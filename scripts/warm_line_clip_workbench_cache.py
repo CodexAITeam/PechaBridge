@@ -161,6 +161,8 @@ def run(args: argparse.Namespace) -> int:
                     "disk_cache_dir": str(corpus.get("disk_cache_dir", "")),
                     "device": str(corpus.get("device", "")),
                     "device_msg": str(corpus.get("device_msg", "")),
+                    "timing": dict(corpus.get("timing") or {}),
+                    "perf": dict(corpus.get("perf") or {}),
                     "elapsed_s": round(float(time.time() - t0), 3),
                 }
             )
@@ -188,12 +190,17 @@ def run(args: argparse.Namespace) -> int:
                 ))
                 return 1
         LOGGER.info(
-            "split=%s ok=%s count=%s cache=%s elapsed=%.1fs",
+            "split=%s ok=%s count=%s cache=%s hit=%s elapsed=%.1fs rows/s=%.1f img_s=%s txt_s=%s save_s=%s",
             rec.get("split"),
             rec.get("ok"),
             rec.get("count", "na"),
             rec.get("cache_source", "na"),
+            str((rec.get("timing") or {}).get("cache_hit_tier", "na")),
             float(rec.get("elapsed_s", 0.0)),
+            float((rec.get("perf") or {}).get("rows_per_s_total", 0.0) or 0.0),
+            str((rec.get("timing") or {}).get("image_encode_s", "na")),
+            str((rec.get("timing") or {}).get("text_encode_s", "na")),
+            str((rec.get("timing") or {}).get("disk_save_s", "na")),
         )
         results.append(rec)
 
