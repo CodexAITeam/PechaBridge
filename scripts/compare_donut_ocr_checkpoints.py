@@ -20,6 +20,7 @@ if str(REPO_ROOT) not in sys.path:
     sys.path.insert(0, str(REPO_ROOT))
 
 import scripts.train_donut_ocr as train_mod
+from pechabridge.ocr.repro_pack import FrozenValSubsetDataset, frozen_val_collate, load_checkpoint_bundle
 
 
 def _parse_args() -> argparse.Namespace:
@@ -41,6 +42,7 @@ def _parse_args() -> argparse.Namespace:
     p.add_argument("--batch_size", type=int, default=8)
     p.add_argument("--device", type=str, default="cuda:0" if torch.cuda.is_available() else "cpu")
     p.add_argument("--show_examples", type=int, default=5, help="How many best/worst examples to print per checkpoint")
+    p.add_argument("--use_repro_bundle", action="store_true", help="Load tokenizer/image_processor/generate config/val subset from checkpoint-*/repro for 1:1 CER reproduction")
     return p.parse_args()
 
 
@@ -188,6 +190,114 @@ def _run_checkpoint(
     }
 
 
+def _run_checkpoint_with_repro_bundle(
+    ckpt_path: str,
+    *,
+    args: argparse.Namespace,
+    device: torch.device,
+) -> Dict[str, object]:
+    ckpt = Path(ckpt_path).expanduser().resolve()
+    model, tokenizer, image_processor, generate_cfg, norm_cfg, records, saved_cer_record = load_checkpoint_bundle(
+        ckpt,
+        tokenizer_loader=train_mod._load_tokenizer_robust,
+        model_loader=train_mod._load_ved_model_robust,
+    )
+    image_preprocess_contract = json.loads((ckpt / "repro" / "image_preprocess.json").read_text(encoding="utf-8"))
+    image_preprocess_pipeline = str(image_preprocess_contract.get("pipeline", "none") or "none")
+    newline_token = str(norm_cfg.get("metric_newline_token", "<NL>") or "<NL>")
+
+    ds = FrozenValSubsetDataset(
+        records,
+        image_processor=image_processor,
+        image_preprocess_fn=train_mod._apply_image_preprocess_pipeline,
+        image_preprocess_pipeline=image_preprocess_pipeline,
+    )
+    dl = DataLoader(ds, batch_size=int(args.batch_size), shuffle=False, collate_fn=frozen_val_collate)
+
+    model.to(device)
+    model.eval()
+
+    gkwargs: Dict[str, object] = {}
+    for k in [
+        "decoder_start_token_id",
+        "bos_token_id",
+        "eos_token_id",
+        "pad_token_id",
+        "max_length",
+        "max_new_tokens",
+        "min_new_tokens",
+        "num_beams",
+        "do_sample",
+        "temperature",
+        "top_p",
+        "repetition_penalty",
+        "no_repeat_ngram_size",
+        "length_penalty",
+        "early_stopping",
+        "use_cache",
+        "bad_words_ids",
+        "forced_bos_token_id",
+        "forced_eos_token_id",
+    ]:
+        v = generate_cfg.get(k)
+        if v is not None:
+            gkwargs[k] = v
+
+    preds_all: List[str] = []
+    refs_all: List[str] = []
+    sample_rows: List[Dict[str, object]] = []
+    with torch.no_grad():
+        for batch in dl:
+            pixel_values = batch["pixel_values"].to(device)
+            gen_ids = model.generate(pixel_values=pixel_values, **gkwargs)
+            pred_norms = train_mod._decode_for_metric(tokenizer, gen_ids.detach().cpu().numpy(), newline_token=newline_token)
+            for meta, p in zip(batch["meta"], pred_norms):
+                pred = str(p or "")
+                ref = str(meta.get("gt_text_metric_norm", "") or "")
+                preds_all.append(pred)
+                refs_all.append(ref)
+                sample_rows.append(
+                    {
+                        "i": int(meta.get("idx", len(sample_rows))),
+                        "id": str(meta.get("id", "")),
+                        "pred": pred,
+                        "ref": ref,
+                        "pred_len": len(pred),
+                        "ref_len": len(ref),
+                        "empty_pred": int(not pred),
+                        "empty_ref": int(not ref),
+                    }
+                )
+
+    valid_pairs = [(p, r) for p, r in zip(preds_all, refs_all) if r]
+    empty_ref_count = sum(1 for r in refs_all if not r)
+    empty_pred_count = sum(1 for p, r in zip(preds_all, refs_all) if (not p) and r)
+    cer = train_mod._char_error_rate([p for p, _ in valid_pairs], [r for _, r in valid_pairs], newline_token) if valid_pairs else 1.0
+    for row in sample_rows:
+        if row["ref"]:
+            row["cer"] = train_mod._sample_cer(str(row["pred"]), str(row["ref"]))
+        else:
+            row["cer"] = None
+    worst = [r for r in sample_rows if r["cer"] is not None]
+    worst.sort(key=lambda x: float(x["cer"]), reverse=True)
+    best = [r for r in worst if float(r["cer"]) <= 1.0]
+    best.sort(key=lambda x: float(x["cer"]))
+    out = {
+        "checkpoint": str(ckpt),
+        "cer": float(cer),
+        "cer_percent": float(cer) * 100.0,
+        "valid_n": int(len(valid_pairs)),
+        "empty_ref_count": int(empty_ref_count),
+        "empty_pred_count": int(empty_pred_count),
+        "worst_examples": worst[: max(0, int(args.show_examples))],
+        "best_examples": best[: max(0, int(args.show_examples))],
+        "repro_bundle": True,
+        "repro_saved_cer": saved_cer_record.get("repro_cer"),
+        "repro_saved_valid_n": saved_cer_record.get("repro_valid_n"),
+    }
+    return out
+
+
 def main() -> int:
     args = _parse_args()
     torch.manual_seed(int(args.seed))
@@ -196,20 +306,31 @@ def main() -> int:
     if not ckpts:
         raise SystemExit("No checkpoints provided")
 
-    tokenizer = _build_tokenizer(args)
-    ds, _, _ = _build_dataset(args, tokenizer)
-    subset, sampled_idx = _sample_subset(ds, int(args.num_samples), int(args.seed))
-    collator = train_mod.OCRDataCollator(tokenizer)
-
-    print(f"Using {len(subset)} validation samples (seed={args.seed})")
-    print(f"Sample indices head: {sampled_idx[:10]}")
-    print(f"Device: {device}")
-    print("")
+    tokenizer = None
+    subset = None
+    collator = None
+    if not args.use_repro_bundle:
+        tokenizer = _build_tokenizer(args)
+        ds, _, _ = _build_dataset(args, tokenizer)
+        subset, sampled_idx = _sample_subset(ds, int(args.num_samples), int(args.seed))
+        collator = train_mod.OCRDataCollator(tokenizer)
+        print(f"Using {len(subset)} validation samples (seed={args.seed})")
+        print(f"Sample indices head: {sampled_idx[:10]}")
+        print(f"Device: {device}")
+        print("")
+    else:
+        print("Using checkpoint repro bundles (val_subset + tokenizer + image_processor + generate_config from checkpoint-*/repro)")
+        print(f"Device: {device}")
+        print("")
 
     results: List[Dict[str, object]] = []
     for ckpt in ckpts:
         print(f"=== {ckpt} ===")
-        res = _run_checkpoint(ckpt, subset=subset, tokenizer=tokenizer, collator=collator, args=args, device=device)
+        if args.use_repro_bundle:
+            res = _run_checkpoint_with_repro_bundle(ckpt, args=args, device=device)
+        else:
+            assert subset is not None and tokenizer is not None and collator is not None
+            res = _run_checkpoint(ckpt, subset=subset, tokenizer=tokenizer, collator=collator, args=args, device=device)
         results.append(res)
         print(
             json.dumps(
@@ -220,6 +341,7 @@ def main() -> int:
                     "valid_n": res["valid_n"],
                     "empty_ref_count": res["empty_ref_count"],
                     "empty_pred_count": res["empty_pred_count"],
+                    **({"repro_saved_cer": res.get("repro_saved_cer"), "repro_saved_valid_n": res.get("repro_saved_valid_n")} if args.use_repro_bundle else {}),
                 },
                 ensure_ascii=False,
             )
