@@ -3225,6 +3225,7 @@ def _resolve_donut_runtime_dirs(model_root_or_model_dir: str) -> Tuple[Optional[
         )
 
     # Accept either output root (`.../donut_openpecha_bdrc`) or direct model dir (`.../model`).
+    repro_dir = root / "repro"
     if _is_hf_model_dir(root):
         model_dir = root
         base_dir = root.parent
@@ -3232,8 +3233,15 @@ def _resolve_donut_runtime_dirs(model_root_or_model_dir: str) -> Tuple[Optional[
         model_dir = root / "model"
         base_dir = root
 
-    tokenizer_dir = base_dir / "tokenizer"
-    image_processor_dir = base_dir / "image_processor"
+    # Prefer checkpoint-local repro bundle artifacts when present (1:1 train/eval parity).
+    if repro_dir.exists() and repro_dir.is_dir():
+        repro_tok = repro_dir / "tokenizer"
+        repro_imgp = repro_dir / "image_processor"
+        tokenizer_dir = repro_tok if repro_tok.exists() else (base_dir / "tokenizer")
+        image_processor_dir = repro_imgp if repro_imgp.exists() else (base_dir / "image_processor")
+    else:
+        tokenizer_dir = base_dir / "tokenizer"
+        image_processor_dir = base_dir / "image_processor"
 
     if not _is_hf_model_dir(model_dir):
         return None, None, None, f"Could not find DONUT/TroCR model dir at {model_dir}"
@@ -3242,6 +3250,33 @@ def _resolve_donut_runtime_dirs(model_root_or_model_dir: str) -> Tuple[Optional[
     if not image_processor_dir.exists():
         image_processor_dir = model_dir
     return model_dir, tokenizer_dir, image_processor_dir, ""
+
+
+def _load_donut_repro_bundle_cfg_ui(model_root_or_model_dir: str) -> Dict[str, Any]:
+    root = Path((model_root_or_model_dir or "").strip()).expanduser().resolve()
+    repro = root / "repro"
+    if not repro.exists() or not repro.is_dir():
+        return {"has_repro": False}
+    out: Dict[str, Any] = {"has_repro": True, "repro_dir": str(repro)}
+    try:
+        p = repro / "generate_config.json"
+        if p.exists():
+            out["generate_config"] = json.loads(p.read_text(encoding="utf-8"))
+    except Exception:
+        pass
+    try:
+        p = repro / "image_preprocess.json"
+        if p.exists():
+            out["image_preprocess"] = json.loads(p.read_text(encoding="utf-8"))
+    except Exception:
+        pass
+    try:
+        p = repro / "text_normalization.json"
+        if p.exists():
+            out["text_normalization"] = json.loads(p.read_text(encoding="utf-8"))
+    except Exception:
+        pass
+    return out
 
 
 @lru_cache(maxsize=8)
@@ -3257,13 +3292,14 @@ def _load_donut_ocr_runtime_cached(model_dir_s: str, tokenizer_dir_s: str, image
     image_processor_dir = Path(image_processor_dir_s).expanduser().resolve()
 
     from scripts.train_donut_ocr import (
+        _load_tokenizer_robust,
         _load_ved_model_robust,
         _paired_end_token_for_start,
         _strip_special_token_strings,
     )  # reuse training-side HF/meta/token fixes
 
     model = _load_ved_model_robust(str(model_dir))
-    tokenizer = AutoTokenizer.from_pretrained(str(tokenizer_dir), use_fast=True)
+    tokenizer = _load_tokenizer_robust(str(tokenizer_dir))
     image_processor = AutoImageProcessor.from_pretrained(str(image_processor_dir))
     # Align generation/model token IDs with the loaded tokenizer (same idea as training script).
     try:
@@ -3391,6 +3427,26 @@ def run_donut_ocr_inference_ui(
     if err:
         return image, f"Failed: {err}", json.dumps({"ok": False, "error": err}, ensure_ascii=False, indent=2)
 
+    repro_cfg = _load_donut_repro_bundle_cfg_ui(model_root_or_model_dir)
+    effective_preproc = str(image_preprocess_pipeline or "none")
+    effective_max_len = max(8, int(generation_max_length))
+    effective_num_beams = max(1, int(num_beams))
+    if bool(repro_cfg.get("has_repro")):
+        try:
+            ip_cfg = repro_cfg.get("image_preprocess") or {}
+            if isinstance(ip_cfg, dict):
+                pipe = str(ip_cfg.get("pipeline", "") or "").strip().lower()
+                if pipe in {"none", "pb", "bdrc"}:
+                    effective_preproc = pipe
+            gcfg = repro_cfg.get("generate_config") or {}
+            if isinstance(gcfg, dict):
+                if gcfg.get("max_length") is not None:
+                    effective_max_len = max(8, int(gcfg["max_length"]))
+                if gcfg.get("num_beams") is not None:
+                    effective_num_beams = max(1, int(gcfg["num_beams"]))
+        except Exception:
+            pass
+
     try:
         runtime = _load_donut_ocr_runtime_cached(
             str(model_dir),
@@ -3404,7 +3460,7 @@ def run_donut_ocr_inference_ui(
 
     try:
         pil = Image.fromarray(np.asarray(image).astype(np.uint8)).convert("RGB")
-        proc_pil = _apply_donut_ui_preprocess(pil, image_preprocess_pipeline)
+        proc_pil = _apply_donut_ui_preprocess(pil, effective_preproc)
         image_processor = runtime["image_processor"]
         tokenizer = runtime["tokenizer"]
         model = runtime["model"]
@@ -3412,12 +3468,39 @@ def run_donut_ocr_inference_ui(
 
         pixel_values = image_processor(images=proc_pil, return_tensors="pt").pixel_values
         pixel_values = pixel_values.to(device)
+        gen_kwargs: Dict[str, Any] = {
+            "max_length": int(effective_max_len),
+            "num_beams": int(effective_num_beams),
+        }
+        if bool(repro_cfg.get("has_repro")):
+            try:
+                gcfg = repro_cfg.get("generate_config") or {}
+                for k in (
+                    "decoder_start_token_id",
+                    "bos_token_id",
+                    "eos_token_id",
+                    "pad_token_id",
+                    "max_new_tokens",
+                    "min_new_tokens",
+                    "do_sample",
+                    "temperature",
+                    "top_p",
+                    "repetition_penalty",
+                    "no_repeat_ngram_size",
+                    "length_penalty",
+                    "early_stopping",
+                    "bad_words_ids",
+                    "forced_bos_token_id",
+                    "forced_eos_token_id",
+                    "use_cache",
+                ):
+                    v = gcfg.get(k) if isinstance(gcfg, dict) else None
+                    if v is not None:
+                        gen_kwargs[k] = v
+            except Exception:
+                pass
         with torch.no_grad():
-            generated = model.generate(
-                pixel_values=pixel_values,
-                max_length=max(8, int(generation_max_length)),
-                num_beams=max(1, int(num_beams)),
-            )
+            generated = model.generate(pixel_values=pixel_values, **gen_kwargs)
         text = tokenizer.batch_decode(generated, skip_special_tokens=True)[0] if len(generated) else ""
         text = _strip_special_token_strings(str(text or ""), tokenizer)
         gen_ids: List[int] = []
@@ -3434,9 +3517,14 @@ def run_donut_ocr_inference_ui(
             "image_processor_dir": runtime["image_processor_dir"],
             "device": runtime["device"],
             "device_msg": runtime.get("device_msg", ""),
-            "image_preprocess_pipeline": (image_preprocess_pipeline or "none"),
-            "generation_max_length": int(generation_max_length),
-            "num_beams": int(num_beams),
+            "image_preprocess_pipeline_requested": (image_preprocess_pipeline or "none"),
+            "image_preprocess_pipeline_effective": str(effective_preproc),
+            "generation_max_length_requested": int(generation_max_length),
+            "generation_max_length_effective": int(effective_max_len),
+            "num_beams_requested": int(num_beams),
+            "num_beams_effective": int(effective_num_beams),
+            "loaded_from_repro_bundle": bool(repro_cfg.get("has_repro")),
+            "repro_dir": repro_cfg.get("repro_dir", ""),
             "decoder_start_token_id": getattr(model.config, "decoder_start_token_id", None),
             "pad_token_id": getattr(model.config, "pad_token_id", None),
             "eos_token_id": getattr(model.config, "eos_token_id", None),
@@ -3904,27 +3992,22 @@ def scan_donut_ocr_models_ui(models_dir: str):
         if not p.is_dir():
             continue
 
-        # Final train output root layout: <root>/model + tokenizer + image_processor
-        if p.name == "model" and _is_hf_model_dir(p):
-            parent = p.parent
-            tok = parent / "tokenizer"
-            imgp = parent / "image_processor"
-            if tok.exists() and imgp.exists():
-                found_entries.append(str(parent.resolve()))
-            continue
-
-        # In-training checkpoints: <root>/checkpoint-XXXX + tokenizer + image_processor in parent
+        # Only show in-training checkpoints that have a repro bundle (for 1:1 inference parity).
         if p.name.startswith("checkpoint-") and _is_hf_model_dir(p):
-            parent = p.parent
-            tok = parent / "tokenizer"
-            imgp = parent / "image_processor"
-            if tok.exists() and imgp.exists():
+            repro = p / "repro"
+            if (
+                repro.exists()
+                and (repro / "generate_config.json").exists()
+                and (repro / "image_preprocess.json").exists()
+                and (repro / "tokenizer").exists()
+                and (repro / "image_processor").exists()
+            ):
                 found_entries.append(str(p.resolve()))
 
     found_entries = sorted(set(found_entries))
     default = found_entries[0] if found_entries else ""
     msg = (
-        f"Found {len(found_entries)} DONUT/TroCR model entries (final outputs and/or checkpoints) in {base}"
+        f"Found {len(found_entries)} DONUT/TroCR checkpoints with repro bundles in {base}"
     )
     return gr.update(choices=found_entries, value=(default if default else None)), default, msg
 

@@ -31,6 +31,8 @@ import json
 import logging
 import math
 import os
+import urllib.error
+import urllib.request
 from collections import Counter, defaultdict
 from pathlib import Path
 from typing import Any, Dict, Iterable, List, Mapping, MutableMapping, Optional, Sequence, Tuple
@@ -63,6 +65,13 @@ IMAGE_COLUMN_CANDIDATES: Tuple[str, ...] = (
     "line_img",
     "crop",
     "line",
+)
+IMAGE_URL_COLUMN_CANDIDATES: Tuple[str, ...] = (
+    "url",
+    "image_url",
+    "img_url",
+    "image-uri",
+    "image_uri",
 )
 TEXT_COLUMN_CANDIDATES: Tuple[str, ...] = (
     "text",
@@ -171,6 +180,21 @@ def _detect_image_column(
     return None
 
 
+def _detect_image_url_column(column_names: Sequence[str], explicit: Optional[str] = None) -> Optional[str]:
+    if explicit:
+        return explicit if explicit in set(column_names) else None
+    lower_map = {str(c).lower(): str(c) for c in column_names}
+    for cand in IMAGE_URL_COLUMN_CANDIDATES:
+        if cand.lower() in lower_map:
+            return lower_map[cand.lower()]
+    # Fallback: any column that looks like a URL-ish image pointer.
+    for col in column_names:
+        low = str(col).lower()
+        if "url" in low and ("image" in low or "img" in low or low == "url"):
+            return str(col)
+    return None
+
+
 def _detect_text_column(column_names: Sequence[str], explicit: Optional[str] = None) -> Optional[str]:
     if explicit:
         return explicit if explicit in set(column_names) else None
@@ -268,8 +292,33 @@ def _coerce_pil_image(value: Any) -> Optional[Image.Image]:
     return None
 
 
-def _save_line_png(image_value: Any, out_png: Path) -> Tuple[bool, Dict[str, Any]]:
+def _download_image_from_url(url: str, *, timeout_s: float = 20.0) -> Optional[Image.Image]:
+    raw = str(url or "").strip()
+    if not raw:
+        return None
+    if not (raw.startswith("http://") or raw.startswith("https://")):
+        return None
+    req = urllib.request.Request(
+        raw,
+        headers={
+            "User-Agent": "PechaBridge-OCR-Downloader/1.0 (+https://github.com/openpecha)"
+        },
+    )
+    with urllib.request.urlopen(req, timeout=float(timeout_s)) as resp:
+        data = resp.read()
+    with Image.open(io.BytesIO(data)) as im:
+        return im.copy()
+
+
+def _save_line_png(image_value: Any, out_png: Path, *, url_timeout_s: float = 20.0) -> Tuple[bool, Dict[str, Any]]:
     pil = _coerce_pil_image(image_value)
+    if pil is None and isinstance(image_value, str):
+        try:
+            pil = _download_image_from_url(image_value, timeout_s=float(url_timeout_s))
+        except urllib.error.URLError as exc:
+            return False, {"error": f"url_download_failed:{type(exc).__name__}"}
+        except Exception as exc:
+            return False, {"error": f"url_download_failed:{type(exc).__name__}"}
     if pil is None:
         return False, {"error": "unsupported_image_value"}
     pil = ImageOps.exif_transpose(pil)
@@ -462,6 +511,7 @@ def create_parser(add_help: bool = True) -> argparse.ArgumentParser:
         help="Optional split filter (repeatable), e.g. --split train --split validation.",
     )
     parser.add_argument("--image-column", type=str, default="", help="Explicit image column name.")
+    parser.add_argument("--image-url-column", type=str, default="", help="Explicit URL column for image download (HTTP/HTTPS).")
     parser.add_argument("--text-column", type=str, default="", help="Explicit text column name.")
     parser.add_argument("--doc-column", type=str, default="", help="Explicit doc-id source column name.")
     parser.add_argument("--page-column", type=str, default="", help="Explicit page-id source column name.")
@@ -470,6 +520,8 @@ def create_parser(add_help: bool = True) -> argparse.ArgumentParser:
     parser.add_argument("--revision", type=str, default="", help="Optional dataset revision/commit.")
     parser.add_argument("--token", type=str, default=os.environ.get("HF_TOKEN", ""), help="HF token (or set HF_TOKEN).")
     parser.add_argument("--max-rows-per-split", type=int, default=0, help="Debug cap per split (0 = no cap).")
+    parser.add_argument("--max-images", type=int, default=0, help="Cap on images saved per canonical split (train/eval/test); 0 = no cap.")
+    parser.add_argument("--url-timeout-seconds", type=float, default=20.0, help="Timeout for downloading images from URL columns.")
     parser.add_argument("--trust-remote-code", action="store_true", help="Pass trust_remote_code=True to datasets.")
     parser.add_argument("--streaming", action="store_true", help="Use HF streaming mode.")
     parser.add_argument("--all-configs", action="store_true", help="Try to load all dataset configs if present.")
@@ -508,6 +560,7 @@ def run(args: argparse.Namespace) -> Dict[str, Any]:
             "rows_saved": 0,
             "rows_skipped_no_image_column": 0,
             "rows_skipped_image_decode": 0,
+            "rows_skipped_image_download": 0,
             "splits_skipped_by_filter": 0,
             "canonical_splits_created": 0,
         }
@@ -583,6 +636,7 @@ def run(args: argparse.Namespace) -> Dict[str, Any]:
                     column_names = list(getattr(split_ds, "column_names", []) or [])
                     features = getattr(split_ds, "features", None)
                     image_col = _detect_image_column(column_names, features, explicit=(args.image_column or None))
+                    image_url_col = _detect_image_url_column(column_names, explicit=(args.image_url_column or None))
                     text_col = _detect_text_column(column_names, explicit=(args.text_column or None))
 
                     source_key = f"{dataset_id}::{config_label or 'default'}::{split_name}"
@@ -594,12 +648,13 @@ def run(args: argparse.Namespace) -> Dict[str, Any]:
                         "canonical_split": canonical_split,
                         "columns": column_names,
                         "image_column_detected": image_col or "",
+                        "image_url_column_detected": image_url_col or "",
                         "text_column_detected": text_col or "",
                     }
 
-                    if not image_col:
+                    if not image_col and not image_url_col:
                         LOGGER.warning(
-                            "No image column detected for %s (columns=%s). Skipping split.",
+                            "No image column or image-url column detected for %s (columns=%s). Skipping split.",
                             source_key,
                             column_names,
                         )
@@ -613,6 +668,14 @@ def run(args: argparse.Namespace) -> Dict[str, Any]:
                         desc=f"{dataset_short}:{split_name}->{canonical_split}",
                     )
                     for row_idx, row in progress:
+                        if int(args.max_images or 0) > 0 and int(counts_by_canonical_split[canonical_split]["rows_saved"]) >= int(args.max_images):
+                            LOGGER.info(
+                                "Reached --max-images=%d for split=%s (saved=%d). Skipping remaining rows in this split.",
+                                int(args.max_images),
+                                canonical_split,
+                                int(counts_by_canonical_split[canonical_split]["rows_saved"]),
+                            )
+                            break
                         if int(args.max_rows_per_split) > 0 and row_idx >= int(args.max_rows_per_split):
                             break
                         totals["rows_seen"] += 1
@@ -621,7 +684,8 @@ def run(args: argparse.Namespace) -> Dict[str, Any]:
                         if not isinstance(row, Mapping):
                             row = {"value": row}
 
-                        image_value = row.get(image_col)
+                        image_source_col = image_col if image_col else image_url_col
+                        image_value = row.get(image_source_col) if image_source_col else None
                         if image_value is None:
                             totals["rows_skipped_image_decode"] += 1
                             counts_by_dataset[dataset_id]["rows_skipped_image_decode"] += 1
@@ -652,17 +716,26 @@ def run(args: argparse.Namespace) -> Dict[str, Any]:
                             / line_dir_name
                         )
                         line_png = line_dir / "line.png"
-                        ok, img_meta = _save_line_png(image_value, line_png)
+                        ok, img_meta = _save_line_png(
+                            image_value,
+                            line_png,
+                            url_timeout_s=float(args.url_timeout_seconds),
+                        )
                         if not ok:
-                            totals["rows_skipped_image_decode"] += 1
-                            counts_by_dataset[dataset_id]["rows_skipped_image_decode"] += 1
+                            err_s = str(img_meta.get("error", ""))
+                            if err_s.startswith("url_download_failed"):
+                                totals["rows_skipped_image_download"] += 1
+                                counts_by_dataset[dataset_id]["rows_skipped_image_download"] += 1
+                            else:
+                                totals["rows_skipped_image_decode"] += 1
+                                counts_by_dataset[dataset_id]["rows_skipped_image_decode"] += 1
                             continue
 
                         line_rel_path = str(line_png.relative_to(out_dir))
                         source_record: Dict[str, Any] = {}
                         for key, value in row.items():
                             pref_key = f"src__{key}"
-                            if key == image_col:
+                            if image_source_col and key == image_source_col:
                                 source_record[pref_key] = line_rel_path
                             else:
                                 source_record[pref_key] = _serialize_source_value(value)
@@ -681,7 +754,7 @@ def run(args: argparse.Namespace) -> Dict[str, Any]:
                             "line_id": int(line_id),
                             "line_path": line_rel_path,
                             "text": text_value,
-                            "image_column": image_col,
+                            "image_column": image_source_col or "",
                             "text_column": text_col or "",
                             "line_folder_dup_idx": int(dup_idx),
                             "width_px": int(img_meta.get("width_px", -1)),
