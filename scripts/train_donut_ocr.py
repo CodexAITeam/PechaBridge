@@ -7,6 +7,7 @@ import json
 import inspect
 import logging
 import os
+import random
 import re
 import shutil
 import sys
@@ -38,6 +39,7 @@ if str(REPO_ROOT) not in sys.path:
 from tibetan_utils.arg_utils import create_train_donut_ocr_parser
 from pechabridge.ocr.preprocess import PreprocessConfig as PBPreprocessConfig, preprocess_patch_image
 from pechabridge.ocr.preprocess_bdrc import BDRCPreprocessConfig, preprocess_image_bdrc
+from pechabridge.ocr.repro_pack import ReproPack
 from pechabridge.ocr.sentencepiece_tokenizer_adapter import (
     find_sentencepiece_model_path as sp_find_model_path,
     load_sentencepiece_tokenizer as load_sentencepiece_tokenizer_adapter,
@@ -47,6 +49,46 @@ LOGGER = logging.getLogger("train_donut_ocr")
 
 
 _ZERO_WIDTH_CHARS = ("\u200b", "\u200c", "\u200d", "\ufeff")
+
+
+def _configure_determinism(seed: int) -> None:
+    seed_i = int(seed)
+    # cuBLAS workspace config is required for deterministic CUDA matmul kernels on many setups.
+    os.environ.setdefault("CUBLAS_WORKSPACE_CONFIG", ":4096:8")
+    os.environ.setdefault("PYTHONHASHSEED", str(seed_i))
+
+    random.seed(seed_i)
+    np.random.seed(seed_i)
+    torch.manual_seed(seed_i)
+    if torch.cuda.is_available():
+        torch.cuda.manual_seed_all(seed_i)
+
+    if hasattr(torch.backends, "cudnn"):
+        torch.backends.cudnn.deterministic = True
+        torch.backends.cudnn.benchmark = False
+        if hasattr(torch.backends.cudnn, "allow_tf32"):
+            torch.backends.cudnn.allow_tf32 = False
+    if hasattr(torch.backends, "cuda") and hasattr(torch.backends.cuda, "matmul"):
+        if hasattr(torch.backends.cuda.matmul, "allow_tf32"):
+            torch.backends.cuda.matmul.allow_tf32 = False
+
+    try:
+        torch.use_deterministic_algorithms(True, warn_only=False)
+    except TypeError:
+        # Older torch versions do not support warn_only.
+        torch.use_deterministic_algorithms(True)
+    except Exception as exc:
+        LOGGER.warning("Could not enable torch deterministic algorithms: %s", exc)
+
+    # Keep transformers/accelerate internal seeding aligned with runtime seeding.
+    set_seed(seed_i)
+    LOGGER.info(
+        "Deterministic training enabled (seed=%d, CUBLAS_WORKSPACE_CONFIG=%s, cudnn_deterministic=%s, cudnn_benchmark=%s)",
+        seed_i,
+        os.environ.get("CUBLAS_WORKSPACE_CONFIG", ""),
+        bool(getattr(getattr(torch.backends, "cudnn", object()), "deterministic", False)),
+        bool(getattr(getattr(torch.backends, "cudnn", object()), "benchmark", False)),
+    )
 
 
 def _paired_end_token_for_start(start_token: str) -> str:
@@ -260,6 +302,53 @@ class DonutCheckpointAliasCallback(TrainerCallback):
             LOGGER.info("Created checkpoint alias: %s -> %s", alias_path.name, ckpt_dir.name)
         except Exception as exc:
             LOGGER.warning("Could not create checkpoint alias %s: %s", alias_name, exc)
+        return control
+
+
+class DonutReproPackCallback(TrainerCallback):
+    """Write a self-contained repro bundle under each HF checkpoint directory."""
+
+    def __init__(self, repro_pack: Optional[ReproPack] = None):
+        self.repro_pack = repro_pack
+        self.trainer = None
+
+    def bind_trainer(self, trainer) -> None:
+        self.trainer = trainer
+
+    def on_save(self, args, state, control, **kwargs):  # type: ignore[override]
+        if self.repro_pack is None or self.trainer is None:
+            return control
+        step = int(getattr(state, "global_step", 0) or 0)
+        if step <= 0:
+            return control
+        ckpt_dir = Path(str(getattr(args, "output_dir", ""))).expanduser().resolve() / f"checkpoint-{step}"
+        if not ckpt_dir.exists():
+            return control
+        optimizer = getattr(self.trainer, "optimizer", None)
+        scheduler = getattr(self.trainer, "lr_scheduler", None)
+        scaler = getattr(self.trainer, "scaler", None)
+        if scaler is None:
+            try:
+                scaler = getattr(getattr(self.trainer, "accelerator", None), "scaler", None)
+            except Exception:
+                scaler = None
+        model_for_eval = getattr(self.trainer, "model", None)
+        if model_for_eval is None:
+            return control
+        try:
+            self.repro_pack.save_checkpoint_bundle(
+                ckpt_dir,
+                trainer=self.trainer,
+                state=state,
+                model=model_for_eval,
+                optimizer=optimizer,
+                scheduler=scheduler,
+                scaler=scaler,
+            )
+        except Exception as exc:
+            # Non-fatal: do not break training due to repro dump issues.
+            if _is_primary_process_runtime():
+                LOGGER.error("ReproPack checkpoint save failed at step=%d: %s", step, exc)
         return control
 
 
@@ -1500,7 +1589,7 @@ def _char_error_rate(preds: Sequence[str], refs: Sequence[str], newline_token: s
 
 def run(args) -> Dict[str, object]:
     _configure_logging()
-    set_seed(int(args.seed))
+    _configure_determinism(int(args.seed))
     if bool(getattr(args, "fp16", False)) and bool(getattr(args, "bf16", False)):
         raise ValueError("Only one of --fp16 / --bf16 can be enabled.")
 
@@ -1692,6 +1781,21 @@ def run(args) -> Dict[str, object]:
         )
 
     collator = OCRDataCollator(tokenizer)
+    _repro_has_eval = (val_dataset is not None and len(val_dataset) > 0)
+    repro_pack = ReproPack(
+        args=args,
+        tokenizer=tokenizer,
+        image_processor=image_processor,
+        image_preprocess_pipeline=image_preproc_mode,
+        val_dataset=val_dataset if _repro_has_eval else None,
+        decode_for_metric_fn=_decode_for_metric,
+        normalize_for_metric_fn=_normalize_for_metric,
+        levenshtein_fn=_levenshtein,
+        image_preprocess_fn=_apply_image_preprocess_pipeline,
+        format_target_text_fn=_format_ocr_target_text,
+        encode_target_ids_fn=_encode_target_ids_with_terminal_preservation,
+        logger=LOGGER,
+    ) if _repro_has_eval else None
     zero_cer_debug_count = {"n": 0}
     high_cer_debug_count = {"n": 0}
     collapse_warn_count = {"n": 0}
@@ -1839,6 +1943,7 @@ def run(args) -> Dict[str, object]:
         save_steps=int(args.save_steps),
         save_total_limit=int(args.save_total_limit),
         dataloader_num_workers=int(args.num_workers),
+        seed=int(args.seed),
         predict_with_generate=bool(has_eval),
         generation_max_length=int(args.generation_max_length),
         fp16=bool(args.fp16),
@@ -1852,6 +1957,10 @@ def run(args) -> Dict[str, object]:
         greater_is_better=False if has_eval else None,
     )
     ta_sig = inspect.signature(Seq2SeqTrainingArguments.__init__)
+    if "data_seed" in ta_sig.parameters:
+        ta_kwargs["data_seed"] = int(args.seed)
+    if "full_determinism" in ta_sig.parameters:
+        ta_kwargs["full_determinism"] = True
     if "evaluation_strategy" in ta_sig.parameters:
         ta_kwargs["evaluation_strategy"] = ("steps" if has_eval else "no")
     elif "eval_strategy" in ta_sig.parameters:
@@ -1907,6 +2016,9 @@ def run(args) -> Dict[str, object]:
         trainer.remove_callback(ProgressCallback)
         trainer.add_callback(DonutProgressCallback())
         trainer.add_callback(DonutCheckpointAliasCallback())
+        repro_cb = DonutReproPackCallback(repro_pack=repro_pack)
+        repro_cb.bind_trainer(trainer)
+        trainer.add_callback(repro_cb)
         LOGGER.info("Enabled DONUT TQDM postfix metrics callback")
     except Exception as exc:
         LOGGER.warning("Could not replace default ProgressCallback: %s", exc)
@@ -1920,6 +2032,17 @@ def run(args) -> Dict[str, object]:
             model=model,
             output_dir=output_dir,
         )
+    if repro_pack is not None:
+        try:
+            frozen_records = repro_pack.freeze_val_subset()
+            if _is_primary_process_runtime():
+                LOGGER.info(
+                    "ReproPack fixed val subset frozen: n=%d ids_head=%s",
+                    int(len(frozen_records)),
+                    [str(r.sample_id) for r in frozen_records[:8]],
+                )
+        except Exception as exc:
+            LOGGER.warning("Could not freeze ReproPack val subset before training: %s", exc)
 
     resume_ckpt = str(getattr(args, "resume_from_checkpoint", "") or "").strip()
     resume_probe_n = max(0, int(getattr(args, "resume_probe_eval_samples", 5) or 0))

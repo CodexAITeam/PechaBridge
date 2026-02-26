@@ -3609,6 +3609,9 @@ def run_page_line_donut_ocr_preview_ui(
     # Quick tab is opinionated: use BDRC preprocessing, while the lower-level helper still prefers
     # the train-script preprocessing implementation when importable.
     effective_preproc = "bdrc"
+    line_device_norm = str(line_device or "").strip()
+    if line_device_norm.lower() == "auto":
+        line_device_norm = ""
 
     if mode == "Single Line -> DONUT":
         line_img = direct_line_image if direct_line_image is not None else image
@@ -3657,6 +3660,8 @@ def run_page_line_donut_ocr_preview_ui(
             "mode": mode,
             "requested_donut_preprocess": requested_preproc,
             "effective_donut_preprocess": effective_preproc,
+            "line_device_requested": str(line_device or ""),
+            "line_device_effective": (line_device_norm if line_device_norm else "auto"),
             "line_image_size": {"width": w, "height": h},
             "ocr": debug_obj,
         }
@@ -3675,7 +3680,7 @@ def run_page_line_donut_ocr_preview_ui(
         model_path=line_model_path,
         conf=line_conf,
         imgsz=line_imgsz,
-        device=line_device,
+        device=line_device_norm,
         min_line_height=line_min_height,
         projection_smooth=line_projection_smooth,
         projection_threshold_rel=line_projection_threshold_rel,
@@ -3861,6 +3866,8 @@ def run_page_line_donut_ocr_preview_ui(
         "mode": mode,
         "requested_donut_preprocess": requested_preproc,
         "effective_donut_preprocess": effective_preproc,
+        "line_device_requested": str(line_device or ""),
+        "line_device_effective": (line_device_norm if line_device_norm else "auto"),
         "split_status": split_status,
         "ocr_status": note,
         "total_detected_lines": int(total_detected_lines),
@@ -10345,7 +10352,7 @@ def build_ui() -> gr.Blocks:
                     with gr.Accordion("Model Selection", open=True):
                         lineocr_line_models_dir = gr.Textbox(
                             label="Scan line models dir",
-                            value=str((workspace_root / "models").resolve()),
+                            value=str((workspace_root / "models" / "layoutModels").resolve()),
                         )
                         with gr.Row():
                             lineocr_line_scan_btn = gr.Button("Scan Line Models")
@@ -10383,7 +10390,11 @@ def build_ui() -> gr.Blocks:
                         with gr.Row():
                             lineocr_line_conf = gr.Slider(0.01, 0.99, value=0.25, step=0.01, label="line_conf")
                             lineocr_line_imgsz = gr.Number(label="line_imgsz", value=1024, precision=0)
-                        lineocr_line_device = gr.Textbox(label="line_device", value="")
+                        lineocr_line_device = gr.Dropdown(
+                            choices=["auto", "cpu", "cuda:0", "cuda:1", "cuda:2", "cuda:3", "mps"],
+                            value="auto",
+                            label="line_device",
+                        )
                         with gr.Row():
                             lineocr_min_line_height = gr.Number(label="min_line_height_px", value=10, precision=0)
                             lineocr_merge_gap = gr.Number(label="line_merge_gap_px", value=5, precision=0)
