@@ -907,6 +907,39 @@ def _drop_encoder_pooler_if_meta(model: VisionEncoderDecoderModel) -> None:
             pass
 
 
+def _prepare_model_for_generate_runtime(model: nn.Module) -> None:
+    """Best-effort guard against meta/plain helper tensors before generate().
+
+    We already sanitize after initial load, but some transformers/DDP combos can
+    still expose TrOCR helper tensors (`weights`, `_float_tensor`) in unexpected
+    states during checkpoint save/eval callbacks.
+    """
+    gen_model = model.module if hasattr(model, "module") and isinstance(getattr(model, "module"), nn.Module) else model
+    if not isinstance(gen_model, nn.Module):
+        return
+    try:
+        target_device = str(next(gen_model.parameters()).device)
+    except Exception:
+        target_device = "cpu"
+    try:
+        _materialize_meta_buffers_inplace(gen_model, device=target_device)
+    except Exception:
+        pass
+    try:
+        _materialize_meta_tensor_attrs_inplace(gen_model, device=target_device)
+    except Exception:
+        pass
+    try:
+        _register_trocr_sinusoidal_weights_as_buffer(gen_model)
+    except Exception:
+        pass
+    try:
+        if isinstance(gen_model, VisionEncoderDecoderModel):
+            _drop_encoder_pooler_if_meta(gen_model)
+    except Exception:
+        pass
+
+
 def _load_ved_model_robust(model_name_or_path: str) -> VisionEncoderDecoderModel:
     """Load VisionEncoderDecoderModel robustly across transformers versions.
 
@@ -1794,6 +1827,7 @@ def run(args) -> Dict[str, object]:
         image_preprocess_fn=_apply_image_preprocess_pipeline,
         format_target_text_fn=_format_ocr_target_text,
         encode_target_ids_fn=_encode_target_ids_with_terminal_preservation,
+        prepare_model_for_generate_fn=_prepare_model_for_generate_runtime,
         logger=LOGGER,
     ) if _repro_has_eval else None
     zero_cer_debug_count = {"n": 0}

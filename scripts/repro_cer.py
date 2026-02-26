@@ -139,6 +139,7 @@ def main(argv: Sequence[str] | None = None) -> int:
     model, tokenizer, image_processor, generate_cfg, norm_cfg, records, saved_cer_record = load_checkpoint_bundle(
         ckpt_dir,
         tokenizer_loader=train_mod._load_tokenizer_robust,
+        model_loader=train_mod._load_ved_model_robust,
     )
     image_preprocess_contract = json.loads((repro_dir / "image_preprocess.json").read_text(encoding="utf-8"))
     image_preprocess_pipeline = str(image_preprocess_contract.get("pipeline", "none"))
@@ -213,4 +214,3 @@ def main(argv: Sequence[str] | None = None) -> int:
 
 if __name__ == "__main__":
     raise SystemExit(main())
-

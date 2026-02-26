@@ -243,6 +243,7 @@ class ReproPack:
         image_preprocess_fn: Callable[[Image.Image, str], Image.Image],
         format_target_text_fn: Callable[..., str],
         encode_target_ids_fn: Callable[..., List[int]],
+        prepare_model_for_generate_fn: Optional[Callable[[Any], None]],
         logger,
     ):
         self.args = args
@@ -256,6 +257,7 @@ class ReproPack:
         self._image_preprocess_fn = image_preprocess_fn
         self._format_target_text_fn = format_target_text_fn
         self._encode_target_ids_fn = encode_target_ids_fn
+        self._prepare_model_for_generate_fn = prepare_model_for_generate_fn
         self._logger = logger
         self._frozen_records: List[FrozenValRecord] = []
         self._subset_frozen = False
@@ -389,6 +391,11 @@ class ReproPack:
         gen_model = model
         if not hasattr(gen_model, "generate") and hasattr(gen_model, "module") and hasattr(gen_model.module, "generate"):
             gen_model = gen_model.module
+        if self._prepare_model_for_generate_fn is not None:
+            try:
+                self._prepare_model_for_generate_fn(gen_model)
+            except Exception as exc:
+                self._logger.warning("ReproPack: prepare_model_for_generate failed before eval: %s", exc)
         records = self.freeze_val_subset()
         if not records:
             return {"cer": 1.0, "cer_percent": 100.0, "valid_n": 0, "empty_ref_count": 0, "empty_pred_count": 0}, []
@@ -686,6 +693,7 @@ def load_checkpoint_bundle(
     ckpt_dir: str | Path,
     *,
     tokenizer_loader: Optional[Callable[[str], Any]] = None,
+    model_loader: Optional[Callable[[str], Any]] = None,
 ) -> Tuple[Any, Any, Any, Dict[str, Any], Dict[str, Any], List[FrozenValRecord], Dict[str, Any]]:
     ckpt = Path(ckpt_dir).expanduser().resolve()
     repro = ckpt / "repro"
@@ -694,7 +702,10 @@ def load_checkpoint_bundle(
     _require_file(repro / "text_normalization.json", "text normalization contract")
     _require_file(repro / "metrics.json", "metrics contract")
     _require_file(repro / "val_subset.jsonl", "val subset")
-    model = VisionEncoderDecoderModel.from_pretrained(str(ckpt))
+    if model_loader is not None:
+        model = model_loader(str(ckpt))
+    else:
+        model = VisionEncoderDecoderModel.from_pretrained(str(ckpt))
     if tokenizer_loader is not None:
         tokenizer = tokenizer_loader(str(repro / "tokenizer"))
     else:
