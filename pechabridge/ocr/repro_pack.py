@@ -8,6 +8,7 @@ import time
 from dataclasses import dataclass
 from pathlib import Path
 from typing import Any, Callable, Dict, Iterable, List, Optional, Sequence, Tuple
+import inspect
 
 import numpy as np
 import torch
@@ -274,12 +275,36 @@ class ReproPack:
         start_tok = str(getattr(self.val_dataset, "target_start_token", "") or "")
         end_tok = str(getattr(self.val_dataset, "target_end_token", "") or "")
         target_text = self._format_target_text_fn(raw_text, start_token=start_tok, end_token=end_tok)
-        ids = self._encode_target_ids_fn(
-            self.tokenizer,
-            target_text,
-            max_target_length=int(getattr(self.val_dataset, "max_target_length", 0) or 0),
-            terminal_token=end_tok,
-        )
+        max_target_length = int(getattr(self.val_dataset, "max_target_length", 0) or 0)
+        end_tok_id = getattr(self.val_dataset, "target_end_token_id", None)
+        if end_tok_id is None and end_tok:
+            try:
+                ids_tmp = self.tokenizer(end_tok, truncation=False, add_special_tokens=False).get("input_ids", [])
+                if isinstance(ids_tmp, list) and len(ids_tmp) == 1:
+                    end_tok_id = int(ids_tmp[0])
+            except Exception:
+                end_tok_id = None
+
+        # Support both old and new helper signatures.
+        try:
+            sig = inspect.signature(self._encode_target_ids_fn)
+            params = sig.parameters
+        except Exception:
+            params = {}
+        if "terminal_token_id" in params:
+            ids = self._encode_target_ids_fn(
+                self.tokenizer,
+                target_text,
+                max_target_length=max_target_length,
+                terminal_token_id=end_tok_id,
+            )
+        else:
+            ids = self._encode_target_ids_fn(
+                self.tokenizer,
+                target_text,
+                max_target_length=max_target_length,
+                terminal_token=end_tok,
+            )
         metric_raw = self.tokenizer.decode(ids, skip_special_tokens=True)
         metric_norm = self._normalize_for_metric_fn(str(metric_raw or ""), str(getattr(self.args, "metric_newline_token", "<NL>")))
         return str(metric_raw or ""), str(metric_norm or "")
