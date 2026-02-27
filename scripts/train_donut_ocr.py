@@ -257,6 +257,30 @@ class DonutProgressCallback(ProgressCallback):
         "epoch",
     )
 
+    def __init__(self):
+        super().__init__()
+        self._last_eval_summary_step = -1
+
+    @staticmethod
+    def _to_float(value: object) -> Optional[float]:
+        if isinstance(value, (int, float)):
+            return float(value)
+        try:
+            return float(str(value))
+        except Exception:
+            return None
+
+    @staticmethod
+    def _to_int(value: object) -> Optional[int]:
+        if isinstance(value, bool):
+            return int(value)
+        if isinstance(value, int):
+            return int(value)
+        try:
+            return int(float(str(value)))
+        except Exception:
+            return None
+
     def on_log(self, args, state, control, logs=None, **kwargs):  # type: ignore[override]
         logs = logs or {}
         if state.is_world_process_zero and self.training_bar is not None:
@@ -281,6 +305,48 @@ class DonutProgressCallback(ProgressCallback):
                     self.training_bar.set_postfix(postfix, refresh=False)
                 except Exception:
                     pass
+
+        # Human-readable eval block (in addition to default metric dict logging).
+        if state.is_world_process_zero and any(str(k).startswith("eval_") for k in logs.keys()):
+            step = int(getattr(state, "global_step", 0) or 0)
+            if step != self._last_eval_summary_step:
+                self._last_eval_summary_step = step
+                eval_loss = self._to_float(logs.get("eval_loss"))
+                cer = self._to_float(logs.get("eval_cer"))
+                cer_pct = self._to_float(logs.get("eval_cer_percent"))
+                cer_min = self._to_float(logs.get("eval_cer_min"))
+                cer_max = self._to_float(logs.get("eval_cer_max"))
+                cer_std = self._to_float(logs.get("eval_cer_std"))
+                empty_n = self._to_int(logs.get("eval_cer_empty_pred_count"))
+                valid_n = self._to_int(logs.get("eval_cer_valid_n"))
+                empty_ratio = self._to_float(logs.get("eval_cer_empty_pred_ratio"))
+                pred_avg_len = self._to_float(logs.get("eval_pred_avg_len"))
+                ref_avg_len = self._to_float(logs.get("eval_ref_avg_len"))
+                runtime = self._to_float(logs.get("eval_runtime"))
+                sps = self._to_float(logs.get("eval_samples_per_second"))
+                epoch = self._to_float(logs.get("epoch"))
+                pred_len_s = f"{pred_avg_len:.1f}" if pred_avg_len is not None else "na"
+                ref_len_s = f"{ref_avg_len:.1f}" if ref_avg_len is not None else "na"
+                runtime_s = f"{runtime:.1f}" if runtime is not None else "na"
+                sps_s = f"{sps:.2f}" if sps is not None else "na"
+                LOGGER.info(
+                    "EVAL step=%d epoch=%s | loss=%s | cer=%s (%s%%) | cer[min=%s max=%s std=%s] | empty=%s/%s (%s%%) | len[pred=%s ref=%s] | %ss @ %s samp/s",
+                    step,
+                    f"{epoch:.3f}" if epoch is not None else "na",
+                    f"{eval_loss:.4f}" if eval_loss is not None else "na",
+                    f"{cer:.4f}" if cer is not None else "na",
+                    f"{cer_pct:.2f}" if cer_pct is not None else "na",
+                    f"{cer_min:.4f}" if cer_min is not None else "na",
+                    f"{cer_max:.4f}" if cer_max is not None else "na",
+                    f"{cer_std:.4f}" if cer_std is not None else "na",
+                    str(empty_n) if empty_n is not None else "na",
+                    str(valid_n) if valid_n is not None else "na",
+                    f"{(100.0 * empty_ratio):.2f}" if empty_ratio is not None else "na",
+                    pred_len_s,
+                    ref_len_s,
+                    runtime_s,
+                    sps_s,
+                )
         super().on_log(args, state, control, logs=logs, **kwargs)
 
 
@@ -1935,6 +2001,16 @@ def run(args) -> Dict[str, object]:
             if not p:
                 empty_pred_count += 1
             valid_pairs.append((p, r))
+        if valid_pairs:
+            sample_cers = [_sample_cer(p, r) for p, r in valid_pairs]
+            cer_min = float(min(sample_cers))
+            cer_max = float(max(sample_cers))
+            cer_std = float(np.std(np.asarray(sample_cers, dtype=np.float64), ddof=0))
+        else:
+            sample_cers = []
+            cer_min = 1.0
+            cer_max = 1.0
+            cer_std = 0.0
         repetitive_pred_count = sum(int(_looks_repetitive_prediction(p)) for p in pred_norms if p)
         avg_pred_len = float(sum(len(p) for p in pred_norms) / max(1, len(pred_norms)))
         avg_ref_len = float(sum(len(r) for r in ref_norms) / max(1, len(ref_norms)))
@@ -1997,12 +2073,12 @@ def run(args) -> Dict[str, object]:
         if cer > 1.0 and high_cer_debug_count["n"] < 3:
             high_cer_debug_count["n"] += 1
             sample_rows = []
-            for p, r in valid_pairs[:]:
+            for (p, r), sample_cer in zip(valid_pairs, sample_cers):
                 sample_rows.append(
                     {
                         "ref_len": len(r),
                         "pred_len": len(p),
-                        "sample_cer": round(_sample_cer(p, r), 4),
+                        "sample_cer": round(float(sample_cer), 4),
                         "ref": r[:180],
                         "pred": p[:180],
                     }
@@ -2027,6 +2103,9 @@ def run(args) -> Dict[str, object]:
             "cer": float(cer),
             "cer_percent": float(cer) * 100.0,
             "cer_valid_n": int(len(valid_pairs)),
+            "cer_min": float(cer_min),
+            "cer_max": float(cer_max),
+            "cer_std": float(cer_std),
             "cer_empty_ref_count": int(empty_ref_count),
             "cer_empty_pred_count": int(empty_pred_count),
             "cer_empty_pred_ratio": float(empty_pred_count / max(1, len(valid_pairs))) if valid_pairs else 1.0,
