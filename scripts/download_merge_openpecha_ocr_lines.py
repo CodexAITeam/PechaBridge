@@ -32,6 +32,7 @@ import logging
 import math
 import os
 import urllib.error
+import urllib.parse
 import urllib.request
 from collections import Counter, defaultdict
 from pathlib import Path
@@ -168,7 +169,13 @@ def _detect_image_column(
     explicit: Optional[str] = None,
 ) -> Optional[str]:
     if explicit:
-        return explicit if explicit in set(column_names) else None
+        if explicit in set(column_names):
+            return explicit
+        LOGGER.warning(
+            "Explicit --image-column=%r not found in columns=%s. Falling back to auto-detection.",
+            str(explicit),
+            list(column_names),
+        )
     if features:
         for name, feat in features.items():
             if name in column_names and _is_hf_image_feature(feat):
@@ -182,7 +189,13 @@ def _detect_image_column(
 
 def _detect_image_url_column(column_names: Sequence[str], explicit: Optional[str] = None) -> Optional[str]:
     if explicit:
-        return explicit if explicit in set(column_names) else None
+        if explicit in set(column_names):
+            return explicit
+        LOGGER.warning(
+            "Explicit --image-url-column=%r not found in columns=%s. Falling back to auto-detection.",
+            str(explicit),
+            list(column_names),
+        )
     lower_map = {str(c).lower(): str(c) for c in column_names}
     for cand in IMAGE_URL_COLUMN_CANDIDATES:
         if cand.lower() in lower_map:
@@ -197,7 +210,13 @@ def _detect_image_url_column(column_names: Sequence[str], explicit: Optional[str
 
 def _detect_text_column(column_names: Sequence[str], explicit: Optional[str] = None) -> Optional[str]:
     if explicit:
-        return explicit if explicit in set(column_names) else None
+        if explicit in set(column_names):
+            return explicit
+        LOGGER.warning(
+            "Explicit --text-column=%r not found in columns=%s. Falling back to auto-detection.",
+            str(explicit),
+            list(column_names),
+        )
     lower_map = {str(c).lower(): str(c) for c in column_names}
     for cand in TEXT_COLUMN_CANDIDATES:
         if cand.lower() in lower_map:
@@ -273,6 +292,13 @@ def _coerce_pil_image(value: Any) -> Optional[Image.Image]:
         return None
     if isinstance(value, Image.Image):
         return value.copy()
+    if isinstance(value, str):
+        raw = value.strip()
+        if raw:
+            p = Path(raw).expanduser()
+            if p.exists() and p.is_file():
+                with Image.open(p) as im:
+                    return im.copy()
     if isinstance(value, Mapping):
         path_val = value.get("path")
         bytes_val = value.get("bytes")
@@ -290,6 +316,30 @@ def _coerce_pil_image(value: Any) -> Optional[Image.Image]:
     if np is not None and isinstance(value, np.ndarray):
         return Image.fromarray(value)
     return None
+
+
+def _maybe_hf_resolve_url(
+    raw: str,
+    *,
+    dataset_id: str,
+    revision: str,
+) -> Optional[str]:
+    candidate = str(raw or "").strip()
+    if not candidate:
+        return None
+    low = candidate.lower()
+    if low.startswith("http://") or low.startswith("https://"):
+        return candidate
+    if "://" in candidate:
+        return None
+    # Ignore obvious non-image payloads.
+    if "." not in candidate:
+        return None
+    repo_path = candidate.lstrip("/")
+    repo_path_q = urllib.parse.quote(repo_path, safe="/:@")
+    ds_q = urllib.parse.quote(str(dataset_id), safe="/")
+    rev_q = urllib.parse.quote(str(revision or "main"), safe="")
+    return f"https://huggingface.co/datasets/{ds_q}/resolve/{rev_q}/{repo_path_q}"
 
 
 def _download_image_from_url(url: str, *, timeout_s: float = 20.0) -> Optional[Image.Image]:
@@ -690,6 +740,16 @@ def run(args: argparse.Namespace) -> Dict[str, Any]:
                             totals["rows_skipped_image_decode"] += 1
                             counts_by_dataset[dataset_id]["rows_skipped_image_decode"] += 1
                             continue
+                        if image_source_col and image_source_col == image_url_col and isinstance(image_value, str):
+                            # Some datasets expose repo-relative paths in `url` columns.
+                            # Convert to a resolvable HF URL when needed.
+                            hf_url = _maybe_hf_resolve_url(
+                                image_value,
+                                dataset_id=dataset_id,
+                                revision=str(args.revision or "main"),
+                            )
+                            if hf_url is not None:
+                                image_value = hf_url
 
                         doc_id, page_id, line_id, id_meta = _build_ids(
                             row,
