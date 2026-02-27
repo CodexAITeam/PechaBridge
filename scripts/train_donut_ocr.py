@@ -110,12 +110,46 @@ def _format_ocr_target_text(raw_text: str, *, start_token: str, end_token: str) 
     return f"{st}{text}{et}"
 
 
+def _resolve_single_token_id_no_mutation(tokenizer, token: str) -> Optional[int]:
+    """Resolve token id without mutating tokenizer vocab.
+
+    This avoids adapter implementations where `convert_tokens_to_ids` may
+    implicitly create new tokens for unknown strings.
+    """
+    tok = str(token or "").strip()
+    if not tok:
+        return None
+    try:
+        ids = tokenizer(
+            tok,
+            truncation=False,
+            add_special_tokens=False,
+        )["input_ids"]
+    except Exception:
+        return None
+    if not isinstance(ids, list):
+        try:
+            ids = list(ids)
+        except Exception:
+            return None
+    if len(ids) != 1:
+        return None
+    try:
+        tok_id = int(ids[0])
+    except Exception:
+        return None
+    unk_id = getattr(tokenizer, "unk_token_id", None)
+    if unk_id is not None and tok_id == int(unk_id):
+        return None
+    return tok_id
+
+
 def _encode_target_ids_with_terminal_preservation(
     tokenizer,
     target_text: str,
     *,
     max_target_length: int,
-    terminal_token: str = "",
+    terminal_token_id: Optional[int] = None,
 ) -> List[int]:
     """Encode labels and keep the terminal token when truncation happens.
 
@@ -130,17 +164,11 @@ def _encode_target_ids_with_terminal_preservation(
     max_len = int(max_target_length or 0)
     if max_len > 0 and len(ids) > max_len:
         ids = list(ids[:max_len])
-        term = str(terminal_token or "").strip()
-        if term and ids:
+        if terminal_token_id is not None and ids:
             try:
-                term_id = tokenizer.convert_tokens_to_ids(term)
-                unk_id = getattr(tokenizer, "unk_token_id", None)
-                if (
-                    term_id is not None
-                    and int(term_id) >= 0
-                    and (unk_id is None or int(term_id) != int(unk_id))
-                ):
-                    ids[-1] = int(term_id)
+                term_id = int(terminal_token_id)
+                if term_id >= 0:
+                    ids[-1] = term_id
             except Exception:
                 pass
     return [int(x) for x in ids]
@@ -178,8 +206,8 @@ def _configure_logging() -> None:
         format="%(asctime)s | %(levelname)s | %(name)s | %(message)s",
     )
     if not is_primary:
-        # Suppress duplicate logs from non-zero ranks in torchrun/DDP.
-        logging.disable(logging.CRITICAL)
+        # Keep hard failures visible on non-primary ranks.
+        logging.getLogger().setLevel(logging.ERROR)
         return
     LOGGER.info("Logging enabled on primary process only (RANK=%d LOCAL_RANK=%d)", rank, local_rank)
 
@@ -193,7 +221,11 @@ def _dist_is_initialized() -> bool:
 
 def _dist_rank() -> int:
     if not _dist_is_initialized():
-        return 0
+        rank_raw = str(os.environ.get("RANK", "0") or "0").strip()
+        try:
+            return int(rank_raw)
+        except Exception:
+            return 0
     try:
         return int(torch.distributed.get_rank())
     except Exception:
@@ -384,6 +416,12 @@ class DonutDebugSeq2SeqTrainer(Seq2SeqTrainer):
             loss, outputs = out
         else:
             loss, outputs = out, None
+        if torch.is_tensor(loss):
+            if not torch.isfinite(loss.detach()).all():
+                raise FloatingPointError(
+                    "Non-finite loss detected (NaN/Inf). "
+                    "Check AMP precision, learning rate, and label masking correctness."
+                )
         try:
             self._log_decoded_training_sample(inputs, outputs)
         except Exception as exc:
@@ -421,6 +459,15 @@ class DonutDebugSeq2SeqTrainer(Seq2SeqTrainer):
         gt_text = self._debug_tokenizer.decode(label_ids.tolist(), skip_special_tokens=True)
         pred_norm = _normalize_for_metric(str(pred_text or ""), self._debug_metric_newline_token)
         gt_norm = _normalize_for_metric(str(gt_text or ""), self._debug_metric_newline_token)
+        try:
+            non_ignored = labels != -100
+            label_ignore_ratio = float((~non_ignored).float().mean().item())
+            label_lengths = non_ignored.sum(dim=1).detach().cpu().tolist()
+            label_unique_tokens = int(torch.unique(labels[non_ignored]).numel()) if bool(non_ignored.any()) else 0
+        except Exception:
+            label_ignore_ratio = -1.0
+            label_lengths = []
+            label_unique_tokens = -1
         step = int(getattr(self.state, "global_step", 0) or 0)
         if (not self._debug_train_decode_preview) or (step % self._debug_train_decode_every_steps != 0):
             if self._debug_train_trace and (step % self._debug_train_trace_every_steps == 0):
@@ -431,12 +478,15 @@ class DonutDebugSeq2SeqTrainer(Seq2SeqTrainer):
         LOGGER.info("train_decode step=%d | GT: %r", step, gt_norm[:500])
         LOGGER.info("train_decode step=%d | PRD: %r", step, pred_norm[:500])
         LOGGER.info(
-            "train_decode step=%d | GT_len=%d PRD_len=%d label_ids_head=%s pred_ids_head=%s",
+            "train_decode step=%d | GT_len=%d PRD_len=%d label_ids_head=%s pred_ids_head=%s label_ignore_ratio=%.4f avg_label_len=%.1f unique_label_tokens=%d",
             step,
             len(gt_norm),
             len(pred_norm),
             label_ids_head,
             pred_ids_head,
+            float(label_ignore_ratio),
+            float(sum(label_lengths) / max(1, len(label_lengths))),
+            int(label_unique_tokens),
         )
         if self._debug_train_trace and (step % self._debug_train_trace_every_steps == 0):
             self._log_verbose_training_trace(inputs=inputs, outputs=outputs, step=step, logits=logits, labels=labels)
@@ -1381,6 +1431,7 @@ class OCRManifestDataset(Dataset):
         image_preprocess_pipeline: str = "none",
         target_start_token: str = "",
         target_end_token: str = "",
+        target_end_token_id: Optional[int] = None,
         manifest_path: Optional[Path] = None,
     ):
         self.samples: List[OCRSample] = []
@@ -1443,6 +1494,11 @@ class OCRManifestDataset(Dataset):
         self.image_preprocess_pipeline = str(image_preprocess_pipeline or "none")
         self.target_start_token = str(target_start_token or "")
         self.target_end_token = str(target_end_token or "")
+        self.target_end_token_id = (
+            int(target_end_token_id)
+            if target_end_token_id is not None
+            else None
+        )
         self._truncation_warned = False
 
     def __len__(self) -> int:
@@ -1469,7 +1525,7 @@ class OCRManifestDataset(Dataset):
                 self.tokenizer,
                 target_text,
                 max_target_length=self.max_target_length,
-                terminal_token=self.target_end_token,
+                terminal_token_id=self.target_end_token_id,
             )
             if (not self._truncation_warned) and self.target_end_token:
                 self._truncation_warned = True
@@ -1492,14 +1548,33 @@ class OCRDataCollator:
     def __call__(self, features: Sequence[Dict[str, object]]) -> Dict[str, torch.Tensor]:
         pixel_values = torch.stack([item["pixel_values"] for item in features])
         label_inputs = [item["labels"] for item in features]
-        padded = self.tokenizer.pad(
+        padded_pack = self.tokenizer.pad(
             {"input_ids": label_inputs},
             padding=True,
             return_tensors="pt",
-        )["input_ids"]
-        lengths = torch.tensor([len(x) for x in label_inputs], dtype=torch.long)
-        pos = torch.arange(padded.shape[1], dtype=torch.long).unsqueeze(0)
-        pad_mask = pos >= lengths.unsqueeze(1)
+        )
+        padded = padded_pack["input_ids"]
+
+        attention_mask = None
+        if isinstance(padded_pack, dict):
+            attention_mask = padded_pack.get("attention_mask")
+        if attention_mask is not None and not torch.is_tensor(attention_mask):
+            try:
+                attention_mask = torch.as_tensor(attention_mask)
+            except Exception:
+                attention_mask = None
+
+        if torch.is_tensor(attention_mask) and attention_mask.shape == padded.shape:
+            pad_mask = attention_mask == 0
+        else:
+            lengths = torch.tensor([len(x) for x in label_inputs], dtype=torch.long)
+            pos = torch.arange(padded.shape[1], dtype=torch.long).unsqueeze(0)
+            padding_side = str(getattr(self.tokenizer, "padding_side", "right") or "right").lower()
+            if padding_side == "left":
+                left_pad_lengths = (padded.shape[1] - lengths).unsqueeze(1)
+                pad_mask = pos < left_pad_lengths
+            else:
+                pad_mask = pos >= lengths.unsqueeze(1)
         padded = padded.clone()
         padded[pad_mask] = -100
         if not self._sanity_logged:
@@ -1707,33 +1782,26 @@ def run(args) -> Dict[str, object]:
             + (" ..." if len(plain_meta_after_resize) > 20 else "")
         )
 
-    decoder_start_id = tokenizer.convert_tokens_to_ids(args.decoder_start_token)
-    unk_id = tokenizer.unk_token_id
-    if (
-        decoder_start_id is None
-        or decoder_start_id < 0
-        or (
-            unk_id is not None
-            and int(decoder_start_id) == int(unk_id)
-            and str(args.decoder_start_token) != str(tokenizer.unk_token)
-        )
-    ):
+    tokenizer_len_before_id_resolution = int(len(tokenizer))
+    decoder_start_id = _resolve_single_token_id_no_mutation(tokenizer, str(args.decoder_start_token))
+    if decoder_start_id is None:
         raise ValueError(f"decoder_start_token not found in tokenizer: {args.decoder_start_token}")
     task_end_token = _paired_end_token_for_start(str(args.decoder_start_token))
     task_end_id = None
     if task_end_token:
-        try:
-            _candidate = tokenizer.convert_tokens_to_ids(task_end_token)
-            if _candidate is not None and int(_candidate) >= 0:
-                if tokenizer.unk_token_id is None or int(_candidate) != int(tokenizer.unk_token_id):
-                    task_end_id = int(_candidate)
-        except Exception:
-            task_end_id = None
+        task_end_id = _resolve_single_token_id_no_mutation(tokenizer, task_end_token)
         if task_end_id is None:
             raise ValueError(
                 f"Paired task end token could not be resolved in tokenizer: start={args.decoder_start_token!r} end={task_end_token!r}. "
                 "This breaks EOS supervision and often causes repetition loops / max-length decoding."
             )
+    tokenizer_len_after_id_resolution = int(len(tokenizer))
+    if tokenizer_len_after_id_resolution != tokenizer_len_before_id_resolution:
+        raise RuntimeError(
+            "Tokenizer vocabulary size changed during start/end token id resolution "
+            f"(before={tokenizer_len_before_id_resolution}, after={tokenizer_len_after_id_resolution}). "
+            "This indicates mutating token lookup and can desync decoder embeddings from labels."
+        )
 
     effective_eos_id = int(task_end_id) if task_end_id is not None else (
         int(tokenizer.eos_token_id) if tokenizer.eos_token_id is not None else None
@@ -1785,6 +1853,7 @@ def run(args) -> Dict[str, object]:
         image_preprocess_pipeline=image_preproc_mode,
         target_start_token=str(args.decoder_start_token),
         target_end_token=str(task_end_token),
+        target_end_token_id=task_end_id,
         manifest_path=train_manifest,
     )
     val_dataset = OCRManifestDataset(
@@ -1795,6 +1864,7 @@ def run(args) -> Dict[str, object]:
         image_preprocess_pipeline=image_preproc_mode,
         target_start_token=str(args.decoder_start_token),
         target_end_token=str(task_end_token),
+        target_end_token_id=task_end_id,
         manifest_path=val_manifest,
     ) if val_rows else None
 
@@ -1844,7 +1914,11 @@ def run(args) -> Dict[str, object]:
             predictions_arr = predictions
         if isinstance(predictions_arr, np.ndarray):
             predictions = predictions_arr
-            if predictions.dtype != object and predictions.ndim >= 2:
+            if (
+                predictions.dtype != object
+                and predictions.ndim >= 2
+                and np.issubdtype(predictions.dtype, np.integer)
+            ):
                 predictions = np.where(predictions < 0, tokenizer.pad_token_id, predictions)
         labels = np.where(labels == -100, tokenizer.pad_token_id, labels)
         pred_texts = _decode_for_metric(tokenizer, predictions, newline_token=args.metric_newline_token)

@@ -27,13 +27,13 @@ def _parse_args() -> argparse.Namespace:
     p = argparse.ArgumentParser(description="Compare OCR checkpoints on a fixed val subset")
     p.add_argument("--val_manifest", type=str, required=True, help="Validation JSONL manifest")
     p.add_argument("--checkpoints", type=str, required=True, help="Comma-separated checkpoint/model dirs")
-    p.add_argument("--tokenizer_path", type=str, default="/home/ubuntu/data/PechaBridge/ext/BoSentencePiece")
+    p.add_argument("--tokenizer_path", type=str, default="openpecha/BoSentencePiece")
     p.add_argument("--image_processor_path", type=str, default="microsoft/trocr-base-stage1")
-    p.add_argument("--image_preprocess_pipeline", type=str, default="bdrc", choices=["none", "pb", "bdrc"])
+    p.add_argument("--image_preprocess_pipeline", type=str, default="none", choices=["none", "pb", "bdrc"])
     p.add_argument("--image_size", type=int, default=384)
-    p.add_argument("--max_target_length", type=int, default=160)
-    p.add_argument("--generation_max_length", type=int, default=160)
-    p.add_argument("--generation_min_new_tokens", type=int, default=16)
+    p.add_argument("--max_target_length", type=int, default=512)
+    p.add_argument("--generation_max_length", type=int, default=512)
+    p.add_argument("--generation_min_new_tokens", type=int, default=0)
     p.add_argument("--decoder_start_token", type=str, default="<s_ocr>")
     p.add_argument("--extra_special_tokens", type=str, default="<NL>,<s_ocr>,</s_ocr>,<s_cls1>")
     p.add_argument("--metric_newline_token", type=str, default="<NL>", choices=["<NL>", "\\n"])
@@ -81,15 +81,21 @@ def _sample_subset(ds, n: int, seed: int):
 
 
 def _configure_model_for_eval(model, tokenizer, decoder_start_token: str, generation_max_length: int, generation_min_new_tokens: int):
-    decoder_start_id = int(tokenizer.convert_tokens_to_ids(decoder_start_token))
+    decoder_start_id = train_mod._resolve_single_token_id_no_mutation(tokenizer, decoder_start_token)
+    if decoder_start_id is None:
+        raise ValueError(f"decoder_start_token not found in tokenizer: {decoder_start_token!r}")
     task_end_token = train_mod._paired_end_token_for_start(decoder_start_token)
     task_end_id = None
     if task_end_token:
-        cid = tokenizer.convert_tokens_to_ids(task_end_token)
-        if cid is not None and int(cid) >= 0 and (tokenizer.unk_token_id is None or int(cid) != int(tokenizer.unk_token_id)):
-            task_end_id = int(cid)
+        task_end_id = train_mod._resolve_single_token_id_no_mutation(tokenizer, task_end_token)
+        if task_end_id is None:
+            raise ValueError(
+                f"paired end token not found in tokenizer: start={decoder_start_token!r} end={task_end_token!r}"
+            )
     effective_eos = int(task_end_id) if task_end_id is not None else (int(tokenizer.eos_token_id) if tokenizer.eos_token_id is not None else None)
-    model.config.decoder_start_token_id = decoder_start_id
+    if tokenizer.pad_token_id is None:
+        raise ValueError("Tokenizer pad_token_id is None.")
+    model.config.decoder_start_token_id = int(decoder_start_id)
     model.config.pad_token_id = int(tokenizer.pad_token_id)
     if effective_eos is not None:
         model.config.eos_token_id = int(effective_eos)
