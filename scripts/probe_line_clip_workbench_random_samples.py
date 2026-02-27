@@ -16,6 +16,8 @@ import numpy as np
 from ui_workbench import (
     _cer_single_ui,
     _get_or_build_line_clip_debug_corpus_ui,
+    _line_clip_debug_cache_key,
+    _load_line_clip_debug_corpus_from_disk_ui,
     scan_line_clip_dual_models_ui,
 )
 
@@ -45,6 +47,12 @@ def create_parser(add_help: bool = True) -> argparse.ArgumentParser:
     p.add_argument("--batch-size", type=int, default=32, help="Batch size used only if cache must be built")
     p.add_argument("--text-max-length", type=int, default=256, help="Tokenizer max length used in cache key/build")
     p.add_argument("--no-l2-normalize", action="store_true", help="Use non-normalized embeddings setting (must match cache/build config)")
+    p.add_argument(
+        "--progress-every-batches",
+        type=int,
+        default=50,
+        help="If cache build is needed, log embedding progress every N batches (0 disables)",
+    )
     p.add_argument("--examples", type=int, default=3, help="How many random sample details to keep per split in JSON report")
     p.add_argument("--json-out", type=str, default="", help="Optional path to write full JSON report")
     return p
@@ -287,11 +295,37 @@ def run(args: argparse.Namespace) -> int:
     examples = max(0, int(getattr(args, "examples", 3)))
     batch_size = max(1, int(getattr(args, "batch_size", 32)))
     text_max_length = max(8, int(getattr(args, "text_max_length", 256)))
+    progress_every_batches = max(0, int(getattr(args, "progress_every_batches", 0) or 0))
 
     rng = np.random.default_rng(seed)
     results: List[Dict[str, Any]] = []
     t0_all = time.time()
     for split in splits:
+        key = _line_clip_debug_cache_key(
+            dataset_root=str(dataset_root),
+            split_name=str(split),
+            image_backbone_path=str(bundle["image_backbone"]),
+            image_head_path=str(bundle["image_head"]),
+            text_encoder_dir=str(bundle["text_encoder"]),
+            text_head_path=str(bundle["text_head"]),
+            text_max_length=text_max_length,
+            l2_normalize=l2_normalize,
+        )
+        disk_cached = _load_line_clip_debug_corpus_from_disk_ui(key)
+        if disk_cached is None:
+            LOGGER.info("split=%s cache MISS -> building corpus banks: image+text", split)
+        else:
+            has_image = bool(disk_cached.get("image_embeddings") is not None)
+            has_text = bool(disk_cached.get("text_embeddings") is not None)
+            LOGGER.info(
+                "split=%s cache HIT on disk (image=%s text=%s) at %s",
+                split,
+                has_image,
+                has_text,
+                str(disk_cached.get("disk_cache_dir", "")),
+            )
+            if not (has_image and has_text):
+                LOGGER.info("split=%s cache is partial -> building missing bank(s) to satisfy probe", split)
         LOGGER.info("Loading/building corpus cache for split=%s ...", split)
         corpus = _get_or_build_line_clip_debug_corpus_ui(
             dataset_root=str(dataset_root),
@@ -304,6 +338,8 @@ def run(args: argparse.Namespace) -> int:
             batch_size=batch_size,
             text_max_length=text_max_length,
             l2_normalize=l2_normalize,
+            required_banks="both",
+            progress_every_batches=progress_every_batches,
         )
         split_report = _split_probe(
             corpus=corpus,
