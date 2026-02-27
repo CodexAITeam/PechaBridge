@@ -1076,7 +1076,7 @@ def add_train_donut_ocr_arguments(parser):
                        help='Maximum number of checkpoints to keep')
     parser.add_argument('--num_workers', type=int, default=4,
                        help='DataLoader workers')
-    parser.add_argument('--seed', type=int, default=23,
+    parser.add_argument('--seed', type=int, default=42,
                        help='Random seed')
     parser.add_argument('--fp16', action='store_true',
                        help='Enable fp16 training')
@@ -1141,7 +1141,7 @@ def add_run_donut_ocr_workflow_arguments(parser):
     parser.add_argument('--image_preprocess_pipeline', '--image-preprocess-pipeline', dest='image_preprocess_pipeline', type=str,
                        default='none', choices=['none', 'pb', 'bdrc'],
                        help='Optional deterministic image preprocessing before Donut image processor in workflow train step')
-    parser.add_argument('--seed', type=int, default=23,
+    parser.add_argument('--seed', type=int, default=42,
                        help='Random seed')
     parser.add_argument('--skip_generation', action='store_true',
                        help='Skip synthetic generation and use existing dataset dir')

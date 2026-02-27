@@ -80,7 +80,6 @@ class SentencePieceTokenizerAdapter:
         self.name_or_path = str(td)
         self.base_vocab_size = int(self._sp.get_piece_size())
         self.model_max_length = 512
-        self.padding_side = "right"
 
         self._added_token_to_id: Dict[str, int] = {}
         self._id_to_added_token: Dict[int, str] = {}
@@ -110,9 +109,6 @@ class SentencePieceTokenizerAdapter:
             return
 
         self.model_max_length = int(cfg.get("model_max_length") or self.model_max_length or 512)
-        pad_side = str(cfg.get("padding_side") or "").strip().lower()
-        if pad_side in {"left", "right"}:
-            self.padding_side = pad_side
         for attr, key in [
             ("_unk_token", "unk_token"),
             ("_pad_token", "pad_token"),
@@ -391,35 +387,20 @@ class SentencePieceTokenizerAdapter:
         if seqs is None:
             raise ValueError("encoded_inputs must contain input_ids")
         seq_lists = [[int(x) for x in seq] for seq in seqs]
-        attention_mask: List[List[int]] = []
         if not seq_lists:
             padded: List[List[int]] = []
         elif padding:
             max_len = max(len(seq) for seq in seq_lists)
             pad_id = int(self.pad_token_id if self.pad_token_id is not None else 0)
-            padded = []
-            for seq in seq_lists:
-                pad_len = max(0, max_len - len(seq))
-                if self.padding_side == "left":
-                    row = ([pad_id] * pad_len) + seq
-                    attn = ([0] * pad_len) + ([1] * len(seq))
-                else:
-                    row = seq + ([pad_id] * pad_len)
-                    attn = ([1] * len(seq)) + ([0] * pad_len)
-                padded.append(row)
-                attention_mask.append(attn)
+            padded = [seq + [pad_id] * (max_len - len(seq)) for seq in seq_lists]
         else:
             padded = seq_lists
-            attention_mask = [[1] * len(seq) for seq in seq_lists]
 
         if return_tensors == "pt":
             import torch
 
-            return {
-                "input_ids": torch.tensor(padded, dtype=torch.long),
-                "attention_mask": torch.tensor(attention_mask, dtype=torch.long),
-            }
-        return {"input_ids": padded, "attention_mask": attention_mask}
+            return {"input_ids": torch.tensor(padded, dtype=torch.long)}
+        return {"input_ids": padded}
 
     def add_special_tokens(self, special_tokens_dict: Dict[str, Any]) -> int:
         added_before = len(self._added_token_to_id)
@@ -462,7 +443,6 @@ class SentencePieceTokenizerAdapter:
             "tokenizer_class": "SentencePieceTokenizerAdapter",
             "source_tokenizer_dir": str(self._tokenizer_dir),
             "model_max_length": int(self.model_max_length),
-            "padding_side": str(self.padding_side),
             "unk_token": self._unk_token,
             "pad_token": self._pad_token,
             "bos_token": self._bos_token,
