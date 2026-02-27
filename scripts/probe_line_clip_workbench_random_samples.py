@@ -17,6 +17,7 @@ from ui_workbench import (
     _cer_single_ui,
     _get_or_build_line_clip_debug_corpus_ui,
     _line_clip_debug_cache_key,
+    _line_clip_debug_disk_cache_dir_ui,
     _load_line_clip_debug_corpus_from_disk_ui,
     scan_line_clip_dual_models_ui,
 )
@@ -311,6 +312,8 @@ def run(args: argparse.Namespace) -> int:
             text_max_length=text_max_length,
             l2_normalize=l2_normalize,
         )
+        cache_dir = _line_clip_debug_disk_cache_dir_ui(key)
+        LOGGER.info("split=%s checking corpus cache at: %s", split, str(cache_dir))
         disk_cached = _load_line_clip_debug_corpus_from_disk_ui(key)
         if disk_cached is None:
             LOGGER.info("split=%s cache MISS -> building corpus banks: image+text", split)
