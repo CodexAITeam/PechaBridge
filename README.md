@@ -88,6 +88,7 @@ Legacy files `requirements-ui.txt`, `requirements-vlm.txt`, and `requirements-lo
 - Retrieval training with mp-InfoNCE (MNN/OCR weak positives): [docs/retrieval_mpnce_training.md](docs/retrieval_mpnce_training.md)
 - DONUT/TroCR OCR training (OpenPecha/BDRC manifests, CER, checkpoints): [README_DONUT_OCR.md](README_DONUT_OCR.md)
 - Line-CLIP dual vision-text encoder training (DINOv2 + text encoder): [README_LINE_CLIP_DUAL_ENCODER.md](README_LINE_CLIP_DUAL_ENCODER.md)
+- line_clip cache warmup + in-split/cross-split probing & evaluation guide: [docs/line_clip_dual_encoder_probe_guide.md](docs/line_clip_dual_encoder_probe_guide.md)
 - Weak OCR labeling for patch datasets: [docs/weak_ocr.md](docs/weak_ocr.md)
 - Diffusion + LoRA details: [docs/texture_augmentation.md](docs/texture_augmentation.md)
 - Retrieval roadmap: [docs/tibetan_ngram_retrieval_plan.md](docs/tibetan_ngram_retrieval_plan.md)
@@ -200,6 +201,21 @@ python cli.py train-text-hierarchy-vit \
   --model-name-or-path facebook/dinov2-base \
   --text-encoder-name-or-path google/byt5-small \
   --image-preprocess-pipeline bdrc
+
+# Warm line_clip workbench corpus cache (best model auto-selected)
+python cli.py warm-line-clip-workbench-cache \
+  --models-dir ./models \
+  --dataset-root ./datasets/openpecha_ocr_lines \
+  --splits eval,test \
+  --only both \
+  --device cpu
+
+# Probe best line_clip model on random samples (in-split and/or cross-split)
+python cli.py probe-line-clip-workbench-random-samples \
+  --dataset-root ./datasets/openpecha_ocr_lines \
+  --cross-split eval:test \
+  --samples-per-split 200 \
+  --summary-only
 
 # Train Donut/TroCR OCR directly on line manifests (with CER on eval split)
 python cli.py train-donut-ocr \
