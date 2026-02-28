@@ -1991,15 +1991,83 @@ def run(args) -> Dict[str, object]:
         ref_texts = _decode_for_metric(tokenizer, labels, newline_token=args.metric_newline_token)
         pred_norms = [str(p or "") for p in pred_texts]
         ref_norms = [str(r or "") for r in ref_texts]
+        pred_sequences: Optional[np.ndarray] = None
+        try:
+            pred_arr = np.asarray(predictions)
+            if pred_arr.dtype != object and pred_arr.ndim >= 2 and np.issubdtype(pred_arr.dtype, np.integer):
+                pred_sequences = pred_arr.astype(np.int64, copy=False)
+        except Exception:
+            pred_sequences = None
+        eos_id = getattr(tokenizer, "eos_token_id", None)
+        pad_id = getattr(tokenizer, "pad_token_id", None)
+        unk_id = getattr(tokenizer, "unk_token_id", None)
+        decoder_start_id = getattr(getattr(model, "config", None), "decoder_start_token_id", None)
+        try:
+            special_id_set = set(int(x) for x in getattr(tokenizer, "all_special_ids", []) if x is not None)
+        except Exception:
+            special_id_set = set()
+        empty_first_eos = 0
+        empty_first_pad_or_none = 0
+        empty_first_special_other = 0
+        empty_first_non_special = 0
+        empty_strip_artifact_count = 0
+        empty_debug_rows: List[Dict[str, object]] = []
         valid_pairs: List[Tuple[str, str]] = []
         empty_ref_count = 0
         empty_pred_count = 0
-        for p, r in zip(pred_norms, ref_norms):
+        for idx, (p, r) in enumerate(zip(pred_norms, ref_norms)):
             if not r:
                 empty_ref_count += 1
                 continue
             if not p:
                 empty_pred_count += 1
+                first_tok_id: Optional[int] = None
+                if pred_sequences is not None and idx < pred_sequences.shape[0]:
+                    seq = pred_sequences[idx].tolist()
+                    saw_start = False
+                    for tok_raw in seq:
+                        try:
+                            tok = int(tok_raw)
+                        except Exception:
+                            continue
+                        if tok < 0 and pad_id is not None:
+                            tok = int(pad_id)
+                        if decoder_start_id is not None and not saw_start and tok == int(decoder_start_id):
+                            saw_start = True
+                            continue
+                        if pad_id is not None and tok == int(pad_id):
+                            continue
+                        first_tok_id = tok
+                        break
+                if first_tok_id is None or (pad_id is not None and first_tok_id == int(pad_id)):
+                    empty_first_pad_or_none += 1
+                elif eos_id is not None and first_tok_id == int(eos_id):
+                    empty_first_eos += 1
+                elif first_tok_id in special_id_set or (unk_id is not None and first_tok_id == int(unk_id)):
+                    empty_first_special_other += 1
+                else:
+                    empty_first_non_special += 1
+                if pred_sequences is not None and idx < pred_sequences.shape[0]:
+                    try:
+                        seq_ids = [int(x) for x in pred_sequences[idx].tolist()]
+                        raw_skip = tokenizer.decode(seq_ids, skip_special_tokens=True)
+                        raw_skip_norm = _normalize_for_metric(str(raw_skip or ""), args.metric_newline_token)
+                        if raw_skip_norm and not p:
+                            empty_strip_artifact_count += 1
+                        if len(empty_debug_rows) < 5:
+                            raw_no_skip = tokenizer.decode(seq_ids, skip_special_tokens=False)
+                            empty_debug_rows.append(
+                                {
+                                    "idx": int(idx),
+                                    "first_tok_id": first_tok_id,
+                                    "raw_no_skip": str(raw_no_skip)[:180],
+                                    "raw_skip": str(raw_skip)[:180],
+                                    "pred_norm": str(p)[:180],
+                                    "ref_norm": str(r)[:180],
+                                }
+                            )
+                    except Exception:
+                        pass
             valid_pairs.append((p, r))
         if valid_pairs:
             sample_cers = [_sample_cer(p, r) for p, r in valid_pairs]
@@ -2041,7 +2109,35 @@ def run(args) -> Dict[str, object]:
                     ref[:180],
                     pred[:180],
                 )
+            LOGGER.error(
+                "collapse_forensics | empty_first_token: eos=%d pad_or_none=%d special_other=%d non_special=%d strip_artifacts=%d",
+                int(empty_first_eos),
+                int(empty_first_pad_or_none),
+                int(empty_first_special_other),
+                int(empty_first_non_special),
+                int(empty_strip_artifact_count),
+            )
+            for row in empty_debug_rows[:3]:
+                LOGGER.error(
+                    "collapse_empty_sample idx=%d first_tok_id=%s | raw_no_skip=%r | raw_skip=%r | ref=%r",
+                    int(row.get("idx", -1)),
+                    str(row.get("first_tok_id")),
+                    str(row.get("raw_no_skip", "")),
+                    str(row.get("raw_skip", "")),
+                    str(row.get("ref_norm", "")),
+                )
             LOGGER.error("=" * 120)
+        if valid_pairs and empty_pred_count > 0:
+            LOGGER.info(
+                "eval_empty_pred_forensics | empty=%d/%d eos_first=%d pad_or_none_first=%d special_other_first=%d non_special_first=%d strip_artifacts=%d",
+                int(empty_pred_count),
+                int(len(valid_pairs)),
+                int(empty_first_eos),
+                int(empty_first_pad_or_none),
+                int(empty_first_special_other),
+                int(empty_first_non_special),
+                int(empty_strip_artifact_count),
+            )
         if valid_pairs:
             cer = _char_error_rate(
                 [p for p, _ in valid_pairs],
@@ -2109,6 +2205,11 @@ def run(args) -> Dict[str, object]:
             "cer_empty_ref_count": int(empty_ref_count),
             "cer_empty_pred_count": int(empty_pred_count),
             "cer_empty_pred_ratio": float(empty_pred_count / max(1, len(valid_pairs))) if valid_pairs else 1.0,
+            "cer_empty_pred_first_token_eos_count": int(empty_first_eos),
+            "cer_empty_pred_first_token_pad_or_none_count": int(empty_first_pad_or_none),
+            "cer_empty_pred_first_token_special_other_count": int(empty_first_special_other),
+            "cer_empty_pred_first_token_non_special_count": int(empty_first_non_special),
+            "cer_empty_pred_strip_artifact_count": int(empty_strip_artifact_count),
             "pred_repetitive_count": int(repetitive_pred_count),
             "pred_repetitive_ratio": float(repetitive_pred_count / max(1, len(pred_norms))),
             "pred_avg_len": float(avg_pred_len),
