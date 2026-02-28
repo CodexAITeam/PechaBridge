@@ -4,11 +4,13 @@
 from __future__ import annotations
 
 import argparse
+import csv
 import json
+import re
 import sys
 from pathlib import Path
 from types import SimpleNamespace
-from typing import Dict, List, Sequence
+from typing import Dict, List, Sequence, Tuple
 
 import numpy as np
 import torch
@@ -26,7 +28,9 @@ from pechabridge.ocr.repro_pack import FrozenValSubsetDataset, frozen_val_collat
 def _parse_args() -> argparse.Namespace:
     p = argparse.ArgumentParser(description="Compare OCR checkpoints on a fixed val subset")
     p.add_argument("--val_manifest", type=str, required=True, help="Validation JSONL manifest")
-    p.add_argument("--checkpoints", type=str, required=True, help="Comma-separated checkpoint/model dirs")
+    p.add_argument("--checkpoints", type=str, default="", help="Comma-separated checkpoint/model dirs")
+    p.add_argument("--checkpoints_dir", type=str, default="", help="Directory containing checkpoint-* folders")
+    p.add_argument("--checkpoint_pattern", type=str, default="checkpoint-[0-9]*", help="Glob pattern used inside --checkpoints_dir")
     p.add_argument("--tokenizer_path", type=str, default="openpecha/BoSentencePiece")
     p.add_argument("--image_processor_path", type=str, default="microsoft/trocr-base-stage1")
     p.add_argument("--image_preprocess_pipeline", type=str, default="none", choices=["none", "pb", "bdrc"])
@@ -43,7 +47,33 @@ def _parse_args() -> argparse.Namespace:
     p.add_argument("--device", type=str, default="cuda:0" if torch.cuda.is_available() else "cpu")
     p.add_argument("--show_examples", type=int, default=5, help="How many best/worst examples to print per checkpoint")
     p.add_argument("--use_repro_bundle", action="store_true", help="Load tokenizer/image_processor/generate config/val subset from checkpoint-*/repro for 1:1 CER reproduction")
+    p.add_argument("--output_json", type=str, default="", help="Optional path to write full comparison JSON")
+    p.add_argument("--output_csv", type=str, default="", help="Optional path to write comparison CSV")
     return p.parse_args()
+
+
+def _checkpoint_sort_key(p: Path) -> Tuple[int, str]:
+    m = re.search(r"checkpoint-(\d+)", p.name)
+    if m:
+        return (int(m.group(1)), p.name)
+    return (10**18, p.name)
+
+
+def _resolve_checkpoints(args: argparse.Namespace) -> List[str]:
+    from_list = [s.strip() for s in str(args.checkpoints or "").split(",") if s.strip()]
+    found: List[Path] = [Path(s).expanduser().resolve() for s in from_list]
+
+    if args.checkpoints_dir:
+        root = Path(str(args.checkpoints_dir)).expanduser().resolve()
+        for p in sorted(root.glob(str(args.checkpoint_pattern)), key=_checkpoint_sort_key):
+            if p.is_dir():
+                found.append(p.resolve())
+
+    dedup: Dict[str, Path] = {}
+    for p in found:
+        dedup[str(p)] = p
+    out = [str(p) for p in sorted(dedup.values(), key=_checkpoint_sort_key)]
+    return out
 
 
 def _build_tokenizer(args: argparse.Namespace):
@@ -175,9 +205,11 @@ def _run_checkpoint(
     empty_ref_count = sum(1 for r in refs_all if not r)
     empty_pred_count = sum(1 for p, r in zip(preds_all, refs_all) if (not p) and r)
     cer = train_mod._char_error_rate([p for p, _ in valid_pairs], [r for _, r in valid_pairs], args.metric_newline_token) if valid_pairs else 1.0
+    cer_vals: List[float] = []
     for row in sample_rows:
         if row["ref"]:
             row["cer"] = train_mod._sample_cer(str(row["pred"]), str(row["ref"]))
+            cer_vals.append(float(row["cer"]))
         else:
             row["cer"] = None
     worst = [r for r in sample_rows if r["cer"] is not None]
@@ -188,6 +220,9 @@ def _run_checkpoint(
         "checkpoint": str(ckpt_path),
         "cer": float(cer),
         "cer_percent": float(cer) * 100.0,
+        "cer_min": float(min(cer_vals)) if cer_vals else None,
+        "cer_max": float(max(cer_vals)) if cer_vals else None,
+        "cer_std": float(np.std(cer_vals)) if cer_vals else None,
         "valid_n": int(len(valid_pairs)),
         "empty_ref_count": int(empty_ref_count),
         "empty_pred_count": int(empty_pred_count),
@@ -279,9 +314,11 @@ def _run_checkpoint_with_repro_bundle(
     empty_ref_count = sum(1 for r in refs_all if not r)
     empty_pred_count = sum(1 for p, r in zip(preds_all, refs_all) if (not p) and r)
     cer = train_mod._char_error_rate([p for p, _ in valid_pairs], [r for _, r in valid_pairs], newline_token) if valid_pairs else 1.0
+    cer_vals: List[float] = []
     for row in sample_rows:
         if row["ref"]:
             row["cer"] = train_mod._sample_cer(str(row["pred"]), str(row["ref"]))
+            cer_vals.append(float(row["cer"]))
         else:
             row["cer"] = None
     worst = [r for r in sample_rows if r["cer"] is not None]
@@ -292,6 +329,9 @@ def _run_checkpoint_with_repro_bundle(
         "checkpoint": str(ckpt),
         "cer": float(cer),
         "cer_percent": float(cer) * 100.0,
+        "cer_min": float(min(cer_vals)) if cer_vals else None,
+        "cer_max": float(max(cer_vals)) if cer_vals else None,
+        "cer_std": float(np.std(cer_vals)) if cer_vals else None,
         "valid_n": int(len(valid_pairs)),
         "empty_ref_count": int(empty_ref_count),
         "empty_pred_count": int(empty_pred_count),
@@ -308,9 +348,9 @@ def main() -> int:
     args = _parse_args()
     torch.manual_seed(int(args.seed))
     device = torch.device(args.device)
-    ckpts = [s.strip() for s in str(args.checkpoints).split(",") if s.strip()]
+    ckpts = _resolve_checkpoints(args)
     if not ckpts:
-        raise SystemExit("No checkpoints provided")
+        raise SystemExit("No checkpoints found. Provide --checkpoints and/or --checkpoints_dir.")
 
     tokenizer = None
     subset = None
@@ -344,6 +384,9 @@ def main() -> int:
                     "checkpoint": res["checkpoint"],
                     "cer": round(float(res["cer"]), 4),
                     "cer_percent": round(float(res["cer_percent"]), 2),
+                    "cer_min": round(float(res["cer_min"]), 4) if res.get("cer_min") is not None else None,
+                    "cer_max": round(float(res["cer_max"]), 4) if res.get("cer_max") is not None else None,
+                    "cer_std": round(float(res["cer_std"]), 4) if res.get("cer_std") is not None else None,
                     "valid_n": res["valid_n"],
                     "empty_ref_count": res["empty_ref_count"],
                     "empty_pred_count": res["empty_pred_count"],
@@ -366,7 +409,52 @@ def main() -> int:
 
     print("=== summary (sorted by CER) ===")
     for r in sorted(results, key=lambda x: float(x["cer"])):
-        print(f"{float(r['cer_percent']):6.2f}% | {r['checkpoint']}")
+        cmin = r.get("cer_min")
+        cmax = r.get("cer_max")
+        cstd = r.get("cer_std")
+        cmin_s = f"{float(cmin):.4f}" if cmin is not None else "n/a"
+        cmax_s = f"{float(cmax):.4f}" if cmax is not None else "n/a"
+        cstd_s = f"{float(cstd):.4f}" if cstd is not None else "n/a"
+        print(
+            f"{float(r['cer_percent']):6.2f}% | min={cmin_s} max={cmax_s} std={cstd_s} | {r['checkpoint']}"
+        )
+
+    if args.output_json:
+        out_json = Path(str(args.output_json)).expanduser().resolve()
+        out_json.parent.mkdir(parents=True, exist_ok=True)
+        payload = {
+            "num_checkpoints": len(results),
+            "num_samples": None if args.use_repro_bundle else int(args.num_samples),
+            "seed": int(args.seed),
+            "use_repro_bundle": bool(args.use_repro_bundle),
+            "results": results,
+        }
+        out_json.write_text(json.dumps(payload, ensure_ascii=False, indent=2), encoding="utf-8")
+        print(f"Wrote JSON: {out_json}")
+
+    if args.output_csv:
+        out_csv = Path(str(args.output_csv)).expanduser().resolve()
+        out_csv.parent.mkdir(parents=True, exist_ok=True)
+        fields = [
+            "checkpoint",
+            "cer",
+            "cer_percent",
+            "cer_min",
+            "cer_max",
+            "cer_std",
+            "valid_n",
+            "empty_ref_count",
+            "empty_pred_count",
+            "repro_bundle",
+            "repro_saved_cer",
+            "repro_saved_valid_n",
+        ]
+        with out_csv.open("w", encoding="utf-8", newline="") as f:
+            w = csv.DictWriter(f, fieldnames=fields)
+            w.writeheader()
+            for r in results:
+                w.writerow({k: r.get(k) for k in fields})
+        print(f"Wrote CSV: {out_csv}")
     return 0
 
 
