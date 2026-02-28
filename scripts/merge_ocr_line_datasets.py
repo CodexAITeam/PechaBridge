@@ -32,6 +32,11 @@ LOGGER = logging.getLogger("merge_ocr_line_datasets")
 
 _SPLITS = ("train", "eval", "test")
 
+try:
+    from tqdm.auto import tqdm
+except Exception:  # pragma: no cover
+    tqdm = None
+
 
 def _configure_logging(verbose: bool = False) -> None:
     logging.basicConfig(
@@ -42,8 +47,7 @@ def _configure_logging(verbose: bool = False) -> None:
 
 def _safe_jsonl_rows(path: Path) -> Iterable[Dict[str, Any]]:
     if not path.exists():
-        return []
-    rows: List[Dict[str, Any]] = []
+        return
     with path.open("r", encoding="utf-8") as f:
         for line in f:
             raw = line.strip()
@@ -54,8 +58,7 @@ def _safe_jsonl_rows(path: Path) -> Iterable[Dict[str, Any]]:
             except Exception:
                 continue
             if isinstance(obj, dict):
-                rows.append(obj)
-    return rows
+                yield obj
 
 
 def _safe_write_jsonl(path: Path, rows: Iterable[Dict[str, Any]]) -> None:
@@ -145,6 +148,20 @@ def _iter_split_roots(dataset_root: Path, split_filter: Optional[set[str]]) -> I
             yield split, split_dir
 
 
+def _count_manifest_rows(path: Path) -> int:
+    count = 0
+    for _row in _safe_jsonl_rows(path):
+        count += 1
+    return count
+
+
+def _count_dataset_rows(dataset_root: Path, split_filter: Optional[set[str]]) -> int:
+    total = 0
+    for _split, split_dir in _iter_split_roots(dataset_root, split_filter):
+        total += _count_manifest_rows(split_dir / "meta" / "lines.jsonl")
+    return total
+
+
 def create_parser() -> argparse.ArgumentParser:
     p = argparse.ArgumentParser(description="Merge two OCR line datasets into one TextHierarchy-style dataset.")
     p.add_argument("--dataset-a", required=True, help="First dataset root")
@@ -155,6 +172,7 @@ def create_parser() -> argparse.ArgumentParser:
     p.add_argument("--copy-mode", choices=["hardlink", "symlink", "copy"], default="hardlink")
     p.add_argument("--split", dest="splits", action="append", default=[], help="Optional split filter (repeatable)")
     p.add_argument("--skip-parquet", action="store_true")
+    p.add_argument("--no-progress", action="store_true", help="Disable tqdm progress bar")
     p.add_argument("--verbose", action="store_true")
     return p
 
@@ -170,6 +188,7 @@ def _merge_one_dataset(
     per_split: Dict[str, Counter],
     source_columns_merged: Dict[str, Dict[str, Any]],
     split_mapping_merged: Dict[str, str],
+    progress: Optional[Any] = None,
 ) -> None:
     for split, split_dir in _iter_split_roots(dataset_root, split_filter):
         manifest = split_dir / "meta" / "lines.jsonl"
@@ -184,6 +203,8 @@ def _merge_one_dataset(
             for row_idx, row in enumerate(_safe_jsonl_rows(manifest)):
                 totals["rows_seen"] += 1
                 per_split[split]["rows_seen"] += 1
+                if progress is not None:
+                    progress.update(1)
                 if not isinstance(row, Mapping):
                     continue
                 src_img = _resolve_line_image_path(dataset_root, row)
@@ -255,6 +276,14 @@ def run(args: argparse.Namespace) -> Dict[str, Any]:
     source_columns_merged: Dict[str, Dict[str, Any]] = {}
     split_mapping_merged: Dict[str, str] = {}
 
+    progress = None
+    if not bool(args.no_progress):
+        if tqdm is None:
+            LOGGER.warning("tqdm not available; continuing without progress bar.")
+        else:
+            total_rows = _count_dataset_rows(a_root, split_filter) + _count_dataset_rows(b_root, split_filter)
+            progress = tqdm(total=total_rows, desc="Merging OCR lines", unit="rows", dynamic_ncols=True)
+
     # Fresh output manifests.
     for split in _SPLITS:
         split_jsonl = out_dir / split / "meta" / "lines.jsonl"
@@ -265,28 +294,34 @@ def run(args: argparse.Namespace) -> Dict[str, Any]:
     if root_jsonl.exists():
         root_jsonl.unlink()
 
-    _merge_one_dataset(
-        dataset_root=a_root,
-        source_tag=tag_a,
-        out_dir=out_dir,
-        split_filter=split_filter,
-        copy_mode=str(args.copy_mode),
-        totals=totals,
-        per_split=per_split,
-        source_columns_merged=source_columns_merged,
-        split_mapping_merged=split_mapping_merged,
-    )
-    _merge_one_dataset(
-        dataset_root=b_root,
-        source_tag=tag_b,
-        out_dir=out_dir,
-        split_filter=split_filter,
-        copy_mode=str(args.copy_mode),
-        totals=totals,
-        per_split=per_split,
-        source_columns_merged=source_columns_merged,
-        split_mapping_merged=split_mapping_merged,
-    )
+    try:
+        _merge_one_dataset(
+            dataset_root=a_root,
+            source_tag=tag_a,
+            out_dir=out_dir,
+            split_filter=split_filter,
+            copy_mode=str(args.copy_mode),
+            totals=totals,
+            per_split=per_split,
+            source_columns_merged=source_columns_merged,
+            split_mapping_merged=split_mapping_merged,
+            progress=progress,
+        )
+        _merge_one_dataset(
+            dataset_root=b_root,
+            source_tag=tag_b,
+            out_dir=out_dir,
+            split_filter=split_filter,
+            copy_mode=str(args.copy_mode),
+            totals=totals,
+            per_split=per_split,
+            source_columns_merged=source_columns_merged,
+            split_mapping_merged=split_mapping_merged,
+            progress=progress,
+        )
+    finally:
+        if progress is not None:
+            progress.close()
 
     # Build root meta/lines.jsonl by concatenating split files.
     with root_jsonl.open("w", encoding="utf-8") as out_fp:
@@ -330,4 +365,3 @@ def main() -> int:
 
 if __name__ == "__main__":
     raise SystemExit(main())
-

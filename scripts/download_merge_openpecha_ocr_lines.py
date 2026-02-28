@@ -37,7 +37,7 @@ import urllib.request
 from collections import Counter, defaultdict
 from concurrent.futures import FIRST_COMPLETED, Future, ThreadPoolExecutor, wait
 from pathlib import Path
-from typing import Any, Dict, Iterable, List, Mapping, MutableMapping, Optional, Sequence, Tuple
+from typing import Any, Dict, Iterable, List, Mapping, MutableMapping, Optional, Sequence, Set, Tuple
 
 import pandas as pd
 from PIL import Image, ImageOps
@@ -536,6 +536,40 @@ def _write_parquet_from_jsonl(jsonl_path: Path, parquet_path: Path) -> None:
         df.to_parquet(parquet_path, index=False)
 
 
+def _load_existing_line_paths(jsonl_path: Path) -> Set[str]:
+    existing: Set[str] = set()
+    if not jsonl_path.exists() or jsonl_path.stat().st_size <= 0:
+        return existing
+    with jsonl_path.open("r", encoding="utf-8") as fp:
+        for line in fp:
+            raw = line.strip()
+            if not raw:
+                continue
+            try:
+                obj = json.loads(raw)
+            except Exception:
+                continue
+            if not isinstance(obj, Mapping):
+                continue
+            rel = str(obj.get("line_path", "") or "").strip()
+            if rel:
+                existing.add(rel)
+    return existing
+
+
+def _probe_existing_png_meta(path: Path) -> Dict[str, Any]:
+    try:
+        with Image.open(path) as im:
+            im = ImageOps.exif_transpose(im)
+            return {
+                "width_px": int(im.width),
+                "height_px": int(im.height),
+                "image_mode": str(im.mode),
+            }
+    except Exception:
+        return {"width_px": -1, "height_px": -1, "image_mode": ""}
+
+
 def create_parser(add_help: bool = True) -> argparse.ArgumentParser:
     parser = argparse.ArgumentParser(
         description="Download and merge OpenPecha OCR HF datasets into a TextHierarchy-style line dataset.",
@@ -578,6 +612,11 @@ def create_parser(add_help: bool = True) -> argparse.ArgumentParser:
     parser.add_argument("--trust-remote-code", action="store_true", help="Pass trust_remote_code=True to datasets.")
     parser.add_argument("--streaming", action="store_true", help="Use HF streaming mode.")
     parser.add_argument("--all-configs", action="store_true", help="Try to load all dataset configs if present.")
+    parser.add_argument(
+        "--resume",
+        action="store_true",
+        help="Continue into an existing output dir: keep existing metadata/images and append only missing rows.",
+    )
     parser.add_argument("--skip-parquet", action="store_true", help="Only write lines.jsonl (skip parquet conversion).")
     parser.add_argument("--verbose", action="store_true", help="Verbose logging.")
     return parser
@@ -614,6 +653,8 @@ def run(args: argparse.Namespace) -> Dict[str, Any]:
             "rows_skipped_no_image_column": 0,
             "rows_skipped_image_decode": 0,
             "rows_skipped_image_download": 0,
+            "rows_skipped_already_present": 0,
+            "rows_resumed_from_existing_image": 0,
             "splits_skipped_by_filter": 0,
             "canonical_splits_created": 0,
         }
@@ -621,9 +662,26 @@ def run(args: argparse.Namespace) -> Dict[str, Any]:
     counts_by_dataset: Dict[str, Counter] = defaultdict(Counter)
     counts_by_canonical_split: Dict[str, Counter] = defaultdict(Counter)
     split_outputs: Dict[str, Dict[str, Any]] = {}
+    existing_line_paths_by_split: Dict[str, Set[str]] = {}
+
+    if bool(args.resume) and out_dir.exists():
+        for split_dir in out_dir.iterdir():
+            if not split_dir.is_dir():
+                continue
+            split_jsonl = split_dir / "meta" / "lines.jsonl"
+            if not split_jsonl.exists():
+                continue
+            existing_line_paths_by_split[str(split_dir.name)] = _load_existing_line_paths(split_jsonl)
+        loaded_total = sum(len(v) for v in existing_line_paths_by_split.values())
+        LOGGER.info(
+            "Resume enabled: loaded %d existing line_path entries across %d split(s).",
+            int(loaded_total),
+            int(len(existing_line_paths_by_split)),
+        )
 
     with contextlib.ExitStack() as stack:
-        root_fp = stack.enter_context(root_jsonl_path.open("w", encoding="utf-8"))
+        root_mode = "a" if bool(args.resume) and root_jsonl_path.exists() else "w"
+        root_fp = stack.enter_context(root_jsonl_path.open(root_mode, encoding="utf-8"))
 
         def _ensure_split_output(canonical_split: str) -> Dict[str, Any]:
             state = split_outputs.get(canonical_split)
@@ -636,7 +694,8 @@ def run(args: argparse.Namespace) -> Dict[str, Any]:
             split_meta_dir.mkdir(parents=True, exist_ok=True)
             split_jsonl_path = split_meta_dir / "lines.jsonl"
             split_parquet_path = split_meta_dir / "lines.parquet"
-            split_fp = stack.enter_context(split_jsonl_path.open("w", encoding="utf-8"))
+            split_mode = "a" if bool(args.resume) and split_jsonl_path.exists() else "w"
+            split_fp = stack.enter_context(split_jsonl_path.open(split_mode, encoding="utf-8"))
             state = {
                 "root": split_root,
                 "text_root": split_text_root,
@@ -760,6 +819,9 @@ def run(args: argparse.Namespace) -> Dict[str, Any]:
                                 rec["image_mode"] = str(img_meta.get("image_mode", ""))
                                 _safe_jsonl_write_line(root_fp, rec)
                                 _safe_jsonl_write_line(split_outputs[canonical_split_done]["fp"], rec)
+                                existing_line_paths_by_split.setdefault(canonical_split_done, set()).add(
+                                    str(rec.get("line_path", ""))
+                                )
 
                                 totals["rows_saved"] += 1
                                 counts_by_dataset[dataset_id]["rows_saved"] += 1
@@ -839,6 +901,12 @@ def run(args: argparse.Namespace) -> Dict[str, Any]:
                             )
                             line_png = line_dir / "line.png"
                             line_rel_path = str(line_png.relative_to(out_dir))
+                            existing_paths = existing_line_paths_by_split.setdefault(canonical_split, set())
+                            if line_rel_path in existing_paths:
+                                totals["rows_skipped_already_present"] += 1
+                                counts_by_dataset[dataset_id]["rows_skipped_already_present"] += 1
+                                counts_by_canonical_split[canonical_split]["rows_skipped_already_present"] += 1
+                                continue
 
                             source_record: Dict[str, Any] = {}
                             for key, value in row.items():
@@ -871,6 +939,23 @@ def run(args: argparse.Namespace) -> Dict[str, Any]:
                                 **id_meta,
                                 **source_record,
                             }
+                            if bool(args.resume) and line_png.exists():
+                                img_meta = _probe_existing_png_meta(line_png)
+                                rec["width_px"] = int(img_meta.get("width_px", -1))
+                                rec["height_px"] = int(img_meta.get("height_px", -1))
+                                rec["image_mode"] = str(img_meta.get("image_mode", ""))
+                                _safe_jsonl_write_line(root_fp, rec)
+                                _safe_jsonl_write_line(split_outputs[canonical_split]["fp"], rec)
+                                existing_paths.add(line_rel_path)
+                                totals["rows_saved"] += 1
+                                totals["rows_resumed_from_existing_image"] += 1
+                                counts_by_dataset[dataset_id]["rows_saved"] += 1
+                                counts_by_dataset[dataset_id]["rows_resumed_from_existing_image"] += 1
+                                counts_by_dataset[dataset_id][f"split::{split_name}"] += 1
+                                counts_by_canonical_split[canonical_split]["rows_saved"] += 1
+                                counts_by_canonical_split[canonical_split]["rows_resumed_from_existing_image"] += 1
+                                counts_by_canonical_split[canonical_split][f"source_split::{split_name}"] += 1
+                                continue
                             fut = executor.submit(
                                 _save_line_png,
                                 image_value,
