@@ -55,32 +55,71 @@ def _is_repro_checkpoint(p: Path) -> bool:
     )
 
 
+def _checkpoint_step(p: Path) -> int:
+    name = p.name.strip().lower()
+    if name.startswith("checkpoint-"):
+        raw = name.replace("checkpoint-", "", 1)
+        try:
+            return int(raw)
+        except Exception:
+            return -1
+    return -1
+
+
+def _is_plain_checkpoint_with_runtime_assets(p: Path) -> bool:
+    if not _is_hf_model_dir(p):
+        return False
+    parent = p.parent
+    has_parent_assets = (parent / "tokenizer").exists() and (parent / "image_processor").exists()
+    has_local_gen_cfg = (p / "generation_config.json").exists()
+    return bool(has_parent_assets or has_local_gen_cfg)
+
+
 def _find_donut_checkpoint() -> Tuple[str, str]:
     preferred = (ROOT / "models" / "ocr").resolve()
     fallback_root = (ROOT / "models").resolve()
-    candidates: List[Path] = []
+    repro_candidates: List[Path] = []
+    plain_candidates: List[Path] = []
 
     if preferred.exists():
         for p in sorted(preferred.rglob("checkpoint-*")):
             if _is_repro_checkpoint(p):
-                candidates.append(p.resolve())
-        if not candidates:
+                repro_candidates.append(p.resolve())
+            elif _is_plain_checkpoint_with_runtime_assets(p):
+                plain_candidates.append(p.resolve())
+        if not repro_candidates and not plain_candidates:
             for p in sorted(preferred.rglob("*")):
                 if p.is_dir() and _is_repro_checkpoint(p):
-                    candidates.append(p.resolve())
+                    repro_candidates.append(p.resolve())
+                elif p.is_dir() and _is_plain_checkpoint_with_runtime_assets(p):
+                    plain_candidates.append(p.resolve())
 
-    if not candidates and fallback_root.exists():
+    if not repro_candidates and not plain_candidates and fallback_root.exists():
         for p in sorted(fallback_root.rglob("checkpoint-*")):
             if _is_repro_checkpoint(p):
-                candidates.append(p.resolve())
-        if not candidates:
+                repro_candidates.append(p.resolve())
+            elif _is_plain_checkpoint_with_runtime_assets(p):
+                plain_candidates.append(p.resolve())
+        if not repro_candidates and not plain_candidates:
             for p in sorted(fallback_root.rglob("*")):
                 if p.is_dir() and _is_repro_checkpoint(p):
-                    candidates.append(p.resolve())
+                    repro_candidates.append(p.resolve())
+                elif p.is_dir() and _is_plain_checkpoint_with_runtime_assets(p):
+                    plain_candidates.append(p.resolve())
 
-    if not candidates:
-        return "", "Kein DONUT-Checkpoint mit repro-Bundle gefunden (erwartet unter models/ocr/...)."
-    return str(candidates[0]), f"Auto-gewählter DONUT-Checkpoint: {candidates[0]}"
+    if repro_candidates:
+        repro_candidates = sorted(repro_candidates, key=_checkpoint_step, reverse=True)
+        return str(repro_candidates[0]), f"Auto-gewählter DONUT-Checkpoint (repro): {repro_candidates[0]}"
+
+    if plain_candidates:
+        plain_candidates = sorted(plain_candidates, key=_checkpoint_step, reverse=True)
+        return (
+            str(plain_candidates[0]),
+            "Auto-gewählter DONUT-Checkpoint (ohne repro, mit tokenizer/image_processor im Parent): "
+            f"{plain_candidates[0]}",
+        )
+
+    return "", "Kein DONUT-Checkpoint gefunden (erwartet unter models/ocr/ oder models/)."
 
 
 def _find_layout_model() -> Tuple[str, str]:
@@ -593,4 +632,3 @@ if __name__ == "__main__":
         port = 7865
     share = os.environ.get("UI_SHARE", "").strip().lower() in {"1", "true", "yes", "on"}
     app.launch(server_name=host, server_port=port, share=share)
-
