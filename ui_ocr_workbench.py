@@ -30,6 +30,12 @@ except Exception:
 
 
 ROOT = Path(__file__).resolve().parent
+MODE_AUTO = "Fully Automatic OCR"
+MODE_MANUAL = "Manual Mode"
+
+
+def _is_manual_mode(mode: str) -> bool:
+    return str(mode or "").strip() == MODE_MANUAL
 
 
 def _load_font() -> ImageFont.ImageFont:
@@ -118,17 +124,17 @@ def _find_donut_checkpoint() -> Tuple[str, str]:
 
     if repro_candidates:
         repro_candidates = sorted(repro_candidates, key=_checkpoint_step, reverse=True)
-        return str(repro_candidates[0]), f"Auto-gewählter DONUT-Checkpoint (repro): {repro_candidates[0]}"
+        return str(repro_candidates[0]), f"Auto-selected DONUT checkpoint (repro): {repro_candidates[0]}"
 
     if plain_candidates:
         plain_candidates = sorted(plain_candidates, key=_checkpoint_step, reverse=True)
         return (
             str(plain_candidates[0]),
-            "Auto-gewählter DONUT-Checkpoint (ohne repro, mit tokenizer/image_processor im Parent): "
+            "Auto-selected DONUT checkpoint (without repro, using parent tokenizer/image_processor): "
             f"{plain_candidates[0]}",
         )
 
-    return "", "Kein DONUT-Checkpoint gefunden (erwartet unter models/ocr/ oder models/)."
+    return "", "No DONUT checkpoint found (expected under models/ocr/ or models/)."
 
 
 def _find_layout_model() -> Tuple[str, str]:
@@ -152,8 +158,8 @@ def _find_layout_model() -> Tuple[str, str]:
         _scan(fallback_root)
 
     if not candidates:
-        return "", "Kein Layout-Analysemodell gefunden (erwartet unter models/layoutAnalysis/)."
-    return str(candidates[0]), f"Auto-gewähltes Layout-Modell: {candidates[0]}"
+        return "", "No layout analysis model found (expected under models/layoutAnalysis/)."
+    return str(candidates[0]), f"Auto-selected layout model: {candidates[0]}"
 
 
 def _normalize_box(box: List[int], w: int, h: int) -> Optional[List[int]]:
@@ -224,7 +230,7 @@ def _run_donut_on_crop_fallback(
     max_len: int,
 ) -> Tuple[str, Dict[str, Any]]:
     if torch is None:
-        raise RuntimeError("PyTorch nicht verfügbar.")
+        raise RuntimeError("PyTorch not available.")
     model_dir, tokenizer_dir, image_processor_dir, err = _resolve_donut_runtime_dirs(donut_checkpoint)
     if err:
         raise RuntimeError(err)
@@ -331,11 +337,11 @@ def _run_full_auto(
 ) -> Tuple[np.ndarray, str, str, Dict[str, Any], str]:
     image = state.get("image")
     if image is None:
-        return None, "", "Bitte zuerst ein Bild hochladen.", state, "{}"
+        return None, "", "Please upload an image first.", state, "{}"
     if not donut_checkpoint.strip():
-        return image, "", "DONUT-Checkpoint fehlt.", state, "{}"
+        return image, "", "DONUT checkpoint is missing.", state, "{}"
     if not layout_model.strip():
-        return image, "", "Layout-Modell fehlt.", state, "{}"
+        return image, "", "Layout model is missing.", state, "{}"
 
     split_out = run_tibetan_text_line_split_classical(
         image=np.asarray(image).astype(np.uint8, copy=False),
@@ -393,7 +399,7 @@ def _run_full_auto(
         "line_count": len(rows),
         "split_json": json.loads(split_json) if (split_json or "").strip().startswith("{") else split_json,
     }
-    return overlay, transcript, f"{split_status} OCR auf {len(rows)} Zeilen.", state, json.dumps(debug, ensure_ascii=False, indent=2)
+    return overlay, transcript, f"{split_status} OCR executed on {len(rows)} line(s).", state, json.dumps(debug, ensure_ascii=False, indent=2)
 
 
 def _find_line_hit(rows: List[Dict[str, Any]], x: int, y: int) -> Optional[Dict[str, Any]]:
@@ -439,17 +445,17 @@ def _manual_click(
 ) -> Tuple[np.ndarray, str, str, Dict[str, Any], str]:
     image = state.get("image")
     if image is None:
-        return None, "", "Bitte zuerst ein Bild hochladen.", state, "{}"
+        return None, "", "Please upload an image first.", state, "{}"
     if not donut_checkpoint.strip():
-        return image, "", "DONUT-Checkpoint fehlt.", state, "{}"
+        return image, "", "DONUT checkpoint is missing.", state, "{}"
 
     idx = getattr(evt, "index", None)
     if not isinstance(idx, (tuple, list)) or len(idx) < 2:
-        return np.asarray(image), _line_text(state.get("line_rows") or []), "Klickposition nicht verfügbar.", state, "{}"
+        return np.asarray(image), _line_text(state.get("line_rows") or []), "Click position not available.", state, "{}"
     try:
         click_x, click_y = int(idx[0]), int(idx[1])
     except Exception:
-        return np.asarray(image), _line_text(state.get("line_rows") or []), "Ungültige Klickposition.", state, "{}"
+        return np.asarray(image), _line_text(state.get("line_rows") or []), "Invalid click position.", state, "{}"
 
     src = np.asarray(image).astype(np.uint8, copy=False)
     h, w = src.shape[:2]
@@ -469,7 +475,7 @@ def _manual_click(
         rows = _add_or_update_line(rows, new_row)
         state["line_rows"] = rows
         overlay = _render_overlay(src, rows)
-        return overlay, _line_text(rows), f"Zeile bei Klick ({click_x},{click_y}) neu transkribiert.", state, json.dumps(
+        return overlay, _line_text(rows), f"Re-transcribed line at click ({click_x},{click_y}).", state, json.dumps(
             {"ok": True, "mode": "manual", "action": "clicked_existing_line", "line_box": new_row["line_box"]},
             ensure_ascii=False,
             indent=2,
@@ -479,7 +485,7 @@ def _manual_click(
     if not isinstance(anchor, (list, tuple)) or len(anchor) != 2:
         state["manual_anchor"] = [int(click_x), int(click_y)]
         overlay = _render_overlay(src, rows)
-        return overlay, _line_text(rows), f"Startpunkt gesetzt bei ({click_x},{click_y}). Zweiten Klick für ROI setzen.", state, "{}"
+        return overlay, _line_text(rows), f"Start point set at ({click_x},{click_y}). Click a second point to define ROI.", state, "{}"
 
     ax, ay = int(anchor[0]), int(anchor[1])
     state["manual_anchor"] = None
@@ -487,7 +493,7 @@ def _manual_click(
     y1, y2 = sorted([ay, click_y])
     if (x2 - x1) < 3 or (y2 - y1) < 3:
         overlay = _render_overlay(src, rows)
-        return overlay, _line_text(rows), "ROI zu klein. Bitte größeren Bereich wählen.", state, "{}"
+        return overlay, _line_text(rows), "ROI is too small. Please select a larger area.", state, "{}"
     roi = _normalize_box([x1, y1, x2, y2], w, h)
     return _manual_process_roi(state, donut_checkpoint, device, max_len, roi)
 
@@ -501,7 +507,7 @@ def _manual_process_roi(
 ) -> Tuple[np.ndarray, str, str, Dict[str, Any], str]:
     image = state.get("image")
     if image is None:
-        return None, "", "Bitte zuerst ein Bild hochladen.", state, "{}"
+        return None, "", "Please upload an image first.", state, "{}"
     src = np.asarray(image).astype(np.uint8, copy=False)
     h, w = src.shape[:2]
     rows = list(state.get("line_rows") or [])
@@ -509,7 +515,7 @@ def _manual_process_roi(
     roi = _normalize_box(roi or [], w, h)
     if roi is None:
         overlay = _render_overlay(src, rows)
-        return overlay, _line_text(rows), "ROI ungültig.", state, "{}"
+        return overlay, _line_text(rows), "ROI is invalid.", state, "{}"
     rx1, ry1, rx2, ry2 = roi
     roi_crop = src[ry1:ry2, rx1:rx2]
     roi_w = int(rx2 - rx1)
@@ -586,7 +592,7 @@ def _manual_process_roi(
         "new_rows": created_rows,
         "total_rows": len(rows),
     }
-    return overlay, _line_text(rows), f"Manuelle Auswahl verarbeitet. Neue/aktualisierte Zeilen: {len(created_rows)}.", state, json.dumps(debug, ensure_ascii=False, indent=2)
+    return overlay, _line_text(rows), f"Manual ROI processed. New/updated lines: {len(created_rows)}.", state, json.dumps(debug, ensure_ascii=False, indent=2)
 
 
 def _manual_full_image_roi(
@@ -596,13 +602,13 @@ def _manual_full_image_roi(
     device_s: str,
     max_len_s: int,
 ) -> Tuple[np.ndarray, str, str, Dict[str, Any], str]:
-    if not str(mode_s).startswith("manu"):
+    if not _is_manual_mode(mode_s):
         img = state_s.get("image")
         overlay = np.asarray(img).astype(np.uint8, copy=False) if img is not None else None
-        return overlay, _line_text(state_s.get("line_rows") or []), "Button nur im manuellen Modus aktiv.", state_s, "{}"
+        return overlay, _line_text(state_s.get("line_rows") or []), "This button is only active in Manual Mode.", state_s, "{}"
     img = state_s.get("image")
     if img is None:
-        return None, "", "Bitte zuerst ein Bild hochladen.", state_s, "{}"
+        return None, "", "Please upload an image first.", state_s, "{}"
     src = np.asarray(img).astype(np.uint8, copy=False)
     h, w = src.shape[:2]
     return _manual_process_roi(state_s, donut_s, device_s, int(max_len_s), [0, 0, w, h])
@@ -610,7 +616,7 @@ def _manual_full_image_roi(
 
 def _on_upload(file_obj: Any, state: Dict[str, Any]) -> Tuple[np.ndarray, str, Dict[str, Any], str]:
     if file_obj is None:
-        return None, "", _base_state(), "Kein Bild geladen."
+        return None, "", _base_state(), "No image loaded."
     path = getattr(file_obj, "name", "") or str(file_obj)
     p = Path(path).expanduser().resolve()
     if not p.exists():
@@ -620,7 +626,7 @@ def _on_upload(file_obj: Any, state: Dict[str, Any]) -> Tuple[np.ndarray, str, D
     new_state["image_path"] = str(p)
     new_state["image_name"] = p.name
     new_state["image"] = img
-    return img, "", new_state, f"Bild geladen: {p.name}"
+    return img, "", new_state, f"Image loaded: {p.name}"
 
 
 def _save_results(
@@ -631,7 +637,7 @@ def _save_results(
 ) -> str:
     image = state.get("image")
     if image is None:
-        return "Nichts zu speichern: kein Bild geladen."
+        return "Nothing to save: no image loaded."
     name = str(state.get("image_name") or "image.png")
     stem = Path(name).stem
     ts = datetime.now().strftime("%Y%m%d-%H%M%S")
@@ -671,7 +677,7 @@ def _save_results(
         "lines": saved_rows,
     }
     (out_dir / "line_boxes_ocr.json").write_text(json.dumps(payload, ensure_ascii=False, indent=2), encoding="utf-8")
-    return f"Gespeichert unter: {out_dir}"
+    return f"Saved to: {out_dir}"
 
 
 def build_ui() -> gr.Blocks:
@@ -690,9 +696,21 @@ def build_ui() -> gr.Blocks:
 #ocr_image_panel img {
   max-height: none !important;
 }
+#transcript_panel {
+  min-height: 300px;
+  min-width: 320px;
+  resize: both;
+  overflow: auto;
+  border: 1px dashed #cbd5e1;
+  border-radius: 8px;
+  padding: 4px;
+}
 #transcript_box textarea {
   font-size: 18px !important;
   line-height: 1.45 !important;
+  min-height: 300px !important;
+  resize: both !important;
+  overflow: auto !important;
 }
 #font_btn_plus, #font_btn_minus {
   min-width: 36px !important;
@@ -700,51 +718,52 @@ def build_ui() -> gr.Blocks:
   padding: 0 !important;
 }
 #font_ctrl_col {
-  max-width: 52px;
+  max-width: 50px;
+  min-width: 50px;
 }
 """
 
     with gr.Blocks(title="OCR Workbench (DONUT)", css=ui_css) as demo:
         gr.Markdown("## OCR Workbench (DONUT + Layout)")
         gr.Markdown(
-            "Vollautomatik: Layout -> Zeilen -> OCR. Manuell: Klick auf vorhandene Zeile oder ROI per 2 Klicks (Start/Ende)."
+            "Automatic mode: layout -> line detection -> OCR. Manual mode: click an existing line or define an ROI with two clicks."
         )
         advanced_view = gr.Checkbox(label="Advanced View", value=False)
 
         with gr.Row():
             donut_path = gr.Textbox(label="DONUT Checkpoint", value=donut_ckpt)
-            layout_path = gr.Textbox(label="Layout Analysemodell", value=layout_model)
+            layout_path = gr.Textbox(label="Layout Analysis Model", value=layout_model)
         with gr.Row(visible=False) as advanced_scan_row:
             donut_info = gr.Textbox(label="DONUT Auto-Scan", value=donut_msg, interactive=False)
             layout_info = gr.Textbox(label="Layout Auto-Scan", value=layout_msg, interactive=False)
 
         with gr.Row():
-            mode = gr.Radio(choices=["voll-automatische OCR", "manueller Modus"], value="voll-automatische OCR", label="Modus")
-            device = gr.Dropdown(choices=["auto", "cuda:0", "cpu"], value="auto", label="Inferenzgerät")
-            max_len = gr.Number(label="DONUT generation_max_length", value=512, precision=0)
+            mode = gr.Radio(choices=[MODE_AUTO, MODE_MANUAL], value=MODE_AUTO, label="Mode")
+            device = gr.Dropdown(choices=["auto", "cuda:0", "cpu"], value="auto", label="Inference Device")
+            max_len = gr.Number(label="DONUT generation_max_length", value=160, precision=0)
 
         status = gr.Textbox(label="Status", interactive=False)
         debug_json = gr.Code(label="Debug JSON", language="json", visible=False)
 
         state = gr.State(_base_state())
         with gr.Row():
-            image_file = gr.File(label="Bild hochladen", file_types=["image"])
-            run_btn = gr.Button("OCR Ausführen", variant="primary")
-            full_roi_btn = gr.Button("Ganzes Bild als ROI (manuell)")
+            image_file = gr.File(label="Upload Image", file_types=["image"])
+            run_btn = gr.Button("Run OCR", variant="primary")
+            full_roi_btn = gr.Button("Process Full Image as ROI", visible=False)
             save_btn = gr.Button("Save", variant="secondary")
 
         with gr.Row():
             image_view = gr.Image(
-                label="Bild / Overlay",
+                label="Image / Overlay",
                 type="numpy",
                 interactive=True,
                 height=300,
                 elem_id="ocr_image_panel",
+                show_label=False,
             )
-            with gr.Column():
-                gr.Markdown("**Transkribierter Text (editierbar)**")
+            with gr.Column(elem_id="transcript_panel"):
                 with gr.Row():
-                    transcript = gr.Textbox(label="", lines=28, elem_id="transcript_box")
+                    transcript = gr.Textbox(label="", lines=28, elem_id="transcript_box", show_label=False)
                     with gr.Column(elem_id="font_ctrl_col"):
                         font_plus_btn = gr.Button("+", elem_id="font_btn_plus")
                         font_minus_btn = gr.Button("−", elem_id="font_btn_minus")
@@ -757,11 +776,11 @@ def build_ui() -> gr.Blocks:
         )
 
         def _run(mode_s: str, state_s: Dict[str, Any], donut_s: str, layout_s: str, device_s: str, max_len_s: int):
-            if str(mode_s).startswith("voll"):
+            if not _is_manual_mode(mode_s):
                 return _run_full_auto(state_s, donut_s, layout_s, device_s, int(max_len_s))
             img = state_s.get("image")
             overlay = np.asarray(img).astype(np.uint8, copy=False) if img is not None else None
-            return overlay, _line_text(state_s.get("line_rows") or []), "Manueller Modus: im Bild klicken (Zeile oder ROI mit 2 Klicks).", state_s, "{}"
+            return overlay, _line_text(state_s.get("line_rows") or []), "Manual Mode: click an existing line or define ROI with two clicks.", state_s, "{}"
 
         run_btn.click(
             fn=_run,
@@ -770,9 +789,9 @@ def build_ui() -> gr.Blocks:
         )
 
         def _on_select(mode_s: str, state_s: Dict[str, Any], donut_s: str, layout_s: str, device_s: str, max_len_s: int, evt: gr.SelectData):
-            if not str(mode_s).startswith("manu"):
+            if not _is_manual_mode(mode_s):
                 overlay = state_s.get("image")
-                return overlay, _line_text(state_s.get("line_rows") or []), "Klicks sind im manuellen Modus aktiv.", state_s, "{}"
+                return overlay, _line_text(state_s.get("line_rows") or []), "Clicks are active in Manual Mode only.", state_s, "{}"
             return _manual_click(state_s, donut_s, layout_s, device_s, int(max_len_s), evt)
 
         image_view.select(
@@ -800,8 +819,9 @@ def build_ui() -> gr.Blocks:
   const ta = document.querySelector('#transcript_box textarea');
   if (!ta) return;
   const cur = parseFloat(window.getComputedStyle(ta).fontSize) || 18;
-  ta.style.fontSize = `${Math.min(42, cur + 1)}px`;
-  ta.style.lineHeight = '1.45';
+  const next = Math.min(42, cur + 1);
+  ta.style.setProperty('font-size', `${next}px`, 'important');
+  ta.style.setProperty('line-height', '1.45', 'important');
 }
 """,
         )
@@ -812,8 +832,9 @@ def build_ui() -> gr.Blocks:
   const ta = document.querySelector('#transcript_box textarea');
   if (!ta) return;
   const cur = parseFloat(window.getComputedStyle(ta).fontSize) || 18;
-  ta.style.fontSize = `${Math.max(10, cur - 1)}px`;
-  ta.style.lineHeight = '1.45';
+  const next = Math.max(10, cur - 1);
+  ta.style.setProperty('font-size', `${next}px`, 'important');
+  ta.style.setProperty('line-height', '1.45', 'important');
 }
 """,
         )
@@ -826,6 +847,12 @@ def build_ui() -> gr.Blocks:
             fn=_toggle_advanced,
             inputs=[advanced_view],
             outputs=[advanced_scan_row, debug_json],
+        )
+
+        mode.change(
+            fn=lambda m: gr.update(visible=_is_manual_mode(m)),
+            inputs=[mode],
+            outputs=[full_roi_btn],
         )
 
     return demo
