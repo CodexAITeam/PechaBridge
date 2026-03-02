@@ -22,6 +22,10 @@ from ui_workbench import (
     run_donut_ocr_inference_ui,
     run_tibetan_text_line_split_classical,
 )
+try:
+    from pechabridge.ocr.preprocess_bdrc import BDRCPreprocessConfig
+except Exception:
+    BDRCPreprocessConfig = None
 
 try:
     import torch
@@ -32,6 +36,7 @@ except Exception:
 ROOT = Path(__file__).resolve().parent
 MODE_AUTO = "Fully Automatic OCR"
 MODE_MANUAL = "Manual Mode"
+_DONUT_ACTIVE_RUNTIME: Dict[str, Any] = {"checkpoint": "", "runtime": None}
 
 
 def _is_manual_mode(mode: str) -> bool:
@@ -221,6 +226,61 @@ def _to_rgb_uint8(path: str) -> np.ndarray:
     return arr
 
 
+def _resolve_device_for_runtime(pref: str) -> str:
+    p = str(pref or "auto").strip().lower()
+    if p in {"", "auto"}:
+        if torch is not None and bool(getattr(torch.cuda, "is_available", lambda: False)()):
+            return "cuda:0"
+        return "cpu"
+    if p.startswith("cuda"):
+        if torch is None or not bool(getattr(torch.cuda, "is_available", lambda: False)()):
+            return "cpu"
+    return p
+
+
+def _ensure_donut_runtime_loaded(
+    donut_checkpoint: str,
+    device_pref: str,
+) -> Tuple[Optional[Dict[str, Any]], str]:
+    if torch is None:
+        return None, "PyTorch not available."
+    model_dir, tokenizer_dir, image_processor_dir, err = _resolve_donut_runtime_dirs(donut_checkpoint)
+    if err:
+        return None, str(err)
+
+    checkpoint_key = str(Path(donut_checkpoint).expanduser().resolve())
+    target_device = _resolve_device_for_runtime(device_pref)
+    active_ckpt = str(_DONUT_ACTIVE_RUNTIME.get("checkpoint") or "")
+    active_runtime = _DONUT_ACTIVE_RUNTIME.get("runtime")
+
+    if active_runtime is not None and active_ckpt == checkpoint_key:
+        cur_device = str(active_runtime.get("device") or "")
+        if cur_device != target_device:
+            try:
+                active_runtime["model"].to(target_device)
+                active_runtime["device"] = target_device
+                active_runtime["device_msg"] = f"Moved DONUT runtime to {target_device}"
+                return active_runtime, str(active_runtime["device_msg"])
+            except Exception:
+                # Fall back to loading a fresh runtime below.
+                pass
+        return active_runtime, f"DONUT runtime ready on {cur_device or target_device}"
+
+    try:
+        runtime = _load_donut_ocr_runtime_cached(
+            str(model_dir),
+            str(tokenizer_dir),
+            str(image_processor_dir),
+            target_device,
+        )
+    except Exception as exc:
+        return None, f"Failed loading DONUT runtime: {type(exc).__name__}: {exc}"
+
+    _DONUT_ACTIVE_RUNTIME["checkpoint"] = checkpoint_key
+    _DONUT_ACTIVE_RUNTIME["runtime"] = runtime
+    return runtime, f"DONUT runtime loaded on {runtime.get('device', target_device)}"
+
+
 def _strip_special_token_strings_local(text: str, tokenizer: Any) -> str:
     out = str(text or "")
     try:
@@ -236,22 +296,42 @@ def _strip_special_token_strings_local(text: str, tokenizer: Any) -> str:
     return out
 
 
-def _donut_preprocess_preview(crop: np.ndarray, donut_checkpoint: str) -> Tuple[np.ndarray, np.ndarray, str]:
+def _donut_preprocess_preview(
+    crop: np.ndarray,
+    donut_checkpoint: str,
+    bdrc_preprocess_overrides: Optional[Dict[str, Any]] = None,
+) -> Tuple[np.ndarray, np.ndarray, str]:
     pil = Image.fromarray(np.asarray(crop).astype(np.uint8)).convert("RGB")
     pre = np.asarray(pil).astype(np.uint8, copy=False)
     effective_preproc = "bdrc"
+    lock_preproc_to_bdrc = bool(
+        isinstance(bdrc_preprocess_overrides, dict) and len(bdrc_preprocess_overrides) > 0
+    )
     try:
-        repro_cfg = _load_donut_repro_bundle_cfg_ui(donut_checkpoint)
-        if bool(repro_cfg.get("has_repro")):
-            ip_cfg = repro_cfg.get("image_preprocess") or {}
-            if isinstance(ip_cfg, dict):
-                pipe = str(ip_cfg.get("pipeline", "") or "").strip().lower()
-                if pipe in {"none", "pb", "bdrc"}:
-                    effective_preproc = pipe
+        if not lock_preproc_to_bdrc:
+            repro_cfg = _load_donut_repro_bundle_cfg_ui(donut_checkpoint)
+            if bool(repro_cfg.get("has_repro")):
+                ip_cfg = repro_cfg.get("image_preprocess") or {}
+                if isinstance(ip_cfg, dict):
+                    pipe = str(ip_cfg.get("pipeline", "") or "").strip().lower()
+                    if pipe in {"none", "pb", "bdrc"}:
+                        effective_preproc = pipe
     except Exception:
         pass
     try:
-        proc = _apply_donut_ui_preprocess(pil, effective_preproc)
+        proc = _apply_donut_ui_preprocess(
+            pil,
+            effective_preproc,
+            bdrc_config_override=(
+                bdrc_preprocess_overrides
+                if (
+                    effective_preproc == "bdrc"
+                    and isinstance(bdrc_preprocess_overrides, dict)
+                    and len(bdrc_preprocess_overrides) > 0
+                )
+                else None
+            ),
+        )
         post = np.asarray(proc).astype(np.uint8, copy=False)
     except Exception:
         post = pre
@@ -263,33 +343,43 @@ def _run_donut_on_crop_fallback(
     donut_checkpoint: str,
     device: str,
     max_len: int,
+    bdrc_preprocess_overrides: Optional[Dict[str, Any]] = None,
 ) -> Tuple[str, Dict[str, Any]]:
     if torch is None:
         raise RuntimeError("PyTorch not available.")
-    model_dir, tokenizer_dir, image_processor_dir, err = _resolve_donut_runtime_dirs(donut_checkpoint)
-    if err:
-        raise RuntimeError(err)
+    runtime, rt_msg = _ensure_donut_runtime_loaded(donut_checkpoint, device)
+    if runtime is None:
+        raise RuntimeError(rt_msg)
     repro_cfg = _load_donut_repro_bundle_cfg_ui(donut_checkpoint)
     effective_preproc = "bdrc"
+    lock_preproc_to_bdrc = bool(
+        isinstance(bdrc_preprocess_overrides, dict) and len(bdrc_preprocess_overrides) > 0
+    )
     effective_max_len = max(8, int(max_len))
     if bool(repro_cfg.get("has_repro")):
         ip_cfg = repro_cfg.get("image_preprocess") or {}
         if isinstance(ip_cfg, dict):
             pipe = str(ip_cfg.get("pipeline", "") or "").strip().lower()
-            if pipe in {"none", "pb", "bdrc"}:
+            if pipe in {"none", "pb", "bdrc"} and not lock_preproc_to_bdrc:
                 effective_preproc = pipe
         gcfg = repro_cfg.get("generate_config") or {}
         if isinstance(gcfg, dict) and gcfg.get("max_length") is not None:
             effective_max_len = max(8, int(gcfg["max_length"]))
 
-    runtime = _load_donut_ocr_runtime_cached(
-        str(model_dir),
-        str(tokenizer_dir),
-        str(image_processor_dir),
-        str(device or "auto"),
-    )
     pil = Image.fromarray(np.asarray(crop).astype(np.uint8)).convert("RGB")
-    proc_pil = _apply_donut_ui_preprocess(pil, effective_preproc)
+    proc_pil = _apply_donut_ui_preprocess(
+        pil,
+        effective_preproc,
+        bdrc_config_override=(
+            bdrc_preprocess_overrides
+            if (
+                effective_preproc == "bdrc"
+                and isinstance(bdrc_preprocess_overrides, dict)
+                and len(bdrc_preprocess_overrides) > 0
+            )
+            else None
+        ),
+    )
     image_processor = runtime["image_processor"]
     tokenizer = runtime["tokenizer"]
     model = runtime["model"]
@@ -304,7 +394,14 @@ def _run_donut_on_crop_fallback(
         "ok": True,
         "fallback_used": True,
         "fallback_reason": "ui_workbench _strip_special_token_strings NameError",
+        "runtime_status": rt_msg,
         "image_preprocess_pipeline_effective": effective_preproc,
+        "image_preprocess_locked_by_bdrc_overrides": bool(lock_preproc_to_bdrc),
+        "bdrc_preprocess_overrides_applied": bool(
+            effective_preproc == "bdrc"
+            and isinstance(bdrc_preprocess_overrides, dict)
+            and len(bdrc_preprocess_overrides) > 0
+        ),
         "generation_max_length_effective": int(effective_max_len),
         "device": str(dev),
     }
@@ -327,13 +424,105 @@ def _base_state() -> Dict[str, Any]:
     }
 
 
+def _bdrc_ui_defaults() -> Dict[str, Any]:
+    base: Dict[str, Any] = {}
+    try:
+        if BDRCPreprocessConfig is not None:
+            base = dict(BDRCPreprocessConfig.vit_defaults().to_dict())
+    except Exception:
+        base = {}
+    return {
+        "gray_mode": str(base.get("gray_mode", "luma")),
+        "normalize_background": bool(base.get("normalize_background", False)),
+        "background_blur_ksize": int(base.get("background_blur_ksize", 0)),
+        "background_strength": float(base.get("background_strength", 1.0)),
+        "upscale_factor": float(base.get("upscale_factor", 1.0)),
+        "upscale_interpolation": str(base.get("upscale_interpolation", "lanczos")),
+        "binarize": bool(base.get("binarize", True)),
+        "threshold_method": str(base.get("threshold_method", "adaptive")),
+        "threshold_block_size": int(base.get("threshold_block_size", 51)),
+        "threshold_c": int(base.get("threshold_c", 13)),
+        "fixed_threshold": int(base.get("fixed_threshold", 120)),
+        "morph_close": bool(base.get("morph_close", False)),
+        "morph_close_kernel": int(base.get("morph_close_kernel", 2)),
+        "remove_small_components": bool(base.get("remove_small_components", False)),
+        "min_component_area": int(base.get("min_component_area", 12)),
+    }
+
+
+def _build_bdrc_preprocess_overrides_ui(
+    gray_mode: str,
+    normalize_background: bool,
+    background_blur_ksize: int,
+    background_strength: float,
+    upscale_factor: float,
+    upscale_interpolation: str,
+    binarize: bool,
+    threshold_method: str,
+    threshold_block_size: int,
+    threshold_c: int,
+    fixed_threshold: int,
+    morph_close: bool,
+    morph_close_kernel: int,
+    remove_small_components: bool,
+    min_component_area: int,
+) -> Dict[str, Any]:
+    gm = str(gray_mode or "luma").strip().lower()
+    if gm not in {"luma", "min_rgb", "max_rgb", "r", "g", "b"}:
+        gm = "luma"
+
+    interp = str(upscale_interpolation or "lanczos").strip().lower()
+    if interp not in {"nearest", "linear", "cubic", "lanczos"}:
+        interp = "lanczos"
+
+    tmethod = str(threshold_method or "adaptive").strip().lower()
+    if tmethod not in {"adaptive", "otsu", "fixed"}:
+        tmethod = "adaptive"
+
+    block = int(max(3, int(threshold_block_size)))
+    if block % 2 == 0:
+        block += 1
+
+    blur_k = int(max(0, int(background_blur_ksize)))
+    if blur_k > 0 and blur_k % 2 == 0:
+        blur_k += 1
+
+    close_k = int(max(0, int(morph_close_kernel)))
+    if close_k > 0 and close_k % 2 == 0:
+        close_k += 1
+
+    return {
+        "gray_mode": gm,
+        "normalize_background": bool(normalize_background),
+        "background_blur_ksize": blur_k,
+        "background_strength": float(max(0.0, min(3.0, float(background_strength)))),
+        "upscale_factor": float(max(1.0, float(upscale_factor))),
+        "upscale_interpolation": interp,
+        "binarize": bool(binarize),
+        "threshold_method": tmethod,
+        "adaptive_threshold": bool(tmethod == "adaptive"),
+        "threshold_block_size": int(block),
+        "threshold_c": int(threshold_c),
+        "fixed_threshold": int(max(0, min(255, int(fixed_threshold)))),
+        "morph_close": bool(morph_close),
+        "morph_close_kernel": int(close_k),
+        "remove_small_components": bool(remove_small_components),
+        "min_component_area": int(max(0, int(min_component_area))),
+    }
+
+
 def _run_donut_on_crop(
     crop: np.ndarray,
     donut_checkpoint: str,
     device: str,
     max_len: int,
+    bdrc_preprocess_overrides: Optional[Dict[str, Any]] = None,
 ) -> Tuple[str, Dict[str, Any], np.ndarray, np.ndarray]:
-    pre_img, post_img, effective_preproc = _donut_preprocess_preview(crop, donut_checkpoint)
+    pre_img, post_img, effective_preproc = _donut_preprocess_preview(
+        crop,
+        donut_checkpoint,
+        bdrc_preprocess_overrides=bdrc_preprocess_overrides,
+    )
     _, pred, debug_json = run_donut_ocr_inference_ui(
         image=crop,
         model_root_or_model_dir=donut_checkpoint,
@@ -341,6 +530,7 @@ def _run_donut_on_crop(
         device_preference=device,
         generation_max_length=int(max_len),
         num_beams=1,
+        bdrc_preprocess_overrides=bdrc_preprocess_overrides,
     )
     try:
         dbg = json.loads(debug_json or "{}")
@@ -354,7 +544,13 @@ def _run_donut_on_crop(
     err_msg = str(dbg_obj.get("error", "") or "")
     if "_strip_special_token_strings" in err_msg:
         try:
-            text_fb, dbg_fb = _run_donut_on_crop_fallback(crop, donut_checkpoint, device, max_len)
+            text_fb, dbg_fb = _run_donut_on_crop_fallback(
+                crop,
+                donut_checkpoint,
+                device,
+                max_len,
+                bdrc_preprocess_overrides=bdrc_preprocess_overrides,
+            )
             dbg_fb.setdefault("effective_preprocess_preview", effective_preproc)
             return text_fb, dbg_fb, pre_img, post_img
         except Exception as exc:
@@ -374,6 +570,7 @@ def _run_full_auto(
     layout_model: str,
     device: str,
     max_len: int,
+    bdrc_preprocess_overrides: Optional[Dict[str, Any]] = None,
 ) -> Tuple[np.ndarray, str, str, Dict[str, Any], str, Optional[np.ndarray], Optional[np.ndarray]]:
     image = state.get("image")
     if image is None:
@@ -418,7 +615,13 @@ def _run_full_auto(
             continue
         x1, y1, x2, y2 = box
         crop = src[y1:y2, x1:x2]
-        text, dbg, pre_img, post_img = _run_donut_on_crop(crop, donut_checkpoint, device, max_len)
+        text, dbg, pre_img, post_img = _run_donut_on_crop(
+            crop,
+            donut_checkpoint,
+            device,
+            max_len,
+            bdrc_preprocess_overrides=bdrc_preprocess_overrides,
+        )
         last_pre, last_post = pre_img, post_img
         rows.append(
             {
@@ -442,6 +645,11 @@ def _run_full_auto(
         "mode": "full_auto",
         "split_status": split_status,
         "line_count": len(rows),
+        "bdrc_preprocess_overrides": (
+            dict(bdrc_preprocess_overrides)
+            if isinstance(bdrc_preprocess_overrides, dict)
+            else None
+        ),
         "split_json": json.loads(split_json) if (split_json or "").strip().startswith("{") else split_json,
     }
     strong_overlay = _render_overlay(src, rows)
@@ -495,6 +703,7 @@ def _manual_click(
     layout_model: str,
     device: str,
     max_len: int,
+    bdrc_preprocess_overrides: Optional[Dict[str, Any]],
     evt: gr.SelectData,
 ) -> Tuple[np.ndarray, str, str, Dict[str, Any], str, Optional[np.ndarray], Optional[np.ndarray]]:
     image = state.get("image")
@@ -521,7 +730,13 @@ def _manual_click(
     if hit is not None:
         x1, y1, x2, y2 = [int(v) for v in hit["line_box"]]
         crop = src[y1:y2, x1:x2]
-        text, dbg, pre_img, post_img = _run_donut_on_crop(crop, donut_checkpoint, device, max_len)
+        text, dbg, pre_img, post_img = _run_donut_on_crop(
+            crop,
+            donut_checkpoint,
+            device,
+            max_len,
+            bdrc_preprocess_overrides=bdrc_preprocess_overrides,
+        )
         new_row = dict(hit)
         new_row["text"] = text
         new_row["ocr_debug"] = dbg
@@ -551,7 +766,14 @@ def _manual_click(
         overlay = _render_overlay(src, rows)
         return overlay, _line_text(rows), "ROI is too small. Please select a larger area.", state, "{}", state.get("last_donut_pre"), state.get("last_donut_post")
     roi = _normalize_box([x1, y1, x2, y2], w, h)
-    return _manual_process_roi(state, donut_checkpoint, device, max_len, roi)
+    return _manual_process_roi(
+        state,
+        donut_checkpoint,
+        device,
+        max_len,
+        roi,
+        bdrc_preprocess_overrides=bdrc_preprocess_overrides,
+    )
 
 
 def _manual_process_roi(
@@ -560,6 +782,7 @@ def _manual_process_roi(
     device: str,
     max_len: int,
     roi: Optional[List[int]],
+    bdrc_preprocess_overrides: Optional[Dict[str, Any]] = None,
 ) -> Tuple[np.ndarray, str, str, Dict[str, Any], str, Optional[np.ndarray], Optional[np.ndarray]]:
     image = state.get("image")
     if image is None:
@@ -581,7 +804,13 @@ def _manual_process_roi(
     last_pre: Optional[np.ndarray] = None
     last_post: Optional[np.ndarray] = None
     if _roi_is_single_line(roi_w, roi_h):
-        text, dbg, pre_img, post_img = _run_donut_on_crop(roi_crop, donut_checkpoint, device, max_len)
+        text, dbg, pre_img, post_img = _run_donut_on_crop(
+            roi_crop,
+            donut_checkpoint,
+            device,
+            max_len,
+            bdrc_preprocess_overrides=bdrc_preprocess_overrides,
+        )
         last_pre, last_post = pre_img, post_img
         created_rows.append(
             {
@@ -614,7 +843,13 @@ def _manual_process_roi(
                 continue
             lx1, ly1, lx2, ly2 = gbox
             lcrop = src[ly1:ly2, lx1:lx2]
-            text, dbg, pre_img, post_img = _run_donut_on_crop(lcrop, donut_checkpoint, device, max_len)
+            text, dbg, pre_img, post_img = _run_donut_on_crop(
+                lcrop,
+                donut_checkpoint,
+                device,
+                max_len,
+                bdrc_preprocess_overrides=bdrc_preprocess_overrides,
+            )
             last_pre, last_post = pre_img, post_img
             created_rows.append(
                 {
@@ -626,7 +861,13 @@ def _manual_process_roi(
                 }
             )
         if not created_rows:
-            text, dbg, pre_img, post_img = _run_donut_on_crop(roi_crop, donut_checkpoint, device, max_len)
+            text, dbg, pre_img, post_img = _run_donut_on_crop(
+                roi_crop,
+                donut_checkpoint,
+                device,
+                max_len,
+                bdrc_preprocess_overrides=bdrc_preprocess_overrides,
+            )
             last_pre, last_post = pre_img, post_img
             created_rows.append(
                 {
@@ -654,6 +895,11 @@ def _manual_process_roi(
         "roi": roi,
         "new_rows": created_rows,
         "total_rows": len(rows),
+        "bdrc_preprocess_overrides": (
+            dict(bdrc_preprocess_overrides)
+            if isinstance(bdrc_preprocess_overrides, dict)
+            else None
+        ),
     }
     return (
         overlay,
@@ -672,6 +918,7 @@ def _manual_full_image_roi(
     donut_s: str,
     device_s: str,
     max_len_s: int,
+    bdrc_preprocess_overrides: Optional[Dict[str, Any]] = None,
 ) -> Tuple[np.ndarray, str, str, Dict[str, Any], str, Optional[np.ndarray], Optional[np.ndarray]]:
     if not _is_manual_mode(mode_s):
         img = state_s.get("image")
@@ -682,7 +929,14 @@ def _manual_full_image_roi(
         return None, "", "Please upload an image first.", state_s, "{}", state_s.get("last_donut_pre"), state_s.get("last_donut_post")
     src = np.asarray(img).astype(np.uint8, copy=False)
     h, w = src.shape[:2]
-    return _manual_process_roi(state_s, donut_s, device_s, int(max_len_s), [0, 0, w, h])
+    return _manual_process_roi(
+        state_s,
+        donut_s,
+        device_s,
+        int(max_len_s),
+        [0, 0, w, h],
+        bdrc_preprocess_overrides=bdrc_preprocess_overrides,
+    )
 
 
 def _on_upload(file_obj: Any, state: Dict[str, Any]) -> Tuple[np.ndarray, str, Dict[str, Any], str]:
@@ -754,6 +1008,7 @@ def _save_results(
 def build_ui() -> gr.Blocks:
     donut_ckpt, donut_msg = _find_donut_checkpoint()
     layout_model, layout_msg = _find_layout_model()
+    bdrc_defaults = _bdrc_ui_defaults()
     ui_css = """
 #ocr_image_panel {
   min-height: 300px;
@@ -789,8 +1044,8 @@ def build_ui() -> gr.Blocks:
   padding: 0 !important;
 }
 #font_ctrl_col {
-  max-width: 50px;
-  min-width: 50px;
+  max-width: 24px;
+  min-width: 24px;
 }
 """
 
@@ -810,8 +1065,97 @@ def build_ui() -> gr.Blocks:
 
         with gr.Row():
             mode = gr.Radio(choices=[MODE_AUTO, MODE_MANUAL], value=MODE_AUTO, label="Mode")
+        with gr.Row(visible=False) as advanced_runtime_row:
             device = gr.Dropdown(choices=["auto", "cuda:0", "cpu"], value="auto", label="Inference Device")
             max_len = gr.Number(label="DONUT generation_max_length", value=160, precision=0)
+        with gr.Row(visible=False) as advanced_bdrc_row:
+            with gr.Accordion("BDRC Preprocess 1-5 (DONUT Input)", open=False):
+                gr.Markdown(
+                    "1) Background normalize  2) Thresholding  3) Morph close + tiny component filter  "
+                    "4) Upscale before binarization  5) Gray channel mode"
+                )
+                with gr.Row():
+                    bdrc_gray_mode = gr.Dropdown(
+                        choices=["luma", "min_rgb", "max_rgb", "r", "g", "b"],
+                        value=str(bdrc_defaults["gray_mode"]),
+                        label="5) gray_mode",
+                    )
+                    bdrc_upscale_factor = gr.Slider(
+                        minimum=1.0,
+                        maximum=3.0,
+                        step=0.1,
+                        value=float(bdrc_defaults["upscale_factor"]),
+                        label="4) upscale_factor",
+                    )
+                    bdrc_upscale_interp = gr.Dropdown(
+                        choices=["lanczos", "cubic", "linear", "nearest"],
+                        value=str(bdrc_defaults["upscale_interpolation"]),
+                        label="4) upscale_interpolation",
+                    )
+                with gr.Row():
+                    bdrc_normalize_bg = gr.Checkbox(
+                        value=bool(bdrc_defaults["normalize_background"]),
+                        label="1) normalize_background",
+                    )
+                    bdrc_bg_blur_ksize = gr.Number(
+                        value=int(bdrc_defaults["background_blur_ksize"]),
+                        precision=0,
+                        label="1) background_blur_ksize (0=auto)",
+                    )
+                    bdrc_bg_strength = gr.Slider(
+                        minimum=0.0,
+                        maximum=3.0,
+                        step=0.05,
+                        value=float(bdrc_defaults["background_strength"]),
+                        label="1) background_strength",
+                    )
+                with gr.Row():
+                    bdrc_binarize = gr.Checkbox(
+                        value=bool(bdrc_defaults["binarize"]),
+                        label="2) binarize",
+                    )
+                    bdrc_threshold_method = gr.Dropdown(
+                        choices=["adaptive", "otsu", "fixed"],
+                        value=str(bdrc_defaults["threshold_method"]),
+                        label="2) threshold_method",
+                    )
+                    bdrc_fixed_threshold = gr.Slider(
+                        minimum=0,
+                        maximum=255,
+                        step=1,
+                        value=int(bdrc_defaults["fixed_threshold"]),
+                        label="2) fixed_threshold",
+                    )
+                with gr.Row():
+                    bdrc_threshold_block = gr.Number(
+                        value=int(bdrc_defaults["threshold_block_size"]),
+                        precision=0,
+                        label="2) threshold_block_size (odd)",
+                    )
+                    bdrc_threshold_c = gr.Number(
+                        value=int(bdrc_defaults["threshold_c"]),
+                        precision=0,
+                        label="2) threshold_c",
+                    )
+                with gr.Row():
+                    bdrc_morph_close = gr.Checkbox(
+                        value=bool(bdrc_defaults["morph_close"]),
+                        label="3) morph_close",
+                    )
+                    bdrc_morph_close_kernel = gr.Number(
+                        value=int(bdrc_defaults["morph_close_kernel"]),
+                        precision=0,
+                        label="3) morph_close_kernel (odd)",
+                    )
+                    bdrc_remove_small_components = gr.Checkbox(
+                        value=bool(bdrc_defaults["remove_small_components"]),
+                        label="3) remove_small_components",
+                    )
+                    bdrc_min_component_area = gr.Number(
+                        value=int(bdrc_defaults["min_component_area"]),
+                        precision=0,
+                        label="3) min_component_area",
+                    )
 
         status = gr.Textbox(label="Status", interactive=False)
         debug_json = gr.Code(label="Debug JSON", language="json", visible=False)
@@ -833,14 +1177,15 @@ def build_ui() -> gr.Blocks:
                 height=300,
                 elem_id="ocr_image_panel",
                 show_label=False,
+                scale=3,
             )
-            with gr.Column(elem_id="transcript_panel"):
+            with gr.Column(elem_id="transcript_panel", scale=7):
                 with gr.Row():
-                    transcript = gr.Textbox(label="", lines=28, elem_id="transcript_box", show_label=False)
-                    with gr.Column(elem_id="font_ctrl_col"):
+                    transcript = gr.Textbox(label="", lines=28, elem_id="transcript_box", show_label=False, scale=36)
+                    with gr.Column(elem_id="font_ctrl_col", scale=1, min_width=24):
                         font_plus_btn = gr.Button("+", elem_id="font_btn_plus")
                         font_minus_btn = gr.Button("−", elem_id="font_btn_minus")
-        save_status = gr.Textbox(label="Save Status", interactive=False)
+        save_status = gr.Textbox(label="Save Status", interactive=False, visible=False)
 
         image_file.change(
             fn=_on_upload,
@@ -848,50 +1193,353 @@ def build_ui() -> gr.Blocks:
             outputs=[image_view, transcript, state, status],
         )
 
-        def _run(mode_s: str, state_s: Dict[str, Any], donut_s: str, layout_s: str, device_s: str, max_len_s: int):
+        def _run(
+            mode_s: str,
+            state_s: Dict[str, Any],
+            donut_s: str,
+            layout_s: str,
+            device_s: str,
+            max_len_s: int,
+            gray_mode_s: str,
+            normalize_background_s: bool,
+            background_blur_ksize_s: int,
+            background_strength_s: float,
+            upscale_factor_s: float,
+            upscale_interpolation_s: str,
+            binarize_s: bool,
+            threshold_method_s: str,
+            threshold_block_size_s: int,
+            threshold_c_s: int,
+            fixed_threshold_s: int,
+            morph_close_s: bool,
+            morph_close_kernel_s: int,
+            remove_small_components_s: bool,
+            min_component_area_s: int,
+        ):
+            bdrc_overrides = _build_bdrc_preprocess_overrides_ui(
+                gray_mode=gray_mode_s,
+                normalize_background=normalize_background_s,
+                background_blur_ksize=int(background_blur_ksize_s),
+                background_strength=float(background_strength_s),
+                upscale_factor=float(upscale_factor_s),
+                upscale_interpolation=upscale_interpolation_s,
+                binarize=binarize_s,
+                threshold_method=threshold_method_s,
+                threshold_block_size=int(threshold_block_size_s),
+                threshold_c=int(threshold_c_s),
+                fixed_threshold=int(fixed_threshold_s),
+                morph_close=morph_close_s,
+                morph_close_kernel=int(morph_close_kernel_s),
+                remove_small_components=remove_small_components_s,
+                min_component_area=int(min_component_area_s),
+            )
             if not _is_manual_mode(mode_s):
-                return _run_full_auto(state_s, donut_s, layout_s, device_s, int(max_len_s))
+                return _run_full_auto(
+                    state_s,
+                    donut_s,
+                    layout_s,
+                    device_s,
+                    int(max_len_s),
+                    bdrc_preprocess_overrides=bdrc_overrides,
+                )
             img = state_s.get("image")
             overlay = np.asarray(img).astype(np.uint8, copy=False) if img is not None else None
+            debug = {
+                "ok": True,
+                "mode": "manual_waiting",
+                "bdrc_preprocess_overrides": bdrc_overrides,
+            }
             return (
                 overlay,
                 _line_text(state_s.get("line_rows") or []),
                 "Manual Mode: click an existing line or define ROI with two clicks.",
                 state_s,
-                "{}",
+                json.dumps(debug, ensure_ascii=False, indent=2),
                 state_s.get("last_donut_pre"),
                 state_s.get("last_donut_post"),
             )
 
         run_btn.click(
             fn=_run,
-            inputs=[mode, state, donut_path, layout_path, device, max_len],
+            inputs=[
+                mode,
+                state,
+                donut_path,
+                layout_path,
+                device,
+                max_len,
+                bdrc_gray_mode,
+                bdrc_normalize_bg,
+                bdrc_bg_blur_ksize,
+                bdrc_bg_strength,
+                bdrc_upscale_factor,
+                bdrc_upscale_interp,
+                bdrc_binarize,
+                bdrc_threshold_method,
+                bdrc_threshold_block,
+                bdrc_threshold_c,
+                bdrc_fixed_threshold,
+                bdrc_morph_close,
+                bdrc_morph_close_kernel,
+                bdrc_remove_small_components,
+                bdrc_min_component_area,
+            ],
             outputs=[image_view, transcript, status, state, debug_json, donut_input_before, donut_input_after],
         )
 
-        def _on_select(mode_s: str, state_s: Dict[str, Any], donut_s: str, layout_s: str, device_s: str, max_len_s: int, evt: gr.SelectData):
+        def _on_select(
+            mode_s: str,
+            state_s: Dict[str, Any],
+            donut_s: str,
+            layout_s: str,
+            device_s: str,
+            max_len_s: int,
+            gray_mode_s: str,
+            normalize_background_s: bool,
+            background_blur_ksize_s: int,
+            background_strength_s: float,
+            upscale_factor_s: float,
+            upscale_interpolation_s: str,
+            binarize_s: bool,
+            threshold_method_s: str,
+            threshold_block_size_s: int,
+            threshold_c_s: int,
+            fixed_threshold_s: int,
+            morph_close_s: bool,
+            morph_close_kernel_s: int,
+            remove_small_components_s: bool,
+            min_component_area_s: int,
+            evt: gr.SelectData,
+        ):
+            bdrc_overrides = _build_bdrc_preprocess_overrides_ui(
+                gray_mode=gray_mode_s,
+                normalize_background=normalize_background_s,
+                background_blur_ksize=int(background_blur_ksize_s),
+                background_strength=float(background_strength_s),
+                upscale_factor=float(upscale_factor_s),
+                upscale_interpolation=upscale_interpolation_s,
+                binarize=binarize_s,
+                threshold_method=threshold_method_s,
+                threshold_block_size=int(threshold_block_size_s),
+                threshold_c=int(threshold_c_s),
+                fixed_threshold=int(fixed_threshold_s),
+                morph_close=morph_close_s,
+                morph_close_kernel=int(morph_close_kernel_s),
+                remove_small_components=remove_small_components_s,
+                min_component_area=int(min_component_area_s),
+            )
             if not _is_manual_mode(mode_s):
-                overlay = state_s.get("image")
+                image = state_s.get("image")
+                if image is None:
+                    return (
+                        None,
+                        _line_text(state_s.get("line_rows") or []),
+                        "Please upload an image first.",
+                        state_s,
+                        "{}",
+                        state_s.get("last_donut_pre"),
+                        state_s.get("last_donut_post"),
+                    )
+                idx = getattr(evt, "index", None)
+                if not isinstance(idx, (tuple, list)) or len(idx) < 2:
+                    overlay = _render_overlay(np.asarray(image).astype(np.uint8, copy=False), state_s.get("line_rows") or [])
+                    return (
+                        overlay,
+                        _line_text(state_s.get("line_rows") or []),
+                        "Click position not available.",
+                        state_s,
+                        "{}",
+                        state_s.get("last_donut_pre"),
+                        state_s.get("last_donut_post"),
+                    )
+                try:
+                    click_x, click_y = int(idx[0]), int(idx[1])
+                except Exception:
+                    overlay = _render_overlay(np.asarray(image).astype(np.uint8, copy=False), state_s.get("line_rows") or [])
+                    return (
+                        overlay,
+                        _line_text(state_s.get("line_rows") or []),
+                        "Invalid click position.",
+                        state_s,
+                        "{}",
+                        state_s.get("last_donut_pre"),
+                        state_s.get("last_donut_post"),
+                    )
+
+                src = np.asarray(image).astype(np.uint8, copy=False)
+                h, w = src.shape[:2]
+                click_x = max(0, min(w - 1, click_x))
+                click_y = max(0, min(h - 1, click_y))
+                rows = list(state_s.get("line_rows") or [])
+                hit = _find_line_hit(rows, click_x, click_y)
+                if hit is None:
+                    overlay = _render_overlay(src, rows)
+                    return (
+                        overlay,
+                        _line_text(rows),
+                        "No detected line at this click position.",
+                        state_s,
+                        "{}",
+                        state_s.get("last_donut_pre"),
+                        state_s.get("last_donut_post"),
+                    )
+
+                if not (donut_s or "").strip():
+                    overlay = _render_overlay(src, rows)
+                    return (
+                        overlay,
+                        _line_text(rows),
+                        "DONUT checkpoint is missing.",
+                        state_s,
+                        "{}",
+                        state_s.get("last_donut_pre"),
+                        state_s.get("last_donut_post"),
+                    )
+
+                x1, y1, x2, y2 = [int(v) for v in hit.get("line_box") or [0, 0, 0, 0]]
+                crop = src[y1:y2, x1:x2]
+                text, dbg, pre_img, post_img = _run_donut_on_crop(
+                    crop,
+                    donut_s,
+                    device_s,
+                    int(max_len_s),
+                    bdrc_preprocess_overrides=bdrc_overrides,
+                )
+                new_row = dict(hit)
+                new_row["text"] = text
+                new_row["ocr_debug"] = dbg
+                new_row["source"] = "overlay_click_debug"
+                rows = _add_or_update_line(rows, new_row)
+                state_s["line_rows"] = rows
+                state_s["last_donut_pre"] = pre_img
+                state_s["last_donut_post"] = post_img
+                overlay = _render_overlay(src, rows)
+                debug = {
+                    "ok": True,
+                    "mode": str(mode_s),
+                    "action": "clicked_detected_line_for_debug_preview",
+                    "line_box": [x1, y1, x2, y2],
+                    "bdrc_preprocess_overrides": bdrc_overrides,
+                }
                 return (
                     overlay,
-                    _line_text(state_s.get("line_rows") or []),
-                    "Clicks are active in Manual Mode only.",
+                    _line_text(rows),
+                    f"Updated debug preview from clicked line at ({click_x},{click_y}).",
                     state_s,
-                    "{}",
-                    state_s.get("last_donut_pre"),
-                    state_s.get("last_donut_post"),
+                    json.dumps(debug, ensure_ascii=False, indent=2),
+                    pre_img,
+                    post_img,
                 )
-            return _manual_click(state_s, donut_s, layout_s, device_s, int(max_len_s), evt)
+            return _manual_click(
+                state_s,
+                donut_s,
+                layout_s,
+                device_s,
+                int(max_len_s),
+                bdrc_overrides,
+                evt,
+            )
 
         image_view.select(
             fn=_on_select,
-            inputs=[mode, state, donut_path, layout_path, device, max_len],
+            inputs=[
+                mode,
+                state,
+                donut_path,
+                layout_path,
+                device,
+                max_len,
+                bdrc_gray_mode,
+                bdrc_normalize_bg,
+                bdrc_bg_blur_ksize,
+                bdrc_bg_strength,
+                bdrc_upscale_factor,
+                bdrc_upscale_interp,
+                bdrc_binarize,
+                bdrc_threshold_method,
+                bdrc_threshold_block,
+                bdrc_threshold_c,
+                bdrc_fixed_threshold,
+                bdrc_morph_close,
+                bdrc_morph_close_kernel,
+                bdrc_remove_small_components,
+                bdrc_min_component_area,
+            ],
             outputs=[image_view, transcript, status, state, debug_json, donut_input_before, donut_input_after],
         )
 
+        def _manual_full_roi_with_bdrc(
+            mode_s: str,
+            state_s: Dict[str, Any],
+            donut_s: str,
+            device_s: str,
+            max_len_s: int,
+            gray_mode_s: str,
+            normalize_background_s: bool,
+            background_blur_ksize_s: int,
+            background_strength_s: float,
+            upscale_factor_s: float,
+            upscale_interpolation_s: str,
+            binarize_s: bool,
+            threshold_method_s: str,
+            threshold_block_size_s: int,
+            threshold_c_s: int,
+            fixed_threshold_s: int,
+            morph_close_s: bool,
+            morph_close_kernel_s: int,
+            remove_small_components_s: bool,
+            min_component_area_s: int,
+        ):
+            bdrc_overrides = _build_bdrc_preprocess_overrides_ui(
+                gray_mode=gray_mode_s,
+                normalize_background=normalize_background_s,
+                background_blur_ksize=int(background_blur_ksize_s),
+                background_strength=float(background_strength_s),
+                upscale_factor=float(upscale_factor_s),
+                upscale_interpolation=upscale_interpolation_s,
+                binarize=binarize_s,
+                threshold_method=threshold_method_s,
+                threshold_block_size=int(threshold_block_size_s),
+                threshold_c=int(threshold_c_s),
+                fixed_threshold=int(fixed_threshold_s),
+                morph_close=morph_close_s,
+                morph_close_kernel=int(morph_close_kernel_s),
+                remove_small_components=remove_small_components_s,
+                min_component_area=int(min_component_area_s),
+            )
+            return _manual_full_image_roi(
+                mode_s,
+                state_s,
+                donut_s,
+                device_s,
+                int(max_len_s),
+                bdrc_preprocess_overrides=bdrc_overrides,
+            )
+
         full_roi_btn.click(
-            fn=_manual_full_image_roi,
-            inputs=[mode, state, donut_path, device, max_len],
+            fn=_manual_full_roi_with_bdrc,
+            inputs=[
+                mode,
+                state,
+                donut_path,
+                device,
+                max_len,
+                bdrc_gray_mode,
+                bdrc_normalize_bg,
+                bdrc_bg_blur_ksize,
+                bdrc_bg_strength,
+                bdrc_upscale_factor,
+                bdrc_upscale_interp,
+                bdrc_binarize,
+                bdrc_threshold_method,
+                bdrc_threshold_block,
+                bdrc_threshold_c,
+                bdrc_fixed_threshold,
+                bdrc_morph_close,
+                bdrc_morph_close_kernel,
+                bdrc_remove_small_components,
+                bdrc_min_component_area,
+            ],
             outputs=[image_view, transcript, status, state, debug_json, donut_input_before, donut_input_after],
         )
 
@@ -935,12 +1583,15 @@ def build_ui() -> gr.Blocks:
                 gr.update(visible=visible),
                 gr.update(visible=visible),
                 gr.update(visible=visible),
+                gr.update(visible=visible),
+                gr.update(visible=visible),
+                gr.update(visible=visible),
             )
 
         advanced_view.change(
             fn=_toggle_advanced,
             inputs=[advanced_view],
-            outputs=[advanced_scan_row, debug_json, donut_input_before, donut_input_after],
+            outputs=[advanced_scan_row, advanced_runtime_row, advanced_bdrc_row, debug_json, donut_input_before, donut_input_after, save_status],
         )
 
         mode.change(
@@ -949,10 +1600,27 @@ def build_ui() -> gr.Blocks:
             outputs=[full_roi_btn],
         )
 
+        def _on_device_change(device_s: str, donut_s: str):
+            _rt, msg = _ensure_donut_runtime_loaded(donut_s, device_s)
+            return msg
+
+        device.change(
+            fn=_on_device_change,
+            inputs=[device, donut_path],
+            outputs=[status],
+        )
+
     return demo
 
 
 if __name__ == "__main__":
+    # Warm-load DONUT runtime on startup (prefer GPU).
+    try:
+        _ckpt, _ = _find_donut_checkpoint()
+        if _ckpt:
+            _ensure_donut_runtime_loaded(_ckpt, "cuda:0")
+    except Exception:
+        pass
     app = build_ui()
     host = os.environ.get("UI_HOST", "127.0.0.1")
     try:

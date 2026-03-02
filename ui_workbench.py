@@ -3356,8 +3356,31 @@ def _load_donut_ocr_runtime_cached(model_dir_s: str, tokenizer_dir_s: str, image
     }
 
 
-def _apply_donut_ui_preprocess(image: Image.Image, pipeline: str) -> Image.Image:
+def _apply_donut_ui_preprocess(
+    image: Image.Image,
+    pipeline: str,
+    bdrc_config_override: Optional[Dict[str, Any]] = None,
+) -> Image.Image:
     rgb = image.convert("RGB")
+    mode = (pipeline or "none").strip().lower()
+
+    # If explicit BDRC overrides were provided, apply local BDRC preproc with that config.
+    if (
+        mode == "bdrc"
+        and isinstance(bdrc_config_override, dict)
+        and len(bdrc_config_override) > 0
+        and _preprocess_image_bdrc is not None
+        and _BDRCPreprocessConfig is not None
+    ):
+        try:
+            if hasattr(_BDRCPreprocessConfig, "from_dict"):
+                bdrc_cfg = _BDRCPreprocessConfig.from_dict(bdrc_config_override)
+            else:
+                bdrc_cfg = _BDRCPreprocessConfig.vit_defaults()
+            return _preprocess_image_bdrc(image=rgb, config=bdrc_cfg).convert("RGB")
+        except Exception:
+            return rgb
+
     # Prefer the exact training-side preprocessing function to avoid UI/training mismatches.
     try:
         from scripts.train_donut_ocr import _apply_image_preprocess_pipeline as _apply_train_donut_preproc
@@ -3366,7 +3389,6 @@ def _apply_donut_ui_preprocess(image: Image.Image, pipeline: str) -> Image.Image
     except Exception:
         pass
 
-    mode = (pipeline or "none").strip().lower()
     if mode == "pb" and _pb_preprocess_patch_image is not None and _PBPreprocessConfig is not None:
         try:
             return _pb_preprocess_patch_image(image=rgb, config=_PBPreprocessConfig()).convert("RGB")
@@ -3419,6 +3441,7 @@ def run_donut_ocr_inference_ui(
     device_preference: str,
     generation_max_length: int,
     num_beams: int,
+    bdrc_preprocess_overrides: Optional[Dict[str, Any]] = None,
 ):
     if image is None:
         return None, "", "{}"
@@ -3428,6 +3451,11 @@ def run_donut_ocr_inference_ui(
 
     repro_cfg = _load_donut_repro_bundle_cfg_ui(model_root_or_model_dir)
     effective_preproc = str(image_preprocess_pipeline or "none")
+    lock_preproc_to_requested = bool(
+        isinstance(bdrc_preprocess_overrides, dict)
+        and len(bdrc_preprocess_overrides) > 0
+        and str(image_preprocess_pipeline or "none").strip().lower() == "bdrc"
+    )
     effective_max_len = max(8, int(generation_max_length))
     effective_num_beams = max(1, int(num_beams))
     if bool(repro_cfg.get("has_repro")):
@@ -3435,7 +3463,7 @@ def run_donut_ocr_inference_ui(
             ip_cfg = repro_cfg.get("image_preprocess") or {}
             if isinstance(ip_cfg, dict):
                 pipe = str(ip_cfg.get("pipeline", "") or "").strip().lower()
-                if pipe in {"none", "pb", "bdrc"}:
+                if pipe in {"none", "pb", "bdrc"} and not lock_preproc_to_requested:
                     effective_preproc = pipe
             gcfg = repro_cfg.get("generate_config") or {}
             if isinstance(gcfg, dict):
@@ -3459,7 +3487,11 @@ def run_donut_ocr_inference_ui(
 
     try:
         pil = Image.fromarray(np.asarray(image).astype(np.uint8)).convert("RGB")
-        proc_pil = _apply_donut_ui_preprocess(pil, effective_preproc)
+        proc_pil = _apply_donut_ui_preprocess(
+            pil,
+            effective_preproc,
+            bdrc_config_override=(bdrc_preprocess_overrides if effective_preproc == "bdrc" else None),
+        )
         image_processor = runtime["image_processor"]
         tokenizer = runtime["tokenizer"]
         model = runtime["model"]
@@ -3519,6 +3551,21 @@ def run_donut_ocr_inference_ui(
             "device_msg": runtime.get("device_msg", ""),
             "image_preprocess_pipeline_requested": (image_preprocess_pipeline or "none"),
             "image_preprocess_pipeline_effective": str(effective_preproc),
+            "image_preprocess_locked_by_bdrc_overrides": bool(lock_preproc_to_requested),
+            "bdrc_preprocess_overrides_applied": bool(
+                effective_preproc == "bdrc"
+                and isinstance(bdrc_preprocess_overrides, dict)
+                and len(bdrc_preprocess_overrides) > 0
+            ),
+            "bdrc_preprocess_overrides": (
+                dict(bdrc_preprocess_overrides)
+                if (
+                    effective_preproc == "bdrc"
+                    and isinstance(bdrc_preprocess_overrides, dict)
+                    and len(bdrc_preprocess_overrides) > 0
+                )
+                else None
+            ),
             "generation_max_length_requested": int(generation_max_length),
             "generation_max_length_effective": int(effective_max_len),
             "num_beams_requested": int(num_beams),
@@ -3548,6 +3595,7 @@ def run_donut_ocr_inference_with_gt_ui(
     generation_max_length: int,
     num_beams: int,
     ground_truth_text: str,
+    bdrc_preprocess_overrides: Optional[Dict[str, Any]] = None,
 ):
     preview, pred_text, debug_json = run_donut_ocr_inference_ui(
         image=image,
@@ -3556,6 +3604,7 @@ def run_donut_ocr_inference_with_gt_ui(
         device_preference=device_preference,
         generation_max_length=generation_max_length,
         num_beams=num_beams,
+        bdrc_preprocess_overrides=bdrc_preprocess_overrides,
     )
     gt = str(ground_truth_text or "")
     cer_text = ""
