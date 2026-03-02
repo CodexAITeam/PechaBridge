@@ -1059,6 +1059,11 @@ def build_ui() -> gr.Blocks:
   font-size: 20px !important;
   line-height: 1.45 !important;
 }
+#donut_input_before,
+#donut_input_after {
+  margin-top: 10px !important;
+  margin-bottom: 10px !important;
+}
 """
 
     with gr.Blocks(title="OCR Workbench (DONUT)", css=ui_css) as demo:
@@ -1172,8 +1177,18 @@ def build_ui() -> gr.Blocks:
         status = gr.Textbox(label="Status", interactive=False)
         debug_json = gr.Code(label="Debug JSON", language="json", visible=False)
         with gr.Column():
-            donut_input_before = gr.Image(label="DONUT Input (Before Preprocess)", type="numpy", visible=False)
-            donut_input_after = gr.Image(label="DONUT Input (After Preprocess)", type="numpy", visible=False)
+            donut_input_before = gr.Image(
+                label="DONUT Input (Before Preprocess)",
+                type="numpy",
+                visible=False,
+                elem_id="donut_input_before",
+            )
+            donut_input_after = gr.Image(
+                label="DONUT Input (After Preprocess)",
+                type="numpy",
+                visible=False,
+                elem_id="donut_input_after",
+            )
         with gr.Row(visible=False) as advanced_debug_text_row:
             debug_text = gr.Textbox(label="Debug Transcription", lines=4, elem_id="debug_text_box")
             with gr.Column(elem_id="debug_font_ctrl_col", scale=1, min_width=24):
