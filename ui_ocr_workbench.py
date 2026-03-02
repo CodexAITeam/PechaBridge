@@ -13,11 +13,20 @@ import numpy as np
 from PIL import Image, ImageDraw, ImageFont
 
 from ui_workbench import (
+    _apply_donut_ui_preprocess,
     _compute_line_projection_state,
+    _load_donut_ocr_runtime_cached,
+    _load_donut_repro_bundle_cfg_ui,
+    _resolve_donut_runtime_dirs,
     _segment_lines_in_text_crop,
     run_donut_ocr_inference_ui,
     run_tibetan_text_line_split_classical,
 )
+
+try:
+    import torch
+except Exception:
+    torch = None
 
 
 ROOT = Path(__file__).resolve().parent
@@ -193,6 +202,73 @@ def _to_rgb_uint8(path: str) -> np.ndarray:
     return arr
 
 
+def _strip_special_token_strings_local(text: str, tokenizer: Any) -> str:
+    out = str(text or "")
+    try:
+        toks = sorted(
+            [str(t) for t in getattr(tokenizer, "all_special_tokens", []) if isinstance(t, str) and t],
+            key=len,
+            reverse=True,
+        )
+    except Exception:
+        toks = []
+    for tok in toks:
+        out = out.replace(tok, "")
+    return out
+
+
+def _run_donut_on_crop_fallback(
+    crop: np.ndarray,
+    donut_checkpoint: str,
+    device: str,
+    max_len: int,
+) -> Tuple[str, Dict[str, Any]]:
+    if torch is None:
+        raise RuntimeError("PyTorch nicht verfügbar.")
+    model_dir, tokenizer_dir, image_processor_dir, err = _resolve_donut_runtime_dirs(donut_checkpoint)
+    if err:
+        raise RuntimeError(err)
+    repro_cfg = _load_donut_repro_bundle_cfg_ui(donut_checkpoint)
+    effective_preproc = "bdrc"
+    effective_max_len = max(8, int(max_len))
+    if bool(repro_cfg.get("has_repro")):
+        ip_cfg = repro_cfg.get("image_preprocess") or {}
+        if isinstance(ip_cfg, dict):
+            pipe = str(ip_cfg.get("pipeline", "") or "").strip().lower()
+            if pipe in {"none", "pb", "bdrc"}:
+                effective_preproc = pipe
+        gcfg = repro_cfg.get("generate_config") or {}
+        if isinstance(gcfg, dict) and gcfg.get("max_length") is not None:
+            effective_max_len = max(8, int(gcfg["max_length"]))
+
+    runtime = _load_donut_ocr_runtime_cached(
+        str(model_dir),
+        str(tokenizer_dir),
+        str(image_processor_dir),
+        str(device or "auto"),
+    )
+    pil = Image.fromarray(np.asarray(crop).astype(np.uint8)).convert("RGB")
+    proc_pil = _apply_donut_ui_preprocess(pil, effective_preproc)
+    image_processor = runtime["image_processor"]
+    tokenizer = runtime["tokenizer"]
+    model = runtime["model"]
+    dev = runtime["device"]
+
+    pixel_values = image_processor(images=proc_pil, return_tensors="pt").pixel_values.to(dev)
+    with torch.no_grad():
+        generated = model.generate(pixel_values=pixel_values, max_length=int(effective_max_len), num_beams=1)
+    text = tokenizer.batch_decode(generated, skip_special_tokens=True)[0] if len(generated) else ""
+    text = _strip_special_token_strings_local(text, tokenizer)
+    return str(text or ""), {
+        "ok": True,
+        "fallback_used": True,
+        "fallback_reason": "ui_workbench _strip_special_token_strings NameError",
+        "image_preprocess_pipeline_effective": effective_preproc,
+        "generation_max_length_effective": int(effective_max_len),
+        "device": str(dev),
+    }
+
+
 @dataclass
 class OCRRuntime:
     donut_path: str
@@ -228,7 +304,22 @@ def _run_donut_on_crop(
         dbg = json.loads(debug_json or "{}")
     except Exception:
         dbg = {"raw_debug": debug_json}
-    return str(pred or ""), dbg if isinstance(dbg, dict) else {"raw_debug": dbg}
+    dbg_obj = dbg if isinstance(dbg, dict) else {"raw_debug": dbg}
+    if bool(dbg_obj.get("ok")):
+        return str(pred or ""), dbg_obj
+
+    err_msg = str(dbg_obj.get("error", "") or "")
+    if "_strip_special_token_strings" in err_msg:
+        try:
+            return _run_donut_on_crop_fallback(crop, donut_checkpoint, device, max_len)
+        except Exception as exc:
+            return str(pred or ""), {
+                "ok": False,
+                "error": err_msg,
+                "fallback_attempted": True,
+                "fallback_error": f"{type(exc).__name__}: {exc}",
+            }
+    return str(pred or ""), dbg_obj
 
 
 def _run_full_auto(
@@ -579,7 +670,7 @@ def build_ui() -> gr.Blocks:
                 save_btn = gr.Button("Save", variant="secondary")
             with gr.Column(scale=3):
                 with gr.Row():
-                    image_view = gr.Image(label="Bild / Overlay", type="numpy", interactive=True)
+                    image_view = gr.Image(label="Bild / Overlay", type="numpy", interactive=True, height=300)
                     transcript = gr.Textbox(label="Transkribierter Text (editierbar)", lines=28)
         save_status = gr.Textbox(label="Save Status", interactive=False)
 

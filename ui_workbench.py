@@ -3295,7 +3295,6 @@ def _load_donut_ocr_runtime_cached(model_dir_s: str, tokenizer_dir_s: str, image
         _load_tokenizer_robust,
         _load_ved_model_robust,
         _paired_end_token_for_start,
-        _strip_special_token_strings,
     )  # reuse training-side HF/meta/token fixes
 
     model = _load_ved_model_robust(str(model_dir))
@@ -3502,6 +3501,7 @@ def run_donut_ocr_inference_ui(
         with torch.no_grad():
             generated = model.generate(pixel_values=pixel_values, **gen_kwargs)
         text = tokenizer.batch_decode(generated, skip_special_tokens=True)[0] if len(generated) else ""
+        from scripts.train_donut_ocr import _strip_special_token_strings
         text = _strip_special_token_strings(str(text or ""), tokenizer)
         gen_ids: List[int] = []
         try:
