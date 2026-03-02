@@ -696,6 +696,11 @@ def build_ui() -> gr.Blocks:
 }
 #font_btn_plus, #font_btn_minus {
   min-width: 36px !important;
+  width: 36px !important;
+  padding: 0 !important;
+}
+#font_ctrl_col {
+  max-width: 52px;
 }
 """
 
@@ -704,11 +709,12 @@ def build_ui() -> gr.Blocks:
         gr.Markdown(
             "Vollautomatik: Layout -> Zeilen -> OCR. Manuell: Klick auf vorhandene Zeile oder ROI per 2 Klicks (Start/Ende)."
         )
+        advanced_view = gr.Checkbox(label="Advanced View", value=False)
 
         with gr.Row():
             donut_path = gr.Textbox(label="DONUT Checkpoint", value=donut_ckpt)
             layout_path = gr.Textbox(label="Layout Analysemodell", value=layout_model)
-        with gr.Row():
+        with gr.Row(visible=False) as advanced_scan_row:
             donut_info = gr.Textbox(label="DONUT Auto-Scan", value=donut_msg, interactive=False)
             layout_info = gr.Textbox(label="Layout Auto-Scan", value=layout_msg, interactive=False)
 
@@ -718,11 +724,9 @@ def build_ui() -> gr.Blocks:
             max_len = gr.Number(label="DONUT generation_max_length", value=512, precision=0)
 
         status = gr.Textbox(label="Status", interactive=False)
-        debug_json = gr.Code(label="Debug JSON", language="json")
+        debug_json = gr.Code(label="Debug JSON", language="json", visible=False)
 
         state = gr.State(_base_state())
-        font_size_state = gr.State(18)
-        font_style_html = gr.HTML("<style>#transcript_box textarea{font-size:18px !important;line-height:1.45 !important;}</style>")
         with gr.Row():
             image_file = gr.File(label="Bild hochladen", file_types=["image"])
             run_btn = gr.Button("OCR Ausführen", variant="primary")
@@ -738,11 +742,12 @@ def build_ui() -> gr.Blocks:
                 elem_id="ocr_image_panel",
             )
             with gr.Column():
+                gr.Markdown("**Transkribierter Text (editierbar)**")
                 with gr.Row():
-                    gr.Markdown("**Transkribierter Text (editierbar)**")
-                    font_minus_btn = gr.Button("−", elem_id="font_btn_minus")
-                    font_plus_btn = gr.Button("+", elem_id="font_btn_plus")
-                transcript = gr.Textbox(label="", lines=28, elem_id="transcript_box")
+                    transcript = gr.Textbox(label="", lines=28, elem_id="transcript_box")
+                    with gr.Column(elem_id="font_ctrl_col"):
+                        font_plus_btn = gr.Button("+", elem_id="font_btn_plus")
+                        font_minus_btn = gr.Button("−", elem_id="font_btn_minus")
         save_status = gr.Textbox(label="Save Status", interactive=False)
 
         image_file.change(
@@ -788,21 +793,39 @@ def build_ui() -> gr.Blocks:
             outputs=[save_status],
         )
 
-        def _change_font(delta: int, current: int) -> Tuple[str, int]:
-            size = int(current or 18) + int(delta)
-            size = max(10, min(42, size))
-            style = f"<style>#transcript_box textarea{{font-size:{size}px !important;line-height:1.45 !important;}}</style>"
-            return style, size
-
         font_plus_btn.click(
-            fn=lambda s: _change_font(1, s),
-            inputs=[font_size_state],
-            outputs=[font_style_html, font_size_state],
+            fn=None,
+            js="""
+() => {
+  const ta = document.querySelector('#transcript_box textarea');
+  if (!ta) return;
+  const cur = parseFloat(window.getComputedStyle(ta).fontSize) || 18;
+  ta.style.fontSize = `${Math.min(42, cur + 1)}px`;
+  ta.style.lineHeight = '1.45';
+}
+""",
         )
         font_minus_btn.click(
-            fn=lambda s: _change_font(-1, s),
-            inputs=[font_size_state],
-            outputs=[font_style_html, font_size_state],
+            fn=None,
+            js="""
+() => {
+  const ta = document.querySelector('#transcript_box textarea');
+  if (!ta) return;
+  const cur = parseFloat(window.getComputedStyle(ta).fontSize) || 18;
+  ta.style.fontSize = `${Math.max(10, cur - 1)}px`;
+  ta.style.lineHeight = '1.45';
+}
+""",
+        )
+
+        def _toggle_advanced(show: bool):
+            visible = bool(show)
+            return gr.update(visible=visible), gr.update(visible=visible)
+
+        advanced_view.change(
+            fn=_toggle_advanced,
+            inputs=[advanced_view],
+            outputs=[advanced_scan_row, debug_json],
         )
 
     return demo
