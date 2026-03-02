@@ -33,7 +33,7 @@ def _parse_args() -> argparse.Namespace:
     p.add_argument("--checkpoint_pattern", type=str, default="checkpoint-[0-9]*", help="Glob pattern used inside --checkpoints_dir")
     p.add_argument("--tokenizer_path", type=str, default="openpecha/BoSentencePiece")
     p.add_argument("--image_processor_path", type=str, default="microsoft/trocr-base-stage1")
-    p.add_argument("--image_preprocess_pipeline", type=str, default="none", choices=["none", "pb", "bdrc"])
+    p.add_argument("--image_preprocess_pipeline", type=str, default="none", choices=["none", "pb", "bdrc", "gray", "rgb"])
     p.add_argument("--image_size", type=int, default=384)
     p.add_argument("--max_target_length", type=int, default=512)
     p.add_argument("--generation_max_length", type=int, default=512)

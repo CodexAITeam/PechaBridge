@@ -39,6 +39,7 @@ if str(REPO_ROOT) not in sys.path:
 from tibetan_utils.arg_utils import create_train_donut_ocr_parser
 from pechabridge.ocr.preprocess import PreprocessConfig as PBPreprocessConfig, preprocess_patch_image
 from pechabridge.ocr.preprocess_bdrc import BDRCPreprocessConfig, preprocess_image_bdrc
+from pechabridge.ocr.preprocess_rgb import RGBLinePreprocessConfig, preprocess_image_rgb_lines
 from pechabridge.ocr.repro_pack import ReproPack
 from pechabridge.ocr.sentencepiece_tokenizer_adapter import (
     find_sentencepiece_model_path as sp_find_model_path,
@@ -1469,7 +1470,7 @@ def _image_preprocess_pipeline_name(args) -> str:
     # Backward-compatible alias: bdrc_no_bin -> gray
     if mode == "bdrc_no_bin":
         mode = "gray"
-    if mode not in {"none", "pb", "bdrc", "gray"}:
+    if mode not in {"none", "pb", "bdrc", "gray", "rgb"}:
         return "none"
     return mode
 
@@ -1484,6 +1485,8 @@ def _apply_image_preprocess_pipeline(image: Image.Image, pipeline: str) -> Image
         cfg = BDRCPreprocessConfig.vit_defaults()
         cfg = BDRCPreprocessConfig.from_dict({**cfg.to_dict(), "binarize": False, "gray_mode": "min_rgb"})
         return preprocess_image_bdrc(image=image, config=cfg).convert("RGB")
+    if mode == "rgb":
+        return preprocess_image_rgb_lines(image=image, config=RGBLinePreprocessConfig.vit_defaults()).convert("RGB")
     return image.convert("RGB")
 
 

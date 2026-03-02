@@ -2,6 +2,7 @@
 
 from .preprocess import PreprocessConfig, preprocess_patch_image
 from .preprocess_bdrc import BDRCPreprocessConfig, preprocess_image_bdrc, pad_ocr_line, bdrc_image_to_normalized_tensor
+from .preprocess_rgb import RGBLinePreprocessConfig, preprocess_image_rgb_lines
 from .weak_labeler import WeakOCRConfig, run_weak_ocr_labeler
 
 __all__ = [
@@ -11,6 +12,8 @@ __all__ = [
     "preprocess_patch_image",
     "BDRCPreprocessConfig",
     "preprocess_image_bdrc",
+    "RGBLinePreprocessConfig",
+    "preprocess_image_rgb_lines",
     "pad_ocr_line",
     "bdrc_image_to_normalized_tensor",
 ]

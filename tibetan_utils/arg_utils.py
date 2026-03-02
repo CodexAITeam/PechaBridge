@@ -1044,7 +1044,7 @@ def add_train_donut_ocr_arguments(parser):
     parser.add_argument('--image_size', type=int, default=384,
                        help='Square resize used by image processor')
     parser.add_argument('--image_preprocess_pipeline', '--image-preprocess-pipeline', dest='image_preprocess_pipeline', type=str,
-                       default='none', choices=['none', 'pb', 'bdrc', 'gray'],
+                       default='none', choices=['none', 'pb', 'bdrc', 'gray', 'rgb'],
                        help='Optional deterministic image preprocessing before Donut image processor')
     parser.add_argument('--max_target_length', type=int, default=512,
                        help='Maximum target token length for training labels')
@@ -1139,7 +1139,7 @@ def add_run_donut_ocr_workflow_arguments(parser):
     parser.add_argument('--image_size', type=int, default=384,
                        help='Image size for OCR model input')
     parser.add_argument('--image_preprocess_pipeline', '--image-preprocess-pipeline', dest='image_preprocess_pipeline', type=str,
-                       default='none', choices=['none', 'pb', 'bdrc', 'gray'],
+                       default='none', choices=['none', 'pb', 'bdrc', 'gray', 'rgb'],
                        help='Optional deterministic image preprocessing before Donut image processor in workflow train step')
     parser.add_argument('--seed', type=int, default=42,
                        help='Random seed')

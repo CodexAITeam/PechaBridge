@@ -51,9 +51,27 @@ python cli.py train-donut-ocr \
 
 - `none`: HF image processor only
 - `pb`: PechaBridge preprocessing
-- `bdrc`: BDRC-like preprocessing (binarization/normalization helpers)
+- `gray`: grayscale (`min_rgb`), no binarization
+- `bdrc`: BDRC-like grayscale + adaptive binarization
+- `rgb`: RGB line-scan cleanup (mild shade correction + optional ink normalization, no hard binarization by default)
 
-Use `bdrc` when training on historical Tibetan line scans and you want behavior closer to BDRC OCR pipelines.
+Use `rgb` when line scans include mixed ink colors (e.g. red + black) and you want color-aware preprocessing without destroying hue information.
+
+Use `bdrc` when you explicitly want grayscale + stronger binarization behavior closer to classic BDRC OCR pipelines.
+
+## RGB Pipeline Example (Red + Black Ink)
+
+```bash
+python cli.py train-donut-ocr \
+  --train_manifest /home/ubuntu/data/PechaBridge/datasets/openpecha_ocr_lines/train/meta/lines.jsonl \
+  --val_manifest /home/ubuntu/data/PechaBridge/datasets/openpecha_ocr_lines/eval/meta/lines.jsonl \
+  --output_dir /home/ubuntu/data/PechaBridge/models/donut_openpecha_rgb_lines \
+  --model_name_or_path microsoft/trocr-base-stage1 \
+  --tokenizer_path openpecha/BoSentencePiece \
+  --image_preprocess_pipeline rgb \
+  --per_device_train_batch_size 64 \
+  --num_train_epochs 200
+```
 
 ## Metrics
 

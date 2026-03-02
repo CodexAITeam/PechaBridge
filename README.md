@@ -28,7 +28,7 @@ The primary entrypoint for end-to-end usage is the **Workbench UI** (`ui_workben
 - **Detection training and inference**: Provides Ultralytics YOLO training, validation, and inference workflows for local data and SBB pages.
 - **Pseudo-labeling and rule-based filtering**: Supports VLM-assisted layout extraction plus post-filtering before annotation review.
 - **Donut-style OCR workflow (Label 1)**: Runs generation, manifest preparation, tokenizer handling, and Vision Transformer encoder + autoregressive decoder training.
-- **Standalone DONUT/TroCR OCR training**: Trains OCR directly on OpenPecha/BDRC line manifests (`train-donut-ocr`) with `none|pb|bdrc` image preprocessing and CER evaluation.
+- **Standalone DONUT/TroCR OCR training**: Trains OCR directly on OpenPecha/BDRC line manifests (`train-donut-ocr`) with `none|pb|gray|bdrc|rgb` image preprocessing and CER evaluation.
 - **Diffusion texture adaptation**: Includes SDXL/SD2.1 + ControlNet augmentation and optional LoRA integration for more realistic page textures.
 - **Patch retrieval dataset generation**: Generates line sub-patches (`datasets/text_patches`) with parquet metadata for retrieval training.
 - **Weak supervision for retrieval**: Supports weak OCR labels and robust MNN mining for cross-page positives.
@@ -221,10 +221,10 @@ python cli.py probe-line-clip-workbench-random-samples \
 python cli.py train-donut-ocr \
   --train_manifest ./datasets/openpecha_ocr_lines/train/meta/lines.jsonl \
   --val_manifest ./datasets/openpecha_ocr_lines/eval/meta/lines.jsonl \
-  --output_dir ./models/donut_openpecha_bdrc \
+  --output_dir ./models/donut_openpecha_rgb \
   --model_name_or_path microsoft/trocr-base-stage1 \
   --tokenizer_path openpecha/BoSentencePiece \
-  --image_preprocess_pipeline bdrc
+  --image_preprocess_pipeline rgb
 
 # Cross-page FAISS evaluation from exported embeddings
 python cli.py eval-faiss-crosspage \
