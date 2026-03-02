@@ -1047,6 +1047,14 @@ def build_ui() -> gr.Blocks:
   max-width: 24px;
   min-width: 24px;
 }
+#debug_font_ctrl_col {
+  max-width: 24px;
+  min-width: 24px;
+}
+#debug_text_box textarea {
+  font-size: 20px !important;
+  line-height: 1.45 !important;
+}
 """
 
     with gr.Blocks(title="OCR Workbench (DONUT)", css=ui_css) as demo:
@@ -1159,8 +1167,14 @@ def build_ui() -> gr.Blocks:
 
         status = gr.Textbox(label="Status", interactive=False)
         debug_json = gr.Code(label="Debug JSON", language="json", visible=False)
-        donut_input_before = gr.Image(label="DONUT Input (Before Preprocess)", type="numpy", visible=False)
-        donut_input_after = gr.Image(label="DONUT Input (After Preprocess)", type="numpy", visible=False)
+        with gr.Row():
+            donut_input_before = gr.Image(label="DONUT Input (Before Preprocess)", type="numpy", visible=False)
+            donut_input_after = gr.Image(label="DONUT Input (After Preprocess)", type="numpy", visible=False)
+        with gr.Row(visible=False) as advanced_debug_text_row:
+            debug_text = gr.Textbox(label="Debug Transcription", lines=4, elem_id="debug_text_box")
+            with gr.Column(elem_id="debug_font_ctrl_col", scale=1, min_width=24):
+                debug_font_plus_btn = gr.Button("+")
+                debug_font_minus_btn = gr.Button("−")
 
         state = gr.State(_base_state())
         with gr.Row():
@@ -1187,11 +1201,12 @@ def build_ui() -> gr.Blocks:
                         font_minus_btn = gr.Button("−", elem_id="font_btn_minus")
         save_status = gr.Textbox(label="Save Status", interactive=False, visible=False)
 
-        image_file.change(
+        _upload_evt = image_file.change(
             fn=_on_upload,
             inputs=[image_file, state],
             outputs=[image_view, transcript, state, status],
         )
+        _upload_evt.then(fn=lambda t: str(t or ""), inputs=[transcript], outputs=[debug_text])
 
         def _run(
             mode_s: str,
@@ -1259,7 +1274,7 @@ def build_ui() -> gr.Blocks:
                 state_s.get("last_donut_post"),
             )
 
-        run_btn.click(
+        _run_evt = run_btn.click(
             fn=_run,
             inputs=[
                 mode,
@@ -1286,6 +1301,7 @@ def build_ui() -> gr.Blocks:
             ],
             outputs=[image_view, transcript, status, state, debug_json, donut_input_before, donut_input_after],
         )
+        _run_evt.then(fn=lambda t: str(t or ""), inputs=[transcript], outputs=[debug_text])
 
         def _on_select(
             mode_s: str,
@@ -1440,7 +1456,7 @@ def build_ui() -> gr.Blocks:
                 evt,
             )
 
-        image_view.select(
+        _select_evt = image_view.select(
             fn=_on_select,
             inputs=[
                 mode,
@@ -1467,6 +1483,7 @@ def build_ui() -> gr.Blocks:
             ],
             outputs=[image_view, transcript, status, state, debug_json, donut_input_before, donut_input_after],
         )
+        _select_evt.then(fn=lambda t: str(t or ""), inputs=[transcript], outputs=[debug_text])
 
         def _manual_full_roi_with_bdrc(
             mode_s: str,
@@ -1516,7 +1533,7 @@ def build_ui() -> gr.Blocks:
                 bdrc_preprocess_overrides=bdrc_overrides,
             )
 
-        full_roi_btn.click(
+        _fullroi_evt = full_roi_btn.click(
             fn=_manual_full_roi_with_bdrc,
             inputs=[
                 mode,
@@ -1542,6 +1559,7 @@ def build_ui() -> gr.Blocks:
             ],
             outputs=[image_view, transcript, status, state, debug_json, donut_input_before, donut_input_after],
         )
+        _fullroi_evt.then(fn=lambda t: str(t or ""), inputs=[transcript], outputs=[debug_text])
 
         save_btn.click(
             fn=_save_results,
@@ -1576,9 +1594,37 @@ def build_ui() -> gr.Blocks:
 """,
         )
 
+        debug_font_plus_btn.click(
+            fn=None,
+            js="""
+() => {
+  const ta = document.querySelector('#debug_text_box textarea');
+  if (!ta) return;
+  const cur = parseFloat(window.getComputedStyle(ta).fontSize) || 20;
+  const next = Math.min(48, cur + 1);
+  ta.style.setProperty('font-size', `${next}px`, 'important');
+  ta.style.setProperty('line-height', '1.45', 'important');
+}
+""",
+        )
+        debug_font_minus_btn.click(
+            fn=None,
+            js="""
+() => {
+  const ta = document.querySelector('#debug_text_box textarea');
+  if (!ta) return;
+  const cur = parseFloat(window.getComputedStyle(ta).fontSize) || 20;
+  const next = Math.max(10, cur - 1);
+  ta.style.setProperty('font-size', `${next}px`, 'important');
+  ta.style.setProperty('line-height', '1.45', 'important');
+}
+""",
+        )
+
         def _toggle_advanced(show: bool):
             visible = bool(show)
             return (
+                gr.update(visible=visible),
                 gr.update(visible=visible),
                 gr.update(visible=visible),
                 gr.update(visible=visible),
@@ -1591,7 +1637,7 @@ def build_ui() -> gr.Blocks:
         advanced_view.change(
             fn=_toggle_advanced,
             inputs=[advanced_view],
-            outputs=[advanced_scan_row, advanced_runtime_row, advanced_bdrc_row, debug_json, donut_input_before, donut_input_after, save_status],
+            outputs=[advanced_scan_row, advanced_runtime_row, advanced_bdrc_row, debug_json, donut_input_before, donut_input_after, save_status, advanced_debug_text_row],
         )
 
         mode.change(
