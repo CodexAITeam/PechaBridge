@@ -421,6 +421,7 @@ def _base_state() -> Dict[str, Any]:
         "line_rows": [],
         "manual_anchor": None,
         "last_mode": "",
+        "last_debug_text": "",
     }
 
 
@@ -639,6 +640,7 @@ def _run_full_auto(
     state["last_mode"] = "full_auto"
     state["last_donut_pre"] = last_pre
     state["last_donut_post"] = last_post
+    state["last_debug_text"] = str(rows[-1].get("text", "") if rows else "")
     transcript = _line_text(rows)
     debug = {
         "ok": True,
@@ -745,6 +747,7 @@ def _manual_click(
         state["line_rows"] = rows
         state["last_donut_pre"] = pre_img
         state["last_donut_post"] = post_img
+        state["last_debug_text"] = str(text or "")
         overlay = _render_overlay(src, rows)
         return overlay, _line_text(rows), f"Re-transcribed line at click ({click_x},{click_y}).", state, json.dumps(
             {"ok": True, "mode": "manual", "action": "clicked_existing_line", "line_box": new_row["line_box"]},
@@ -887,6 +890,7 @@ def _manual_process_roi(
     state["last_mode"] = "manual"
     state["last_donut_pre"] = last_pre
     state["last_donut_post"] = last_post
+    state["last_debug_text"] = str(created_rows[-1].get("text", "") if created_rows else "")
     overlay = _render_overlay(src, rows, roi=roi)
     debug = {
         "ok": True,
@@ -1167,7 +1171,7 @@ def build_ui() -> gr.Blocks:
 
         status = gr.Textbox(label="Status", interactive=False)
         debug_json = gr.Code(label="Debug JSON", language="json", visible=False)
-        with gr.Row():
+        with gr.Column():
             donut_input_before = gr.Image(label="DONUT Input (Before Preprocess)", type="numpy", visible=False)
             donut_input_after = gr.Image(label="DONUT Input (After Preprocess)", type="numpy", visible=False)
         with gr.Row(visible=False) as advanced_debug_text_row:
@@ -1206,7 +1210,11 @@ def build_ui() -> gr.Blocks:
             inputs=[image_file, state],
             outputs=[image_view, transcript, state, status],
         )
-        _upload_evt.then(fn=lambda t: str(t or ""), inputs=[transcript], outputs=[debug_text])
+        _upload_evt.then(
+            fn=lambda st: str((st or {}).get("last_debug_text", "") if isinstance(st, dict) else ""),
+            inputs=[state],
+            outputs=[debug_text],
+        )
 
         def _run(
             mode_s: str,
@@ -1301,7 +1309,11 @@ def build_ui() -> gr.Blocks:
             ],
             outputs=[image_view, transcript, status, state, debug_json, donut_input_before, donut_input_after],
         )
-        _run_evt.then(fn=lambda t: str(t or ""), inputs=[transcript], outputs=[debug_text])
+        _run_evt.then(
+            fn=lambda st: str((st or {}).get("last_debug_text", "") if isinstance(st, dict) else ""),
+            inputs=[state],
+            outputs=[debug_text],
+        )
 
         def _on_select(
             mode_s: str,
@@ -1429,6 +1441,7 @@ def build_ui() -> gr.Blocks:
                 state_s["line_rows"] = rows
                 state_s["last_donut_pre"] = pre_img
                 state_s["last_donut_post"] = post_img
+                state_s["last_debug_text"] = str(text or "")
                 overlay = _render_overlay(src, rows)
                 debug = {
                     "ok": True,
@@ -1483,7 +1496,11 @@ def build_ui() -> gr.Blocks:
             ],
             outputs=[image_view, transcript, status, state, debug_json, donut_input_before, donut_input_after],
         )
-        _select_evt.then(fn=lambda t: str(t or ""), inputs=[transcript], outputs=[debug_text])
+        _select_evt.then(
+            fn=lambda st: str((st or {}).get("last_debug_text", "") if isinstance(st, dict) else ""),
+            inputs=[state],
+            outputs=[debug_text],
+        )
 
         def _manual_full_roi_with_bdrc(
             mode_s: str,
@@ -1559,7 +1576,11 @@ def build_ui() -> gr.Blocks:
             ],
             outputs=[image_view, transcript, status, state, debug_json, donut_input_before, donut_input_after],
         )
-        _fullroi_evt.then(fn=lambda t: str(t or ""), inputs=[transcript], outputs=[debug_text])
+        _fullroi_evt.then(
+            fn=lambda st: str((st or {}).get("last_debug_text", "") if isinstance(st, dict) else ""),
+            inputs=[state],
+            outputs=[debug_text],
+        )
 
         save_btn.click(
             fn=_save_results,
