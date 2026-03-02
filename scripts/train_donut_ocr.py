@@ -1466,7 +1466,10 @@ def _configure_image_processor(image_processor, image_size: int):
 
 def _image_preprocess_pipeline_name(args) -> str:
     mode = str(getattr(args, "image_preprocess_pipeline", "none") or "none").strip().lower()
-    if mode not in {"none", "pb", "bdrc"}:
+    # Backward-compatible alias: bdrc_no_bin -> gray
+    if mode == "bdrc_no_bin":
+        mode = "gray"
+    if mode not in {"none", "pb", "bdrc", "gray"}:
         return "none"
     return mode
 
@@ -1477,6 +1480,10 @@ def _apply_image_preprocess_pipeline(image: Image.Image, pipeline: str) -> Image
         return preprocess_patch_image(image=image, config=PBPreprocessConfig()).convert("RGB")
     if mode == "bdrc":
         return preprocess_image_bdrc(image=image, config=BDRCPreprocessConfig.vit_defaults()).convert("RGB")
+    if mode in {"gray", "bdrc_no_bin"}:
+        cfg = BDRCPreprocessConfig.vit_defaults()
+        cfg = BDRCPreprocessConfig.from_dict({**cfg.to_dict(), "binarize": False, "gray_mode": "min_rgb"})
+        return preprocess_image_bdrc(image=image, config=cfg).convert("RGB")
     return image.convert("RGB")
 
 
