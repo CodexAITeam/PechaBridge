@@ -489,6 +489,24 @@ def _manual_click(
         overlay = _render_overlay(src, rows)
         return overlay, _line_text(rows), "ROI zu klein. Bitte größeren Bereich wählen.", state, "{}"
     roi = _normalize_box([x1, y1, x2, y2], w, h)
+    return _manual_process_roi(state, donut_checkpoint, device, max_len, roi)
+
+
+def _manual_process_roi(
+    state: Dict[str, Any],
+    donut_checkpoint: str,
+    device: str,
+    max_len: int,
+    roi: Optional[List[int]],
+) -> Tuple[np.ndarray, str, str, Dict[str, Any], str]:
+    image = state.get("image")
+    if image is None:
+        return None, "", "Bitte zuerst ein Bild hochladen.", state, "{}"
+    src = np.asarray(image).astype(np.uint8, copy=False)
+    h, w = src.shape[:2]
+    rows = list(state.get("line_rows") or [])
+
+    roi = _normalize_box(roi or [], w, h)
     if roi is None:
         overlay = _render_overlay(src, rows)
         return overlay, _line_text(rows), "ROI ungültig.", state, "{}"
@@ -571,6 +589,25 @@ def _manual_click(
     return overlay, _line_text(rows), f"Manuelle Auswahl verarbeitet. Neue/aktualisierte Zeilen: {len(created_rows)}.", state, json.dumps(debug, ensure_ascii=False, indent=2)
 
 
+def _manual_full_image_roi(
+    mode_s: str,
+    state_s: Dict[str, Any],
+    donut_s: str,
+    device_s: str,
+    max_len_s: int,
+) -> Tuple[np.ndarray, str, str, Dict[str, Any], str]:
+    if not str(mode_s).startswith("manu"):
+        img = state_s.get("image")
+        overlay = np.asarray(img).astype(np.uint8, copy=False) if img is not None else None
+        return overlay, _line_text(state_s.get("line_rows") or []), "Button nur im manuellen Modus aktiv.", state_s, "{}"
+    img = state_s.get("image")
+    if img is None:
+        return None, "", "Bitte zuerst ein Bild hochladen.", state_s, "{}"
+    src = np.asarray(img).astype(np.uint8, copy=False)
+    h, w = src.shape[:2]
+    return _manual_process_roi(state_s, donut_s, device_s, int(max_len_s), [0, 0, w, h])
+
+
 def _on_upload(file_obj: Any, state: Dict[str, Any]) -> Tuple[np.ndarray, str, Dict[str, Any], str]:
     if file_obj is None:
         return None, "", _base_state(), "Kein Bild geladen."
@@ -640,8 +677,29 @@ def _save_results(
 def build_ui() -> gr.Blocks:
     donut_ckpt, donut_msg = _find_donut_checkpoint()
     layout_model, layout_msg = _find_layout_model()
+    ui_css = """
+#ocr_image_panel {
+  min-height: 300px;
+  min-width: 320px;
+  resize: both;
+  overflow: auto;
+  border: 1px dashed #cbd5e1;
+  border-radius: 8px;
+}
+#ocr_image_panel .image-container,
+#ocr_image_panel img {
+  max-height: none !important;
+}
+#transcript_box textarea {
+  font-size: 18px !important;
+  line-height: 1.45 !important;
+}
+#font_btn_plus, #font_btn_minus {
+  min-width: 36px !important;
+}
+"""
 
-    with gr.Blocks(title="OCR Workbench (DONUT)") as demo:
+    with gr.Blocks(title="OCR Workbench (DONUT)", css=ui_css) as demo:
         gr.Markdown("## OCR Workbench (DONUT + Layout)")
         gr.Markdown(
             "Vollautomatik: Layout -> Zeilen -> OCR. Manuell: Klick auf vorhandene Zeile oder ROI per 2 Klicks (Start/Ende)."
@@ -663,15 +721,28 @@ def build_ui() -> gr.Blocks:
         debug_json = gr.Code(label="Debug JSON", language="json")
 
         state = gr.State(_base_state())
+        font_size_state = gr.State(18)
+        font_style_html = gr.HTML("<style>#transcript_box textarea{font-size:18px !important;line-height:1.45 !important;}</style>")
         with gr.Row():
-            with gr.Column(scale=1):
-                image_file = gr.File(label="Bild hochladen", file_types=["image"])
-                run_btn = gr.Button("OCR Ausführen", variant="primary")
-                save_btn = gr.Button("Save", variant="secondary")
-            with gr.Column(scale=3):
+            image_file = gr.File(label="Bild hochladen", file_types=["image"])
+            run_btn = gr.Button("OCR Ausführen", variant="primary")
+            full_roi_btn = gr.Button("Ganzes Bild als ROI (manuell)")
+            save_btn = gr.Button("Save", variant="secondary")
+
+        with gr.Row():
+            image_view = gr.Image(
+                label="Bild / Overlay",
+                type="numpy",
+                interactive=True,
+                height=300,
+                elem_id="ocr_image_panel",
+            )
+            with gr.Column():
                 with gr.Row():
-                    image_view = gr.Image(label="Bild / Overlay", type="numpy", interactive=True, height=300)
-                    transcript = gr.Textbox(label="Transkribierter Text (editierbar)", lines=28)
+                    gr.Markdown("**Transkribierter Text (editierbar)**")
+                    font_minus_btn = gr.Button("−", elem_id="font_btn_minus")
+                    font_plus_btn = gr.Button("+", elem_id="font_btn_plus")
+                transcript = gr.Textbox(label="", lines=28, elem_id="transcript_box")
         save_status = gr.Textbox(label="Save Status", interactive=False)
 
         image_file.change(
@@ -705,10 +776,33 @@ def build_ui() -> gr.Blocks:
             outputs=[image_view, transcript, status, state, debug_json],
         )
 
+        full_roi_btn.click(
+            fn=_manual_full_image_roi,
+            inputs=[mode, state, donut_path, device, max_len],
+            outputs=[image_view, transcript, status, state, debug_json],
+        )
+
         save_btn.click(
             fn=_save_results,
             inputs=[state, transcript, donut_path, layout_path],
             outputs=[save_status],
+        )
+
+        def _change_font(delta: int, current: int) -> Tuple[str, int]:
+            size = int(current or 18) + int(delta)
+            size = max(10, min(42, size))
+            style = f"<style>#transcript_box textarea{{font-size:{size}px !important;line-height:1.45 !important;}}</style>"
+            return style, size
+
+        font_plus_btn.click(
+            fn=lambda s: _change_font(1, s),
+            inputs=[font_size_state],
+            outputs=[font_style_html, font_size_state],
+        )
+        font_minus_btn.click(
+            fn=lambda s: _change_font(-1, s),
+            inputs=[font_size_state],
+            outputs=[font_style_html, font_size_state],
         )
 
     return demo
