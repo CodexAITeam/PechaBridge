@@ -186,15 +186,28 @@ def _render_overlay(image: np.ndarray, lines: List[Dict[str, Any]], roi: Optiona
     panel = Image.fromarray(np.asarray(image).astype(np.uint8)).convert("RGB")
     draw = ImageDraw.Draw(panel)
     font = _load_font()
+
+    def _draw_strong_rect(box: List[int], color: Tuple[int, int, int], inner_width: int = 4, outer_width: int = 8) -> None:
+        x1, y1, x2, y2 = [int(v) for v in box]
+        # Outer dark stroke for contrast on bright backgrounds.
+        draw.rectangle((x1, y1, x2, y2), outline=(0, 0, 0), width=max(2, int(outer_width)))
+        # Inner bright stroke.
+        draw.rectangle((x1, y1, x2, y2), outline=color, width=max(2, int(inner_width)))
+
     for i, rec in enumerate(_sort_lines(lines), start=1):
         x1, y1, x2, y2 = [int(v) for v in rec["line_box"]]
-        draw.rectangle((x1, y1, x2, y2), outline=(255, 176, 0), width=3)
+        _draw_strong_rect([x1, y1, x2, y2], color=(0, 255, 255), inner_width=4, outer_width=8)
         tag = f"line {i}"
-        draw.rectangle((x1 + 2, max(0, y1 - 16), x1 + 12 + 7 * len(tag), max(12, y1 - 2)), fill=(0, 0, 0))
-        draw.text((x1 + 4, max(0, y1 - 15)), tag, fill=(255, 176, 0), font=font)
+        tx1 = x1 + 2
+        ty1 = max(0, y1 - 20)
+        tx2 = x1 + 18 + 8 * len(tag)
+        ty2 = max(16, y1 - 2)
+        draw.rectangle((tx1, ty1, tx2, ty2), fill=(0, 0, 0))
+        draw.rectangle((tx1, ty1, tx2, ty2), outline=(0, 255, 255), width=2)
+        draw.text((tx1 + 4, ty1 + 2), tag, fill=(255, 255, 255), font=font)
     if roi and len(roi) == 4:
         rx1, ry1, rx2, ry2 = [int(v) for v in roi]
-        draw.rectangle((rx1, ry1, rx2, ry2), outline=(70, 200, 255), width=3)
+        _draw_strong_rect([rx1, ry1, rx2, ry2], color=(255, 64, 255), inner_width=4, outer_width=8)
     return np.asarray(panel).astype(np.uint8, copy=False)
 
 
@@ -221,6 +234,28 @@ def _strip_special_token_strings_local(text: str, tokenizer: Any) -> str:
     for tok in toks:
         out = out.replace(tok, "")
     return out
+
+
+def _donut_preprocess_preview(crop: np.ndarray, donut_checkpoint: str) -> Tuple[np.ndarray, np.ndarray, str]:
+    pil = Image.fromarray(np.asarray(crop).astype(np.uint8)).convert("RGB")
+    pre = np.asarray(pil).astype(np.uint8, copy=False)
+    effective_preproc = "bdrc"
+    try:
+        repro_cfg = _load_donut_repro_bundle_cfg_ui(donut_checkpoint)
+        if bool(repro_cfg.get("has_repro")):
+            ip_cfg = repro_cfg.get("image_preprocess") or {}
+            if isinstance(ip_cfg, dict):
+                pipe = str(ip_cfg.get("pipeline", "") or "").strip().lower()
+                if pipe in {"none", "pb", "bdrc"}:
+                    effective_preproc = pipe
+    except Exception:
+        pass
+    try:
+        proc = _apply_donut_ui_preprocess(pil, effective_preproc)
+        post = np.asarray(proc).astype(np.uint8, copy=False)
+    except Exception:
+        post = pre
+    return pre, post, effective_preproc
 
 
 def _run_donut_on_crop_fallback(
@@ -297,7 +332,8 @@ def _run_donut_on_crop(
     donut_checkpoint: str,
     device: str,
     max_len: int,
-) -> Tuple[str, Dict[str, Any]]:
+) -> Tuple[str, Dict[str, Any], np.ndarray, np.ndarray]:
+    pre_img, post_img, effective_preproc = _donut_preprocess_preview(crop, donut_checkpoint)
     _, pred, debug_json = run_donut_ocr_inference_ui(
         image=crop,
         model_root_or_model_dir=donut_checkpoint,
@@ -311,21 +347,25 @@ def _run_donut_on_crop(
     except Exception:
         dbg = {"raw_debug": debug_json}
     dbg_obj = dbg if isinstance(dbg, dict) else {"raw_debug": dbg}
+    dbg_obj.setdefault("effective_preprocess_preview", effective_preproc)
     if bool(dbg_obj.get("ok")):
-        return str(pred or ""), dbg_obj
+        return str(pred or ""), dbg_obj, pre_img, post_img
 
     err_msg = str(dbg_obj.get("error", "") or "")
     if "_strip_special_token_strings" in err_msg:
         try:
-            return _run_donut_on_crop_fallback(crop, donut_checkpoint, device, max_len)
+            text_fb, dbg_fb = _run_donut_on_crop_fallback(crop, donut_checkpoint, device, max_len)
+            dbg_fb.setdefault("effective_preprocess_preview", effective_preproc)
+            return text_fb, dbg_fb, pre_img, post_img
         except Exception as exc:
             return str(pred or ""), {
                 "ok": False,
                 "error": err_msg,
                 "fallback_attempted": True,
                 "fallback_error": f"{type(exc).__name__}: {exc}",
-            }
-    return str(pred or ""), dbg_obj
+                "effective_preprocess_preview": effective_preproc,
+            }, pre_img, post_img
+    return str(pred or ""), dbg_obj, pre_img, post_img
 
 
 def _run_full_auto(
@@ -334,14 +374,14 @@ def _run_full_auto(
     layout_model: str,
     device: str,
     max_len: int,
-) -> Tuple[np.ndarray, str, str, Dict[str, Any], str]:
+) -> Tuple[np.ndarray, str, str, Dict[str, Any], str, Optional[np.ndarray], Optional[np.ndarray]]:
     image = state.get("image")
     if image is None:
-        return None, "", "Please upload an image first.", state, "{}"
+        return None, "", "Please upload an image first.", state, "{}", state.get("last_donut_pre"), state.get("last_donut_post")
     if not donut_checkpoint.strip():
-        return image, "", "DONUT checkpoint is missing.", state, "{}"
+        return image, "", "DONUT checkpoint is missing.", state, "{}", state.get("last_donut_pre"), state.get("last_donut_post")
     if not layout_model.strip():
-        return image, "", "Layout model is missing.", state, "{}"
+        return image, "", "Layout model is missing.", state, "{}", state.get("last_donut_pre"), state.get("last_donut_post")
 
     split_out = run_tibetan_text_line_split_classical(
         image=np.asarray(image).astype(np.uint8, copy=False),
@@ -370,13 +410,16 @@ def _run_full_auto(
     src = np.asarray(image).astype(np.uint8, copy=False)
     h, w = src.shape[:2]
     rows: List[Dict[str, Any]] = []
+    last_pre: Optional[np.ndarray] = None
+    last_post: Optional[np.ndarray] = None
     for rec in line_records_raw:
         box = _normalize_box(rec.get("line_box") or [], w, h)
         if box is None:
             continue
         x1, y1, x2, y2 = box
         crop = src[y1:y2, x1:x2]
-        text, dbg = _run_donut_on_crop(crop, donut_checkpoint, device, max_len)
+        text, dbg, pre_img, post_img = _run_donut_on_crop(crop, donut_checkpoint, device, max_len)
+        last_pre, last_post = pre_img, post_img
         rows.append(
             {
                 "line_id": int(rec.get("line_id", len(rows) + 1)),
@@ -391,6 +434,8 @@ def _run_full_auto(
     state["line_rows"] = rows
     state["manual_anchor"] = None
     state["last_mode"] = "full_auto"
+    state["last_donut_pre"] = last_pre
+    state["last_donut_post"] = last_post
     transcript = _line_text(rows)
     debug = {
         "ok": True,
@@ -399,7 +444,16 @@ def _run_full_auto(
         "line_count": len(rows),
         "split_json": json.loads(split_json) if (split_json or "").strip().startswith("{") else split_json,
     }
-    return overlay, transcript, f"{split_status} OCR executed on {len(rows)} line(s).", state, json.dumps(debug, ensure_ascii=False, indent=2)
+    strong_overlay = _render_overlay(src, rows)
+    return (
+        strong_overlay,
+        transcript,
+        f"{split_status} OCR executed on {len(rows)} line(s).",
+        state,
+        json.dumps(debug, ensure_ascii=False, indent=2),
+        state.get("last_donut_pre"),
+        state.get("last_donut_post"),
+    )
 
 
 def _find_line_hit(rows: List[Dict[str, Any]], x: int, y: int) -> Optional[Dict[str, Any]]:
@@ -442,20 +496,20 @@ def _manual_click(
     device: str,
     max_len: int,
     evt: gr.SelectData,
-) -> Tuple[np.ndarray, str, str, Dict[str, Any], str]:
+) -> Tuple[np.ndarray, str, str, Dict[str, Any], str, Optional[np.ndarray], Optional[np.ndarray]]:
     image = state.get("image")
     if image is None:
-        return None, "", "Please upload an image first.", state, "{}"
+        return None, "", "Please upload an image first.", state, "{}", state.get("last_donut_pre"), state.get("last_donut_post")
     if not donut_checkpoint.strip():
-        return image, "", "DONUT checkpoint is missing.", state, "{}"
+        return image, "", "DONUT checkpoint is missing.", state, "{}", state.get("last_donut_pre"), state.get("last_donut_post")
 
     idx = getattr(evt, "index", None)
     if not isinstance(idx, (tuple, list)) or len(idx) < 2:
-        return np.asarray(image), _line_text(state.get("line_rows") or []), "Click position not available.", state, "{}"
+        return np.asarray(image), _line_text(state.get("line_rows") or []), "Click position not available.", state, "{}", state.get("last_donut_pre"), state.get("last_donut_post")
     try:
         click_x, click_y = int(idx[0]), int(idx[1])
     except Exception:
-        return np.asarray(image), _line_text(state.get("line_rows") or []), "Invalid click position.", state, "{}"
+        return np.asarray(image), _line_text(state.get("line_rows") or []), "Invalid click position.", state, "{}", state.get("last_donut_pre"), state.get("last_donut_post")
 
     src = np.asarray(image).astype(np.uint8, copy=False)
     h, w = src.shape[:2]
@@ -467,25 +521,27 @@ def _manual_click(
     if hit is not None:
         x1, y1, x2, y2 = [int(v) for v in hit["line_box"]]
         crop = src[y1:y2, x1:x2]
-        text, dbg = _run_donut_on_crop(crop, donut_checkpoint, device, max_len)
+        text, dbg, pre_img, post_img = _run_donut_on_crop(crop, donut_checkpoint, device, max_len)
         new_row = dict(hit)
         new_row["text"] = text
         new_row["ocr_debug"] = dbg
         new_row["source"] = "manual_line_click"
         rows = _add_or_update_line(rows, new_row)
         state["line_rows"] = rows
+        state["last_donut_pre"] = pre_img
+        state["last_donut_post"] = post_img
         overlay = _render_overlay(src, rows)
         return overlay, _line_text(rows), f"Re-transcribed line at click ({click_x},{click_y}).", state, json.dumps(
             {"ok": True, "mode": "manual", "action": "clicked_existing_line", "line_box": new_row["line_box"]},
             ensure_ascii=False,
             indent=2,
-        )
+        ), state.get("last_donut_pre"), state.get("last_donut_post")
 
     anchor = state.get("manual_anchor")
     if not isinstance(anchor, (list, tuple)) or len(anchor) != 2:
         state["manual_anchor"] = [int(click_x), int(click_y)]
         overlay = _render_overlay(src, rows)
-        return overlay, _line_text(rows), f"Start point set at ({click_x},{click_y}). Click a second point to define ROI.", state, "{}"
+        return overlay, _line_text(rows), f"Start point set at ({click_x},{click_y}). Click a second point to define ROI.", state, "{}", state.get("last_donut_pre"), state.get("last_donut_post")
 
     ax, ay = int(anchor[0]), int(anchor[1])
     state["manual_anchor"] = None
@@ -493,7 +549,7 @@ def _manual_click(
     y1, y2 = sorted([ay, click_y])
     if (x2 - x1) < 3 or (y2 - y1) < 3:
         overlay = _render_overlay(src, rows)
-        return overlay, _line_text(rows), "ROI is too small. Please select a larger area.", state, "{}"
+        return overlay, _line_text(rows), "ROI is too small. Please select a larger area.", state, "{}", state.get("last_donut_pre"), state.get("last_donut_post")
     roi = _normalize_box([x1, y1, x2, y2], w, h)
     return _manual_process_roi(state, donut_checkpoint, device, max_len, roi)
 
@@ -504,10 +560,10 @@ def _manual_process_roi(
     device: str,
     max_len: int,
     roi: Optional[List[int]],
-) -> Tuple[np.ndarray, str, str, Dict[str, Any], str]:
+) -> Tuple[np.ndarray, str, str, Dict[str, Any], str, Optional[np.ndarray], Optional[np.ndarray]]:
     image = state.get("image")
     if image is None:
-        return None, "", "Please upload an image first.", state, "{}"
+        return None, "", "Please upload an image first.", state, "{}", state.get("last_donut_pre"), state.get("last_donut_post")
     src = np.asarray(image).astype(np.uint8, copy=False)
     h, w = src.shape[:2]
     rows = list(state.get("line_rows") or [])
@@ -515,15 +571,18 @@ def _manual_process_roi(
     roi = _normalize_box(roi or [], w, h)
     if roi is None:
         overlay = _render_overlay(src, rows)
-        return overlay, _line_text(rows), "ROI is invalid.", state, "{}"
+        return overlay, _line_text(rows), "ROI is invalid.", state, "{}", state.get("last_donut_pre"), state.get("last_donut_post")
     rx1, ry1, rx2, ry2 = roi
     roi_crop = src[ry1:ry2, rx1:rx2]
     roi_w = int(rx2 - rx1)
     roi_h = int(ry2 - ry1)
 
     created_rows: List[Dict[str, Any]] = []
+    last_pre: Optional[np.ndarray] = None
+    last_post: Optional[np.ndarray] = None
     if _roi_is_single_line(roi_w, roi_h):
-        text, dbg = _run_donut_on_crop(roi_crop, donut_checkpoint, device, max_len)
+        text, dbg, pre_img, post_img = _run_donut_on_crop(roi_crop, donut_checkpoint, device, max_len)
+        last_pre, last_post = pre_img, post_img
         created_rows.append(
             {
                 "line_id": len(rows) + 1,
@@ -555,7 +614,8 @@ def _manual_process_roi(
                 continue
             lx1, ly1, lx2, ly2 = gbox
             lcrop = src[ly1:ly2, lx1:lx2]
-            text, dbg = _run_donut_on_crop(lcrop, donut_checkpoint, device, max_len)
+            text, dbg, pre_img, post_img = _run_donut_on_crop(lcrop, donut_checkpoint, device, max_len)
+            last_pre, last_post = pre_img, post_img
             created_rows.append(
                 {
                     "line_id": len(rows) + len(created_rows) + 1,
@@ -566,7 +626,8 @@ def _manual_process_roi(
                 }
             )
         if not created_rows:
-            text, dbg = _run_donut_on_crop(roi_crop, donut_checkpoint, device, max_len)
+            text, dbg, pre_img, post_img = _run_donut_on_crop(roi_crop, donut_checkpoint, device, max_len)
+            last_pre, last_post = pre_img, post_img
             created_rows.append(
                 {
                     "line_id": len(rows) + 1,
@@ -583,6 +644,8 @@ def _manual_process_roi(
 
     state["line_rows"] = rows
     state["last_mode"] = "manual"
+    state["last_donut_pre"] = last_pre
+    state["last_donut_post"] = last_post
     overlay = _render_overlay(src, rows, roi=roi)
     debug = {
         "ok": True,
@@ -592,7 +655,15 @@ def _manual_process_roi(
         "new_rows": created_rows,
         "total_rows": len(rows),
     }
-    return overlay, _line_text(rows), f"Manual ROI processed. New/updated lines: {len(created_rows)}.", state, json.dumps(debug, ensure_ascii=False, indent=2)
+    return (
+        overlay,
+        _line_text(rows),
+        f"Manual ROI processed. New/updated lines: {len(created_rows)}.",
+        state,
+        json.dumps(debug, ensure_ascii=False, indent=2),
+        state.get("last_donut_pre"),
+        state.get("last_donut_post"),
+    )
 
 
 def _manual_full_image_roi(
@@ -601,14 +672,14 @@ def _manual_full_image_roi(
     donut_s: str,
     device_s: str,
     max_len_s: int,
-) -> Tuple[np.ndarray, str, str, Dict[str, Any], str]:
+) -> Tuple[np.ndarray, str, str, Dict[str, Any], str, Optional[np.ndarray], Optional[np.ndarray]]:
     if not _is_manual_mode(mode_s):
         img = state_s.get("image")
         overlay = np.asarray(img).astype(np.uint8, copy=False) if img is not None else None
-        return overlay, _line_text(state_s.get("line_rows") or []), "This button is only active in Manual Mode.", state_s, "{}"
+        return overlay, _line_text(state_s.get("line_rows") or []), "This button is only active in Manual Mode.", state_s, "{}", state_s.get("last_donut_pre"), state_s.get("last_donut_post")
     img = state_s.get("image")
     if img is None:
-        return None, "", "Please upload an image first.", state_s, "{}"
+        return None, "", "Please upload an image first.", state_s, "{}", state_s.get("last_donut_pre"), state_s.get("last_donut_post")
     src = np.asarray(img).astype(np.uint8, copy=False)
     h, w = src.shape[:2]
     return _manual_process_roi(state_s, donut_s, device_s, int(max_len_s), [0, 0, w, h])
@@ -744,6 +815,8 @@ def build_ui() -> gr.Blocks:
 
         status = gr.Textbox(label="Status", interactive=False)
         debug_json = gr.Code(label="Debug JSON", language="json", visible=False)
+        donut_input_before = gr.Image(label="DONUT Input (Before Preprocess)", type="numpy", visible=False)
+        donut_input_after = gr.Image(label="DONUT Input (After Preprocess)", type="numpy", visible=False)
 
         state = gr.State(_base_state())
         with gr.Row():
@@ -780,30 +853,46 @@ def build_ui() -> gr.Blocks:
                 return _run_full_auto(state_s, donut_s, layout_s, device_s, int(max_len_s))
             img = state_s.get("image")
             overlay = np.asarray(img).astype(np.uint8, copy=False) if img is not None else None
-            return overlay, _line_text(state_s.get("line_rows") or []), "Manual Mode: click an existing line or define ROI with two clicks.", state_s, "{}"
+            return (
+                overlay,
+                _line_text(state_s.get("line_rows") or []),
+                "Manual Mode: click an existing line or define ROI with two clicks.",
+                state_s,
+                "{}",
+                state_s.get("last_donut_pre"),
+                state_s.get("last_donut_post"),
+            )
 
         run_btn.click(
             fn=_run,
             inputs=[mode, state, donut_path, layout_path, device, max_len],
-            outputs=[image_view, transcript, status, state, debug_json],
+            outputs=[image_view, transcript, status, state, debug_json, donut_input_before, donut_input_after],
         )
 
         def _on_select(mode_s: str, state_s: Dict[str, Any], donut_s: str, layout_s: str, device_s: str, max_len_s: int, evt: gr.SelectData):
             if not _is_manual_mode(mode_s):
                 overlay = state_s.get("image")
-                return overlay, _line_text(state_s.get("line_rows") or []), "Clicks are active in Manual Mode only.", state_s, "{}"
+                return (
+                    overlay,
+                    _line_text(state_s.get("line_rows") or []),
+                    "Clicks are active in Manual Mode only.",
+                    state_s,
+                    "{}",
+                    state_s.get("last_donut_pre"),
+                    state_s.get("last_donut_post"),
+                )
             return _manual_click(state_s, donut_s, layout_s, device_s, int(max_len_s), evt)
 
         image_view.select(
             fn=_on_select,
             inputs=[mode, state, donut_path, layout_path, device, max_len],
-            outputs=[image_view, transcript, status, state, debug_json],
+            outputs=[image_view, transcript, status, state, debug_json, donut_input_before, donut_input_after],
         )
 
         full_roi_btn.click(
             fn=_manual_full_image_roi,
             inputs=[mode, state, donut_path, device, max_len],
-            outputs=[image_view, transcript, status, state, debug_json],
+            outputs=[image_view, transcript, status, state, debug_json, donut_input_before, donut_input_after],
         )
 
         save_btn.click(
@@ -841,12 +930,17 @@ def build_ui() -> gr.Blocks:
 
         def _toggle_advanced(show: bool):
             visible = bool(show)
-            return gr.update(visible=visible), gr.update(visible=visible)
+            return (
+                gr.update(visible=visible),
+                gr.update(visible=visible),
+                gr.update(visible=visible),
+                gr.update(visible=visible),
+            )
 
         advanced_view.change(
             fn=_toggle_advanced,
             inputs=[advanced_view],
-            outputs=[advanced_scan_row, debug_json],
+            outputs=[advanced_scan_row, debug_json, donut_input_before, donut_input_after],
         )
 
         mode.change(
