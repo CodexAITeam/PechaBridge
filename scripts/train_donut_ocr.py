@@ -24,7 +24,6 @@ from PIL import Image
 from torch.utils.data import Dataset, Subset
 from transformers import (
     AutoImageProcessor,
-    AutoTokenizer,
     Seq2SeqTrainer,
     Seq2SeqTrainingArguments,
     VisionEncoderDecoderModel,
@@ -193,6 +192,84 @@ def _candidate_token_ids_for_literal(tokenizer, token: str) -> List[int]:
         seen.add(tid)
         uniq.append(int(tid))
     return uniq
+
+
+def _special_ids_for_token_literal(tokenizer, token: str) -> List[int]:
+    """Resolve literal token ids but keep only tokenizer-declared special ids."""
+    try:
+        special_ids = set(int(x) for x in getattr(tokenizer, "all_special_ids", []) if x is not None)
+    except Exception:
+        special_ids = set()
+    if not special_ids:
+        return []
+    return [int(x) for x in _candidate_token_ids_for_literal(tokenizer, token) if int(x) in special_ids]
+
+
+def _log_token_audit(
+    tokenizer,
+    *,
+    decoder_start_token: str,
+    task_end_token: str,
+) -> None:
+    """Log a compact audit for potentially problematic token ids."""
+    ids: List[int] = []
+    for maybe_id in (
+        getattr(tokenizer, "bos_token_id", None),
+        getattr(tokenizer, "eos_token_id", None),
+        getattr(tokenizer, "pad_token_id", None),
+        getattr(tokenizer, "unk_token_id", None),
+        2,
+        3,
+        4,
+        20000,
+        20005,
+        20006,
+    ):
+        if maybe_id is None:
+            continue
+        try:
+            ids.append(int(maybe_id))
+        except Exception:
+            continue
+    ids.extend(_candidate_token_ids_for_literal(tokenizer, str(decoder_start_token)))
+    ids.extend(_candidate_token_ids_for_literal(tokenizer, str(task_end_token)))
+    # stable unique order
+    seen: set[int] = set()
+    uniq_ids: List[int] = []
+    for tid in ids:
+        if tid in seen:
+            continue
+        seen.add(tid)
+        uniq_ids.append(int(tid))
+    try:
+        special_ids = set(int(x) for x in getattr(tokenizer, "all_special_ids", []) if x is not None)
+    except Exception:
+        special_ids = set()
+    rows: List[Dict[str, object]] = []
+    for tid in uniq_ids:
+        try:
+            tok = tokenizer.convert_ids_to_tokens([int(tid)])
+            tok_val = tok[0] if isinstance(tok, list) and tok else str(tok)
+        except Exception:
+            tok_val = None
+        try:
+            dec_no_skip = tokenizer.decode([int(tid)], skip_special_tokens=False)
+        except Exception:
+            dec_no_skip = None
+        try:
+            dec_skip = tokenizer.decode([int(tid)], skip_special_tokens=True)
+        except Exception:
+            dec_skip = None
+        rows.append(
+            {
+                "id": int(tid),
+                "is_special_id": bool(int(tid) in special_ids),
+                "token": tok_val,
+                "decode_no_skip": dec_no_skip,
+                "decode_skip": dec_skip,
+            }
+        )
+    LOGGER.info("Tokenizer audit: %s", json.dumps(rows, ensure_ascii=False))
 
 
 def _encode_target_ids_with_terminal_preservation(
@@ -1249,159 +1326,38 @@ def _patch_sentencepiece_compat() -> bool:
     return patched
 
 
-def _is_degenerate_sp_tokenizer(tok) -> bool:
-    try:
-        tok_len = int(len(tok))
-    except Exception:
-        return False
-    if tok_len > 32:
-        return False
-    sp_model = getattr(tok, "sp_model", None)
-    return sp_model is None
-
-
-def _tok_cfg_value_to_str(value) -> Optional[str]:
-    if isinstance(value, str):
-        return value
-    if isinstance(value, dict):
-        content = value.get("content")
-        if isinstance(content, str):
-            return content
-    return None
-
-
-def _try_pretrained_fast_from_tokenizer_json(local_dir: Path):
-    try:
-        from transformers import PreTrainedTokenizerFast
-    except Exception:
-        return None
-    tok_json = local_dir / "tokenizer.json"
-    if not tok_json.exists():
-        return None
-
-    kwargs: Dict[str, object] = {}
-    cfg_path = local_dir / "tokenizer_config.json"
-    if cfg_path.exists():
-        try:
-            cfg = json.loads(cfg_path.read_text(encoding="utf-8"))
-            if isinstance(cfg, dict):
-                for key in ("unk_token", "bos_token", "eos_token", "sep_token", "pad_token", "cls_token", "mask_token"):
-                    sval = _tok_cfg_value_to_str(cfg.get(key))
-                    if sval:
-                        kwargs[key] = sval
-                addl = cfg.get("additional_special_tokens")
-                if isinstance(addl, list):
-                    addl_vals = [s for s in (_tok_cfg_value_to_str(x) for x in addl) if s]
-                    if addl_vals:
-                        kwargs["additional_special_tokens"] = addl_vals
-                mml = cfg.get("model_max_length")
-                if isinstance(mml, (int, float)) and int(mml) > 0:
-                    kwargs["model_max_length"] = int(mml)
-        except Exception:
-            pass
-
-    try:
-        tok_fast = PreTrainedTokenizerFast(tokenizer_file=str(tok_json), **kwargs)
-    except Exception:
-        return None
-    try:
-        if int(len(tok_fast)) > 32:
-            LOGGER.warning(
-                "Recovered BoSentencePiece via PreTrainedTokenizerFast(tokenizer.json) fallback (len=%d) from %s",
-                int(len(tok_fast)),
-                local_dir,
-            )
-            return tok_fast
-    except Exception:
-        return None
-    return None
-
-
-def _try_albert_fast_from_local_dir(local_dir: Path):
-    """Try explicit fast tokenizer load from local files when AutoTokenizer falls back badly."""
-    try:
-        from transformers import AlbertTokenizerFast
-    except Exception:
-        return None
-    tok_json = local_dir / "tokenizer.json"
-    if not tok_json.exists():
-        return None
-    try:
-        tok_fast = AlbertTokenizerFast.from_pretrained(str(local_dir))
-    except Exception:
-        return None
-    try:
-        if int(len(tok_fast)) > 32:
-            LOGGER.warning(
-                "Recovered BoSentencePiece via AlbertTokenizerFast fallback (len=%d) from %s",
-                int(len(tok_fast)),
-                local_dir,
-            )
-            return tok_fast
-    except Exception:
-        return None
-    return None
-
-
 def _load_tokenizer_robust(base_path: str):
     if _patch_sentencepiece_compat():
         LOGGER.info("Applied sentencepiece compatibility shim (camelCase aliases).")
-    spec = _maybe_use_local_bosentencepiece(base_path)
-    local_dir: Optional[Path] = None
-    p = Path(str(spec)).expanduser()
-    if p.exists() and p.is_dir():
-        local_dir = p.resolve()
-        _ensure_spiece_alias_if_needed(local_dir)
-        if sp_find_model_path(local_dir) is not None:
-            tok = load_sentencepiece_tokenizer_adapter(local_dir)
-            LOGGER.info(
-                "Loaded tokenizer directly via sentencepiece adapter from %s (len=%d)",
-                local_dir,
-                int(len(tok)),
-            )
-            return tok
-
-    if str(spec).strip() == "openpecha/BoSentencePiece":
-        raise RuntimeError(
-            "BoSentencePiece must be downloaded locally for direct sentencepiece loading. "
-            "Run `python cli.py download-bosentencepiece-tokenizer` (or "
-            "`python scripts/download_bosentencepiece_tokenizer.py`) and then use "
-            "`--tokenizer_path ./ext/BoSentencePiece`."
-        )
-
-    tokenizer = AutoTokenizer.from_pretrained(spec, use_fast=True)
-    if local_dir is not None and _is_degenerate_sp_tokenizer(tokenizer):
-        tok_fast = _try_albert_fast_from_local_dir(local_dir)
-        if tok_fast is not None:
-            return tok_fast
-        tok_ptf = _try_pretrained_fast_from_tokenizer_json(local_dir)
-        if tok_ptf is not None:
-            return tok_ptf
-
-    # Fail fast on the known degenerate ALBERT fallback (only special tokens).
-    tok_len = int(len(tokenizer))
-    if tok_len <= 32:
-        sp_model = getattr(tokenizer, "sp_model", None)
-        if sp_model is None:
-            hint = ""
-            if local_dir is not None:
-                hint = (
-                    f" Local tokenizer dir={local_dir}. If it contains `sentencepiece.model`, "
-                    "ensure `spiece.model` exists (the loader will try to create it automatically)."
-                )
+    spec = str(_maybe_use_local_bosentencepiece(base_path) or "").strip()
+    if not spec:
+        raise RuntimeError("Tokenizer path is required and must point to a local BoSentencePiece directory.")
+    p = Path(spec).expanduser()
+    if not (p.exists() and p.is_dir()):
+        if spec == "openpecha/BoSentencePiece":
             raise RuntimeError(
-                "Tokenizer loaded with suspiciously tiny vocab "
-                f"(len={tok_len}, class={tokenizer.__class__.__name__}). "
-                "This usually means the SentencePiece model was not loaded and only ALBERT special tokens are present."
-                + hint
-                + " To fix BoSentencePiece locally, run from the repo root: "
-                "`python cli.py download-bosentencepiece-tokenizer` "
-                "(or `python scripts/download_bosentencepiece_tokenizer.py`). "
-                "Then set `--tokenizer_path ./ext/BoSentencePiece`. "
-                "Also verify your environment has a working `sentencepiece` install "
-                "(e.g. `python -c \"import sentencepiece; print(sentencepiece.__version__)\"`)."
+                "BoSentencePiece must be available locally. Run `python cli.py download-bosentencepiece-tokenizer` "
+                "(or `python scripts/download_bosentencepiece_tokenizer.py`) and use `--tokenizer_path ./ext/BoSentencePiece`."
             )
-    return tokenizer
+        raise RuntimeError(
+            f"Tokenizer fallback is disabled. Expected local BoSentencePiece directory, got: {spec!r}"
+        )
+    local_dir = p.resolve()
+    _ensure_spiece_alias_if_needed(local_dir)
+    sp_model_path = sp_find_model_path(local_dir)
+    if sp_model_path is None:
+        raise RuntimeError(
+            f"Tokenizer fallback is disabled. Missing sentencepiece model in {local_dir}. "
+            "Expected `spiece.model` or `sentencepiece.model`."
+        )
+    tok = load_sentencepiece_tokenizer_adapter(local_dir)
+    LOGGER.info(
+        "Loaded tokenizer via sentencepiece adapter (BoSentencePiece-only mode) from %s (spm=%s, len=%d)",
+        local_dir,
+        sp_model_path,
+        int(len(tok)),
+    )
+    return tok
 
 
 def _read_manifest(path: Path) -> List[Dict[str, object]]:
@@ -1488,7 +1444,11 @@ def _ensure_pad_token(tokenizer) -> None:
 
 
 def _load_or_build_tokenizer(args, train_rows: Sequence[Dict[str, object]]):
-    base_path = args.tokenizer_path or args.model_name_or_path
+    base_path = str(getattr(args, "tokenizer_path", "") or "").strip()
+    if not base_path:
+        raise RuntimeError(
+            "BoSentencePiece-only mode requires --tokenizer_path to point to a local BoSentencePiece directory."
+        )
     LOGGER.info("Loading tokenizer for OCR training from: %s", base_path)
     tokenizer = _load_tokenizer_robust(base_path)
     special_tokens = _parse_csv_tokens(args.extra_special_tokens)
@@ -1928,6 +1888,11 @@ def run(args) -> Dict[str, object]:
             f"(before={tokenizer_len_before_id_resolution}, after={tokenizer_len_after_id_resolution}). "
             "This indicates mutating token lookup and can desync decoder embeddings from labels."
         )
+    _log_token_audit(
+        tokenizer,
+        decoder_start_token=str(args.decoder_start_token),
+        task_end_token=str(task_end_token),
+    )
 
     effective_eos_id = int(task_end_id) if task_end_id is not None else (
         int(tokenizer.eos_token_id) if tokenizer.eos_token_id is not None else None
@@ -1951,8 +1916,11 @@ def run(args) -> Dict[str, object]:
     if effective_eos_id is not None:
         model.generation_config.eos_token_id = int(effective_eos_id)
     # Prevent degenerate loops that keep emitting the task start token.
-    suppress_start_ids = _candidate_token_ids_for_literal(tokenizer, str(args.decoder_start_token))
-    if not suppress_start_ids:
+    # Suppress only ids that are explicitly marked as special by tokenizer.
+    suppress_start_ids = _special_ids_for_token_literal(tokenizer, str(args.decoder_start_token))
+    if not suppress_start_ids and int(decoder_start_id) in set(
+        int(x) for x in getattr(tokenizer, "all_special_ids", []) if x is not None
+    ):
         suppress_start_ids = [int(decoder_start_id)]
     try:
         model.generation_config.suppress_tokens = [int(x) for x in suppress_start_ids]
