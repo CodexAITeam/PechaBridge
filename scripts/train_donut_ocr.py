@@ -1954,10 +1954,6 @@ def run(args) -> Dict[str, object]:
     suppress_start_ids = _candidate_token_ids_for_literal(tokenizer, str(args.decoder_start_token))
     if not suppress_start_ids:
         suppress_start_ids = [int(decoder_start_id)]
-    # Some tokenizer/adapters decode id=3 as "<s_ocr>" while decoder_start_id resolves
-    # to a different special id. Include 3 explicitly to block this observed loop mode.
-    if 3 not in suppress_start_ids:
-        suppress_start_ids.append(3)
     try:
         model.generation_config.suppress_tokens = [int(x) for x in suppress_start_ids]
     except Exception:
