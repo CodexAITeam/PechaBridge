@@ -1968,6 +1968,15 @@ def run(args) -> Dict[str, object]:
         pass
     model.generation_config.max_length = int(args.generation_max_length)
     model.generation_config.num_beams = 1
+    # Keep eval decoding from drifting into long repeated phrases.
+    try:
+        model.generation_config.no_repeat_ngram_size = 3
+    except Exception:
+        pass
+    try:
+        model.generation_config.repetition_penalty = 1.15
+    except Exception:
+        pass
     gen_min_new_tokens = max(0, int(getattr(args, "generation_min_new_tokens", 0) or 0))
     if gen_min_new_tokens > 0:
         model.generation_config.min_new_tokens = int(gen_min_new_tokens)
