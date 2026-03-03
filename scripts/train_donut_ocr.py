@@ -737,7 +737,6 @@ class DonutReproPackCallback(TrainerCallback):
         ckpt_dir = Path(str(getattr(args, "output_dir", ""))).expanduser().resolve() / f"checkpoint-{step}"
         if not ckpt_dir.exists():
             return control
-        optimizer = getattr(self.trainer, "optimizer", None)
         scheduler = getattr(self.trainer, "lr_scheduler", None)
         scaler = getattr(self.trainer, "scaler", None)
         if scaler is None:
@@ -754,7 +753,6 @@ class DonutReproPackCallback(TrainerCallback):
                 trainer=self.trainer,
                 state=state,
                 model=model_for_eval,
-                optimizer=optimizer,
                 scheduler=scheduler,
                 scaler=scaler,
             )

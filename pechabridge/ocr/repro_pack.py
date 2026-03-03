@@ -611,7 +611,6 @@ class ReproPack:
         trainer,
         state,
         model,
-        optimizer=None,
         scheduler=None,
         scaler=None,
     ) -> Optional[Dict[str, Any]]:
@@ -666,13 +665,9 @@ class ReproPack:
             }
             _write_json(repro_dir / "rng_state_rank0_summary.json", rng_summary)
 
-        # Optional duplicate snapshots (HF already saves optimizer/scheduler in checkpoint root).
+        # Optional duplicate snapshots.
+        # Do not duplicate optimizer state in repro bundle to keep bundle size down.
         if is_rank0:
-            if optimizer is not None:
-                try:
-                    torch.save(optimizer.state_dict(), repro_dir / "optimizer_state_rank0.pt")
-                except Exception:
-                    pass
             if scheduler is not None:
                 try:
                     torch.save(scheduler.state_dict(), repro_dir / "scheduler_state_rank0.pt")
