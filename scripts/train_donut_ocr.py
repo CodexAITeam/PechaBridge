@@ -270,6 +270,193 @@ def _log_token_audit(
             }
         )
     LOGGER.info("Tokenizer audit: %s", json.dumps(rows, ensure_ascii=False))
+    # Highlight ambiguous mappings that can create start/end-token collapse.
+    start_matches = [
+        row for row in rows
+        if str(row.get("decode_no_skip") or "").strip() == str(decoder_start_token or "").strip()
+    ]
+    end_matches = [
+        row for row in rows
+        if str(row.get("decode_no_skip") or "").strip() == str(task_end_token or "").strip()
+    ]
+    if start_matches:
+        LOGGER.info("Tokenizer audit start-token matches: %s", json.dumps(start_matches, ensure_ascii=False))
+    if end_matches:
+        LOGGER.info("Tokenizer audit end-token matches: %s", json.dumps(end_matches, ensure_ascii=False))
+    non_special_start_ids = [int(row["id"]) for row in start_matches if not bool(row.get("is_special_id"))]
+    non_special_end_ids = [int(row["id"]) for row in end_matches if not bool(row.get("is_special_id"))]
+    if non_special_start_ids:
+        LOGGER.error(
+            "Tokenizer ambiguity: decoder start token literal %r is produced by NON-special ids: %s. "
+            "This can cause generation collapse and invalid suppress-token behavior.",
+            str(decoder_start_token),
+            non_special_start_ids,
+        )
+    if non_special_end_ids:
+        LOGGER.error(
+            "Tokenizer ambiguity: decoder end token literal %r is produced by NON-special ids: %s. "
+            "EOS supervision/termination may be unreliable.",
+            str(task_end_token),
+            non_special_end_ids,
+        )
+
+
+def _token_id_repr(tokenizer, token_id: int, *, special_id_set: set[int]) -> Dict[str, object]:
+    tid = int(token_id)
+    try:
+        tok = tokenizer.convert_ids_to_tokens([tid])
+        tok_val = tok[0] if isinstance(tok, list) and tok else str(tok)
+    except Exception:
+        tok_val = None
+    try:
+        dec = tokenizer.decode([tid], skip_special_tokens=False)
+    except Exception:
+        dec = None
+    return {
+        "id": tid,
+        "n": 0,  # filled by caller when used in frequency tables
+        "token": tok_val,
+        "decode_no_skip": dec,
+        "is_special_id": bool(tid in special_id_set),
+    }
+
+
+def _top_token_counter_rows(
+    counter: Counter[int],
+    *,
+    tokenizer,
+    special_id_set: set[int],
+    total: int,
+    limit: int = 12,
+) -> List[Dict[str, object]]:
+    rows: List[Dict[str, object]] = []
+    if total <= 0:
+        return rows
+    for tid, n in counter.most_common(int(max(1, limit))):
+        row = _token_id_repr(tokenizer, int(tid), special_id_set=special_id_set)
+        row["n"] = int(n)
+        row["ratio"] = float(int(n) / max(1, int(total)))
+        rows.append(row)
+    return rows
+
+
+def _sequence_token_forensics(
+    *,
+    sequences: Optional[np.ndarray],
+    tokenizer,
+    pad_id: Optional[int],
+    decoder_start_id: Optional[int],
+    eos_id: Optional[int],
+    special_id_set: set[int],
+    topk: int = 12,
+) -> Dict[str, object]:
+    if sequences is None:
+        return {"available": False}
+    if not isinstance(sequences, np.ndarray) or sequences.ndim < 2:
+        return {"available": False, "reason": "expected integer ndarray [N,T]"}
+    if sequences.dtype == object:
+        return {"available": False, "reason": "object dtype sequences"}
+
+    seqs = sequences.astype(np.int64, copy=False)
+    n_rows = int(seqs.shape[0])
+    t_len = int(seqs.shape[1]) if seqs.ndim >= 2 else 0
+    if n_rows <= 0 or t_len <= 0:
+        return {"available": True, "n_rows": n_rows, "t_len": t_len}
+
+    pad_val = int(pad_id) if pad_id is not None else None
+    dec_start_val = int(decoder_start_id) if decoder_start_id is not None else None
+    eos_val = int(eos_id) if eos_id is not None else None
+
+    all_nonpad_tokens: List[int] = []
+    nonpad_lengths: List[int] = []
+    first_nonpad_counter: Counter[int] = Counter()
+    first_content_counter: Counter[int] = Counter()
+    contains_eos = 0
+    starts_with_decoder_start = 0
+    start_repeat_runs: List[int] = []
+
+    for row in seqs.tolist():
+        row_ids: List[int] = [int(x) for x in row]
+        if dec_start_val is not None and row_ids and int(row_ids[0]) == dec_start_val:
+            starts_with_decoder_start += 1
+
+        nonpad: List[int]
+        if pad_val is None:
+            nonpad = row_ids
+        else:
+            nonpad = [x for x in row_ids if int(x) != pad_val]
+        nonpad_lengths.append(int(len(nonpad)))
+        all_nonpad_tokens.extend(int(x) for x in nonpad)
+
+        if eos_val is not None and any(int(x) == eos_val for x in nonpad):
+            contains_eos += 1
+
+        if nonpad:
+            first_nonpad = int(nonpad[0])
+            first_nonpad_counter[first_nonpad] += 1
+            if dec_start_val is not None and first_nonpad == dec_start_val and len(nonpad) > 1:
+                first_content = int(nonpad[1])
+            else:
+                first_content = first_nonpad
+            first_content_counter[first_content] += 1
+
+        # How long does the sequence stay on decoder start token at prefix?
+        if dec_start_val is None:
+            start_repeat_runs.append(0)
+        else:
+            run = 0
+            for tid in row_ids:
+                if pad_val is not None and int(tid) == pad_val and run == 0:
+                    continue
+                if int(tid) == dec_start_val:
+                    run += 1
+                    continue
+                break
+            start_repeat_runs.append(int(run))
+
+    token_counter: Counter[int] = Counter(int(x) for x in all_nonpad_tokens)
+    total_nonpad = int(sum(token_counter.values()))
+    special_nonpad = int(sum(int(n) for tid, n in token_counter.items() if int(tid) in special_id_set))
+    non_special_nonpad = int(total_nonpad - special_nonpad)
+
+    return {
+        "available": True,
+        "n_rows": n_rows,
+        "t_len": t_len,
+        "nonpad_len_mean": float(np.mean(nonpad_lengths)) if nonpad_lengths else 0.0,
+        "nonpad_len_min": int(min(nonpad_lengths)) if nonpad_lengths else 0,
+        "nonpad_len_max": int(max(nonpad_lengths)) if nonpad_lengths else 0,
+        "starts_with_decoder_start_ratio": float(starts_with_decoder_start / max(1, n_rows)),
+        "contains_eos_ratio": float(contains_eos / max(1, n_rows)),
+        "start_token_prefix_run_mean": float(np.mean(start_repeat_runs)) if start_repeat_runs else 0.0,
+        "start_token_prefix_run_max": int(max(start_repeat_runs)) if start_repeat_runs else 0,
+        "start_token_prefix_run_ge2_ratio": float(sum(int(r >= 2) for r in start_repeat_runs) / max(1, n_rows)),
+        "token_nonpad_total": total_nonpad,
+        "token_special_ratio": float(special_nonpad / max(1, total_nonpad)),
+        "token_non_special_ratio": float(non_special_nonpad / max(1, total_nonpad)),
+        "token_unique_nonpad": int(len(token_counter)),
+        "top_tokens_nonpad": _top_token_counter_rows(
+            token_counter,
+            tokenizer=tokenizer,
+            special_id_set=special_id_set,
+            total=total_nonpad,
+            limit=topk,
+        ),
+        "top_first_nonpad_tokens": _top_token_counter_rows(
+            first_nonpad_counter,
+            tokenizer=tokenizer,
+            special_id_set=special_id_set,
+            total=int(sum(first_nonpad_counter.values())),
+            limit=topk,
+        ),
+        "top_first_content_tokens": _top_token_counter_rows(
+            first_content_counter,
+            tokenizer=tokenizer,
+            special_id_set=special_id_set,
+            total=int(sum(first_content_counter.values())),
+            limit=topk,
+        ),
+    }
 
 
 def _encode_target_ids_with_terminal_preservation(
@@ -2019,6 +2206,7 @@ def run(args) -> Dict[str, object]:
     zero_cer_debug_count = {"n": 0}
     high_cer_debug_count = {"n": 0}
     collapse_warn_count = {"n": 0}
+    eval_forensics_log_count = {"n": 0}
 
     def _compute_metrics(eval_pred):
         predictions, labels = eval_pred
@@ -2132,6 +2320,39 @@ def run(args) -> Dict[str, object]:
         repetitive_pred_count = sum(int(_looks_repetitive_prediction(p)) for p in pred_norms if p)
         avg_pred_len = float(sum(len(p) for p in pred_norms) / max(1, len(pred_norms)))
         avg_ref_len = float(sum(len(r) for r in ref_norms) / max(1, len(ref_norms)))
+
+        pred_token_forensics = _sequence_token_forensics(
+            sequences=pred_sequences,
+            tokenizer=tokenizer,
+            pad_id=pad_id,
+            decoder_start_id=decoder_start_id,
+            eos_id=eos_id,
+            special_id_set=special_id_set,
+            topk=12,
+        )
+        label_token_forensics = _sequence_token_forensics(
+            sequences=np.asarray(labels).astype(np.int64, copy=False) if isinstance(labels, np.ndarray) else None,
+            tokenizer=tokenizer,
+            pad_id=pad_id,
+            decoder_start_id=decoder_start_id,
+            eos_id=eos_id,
+            special_id_set=special_id_set,
+            topk=12,
+        )
+        eval_forensics_log_count["n"] += 1
+        if (
+            eval_forensics_log_count["n"] <= 20
+            or empty_pred_count > 0
+            or repetitive_pred_count > 0
+        ):
+            LOGGER.info(
+                "eval_token_forensics | pred=%s",
+                json.dumps(pred_token_forensics, ensure_ascii=False),
+            )
+            LOGGER.info(
+                "eval_token_forensics | label=%s",
+                json.dumps(label_token_forensics, ensure_ascii=False),
+            )
         if (
             valid_pairs
             and empty_pred_count >= len(valid_pairs)
@@ -2264,6 +2485,12 @@ def run(args) -> Dict[str, object]:
             "pred_repetitive_ratio": float(repetitive_pred_count / max(1, len(pred_norms))),
             "pred_avg_len": float(avg_pred_len),
             "ref_avg_len": float(avg_ref_len),
+            "pred_token_special_ratio": float(pred_token_forensics.get("token_special_ratio", 0.0)),
+            "pred_token_unique_nonpad": int(pred_token_forensics.get("token_unique_nonpad", 0)),
+            "pred_start_prefix_run_mean": float(pred_token_forensics.get("start_token_prefix_run_mean", 0.0)),
+            "pred_start_prefix_run_ge2_ratio": float(pred_token_forensics.get("start_token_prefix_run_ge2_ratio", 0.0)),
+            "pred_starts_with_decoder_start_ratio": float(pred_token_forensics.get("starts_with_decoder_start_ratio", 0.0)),
+            "pred_contains_eos_ratio": float(pred_token_forensics.get("contains_eos_ratio", 0.0)),
         }
 
     has_eval = val_dataset is not None and len(val_dataset) > 0
