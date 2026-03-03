@@ -145,6 +145,56 @@ def _resolve_single_token_id_no_mutation(tokenizer, token: str) -> Optional[int]
     return tok_id
 
 
+def _candidate_token_ids_for_literal(tokenizer, token: str) -> List[int]:
+    """Collect candidate token ids for a literal token string without mutating vocab."""
+    tok = str(token or "").strip()
+    if not tok:
+        return []
+    out: List[int] = []
+
+    # Safe single-id resolution path used across this trainer.
+    sid = _resolve_single_token_id_no_mutation(tokenizer, tok)
+    if sid is not None:
+        out.append(int(sid))
+
+    # Some tokenizer implementations expose a direct mapping; guard against mutation.
+    try:
+        cid = tokenizer.convert_tokens_to_ids(tok)
+        if isinstance(cid, (int, np.integer)):
+            cidi = int(cid)
+            unk_id = getattr(tokenizer, "unk_token_id", None)
+            if cidi >= 0 and (unk_id is None or cidi != int(unk_id)):
+                out.append(cidi)
+    except Exception:
+        pass
+
+    # Exact literal decode match among known special ids catches adapter aliasing.
+    try:
+        for raw_id in getattr(tokenizer, "all_special_ids", []) or []:
+            try:
+                tid = int(raw_id)
+            except Exception:
+                continue
+            try:
+                txt = tokenizer.decode([tid], skip_special_tokens=False)
+            except Exception:
+                continue
+            if str(txt or "").strip() == tok:
+                out.append(tid)
+    except Exception:
+        pass
+
+    # Deduplicate while preserving order.
+    seen: set[int] = set()
+    uniq: List[int] = []
+    for tid in out:
+        if tid in seen:
+            continue
+        seen.add(tid)
+        uniq.append(int(tid))
+    return uniq
+
+
 def _encode_target_ids_with_terminal_preservation(
     tokenizer,
     target_text: str,
@@ -1901,12 +1951,15 @@ def run(args) -> Dict[str, object]:
     if effective_eos_id is not None:
         model.generation_config.eos_token_id = int(effective_eos_id)
     # Prevent degenerate loops that keep emitting the task start token.
+    suppress_start_ids = _candidate_token_ids_for_literal(tokenizer, str(args.decoder_start_token))
+    if not suppress_start_ids:
+        suppress_start_ids = [int(decoder_start_id)]
     try:
-        model.generation_config.suppress_tokens = [int(decoder_start_id)]
+        model.generation_config.suppress_tokens = [int(x) for x in suppress_start_ids]
     except Exception:
         pass
     try:
-        model.generation_config.bad_words_ids = [[int(decoder_start_id)]]
+        model.generation_config.bad_words_ids = [[int(x)] for x in suppress_start_ids]
     except Exception:
         pass
     model.generation_config.max_length = int(args.generation_max_length)
@@ -1920,7 +1973,7 @@ def run(args) -> Dict[str, object]:
         except Exception:
             pass
     LOGGER.info(
-        "Donut target formatting: start=%r end=%r eos_id=%s tokenizer_eos_id=%s gen_max_len=%d gen_min_new=%d beams=%d",
+        "Donut target formatting: start=%r end=%r eos_id=%s tokenizer_eos_id=%s gen_max_len=%d gen_min_new=%d beams=%d suppress_start_ids=%s",
         str(args.decoder_start_token),
         task_end_token,
         str(effective_eos_id),
@@ -1928,6 +1981,7 @@ def run(args) -> Dict[str, object]:
         int(args.generation_max_length),
         int(gen_min_new_tokens),
         int(getattr(model.generation_config, "num_beams", 1) or 1),
+        ",".join(str(int(x)) for x in suppress_start_ids) if suppress_start_ids else "n/a",
     )
 
     train_dataset = OCRManifestDataset(
