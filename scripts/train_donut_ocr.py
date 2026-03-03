@@ -1900,6 +1900,15 @@ def run(args) -> Dict[str, object]:
     model.generation_config.pad_token_id = int(tokenizer.pad_token_id)
     if effective_eos_id is not None:
         model.generation_config.eos_token_id = int(effective_eos_id)
+    # Prevent degenerate loops that keep emitting the task start token.
+    try:
+        model.generation_config.suppress_tokens = [int(decoder_start_id)]
+    except Exception:
+        pass
+    try:
+        model.generation_config.bad_words_ids = [[int(decoder_start_id)]]
+    except Exception:
+        pass
     model.generation_config.max_length = int(args.generation_max_length)
     model.generation_config.num_beams = 1
     gen_min_new_tokens = max(0, int(getattr(args, "generation_min_new_tokens", 0) or 0))
