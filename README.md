@@ -79,8 +79,15 @@ pip install -r requirements.txt
 
 Legacy files `requirements-ui.txt`, `requirements-vlm.txt`, and `requirements-lora.txt` remain as compatibility wrappers.
 
+## Start Here: DONUT OCR Training
+
+If your focus is DONUT/TroCR OCR training, start with this detailed guide:
+
+- [docs/donut_training_guide.md](docs/donut_training_guide.md) (tiny pretraining workflow, anti-collapse diagnostics, full-run recipes for `gray` and `rgb`)
+
 ## Documentation Guide
 
+- NEW: Full DONUT OCR training playbook (Tiny-Pretraining, Anti-Collapse, Full-Run recipes): [docs/donut_training_guide.md](docs/donut_training_guide.md)
 - CLI command reference and end-to-end examples: [README_CLI.md](README_CLI.md)
 - Pseudo-labeling and Label Studio workflow: [README_PSEUDO_LABELING_LABEL_STUDIO.md](README_PSEUDO_LABELING_LABEL_STUDIO.md)
 - Patch dataset generation (YOLO textbox -> lines -> sub-patches): [docs/dataset_generation.md](docs/dataset_generation.md)

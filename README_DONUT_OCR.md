@@ -1,5 +1,8 @@
 # DONUT / TroCR OCR Training (OpenPecha / BDRC Line Manifests)
 
+For a detailed, step-by-step training playbook (including tiny pretraining/overfit flow and collapse diagnostics), see:
+[docs/donut_training_guide.md](docs/donut_training_guide.md)
+
 ## Purpose
 
 This training path fine-tunes a `VisionEncoderDecoderModel` (e.g. `microsoft/trocr-base-stage1`) for Tibetan OCR on **line image + text** pairs.
