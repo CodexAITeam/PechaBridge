@@ -23,6 +23,10 @@ import torch
 import torch.nn as nn
 from PIL import Image
 from torch.utils.data import Dataset, Subset
+try:
+    import albumentations as A
+except Exception:  # pragma: no cover - optional runtime dependency
+    A = None
 from transformers import (
     AutoImageProcessor,
     Seq2SeqTrainer,
@@ -1232,7 +1236,7 @@ def _describe_batch_like(data: Dict[str, object]) -> Dict[str, object]:
 
 def _log_pretrain_device_report(
     *,
-    train_dataset: "OCRManifestDataset",
+    train_dataset: "OCRLineDataset",
     collator: "OCRDataCollator",
     image_processor: object,
     tokenizer: object,
@@ -1659,7 +1663,19 @@ def _configure_image_processor(image_processor, image_size: int):
             image_processor.size = int(image_size)
     except Exception as exc:
         LOGGER.warning("Could not update image processor size: %s", exc)
-
+    # Donut-style processors can preserve aspect ratio with thumbnail + padding.
+    # Keep this conditional so non-Donut image processors keep their native flow.
+    try:
+        if hasattr(image_processor, "do_pad"):
+            if hasattr(image_processor, "do_resize"):
+                image_processor.do_resize = False
+            if hasattr(image_processor, "do_thumbnail"):
+                image_processor.do_thumbnail = True
+            image_processor.do_pad = True
+            if hasattr(image_processor, "random_padding"):
+                image_processor.random_padding = False
+    except Exception as exc:
+        LOGGER.warning("Could not update image processor pad/resize behavior: %s", exc)
 
 def _image_preprocess_pipeline_name(args) -> str:
     mode = str(getattr(args, "image_preprocess_pipeline", "none") or "none").strip().lower()
@@ -1736,7 +1752,7 @@ class OCRSample:
     text: str
 
 
-class OCRManifestDataset(Dataset):
+class OCRLineDataset(Dataset):
     def __init__(
         self,
         rows: Sequence[Dict[str, object]],
@@ -1749,6 +1765,7 @@ class OCRManifestDataset(Dataset):
         target_end_token: str = "",
         target_end_token_id: Optional[int] = None,
         manifest_path: Optional[Path] = None,
+        is_train: bool = False,
     ):
         self.samples: List[OCRSample] = []
         self.stats: Dict[str, int] = {
@@ -1807,7 +1824,7 @@ class OCRManifestDataset(Dataset):
         self.image_processor = image_processor
         self.tokenizer = tokenizer
         self.max_target_length = int(max_target_length)
-        self.image_preprocess_pipeline = str(image_preprocess_pipeline or "none")
+        self.preprocess_mode = str(image_preprocess_pipeline or "none").strip().lower()
         self.target_start_token = str(target_start_token or "")
         self.target_end_token = str(target_end_token or "")
         self.target_end_token_id = (
@@ -1815,6 +1832,114 @@ class OCRManifestDataset(Dataset):
             if target_end_token_id is not None
             else None
         )
+        self.split = "train" if bool(is_train) else "val"
+        self._line_preprocess_cfg = RGBLinePreprocessConfig.vit_defaults()
+        self.train_rgb_aug = None
+        if self.split == "train" and A is not None:
+            try:
+                coarse_dropout = A.CoarseDropout(
+                    num_holes_range=(6, 24),
+                    hole_height_range=(1, 3),
+                    hole_width_range=(1, 3),
+                    fill=255,
+                    p=0.35,
+                )
+            except TypeError:
+                coarse_dropout = A.CoarseDropout(
+                    min_holes=6,
+                    max_holes=24,
+                    min_height=1,
+                    max_height=3,
+                    min_width=1,
+                    max_width=3,
+                    fill_value=255,
+                    p=0.35,
+                )
+
+            try:
+                gauss_noise = A.GaussNoise(
+                    std_range=(0.01, 0.05),
+                    mean_range=(0.0, 0.0),
+                    per_channel=True,
+                    p=0.35,
+                )
+            except TypeError:
+                gauss_noise = A.GaussNoise(
+                    var_limit=(10.0, 50.0),
+                    mean=0.0,
+                    per_channel=True,
+                    p=0.35,
+                )
+
+            try:
+                elastic = A.ElasticTransform(
+                    alpha=1.0,
+                    sigma=20.0,
+                    alpha_affine=0.0,
+                    p=0.35,
+                )
+            except TypeError:
+                elastic = A.ElasticTransform(alpha=1.0, sigma=20.0, p=0.35)
+
+            color_profile_transforms: List[object] = [
+                A.RGBShift(r_shift_limit=14, g_shift_limit=10, b_shift_limit=8, p=1.0)
+            ]
+            if hasattr(A, "FancyPCA"):
+                color_profile_transforms.insert(0, A.FancyPCA(alpha=0.08, p=1.0))
+            color_profile_shift = A.OneOf(color_profile_transforms, p=0.4)
+
+            self.train_rgb_aug = A.Compose(
+                [
+                    # 1) Ink texture and bleed.
+                    A.GaussianBlur(blur_limit=(3, 3), p=0.3),
+                    elastic,
+                    coarse_dropout,
+
+                    # 2) Paper and background.
+                    A.HueSaturationValue(
+                        hue_shift_limit=10,
+                        sat_shift_limit=20,
+                        val_shift_limit=12,
+                        p=0.4,
+                    ),
+                    A.RandomBrightnessContrast(
+                        brightness_limit=0.2,
+                        contrast_limit=0.2,
+                        p=0.4,
+                    ),
+                    gauss_noise,
+                    color_profile_shift,
+
+                    # 3) Slight scan skew geometry (keep very mild).
+                    A.ShiftScaleRotate(
+                        shift_limit=0.01,
+                        scale_limit=0.02,
+                        rotate_limit=1.0,
+                        p=0.35,
+                    ),
+                ]
+            )
+        elif self.split == "train":
+            LOGGER.warning(
+                "Albumentations is not available; RGB train-time line augmentation is disabled."
+            )
+        self._image_processor_call_kwargs: Dict[str, object] = {"return_tensors": "pt"}
+        if hasattr(self.image_processor, "do_pad"):
+            candidate_kwargs = {
+                "do_pad": True,
+                "random_padding": False,
+                "do_resize": False,
+                "do_thumbnail": True,
+            }
+            try:
+                sig = inspect.signature(self.image_processor.__call__)
+                params = sig.parameters
+                has_var_kw = any(p.kind == inspect.Parameter.VAR_KEYWORD for p in params.values())
+                for key, val in candidate_kwargs.items():
+                    if has_var_kw or key in params:
+                        self._image_processor_call_kwargs[key] = val
+            except Exception:
+                self._image_processor_call_kwargs.update(candidate_kwargs)
         self._truncation_warned = False
 
     def __len__(self) -> int:
@@ -1824,8 +1949,21 @@ class OCRManifestDataset(Dataset):
         sample = self.samples[idx]
         with Image.open(sample.image_path) as img:
             rgb = img.convert("RGB")
-        rgb = _apply_image_preprocess_pipeline(rgb, self.image_preprocess_pipeline)
-        pixel_values = self.image_processor(images=rgb, return_tensors="pt").pixel_values.squeeze(0)
+        if self.preprocess_mode == "rgb":
+            rgb = preprocess_image_rgb_lines(image=rgb, config=self._line_preprocess_cfg).convert("RGB")
+        else:
+            rgb = _apply_image_preprocess_pipeline(rgb, self.preprocess_mode)
+
+        if (
+            self.split == "train"
+            and self.train_rgb_aug is not None
+            and self.preprocess_mode in {"rgb", "gray"}
+        ):
+            rgb_np = np.asarray(rgb, dtype=np.uint8)
+            rgb_np = self.train_rgb_aug(image=rgb_np)["image"]
+            rgb = Image.fromarray(rgb_np, mode="RGB")
+        proc_out = self.image_processor(images=rgb, **self._image_processor_call_kwargs)
+        pixel_values = proc_out.pixel_values.squeeze(0)
         target_text = _format_ocr_target_text(
             sample.text,
             start_token=self.target_start_token,
@@ -1854,6 +1992,9 @@ class OCRManifestDataset(Dataset):
             "pixel_values": pixel_values,
             "labels": labels,
         }
+
+
+OCRManifestDataset = OCRLineDataset
 
 
 class OCRDataCollator:
@@ -2191,7 +2332,7 @@ def run(args) -> Dict[str, object]:
         ",".join(str(int(x)) for x in suppress_start_ids) if suppress_start_ids else "n/a",
     )
 
-    train_dataset = OCRManifestDataset(
+    train_dataset = OCRLineDataset(
         train_rows,
         image_processor=image_processor,
         tokenizer=tokenizer,
@@ -2201,8 +2342,9 @@ def run(args) -> Dict[str, object]:
         target_end_token=str(task_end_token),
         target_end_token_id=task_end_id,
         manifest_path=train_manifest,
+        is_train=True,
     )
-    val_dataset = OCRManifestDataset(
+    val_dataset = OCRLineDataset(
         val_rows,
         image_processor=image_processor,
         tokenizer=tokenizer,
@@ -2212,6 +2354,7 @@ def run(args) -> Dict[str, object]:
         target_end_token=str(task_end_token),
         target_end_token_id=task_end_id,
         manifest_path=val_manifest,
+        is_train=False,
     ) if val_rows else None
 
     LOGGER.info("Train dataset size: %d", len(train_dataset))
