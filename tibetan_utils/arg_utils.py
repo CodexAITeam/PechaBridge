@@ -1084,6 +1084,10 @@ def add_train_donut_ocr_arguments(parser):
                        help='Enable bf16 training')
     parser.add_argument('--metric_newline_token', type=str, choices=['<NL>', '\\n'], default='<NL>',
                        help='Newline token normalization used for CER computation')
+    parser.add_argument('--report_to', type=str, default='none',
+                       help='Comma-separated trainer integrations (e.g. "trackio,tensorboard"); use "none" to disable')
+    parser.add_argument('--run_name', type=str, default='',
+                       help='Optional run name for experiment tracking backends')
     parser.add_argument('--debug_train_decode_every_steps', '--debug-train-decode-every-steps', dest='debug_train_decode_every_steps', type=int, default=100,
                        help='Log compact train_decode preview every N train steps when enabled (default: 100)')
     parser.add_argument('--enable_train_decode_preview', '--enable-train-decode-preview', dest='enable_train_decode_preview', action='store_true',
@@ -1141,6 +1145,10 @@ def add_run_donut_ocr_workflow_arguments(parser):
     parser.add_argument('--image_preprocess_pipeline', '--image-preprocess-pipeline', dest='image_preprocess_pipeline', type=str,
                        default='none', choices=['none', 'pb', 'bdrc', 'gray', 'rgb'],
                        help='Optional deterministic image preprocessing before Donut image processor in workflow train step')
+    parser.add_argument('--report_to', type=str, default='none',
+                       help='Comma-separated trainer integrations for workflow train step (e.g. "trackio")')
+    parser.add_argument('--run_name', type=str, default='',
+                       help='Optional run name for workflow train step')
     parser.add_argument('--seed', type=int, default=42,
                        help='Random seed')
     parser.add_argument('--skip_generation', action='store_true',

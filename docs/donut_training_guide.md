@@ -318,7 +318,38 @@ Hinweis:
 
 ---
 
-## 11) Diagnose-Checkliste bei Problemen
+## 11) Smartphone Monitoring mit Trackio (SaaS)
+
+Wenn du W&B vermeiden willst, kannst du ohne eigenes Hosting Trackio nutzen.
+
+1. Training mit Tracking starten:
+
+```bash
+export TRACKIO_SPACE_ID="dein-hf-user/dein-trackio-space"
+export TRACKIO_PROJECT_NAME="donut-full-ocr"
+
+CUDA_VISIBLE_DEVICES=0 python cli.py train-donut-ocr \
+  ... \
+  --report_to trackio \
+  --run_name gray_gpu0_fullrun
+```
+
+2. Zweiten Run eindeutig benennen:
+
+```bash
+CUDA_VISIBLE_DEVICES=1 python cli.py train-donut-ocr \
+  ... \
+  --report_to trackio \
+  --run_name rgb_gpu1_fullrun
+```
+
+3. Am Smartphone:
+- HF Space URL oeffnen (`https://huggingface.co/spaces/<user>/<space>`),
+- im gleichen Projekt die Runs `gray_gpu0_fullrun` und `rgb_gpu1_fullrun` direkt vergleichen.
+
+---
+
+## 12) Diagnose-Checkliste bei Problemen
 
 Wenn Training instabil wird, in dieser Reihenfolge pruefen:
 
@@ -347,7 +378,7 @@ Wenn Training instabil wird, in dieser Reihenfolge pruefen:
 
 ---
 
-## 12) Praktische Empfehlungen fuer stabile Runs
+## 13) Praktische Empfehlungen fuer stabile Runs
 
 1. Immer zuerst Tiny-Run pro Pipeline (`gray`, `rgb`).
 2. Full-Runs aus stabilem Tiny-Checkpoint starten, nicht blind from scratch.
@@ -357,7 +388,7 @@ Wenn Training instabil wird, in dieser Reihenfolge pruefen:
 
 ---
 
-## 13) Kurzfazit
+## 14) Kurzfazit
 
 Tiny-Pretraining ist in diesem Setup die wichtigste Schutzmassnahme gegen:
 

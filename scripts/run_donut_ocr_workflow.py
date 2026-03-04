@@ -182,6 +182,8 @@ def run(args) -> Dict[str, object]:
             fp16=False,
             bf16=False,
             metric_newline_token="<NL>" if str(args.target_newline_token) == "<NL>" else "\\n",
+            report_to=str(getattr(args, "report_to", "none") or "none"),
+            run_name=str(getattr(args, "run_name", "") or ""),
             resume_from_checkpoint="",
         )
         train_summary = run_train_donut_ocr(train_args)

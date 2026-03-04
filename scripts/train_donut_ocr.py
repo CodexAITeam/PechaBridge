@@ -5,6 +5,7 @@ from __future__ import annotations
 
 import json
 import inspect
+import importlib
 import logging
 import os
 import random
@@ -1670,6 +1671,50 @@ def _image_preprocess_pipeline_name(args) -> str:
     return mode
 
 
+def _parse_report_to(raw_value: object) -> List[str]:
+    txt = str(raw_value or "").strip()
+    if not txt:
+        return []
+    parts = [p.strip().lower() for p in re.split(r"[,\s;]+", txt) if p.strip()]
+    if not parts:
+        return []
+    if any(p in {"none", "off", "false", "0"} for p in parts):
+        return []
+    if "all" in parts:
+        return ["all"]
+    dedup: List[str] = []
+    seen = set()
+    for p in parts:
+        if p not in seen:
+            dedup.append(p)
+            seen.add(p)
+    return dedup
+
+
+def _validate_report_to_backends(report_to: Sequence[str]) -> None:
+    backends = [str(x).strip().lower() for x in (report_to or []) if str(x).strip()]
+    if "trackio" in backends:
+        try:
+            importlib.import_module("trackio")
+        except Exception as exc:
+            raise RuntimeError(
+                "report_to includes 'trackio' but package 'trackio' is not importable. "
+                "Install it with `pip install -U trackio` and retry."
+            ) from exc
+        space = str(os.environ.get("TRACKIO_SPACE_ID", "")).strip()
+        proj = str(os.environ.get("TRACKIO_PROJECT_NAME", "")).strip()
+        if not space:
+            LOGGER.warning(
+                "report_to=trackio enabled, but TRACKIO_SPACE_ID is not set. "
+                "Set TRACKIO_SPACE_ID to your HF Space id for hosted dashboards."
+            )
+        LOGGER.info(
+            "Trackio logging enabled | TRACKIO_SPACE_ID=%s | TRACKIO_PROJECT_NAME=%s",
+            space or "<unset>",
+            proj or "<unset>",
+        )
+
+
 def _apply_image_preprocess_pipeline(image: Image.Image, pipeline: str) -> Image.Image:
     mode = str(pipeline or "none").strip().lower()
     if mode == "pb":
@@ -2492,6 +2537,13 @@ def run(args) -> Dict[str, object]:
         }
 
     has_eval = val_dataset is not None and len(val_dataset) > 0
+    report_to = _parse_report_to(getattr(args, "report_to", "none"))
+    _validate_report_to_backends(report_to)
+    run_name = str(getattr(args, "run_name", "") or "").strip()
+    LOGGER.info("Trainer reporting backends: %s", report_to if report_to else ["none"])
+    if run_name:
+        LOGGER.info("Trainer run_name: %s", run_name)
+
     ta_kwargs = dict(
         output_dir=str(output_dir),
         per_device_train_batch_size=int(args.per_device_train_batch_size),
@@ -2512,7 +2564,7 @@ def run(args) -> Dict[str, object]:
         fp16=bool(args.fp16),
         bf16=bool(args.bf16),
         remove_unused_columns=False,
-        report_to=[],
+        report_to=report_to,
         disable_tqdm=False,
         save_strategy="steps",
         load_best_model_at_end=bool(has_eval),
@@ -2520,6 +2572,8 @@ def run(args) -> Dict[str, object]:
         greater_is_better=False if has_eval else None,
     )
     ta_sig = inspect.signature(Seq2SeqTrainingArguments.__init__)
+    if run_name and "run_name" in ta_sig.parameters:
+        ta_kwargs["run_name"] = run_name
     if "data_seed" in ta_sig.parameters:
         ta_kwargs["data_seed"] = int(args.seed)
     if "full_determinism" in ta_sig.parameters:

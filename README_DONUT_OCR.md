@@ -31,6 +31,11 @@ Use either:
 - `python cli.py train-donut-ocr ...` (recommended)
 - or `python scripts/train_donut_ocr.py ...`
 
+Optional experiment tracking flags:
+
+- `--report_to trackio` (or comma-separated integrations)
+- `--run_name <name>` for clear run separation (e.g. gray vs rgb)
+
 ## Example (OpenPecha OCR Lines)
 
 ```bash
