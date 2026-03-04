@@ -1924,22 +1924,6 @@ class OCRLineDataset(Dataset):
                 "Albumentations is not available; RGB train-time line augmentation is disabled."
             )
         self._image_processor_call_kwargs: Dict[str, object] = {"return_tensors": "pt"}
-        if hasattr(self.image_processor, "do_pad"):
-            candidate_kwargs = {
-                "do_pad": True,
-                "random_padding": False,
-                "do_resize": False,
-                "do_thumbnail": True,
-            }
-            try:
-                sig = inspect.signature(self.image_processor.__call__)
-                params = sig.parameters
-                has_var_kw = any(p.kind == inspect.Parameter.VAR_KEYWORD for p in params.values())
-                for key, val in candidate_kwargs.items():
-                    if has_var_kw or key in params:
-                        self._image_processor_call_kwargs[key] = val
-            except Exception:
-                self._image_processor_call_kwargs.update(candidate_kwargs)
         self._truncation_warned = False
 
     def __len__(self) -> int:
