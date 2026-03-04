@@ -1946,7 +1946,10 @@ class OCRLineDataset(Dataset):
             rgb_np = np.asarray(rgb, dtype=np.uint8)
             rgb_np = self.train_rgb_aug(image=rgb_np)["image"]
             rgb = Image.fromarray(rgb_np, mode="RGB")
-        proc_out = self.image_processor(images=rgb, **self._image_processor_call_kwargs)
+        if hasattr(self.image_processor, "preprocess"):
+            proc_out = self.image_processor.preprocess(images=rgb, **self._image_processor_call_kwargs)
+        else:
+            proc_out = self.image_processor(images=rgb, **self._image_processor_call_kwargs)
         pixel_values = proc_out.pixel_values.squeeze(0)
         target_text = _format_ocr_target_text(
             sample.text,
