@@ -874,6 +874,28 @@ class DonutDebugSeq2SeqTrainer(Seq2SeqTrainer):
             self._inference_started_at = 0.0
         return out
 
+    def training_step(self, model, inputs, *args, **kwargs):  # type: ignore[override]
+        if self.is_world_process_zero():
+            batch_idx = int(self._train_batches_seen) + 1
+            if batch_idx == 1 or (batch_idx % int(self._train_running_log_every_batches) == 0):
+                LOGGER.info(
+                    "train_step_start | global_step=%d train_batch=%d device=%s",
+                    int(getattr(self.state, "global_step", 0) or 0),
+                    int(batch_idx),
+                    self._resolve_runtime_device(model, inputs if isinstance(inputs, dict) else None),
+                )
+        out = super().training_step(model, inputs, *args, **kwargs)
+        if self.is_world_process_zero():
+            batch_idx_done = int(self._train_batches_seen)
+            if batch_idx_done == 1 or (batch_idx_done % int(self._train_running_log_every_batches) == 0):
+                LOGGER.info(
+                    "train_step_done | global_step=%d train_batch=%d device=%s",
+                    int(getattr(self.state, "global_step", 0) or 0),
+                    int(batch_idx_done),
+                    self._resolve_runtime_device(model, inputs if isinstance(inputs, dict) else None),
+                )
+        return out
+
     def prediction_step(self, model, inputs, prediction_loss_only, ignore_keys=None):  # type: ignore[override]
         if self._inference_active and self.is_world_process_zero():
             self._inference_batches_seen += 1
