@@ -1988,9 +1988,42 @@ class OCRDataCollator:
     def __init__(self, tokenizer):
         self.tokenizer = tokenizer
         self._sanity_logged = False
+        self._pixel_pad_logged = False
+
+    def _stack_or_pad_pixel_values(self, features: Sequence[Dict[str, object]]) -> torch.Tensor:
+        pix_tensors = [item["pixel_values"] for item in features]
+        if not pix_tensors:
+            return torch.empty(0)
+        base_shape = tuple(int(d) for d in pix_tensors[0].shape)
+        if all(tuple(int(d) for d in t.shape) == base_shape for t in pix_tensors):
+            return torch.stack(pix_tensors)
+
+        channels = int(pix_tensors[0].shape[0])
+        max_h = max(int(t.shape[-2]) for t in pix_tensors)
+        max_w = max(int(t.shape[-1]) for t in pix_tensors)
+        out = pix_tensors[0].new_zeros((len(pix_tensors), channels, max_h, max_w))
+        for i, t in enumerate(pix_tensors):
+            if t.ndim != 3:
+                raise RuntimeError(f"Expected pixel_values tensor with shape [C,H,W], got {tuple(t.shape)}")
+            c, h, w = (int(t.shape[0]), int(t.shape[1]), int(t.shape[2]))
+            if c != channels:
+                raise RuntimeError(
+                    f"Inconsistent channel counts in pixel_values: expected {channels}, got {c} at batch index {i}"
+                )
+            out[i, :, :h, :w] = t
+        if not self._pixel_pad_logged:
+            self._pixel_pad_logged = True
+            LOGGER.info(
+                "pixel_values batch padding enabled | padded_to=[C=%d,H=%d,W=%d] batch=%d",
+                int(channels),
+                int(max_h),
+                int(max_w),
+                int(len(pix_tensors)),
+            )
+        return out
 
     def __call__(self, features: Sequence[Dict[str, object]]) -> Dict[str, torch.Tensor]:
-        pixel_values = torch.stack([item["pixel_values"] for item in features])
+        pixel_values = self._stack_or_pad_pixel_values(features)
         label_inputs = [item["labels"] for item in features]
         padded_pack = self.tokenizer.pad(
             {"input_ids": label_inputs},
