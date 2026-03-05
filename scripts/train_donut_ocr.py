@@ -566,6 +566,27 @@ def _dist_barrier() -> None:
         pass
 
 
+def _dist_runtime_summary() -> Dict[str, object]:
+    out: Dict[str, object] = {
+        "dist_initialized": bool(_dist_is_initialized()),
+        "rank": 0,
+        "world_size": 1,
+        "local_rank_env": str(os.environ.get("LOCAL_RANK", "")),
+        "rank_env": str(os.environ.get("RANK", "")),
+        "world_size_env": str(os.environ.get("WORLD_SIZE", "")),
+    }
+    if _dist_is_initialized():
+        try:
+            out["rank"] = int(torch.distributed.get_rank())
+        except Exception:
+            pass
+        try:
+            out["world_size"] = int(torch.distributed.get_world_size())
+        except Exception:
+            pass
+    return out
+
+
 class DonutProgressCallback(ProgressCallback):
     """Progress bar callback that also shows compact train/eval metrics in TQDM postfix."""
 
@@ -877,15 +898,36 @@ class DonutDebugSeq2SeqTrainer(Seq2SeqTrainer):
             self._train_batches_seen += 1
             n = int(self._train_batches_seen)
             if n == 1 or (n % int(self._train_running_log_every_batches) == 0):
+                pixel_values = inputs.get("pixel_values") if isinstance(inputs, dict) else None
+                labels = inputs.get("labels") if isinstance(inputs, dict) else None
+                pv_shape = tuple(int(x) for x in pixel_values.shape) if torch.is_tensor(pixel_values) else None
+                lb_shape = tuple(int(x) for x in labels.shape) if torch.is_tensor(labels) else None
                 LOGGER.info(
-                    "train_running | global_step=%d train_batch=%d grad_accum=%d device=%s",
+                    "train_running | global_step=%d train_batch=%d grad_accum=%d device=%s pixel_values_shape=%s labels_shape=%s",
                     int(getattr(self.state, "global_step", 0) or 0),
                     n,
                     int(getattr(self.args, "gradient_accumulation_steps", 1) or 1),
                     self._resolve_runtime_device(model, inputs if isinstance(inputs, dict) else None),
+                    str(pv_shape),
+                    str(lb_shape),
+                )
+                LOGGER.info(
+                    "train_fwd_bwd_start | global_step=%d train_batch=%d device=%s",
+                    int(getattr(self.state, "global_step", 0) or 0),
+                    n,
+                    self._resolve_runtime_device(model, inputs if isinstance(inputs, dict) else None),
                 )
 
         out = super().compute_loss(model, inputs, return_outputs=True, **kwargs)
+        if self.is_world_process_zero():
+            n = int(self._train_batches_seen)
+            if n == 1 or (n % int(self._train_running_log_every_batches) == 0):
+                LOGGER.info(
+                    "train_fwd_bwd_done | global_step=%d train_batch=%d device=%s",
+                    int(getattr(self.state, "global_step", 0) or 0),
+                    n,
+                    self._resolve_runtime_device(model, inputs if isinstance(inputs, dict) else None),
+                )
         if isinstance(out, tuple) and len(out) == 2:
             loss, outputs = out
         else:
@@ -2457,6 +2499,7 @@ def _char_error_rate(preds: Sequence[str], refs: Sequence[str], newline_token: s
 def run(args) -> Dict[str, object]:
     _configure_logging()
     _configure_determinism(int(args.seed))
+    LOGGER.info("Distributed runtime: %s", json.dumps(_dist_runtime_summary(), ensure_ascii=False))
     if bool(getattr(args, "fp16", False)) and bool(getattr(args, "bf16", False)):
         raise ValueError("Only one of --fp16 / --bf16 can be enabled.")
 
