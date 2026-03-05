@@ -799,6 +799,8 @@ class DonutDebugSeq2SeqTrainer(Seq2SeqTrainer):
         self._inference_batches_seen = 0
         self._inference_started_at = 0.0
         self._inference_log_every_batches = 50
+        self._train_batches_seen = 0
+        self._train_running_log_every_batches = 50
 
     @staticmethod
     def _resolve_runtime_device(model, inputs: Optional[Dict[str, object]] = None) -> str:
@@ -871,6 +873,18 @@ class DonutDebugSeq2SeqTrainer(Seq2SeqTrainer):
         )
 
     def compute_loss(self, model, inputs, return_outputs=False, **kwargs):  # type: ignore[override]
+        if self.is_world_process_zero():
+            self._train_batches_seen += 1
+            n = int(self._train_batches_seen)
+            if n == 1 or (n % int(self._train_running_log_every_batches) == 0):
+                LOGGER.info(
+                    "train_running | global_step=%d train_batch=%d grad_accum=%d device=%s",
+                    int(getattr(self.state, "global_step", 0) or 0),
+                    n,
+                    int(getattr(self.args, "gradient_accumulation_steps", 1) or 1),
+                    self._resolve_runtime_device(model, inputs if isinstance(inputs, dict) else None),
+                )
+
         out = super().compute_loss(model, inputs, return_outputs=True, **kwargs)
         if isinstance(out, tuple) and len(out) == 2:
             loss, outputs = out
@@ -3145,7 +3159,25 @@ def run(args) -> Dict[str, object]:
                 raise
             LOGGER.warning("Resume checkpoint probe failed (continuing with training): %s", exc)
 
+    LOGGER.info(
+        "train_start | train_samples=%d val_samples=%d logging_steps=%d eval_steps=%d save_steps=%d grad_accum=%d num_workers=%d predict_with_generate=%s",
+        int(len(train_dataset)),
+        int(len(val_dataset)) if val_dataset is not None else 0,
+        int(getattr(args, "logging_steps", 0) or 0),
+        int(getattr(args, "eval_steps", 0) or 0),
+        int(getattr(args, "save_steps", 0) or 0),
+        int(getattr(args, "gradient_accumulation_steps", 1) or 1),
+        int(getattr(args, "num_workers", 0) or 0),
+        bool(getattr(training_args, "predict_with_generate", False)),
+    )
+    train_started_at = time.perf_counter()
     train_result = trainer.train(resume_from_checkpoint=args.resume_from_checkpoint or None)
+    train_elapsed_s = float(time.perf_counter() - train_started_at)
+    LOGGER.info(
+        "train_done | elapsed_s=%.2f global_step=%d",
+        train_elapsed_s,
+        int(getattr(trainer.state, "global_step", 0) or 0),
+    )
     trainer.save_model(str(output_dir / "model"))
     if _is_primary_process_runtime():
         tokenizer.save_pretrained(str(output_dir / "tokenizer"))
