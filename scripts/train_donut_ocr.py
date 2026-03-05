@@ -12,6 +12,7 @@ import random
 import re
 import shutil
 import sys
+import time
 import unicodedata
 from collections import Counter
 from dataclasses import dataclass
@@ -22,7 +23,7 @@ import numpy as np
 import torch
 import torch.nn as nn
 from PIL import Image
-from torch.utils.data import Dataset, Subset
+from torch.utils.data import Dataset, Subset, get_worker_info
 try:
     import albumentations as A
 except Exception:  # pragma: no cover - optional runtime dependency
@@ -1773,6 +1774,10 @@ class OCRLineDataset(Dataset):
         target_end_token_id: Optional[int] = None,
         manifest_path: Optional[Path] = None,
         is_train: bool = False,
+        profile_preprocess_pipeline: bool = False,
+        profile_preprocess_every_n: int = 200,
+        profile_preprocess_trace_n: int = 0,
+        profile_preprocess_slow_ms: float = 800.0,
     ):
         self.samples: List[OCRSample] = []
         self.stats: Dict[str, int] = {
@@ -1841,8 +1846,18 @@ class OCRLineDataset(Dataset):
         )
         self.split = "train" if bool(is_train) else "val"
         self._line_preprocess_cfg = RGBLinePreprocessConfig.vit_defaults()
+        self._profile_preprocess_pipeline = bool(profile_preprocess_pipeline)
+        self._profile_preprocess_every_n = max(1, int(profile_preprocess_every_n))
+        self._profile_preprocess_trace_n = max(0, int(profile_preprocess_trace_n))
+        self._profile_preprocess_slow_ms = max(1.0, float(profile_preprocess_slow_ms))
+        self._profile_seen = 0
+        self._profile_trace_emitted = 0
+        self._profile_totals_ms: Dict[str, float] = {}
+        self._profile_workers_seen: set[int] = set()
         self.train_rgb_aug = None
+        self.train_rgb_aug_steps: List[Tuple[str, object]] = []
         if self.split == "train" and A is not None:
+            blur = A.GaussianBlur(blur_limit=(3, 3), p=0.3)
             try:
                 coarse_dropout = A.CoarseDropout(
                     num_holes_range=(6, 24),
@@ -1894,70 +1909,230 @@ class OCRLineDataset(Dataset):
             if hasattr(A, "FancyPCA"):
                 color_profile_transforms.insert(0, A.FancyPCA(alpha=0.08, p=1.0))
             color_profile_shift = A.OneOf(color_profile_transforms, p=0.4)
+            hue_sat_val = A.HueSaturationValue(
+                hue_shift_limit=10,
+                sat_shift_limit=20,
+                val_shift_limit=12,
+                p=0.4,
+            )
+            rand_brightness_contrast = A.RandomBrightnessContrast(
+                brightness_limit=0.2,
+                contrast_limit=0.2,
+                p=0.4,
+            )
+            mild_geometry = A.ShiftScaleRotate(
+                shift_limit=0.01,
+                scale_limit=0.02,
+                rotate_limit=1.0,
+                p=0.35,
+            )
 
+            self.train_rgb_aug_steps = [
+                ("gaussian_blur", blur),
+                ("elastic_transform", elastic),
+                ("coarse_dropout", coarse_dropout),
+                ("hue_saturation_value", hue_sat_val),
+                ("random_brightness_contrast", rand_brightness_contrast),
+                ("gauss_noise", gauss_noise),
+                ("color_profile_shift", color_profile_shift),
+                ("shift_scale_rotate", mild_geometry),
+            ]
             self.train_rgb_aug = A.Compose(
                 [
                     # 1) Ink texture and bleed.
-                    A.GaussianBlur(blur_limit=(3, 3), p=0.3),
+                    blur,
                     elastic,
                     coarse_dropout,
-
                     # 2) Paper and background.
-                    A.HueSaturationValue(
-                        hue_shift_limit=10,
-                        sat_shift_limit=20,
-                        val_shift_limit=12,
-                        p=0.4,
-                    ),
-                    A.RandomBrightnessContrast(
-                        brightness_limit=0.2,
-                        contrast_limit=0.2,
-                        p=0.4,
-                    ),
+                    hue_sat_val,
+                    rand_brightness_contrast,
                     gauss_noise,
                     color_profile_shift,
-
                     # 3) Slight scan skew geometry (keep very mild).
-                    A.ShiftScaleRotate(
-                        shift_limit=0.01,
-                        scale_limit=0.02,
-                        rotate_limit=1.0,
-                        p=0.35,
-                    ),
+                    mild_geometry,
                 ]
             )
         elif self.split == "train":
             LOGGER.warning(
                 "Albumentations is not available; RGB train-time line augmentation is disabled."
             )
+        if self._profile_preprocess_pipeline:
+            LOGGER.warning(
+                "Dataset preprocess profiling enabled | split=%s every_n=%d trace_n=%d slow_ms=%.1f",
+                self.split,
+                int(self._profile_preprocess_every_n),
+                int(self._profile_preprocess_trace_n),
+                float(self._profile_preprocess_slow_ms),
+            )
         self._image_processor_call_kwargs: Dict[str, object] = {"return_tensors": "pt"}
         self._truncation_warned = False
+
+    def _profile_worker_id(self) -> int:
+        wi = get_worker_info()
+        return int(wi.id) if wi is not None else 0
+
+    @staticmethod
+    def _format_timings(timings: Dict[str, float], *, include_total: bool = True) -> str:
+        keys = sorted(k for k in timings.keys() if include_total or k != "total_ms")
+        return " ".join(f"{k}={float(timings[k]):.2f}ms" for k in keys)
+
+    def _record_preprocess_profile(
+        self,
+        *,
+        idx: int,
+        worker_id: int,
+        timings: Dict[str, float],
+        trace_steps: bool,
+    ) -> None:
+        if not self._profile_preprocess_pipeline:
+            return
+
+        self._profile_seen += 1
+        for key, val in timings.items():
+            self._profile_totals_ms[key] = float(self._profile_totals_ms.get(key, 0.0)) + float(val)
+
+        if worker_id not in self._profile_workers_seen:
+            self._profile_workers_seen.add(int(worker_id))
+            LOGGER.info(
+                "preproc_profiler_worker_ready | split=%s worker=%d",
+                self.split,
+                int(worker_id),
+            )
+
+        total_ms = float(timings.get("total_ms", 0.0))
+        if total_ms >= float(self._profile_preprocess_slow_ms):
+            LOGGER.warning(
+                "preproc_slow_sample | split=%s worker=%d idx=%d %s",
+                self.split,
+                int(worker_id),
+                int(idx),
+                self._format_timings(timings),
+            )
+
+        if trace_steps and self._profile_trace_emitted < self._profile_preprocess_trace_n:
+            self._profile_trace_emitted += 1
+            LOGGER.info(
+                "preproc_trace_sample | split=%s worker=%d idx=%d %s",
+                self.split,
+                int(worker_id),
+                int(idx),
+                self._format_timings(timings),
+            )
+
+        if self._profile_seen % int(self._profile_preprocess_every_n) == 0:
+            denom = float(max(1, self._profile_seen))
+            avg = {k: float(v) / denom for k, v in self._profile_totals_ms.items()}
+            LOGGER.info(
+                "preproc_profile_avg | split=%s worker=%d seen=%d %s",
+                self.split,
+                int(worker_id),
+                int(self._profile_seen),
+                self._format_timings(avg),
+            )
 
     def __len__(self) -> int:
         return len(self.samples)
 
     def __getitem__(self, idx: int) -> Dict[str, object]:
         sample = self.samples[idx]
+        timings: Dict[str, float] = {}
+        worker_id = 0
+        trace_steps = False
+        item_start = 0.0
+        if self._profile_preprocess_pipeline:
+            worker_id = self._profile_worker_id()
+            trace_steps = self._profile_trace_emitted < self._profile_preprocess_trace_n
+            item_start = time.perf_counter()
+
         with Image.open(sample.image_path) as img:
+            t_open = time.perf_counter() if self._profile_preprocess_pipeline else 0.0
             rgb = img.convert("RGB")
+            if self._profile_preprocess_pipeline:
+                timings["open_and_convert_ms"] = (time.perf_counter() - t_open) * 1000.0
+
+        if trace_steps:
+            LOGGER.info("preproc_step_start | split=%s worker=%d idx=%d step=image_preprocess", self.split, int(worker_id), int(idx))
+
+        t_pre = time.perf_counter() if self._profile_preprocess_pipeline else 0.0
         if self.preprocess_mode == "rgb":
             rgb = preprocess_image_rgb_lines(image=rgb, config=self._line_preprocess_cfg).convert("RGB")
         else:
             rgb = _apply_image_preprocess_pipeline(rgb, self.preprocess_mode)
+        if self._profile_preprocess_pipeline:
+            timings["image_preprocess_ms"] = (time.perf_counter() - t_pre) * 1000.0
+        if trace_steps:
+            LOGGER.info("preproc_step_done | split=%s worker=%d idx=%d step=image_preprocess", self.split, int(worker_id), int(idx))
 
         if (
             self.split == "train"
             and self.train_rgb_aug is not None
             and self.preprocess_mode in {"rgb", "gray"}
         ):
-            rgb_np = np.asarray(rgb, dtype=np.uint8)
-            rgb_np = self.train_rgb_aug(image=rgb_np)["image"]
-            rgb = Image.fromarray(rgb_np, mode="RGB")
+            if trace_steps:
+                LOGGER.info("preproc_step_start | split=%s worker=%d idx=%d step=train_aug", self.split, int(worker_id), int(idx))
+
+            if self._profile_preprocess_pipeline:
+                t_np = time.perf_counter()
+                rgb_np = np.asarray(rgb, dtype=np.uint8)
+                timings["to_numpy_ms"] = (time.perf_counter() - t_np) * 1000.0
+
+                if self.train_rgb_aug_steps:
+                    aug_total = 0.0
+                    for aug_name, aug_transform in self.train_rgb_aug_steps:
+                        if trace_steps:
+                            LOGGER.info(
+                                "preproc_step_start | split=%s worker=%d idx=%d step=aug_%s",
+                                self.split,
+                                int(worker_id),
+                                int(idx),
+                                str(aug_name),
+                            )
+                        t_aug = time.perf_counter()
+                        rgb_np = aug_transform(image=rgb_np)["image"]
+                        dt_aug = (time.perf_counter() - t_aug) * 1000.0
+                        timings[f"aug_{aug_name}_ms"] = dt_aug
+                        aug_total += dt_aug
+                        if trace_steps:
+                            LOGGER.info(
+                                "preproc_step_done | split=%s worker=%d idx=%d step=aug_%s",
+                                self.split,
+                                int(worker_id),
+                                int(idx),
+                                str(aug_name),
+                            )
+                    timings["aug_total_ms"] = aug_total
+                else:
+                    t_aug = time.perf_counter()
+                    rgb_np = self.train_rgb_aug(image=rgb_np)["image"]
+                    timings["aug_compose_ms"] = (time.perf_counter() - t_aug) * 1000.0
+
+                t_pil = time.perf_counter()
+                rgb = Image.fromarray(rgb_np, mode="RGB")
+                timings["to_pil_ms"] = (time.perf_counter() - t_pil) * 1000.0
+            else:
+                rgb_np = np.asarray(rgb, dtype=np.uint8)
+                rgb_np = self.train_rgb_aug(image=rgb_np)["image"]
+                rgb = Image.fromarray(rgb_np, mode="RGB")
+
+            if trace_steps:
+                LOGGER.info("preproc_step_done | split=%s worker=%d idx=%d step=train_aug", self.split, int(worker_id), int(idx))
+
+        if trace_steps:
+            LOGGER.info("preproc_step_start | split=%s worker=%d idx=%d step=image_processor", self.split, int(worker_id), int(idx))
+        t_proc = time.perf_counter() if self._profile_preprocess_pipeline else 0.0
         if hasattr(self.image_processor, "preprocess"):
             proc_out = self.image_processor.preprocess(images=rgb, **self._image_processor_call_kwargs)
         else:
             proc_out = self.image_processor(images=rgb, **self._image_processor_call_kwargs)
+        if self._profile_preprocess_pipeline:
+            timings["image_processor_ms"] = (time.perf_counter() - t_proc) * 1000.0
+        if trace_steps:
+            LOGGER.info("preproc_step_done | split=%s worker=%d idx=%d step=image_processor", self.split, int(worker_id), int(idx))
         pixel_values = proc_out.pixel_values.squeeze(0)
+
+        if trace_steps:
+            LOGGER.info("preproc_step_start | split=%s worker=%d idx=%d step=target_tokenize", self.split, int(worker_id), int(idx))
+        t_tok = time.perf_counter() if self._profile_preprocess_pipeline else 0.0
         target_text = _format_ocr_target_text(
             sample.text,
             start_token=self.target_start_token,
@@ -1982,6 +2157,17 @@ class OCRLineDataset(Dataset):
                     int(idx),
                     self.target_end_token,
                 )
+        if self._profile_preprocess_pipeline:
+            timings["target_tokenize_ms"] = (time.perf_counter() - t_tok) * 1000.0
+            timings["total_ms"] = (time.perf_counter() - item_start) * 1000.0
+            self._record_preprocess_profile(
+                idx=int(idx),
+                worker_id=int(worker_id),
+                timings=timings,
+                trace_steps=bool(trace_steps),
+            )
+        if trace_steps:
+            LOGGER.info("preproc_step_done | split=%s worker=%d idx=%d step=target_tokenize", self.split, int(worker_id), int(idx))
         return {
             "pixel_values": pixel_values,
             "labels": labels,
@@ -2370,6 +2556,10 @@ def run(args) -> Dict[str, object]:
         target_end_token_id=task_end_id,
         manifest_path=train_manifest,
         is_train=True,
+        profile_preprocess_pipeline=bool(getattr(args, "profile_preprocess_pipeline", False)),
+        profile_preprocess_every_n=int(getattr(args, "profile_preprocess_every_n", 200) or 200),
+        profile_preprocess_trace_n=int(getattr(args, "profile_preprocess_trace_n", 0) or 0),
+        profile_preprocess_slow_ms=float(getattr(args, "profile_preprocess_slow_ms", 800.0) or 800.0),
     )
     val_dataset = OCRLineDataset(
         val_rows,
@@ -2382,6 +2572,10 @@ def run(args) -> Dict[str, object]:
         target_end_token_id=task_end_id,
         manifest_path=val_manifest,
         is_train=False,
+        profile_preprocess_pipeline=bool(getattr(args, "profile_preprocess_pipeline", False)),
+        profile_preprocess_every_n=int(getattr(args, "profile_preprocess_every_n", 200) or 200),
+        profile_preprocess_trace_n=int(getattr(args, "profile_preprocess_trace_n", 0) or 0),
+        profile_preprocess_slow_ms=float(getattr(args, "profile_preprocess_slow_ms", 800.0) or 800.0),
     ) if val_rows else None
 
     LOGGER.info("Train dataset size: %d", len(train_dataset))
