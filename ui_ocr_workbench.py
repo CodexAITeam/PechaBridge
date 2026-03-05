@@ -16,16 +16,27 @@ from ui_workbench import (
     _apply_donut_ui_preprocess,
     _compute_line_projection_state,
     _load_donut_ocr_runtime_cached,
-    _load_donut_repro_bundle_cfg_ui,
     _resolve_donut_runtime_dirs,
     _segment_lines_in_text_crop,
-    run_donut_ocr_inference_ui,
     run_tibetan_text_line_split_classical,
 )
 try:
-    from pechabridge.ocr.preprocess_bdrc import BDRCPreprocessConfig
+    from pechabridge.ocr.preprocess_bdrc import (
+        BDRCPreprocessConfig,
+        preprocess_image_bdrc,
+    )
 except Exception:
     BDRCPreprocessConfig = None
+    preprocess_image_bdrc = None
+
+try:
+    from pechabridge.ocr.preprocess_rgb import (
+        RGBLinePreprocessConfig,
+        preprocess_image_rgb_lines,
+    )
+except Exception:
+    RGBLinePreprocessConfig = None
+    preprocess_image_rgb_lines = None
 
 try:
     import torch
@@ -296,41 +307,102 @@ def _strip_special_token_strings_local(text: str, tokenizer: Any) -> str:
     return out
 
 
+def _normalize_preprocess_preset(value: str) -> str:
+    mode = str(value or "").strip().lower()
+    if mode in {"bdrc_no_bin", "grey"}:
+        mode = "gray"
+    if mode in {"rgb_lines", "rgb_line"}:
+        mode = "rgb"
+    if mode not in {"bdrc", "gray", "rgb"}:
+        mode = "bdrc"
+    return mode
+
+
+def _effective_preprocess_overrides(
+    preprocess_preset: str,
+    bdrc_preprocess_overrides: Optional[Dict[str, Any]] = None,
+    rgb_preprocess_overrides: Optional[Dict[str, Any]] = None,
+) -> Optional[Dict[str, Any]]:
+    mode = _normalize_preprocess_preset(preprocess_preset)
+    if mode == "rgb":
+        if isinstance(rgb_preprocess_overrides, dict) and len(rgb_preprocess_overrides) > 0:
+            return dict(rgb_preprocess_overrides)
+        return None
+    if mode in {"bdrc", "gray"}:
+        out: Dict[str, Any] = {}
+        if isinstance(bdrc_preprocess_overrides, dict) and len(bdrc_preprocess_overrides) > 0:
+            out.update(dict(bdrc_preprocess_overrides))
+        if mode == "gray":
+            out["binarize"] = False
+            # Keep gray preset aligned with training-side defaults.
+            out["gray_mode"] = "min_rgb"
+        return out or None
+    return None
+
+
+def _apply_workbench_preprocess(
+    image: Image.Image,
+    preprocess_preset: str,
+    bdrc_preprocess_overrides: Optional[Dict[str, Any]] = None,
+    rgb_preprocess_overrides: Optional[Dict[str, Any]] = None,
+) -> Image.Image:
+    rgb = image.convert("RGB")
+    mode = _normalize_preprocess_preset(preprocess_preset)
+    effective_overrides = _effective_preprocess_overrides(
+        preprocess_preset=mode,
+        bdrc_preprocess_overrides=bdrc_preprocess_overrides,
+        rgb_preprocess_overrides=rgb_preprocess_overrides,
+    )
+
+    if mode in {"bdrc", "gray"} and preprocess_image_bdrc is not None and BDRCPreprocessConfig is not None:
+        try:
+            if isinstance(effective_overrides, dict) and hasattr(BDRCPreprocessConfig, "from_dict"):
+                cfg = BDRCPreprocessConfig.from_dict(effective_overrides)
+            else:
+                cfg = BDRCPreprocessConfig.vit_defaults()
+            return preprocess_image_bdrc(image=rgb, config=cfg).convert("RGB")
+        except Exception:
+            return rgb
+
+    if mode == "rgb" and preprocess_image_rgb_lines is not None and RGBLinePreprocessConfig is not None:
+        try:
+            if isinstance(effective_overrides, dict) and hasattr(RGBLinePreprocessConfig, "from_dict"):
+                rgb_cfg = RGBLinePreprocessConfig.from_dict(effective_overrides)
+            else:
+                rgb_cfg = RGBLinePreprocessConfig.vit_defaults()
+            return preprocess_image_rgb_lines(image=rgb, config=rgb_cfg).convert("RGB")
+        except Exception:
+            return rgb
+
+    try:
+        return _apply_donut_ui_preprocess(
+            rgb,
+            mode,
+            bdrc_config_override=(
+                effective_overrides
+                if mode == "bdrc" and isinstance(effective_overrides, dict)
+                else None
+            ),
+        ).convert("RGB")
+    except Exception:
+        return rgb
+
+
 def _donut_preprocess_preview(
     crop: np.ndarray,
-    donut_checkpoint: str,
+    preprocess_preset: str = "bdrc",
     bdrc_preprocess_overrides: Optional[Dict[str, Any]] = None,
+    rgb_preprocess_overrides: Optional[Dict[str, Any]] = None,
 ) -> Tuple[np.ndarray, np.ndarray, str]:
     pil = Image.fromarray(np.asarray(crop).astype(np.uint8)).convert("RGB")
     pre = np.asarray(pil).astype(np.uint8, copy=False)
-    effective_preproc = "bdrc"
-    lock_preproc_to_bdrc = bool(
-        isinstance(bdrc_preprocess_overrides, dict) and len(bdrc_preprocess_overrides) > 0
-    )
+    effective_preproc = _normalize_preprocess_preset(preprocess_preset)
     try:
-        if not lock_preproc_to_bdrc:
-            repro_cfg = _load_donut_repro_bundle_cfg_ui(donut_checkpoint)
-            if bool(repro_cfg.get("has_repro")):
-                ip_cfg = repro_cfg.get("image_preprocess") or {}
-                if isinstance(ip_cfg, dict):
-                    pipe = str(ip_cfg.get("pipeline", "") or "").strip().lower()
-                    if pipe in {"none", "pb", "bdrc"}:
-                        effective_preproc = pipe
-    except Exception:
-        pass
-    try:
-        proc = _apply_donut_ui_preprocess(
-            pil,
-            effective_preproc,
-            bdrc_config_override=(
-                bdrc_preprocess_overrides
-                if (
-                    effective_preproc == "bdrc"
-                    and isinstance(bdrc_preprocess_overrides, dict)
-                    and len(bdrc_preprocess_overrides) > 0
-                )
-                else None
-            ),
+        proc = _apply_workbench_preprocess(
+            image=pil,
+            preprocess_preset=effective_preproc,
+            bdrc_preprocess_overrides=bdrc_preprocess_overrides,
+            rgb_preprocess_overrides=rgb_preprocess_overrides,
         )
         post = np.asarray(proc).astype(np.uint8, copy=False)
     except Exception:
@@ -343,42 +415,29 @@ def _run_donut_on_crop_fallback(
     donut_checkpoint: str,
     device: str,
     max_len: int,
+    preprocess_preset: str = "bdrc",
     bdrc_preprocess_overrides: Optional[Dict[str, Any]] = None,
+    rgb_preprocess_overrides: Optional[Dict[str, Any]] = None,
 ) -> Tuple[str, Dict[str, Any]]:
     if torch is None:
         raise RuntimeError("PyTorch not available.")
     runtime, rt_msg = _ensure_donut_runtime_loaded(donut_checkpoint, device)
     if runtime is None:
         raise RuntimeError(rt_msg)
-    repro_cfg = _load_donut_repro_bundle_cfg_ui(donut_checkpoint)
-    effective_preproc = "bdrc"
-    lock_preproc_to_bdrc = bool(
-        isinstance(bdrc_preprocess_overrides, dict) and len(bdrc_preprocess_overrides) > 0
+    effective_preproc = _normalize_preprocess_preset(preprocess_preset)
+    effective_overrides = _effective_preprocess_overrides(
+        preprocess_preset=effective_preproc,
+        bdrc_preprocess_overrides=bdrc_preprocess_overrides,
+        rgb_preprocess_overrides=rgb_preprocess_overrides,
     )
     effective_max_len = max(8, int(max_len))
-    if bool(repro_cfg.get("has_repro")):
-        ip_cfg = repro_cfg.get("image_preprocess") or {}
-        if isinstance(ip_cfg, dict):
-            pipe = str(ip_cfg.get("pipeline", "") or "").strip().lower()
-            if pipe in {"none", "pb", "bdrc"} and not lock_preproc_to_bdrc:
-                effective_preproc = pipe
-        gcfg = repro_cfg.get("generate_config") or {}
-        if isinstance(gcfg, dict) and gcfg.get("max_length") is not None:
-            effective_max_len = max(8, int(gcfg["max_length"]))
 
     pil = Image.fromarray(np.asarray(crop).astype(np.uint8)).convert("RGB")
-    proc_pil = _apply_donut_ui_preprocess(
-        pil,
-        effective_preproc,
-        bdrc_config_override=(
-            bdrc_preprocess_overrides
-            if (
-                effective_preproc == "bdrc"
-                and isinstance(bdrc_preprocess_overrides, dict)
-                and len(bdrc_preprocess_overrides) > 0
-            )
-            else None
-        ),
+    proc_pil = _apply_workbench_preprocess(
+        image=pil,
+        preprocess_preset=effective_preproc,
+        bdrc_preprocess_overrides=bdrc_preprocess_overrides,
+        rgb_preprocess_overrides=rgb_preprocess_overrides,
     )
     image_processor = runtime["image_processor"]
     tokenizer = runtime["tokenizer"]
@@ -392,19 +451,51 @@ def _run_donut_on_crop_fallback(
     text = _strip_special_token_strings_local(text, tokenizer)
     return str(text or ""), {
         "ok": True,
-        "fallback_used": True,
-        "fallback_reason": "ui_workbench _strip_special_token_strings NameError",
+        "fallback_used": False,
         "runtime_status": rt_msg,
+        "image_preprocess_pipeline_requested": _normalize_preprocess_preset(preprocess_preset),
         "image_preprocess_pipeline_effective": effective_preproc,
-        "image_preprocess_locked_by_bdrc_overrides": bool(lock_preproc_to_bdrc),
-        "bdrc_preprocess_overrides_applied": bool(
-            effective_preproc == "bdrc"
-            and isinstance(bdrc_preprocess_overrides, dict)
-            and len(bdrc_preprocess_overrides) > 0
-        ),
+        "preprocess_overrides_applied": bool(isinstance(effective_overrides, dict) and len(effective_overrides) > 0),
+        "preprocess_overrides": (dict(effective_overrides) if isinstance(effective_overrides, dict) else None),
         "generation_max_length_effective": int(effective_max_len),
         "device": str(dev),
     }
+
+
+def _run_donut_on_crop(
+    crop: np.ndarray,
+    donut_checkpoint: str,
+    device: str,
+    max_len: int,
+    preprocess_preset: str = "bdrc",
+    bdrc_preprocess_overrides: Optional[Dict[str, Any]] = None,
+    rgb_preprocess_overrides: Optional[Dict[str, Any]] = None,
+) -> Tuple[str, Dict[str, Any], np.ndarray, np.ndarray]:
+    pre_img, post_img, effective_preproc = _donut_preprocess_preview(
+        crop,
+        preprocess_preset=preprocess_preset,
+        bdrc_preprocess_overrides=bdrc_preprocess_overrides,
+        rgb_preprocess_overrides=rgb_preprocess_overrides,
+    )
+    try:
+        text_fb, dbg_fb = _run_donut_on_crop_fallback(
+            crop,
+            donut_checkpoint,
+            device,
+            max_len,
+            preprocess_preset=preprocess_preset,
+            bdrc_preprocess_overrides=bdrc_preprocess_overrides,
+            rgb_preprocess_overrides=rgb_preprocess_overrides,
+        )
+        dbg_fb.setdefault("effective_preprocess_preview", effective_preproc)
+        return text_fb, dbg_fb, pre_img, post_img
+    except Exception as exc:
+        return "", {
+            "ok": False,
+            "error": f"{type(exc).__name__}: {exc}",
+            "image_preprocess_pipeline_effective": effective_preproc,
+            "effective_preprocess_preview": effective_preproc,
+        }, pre_img, post_img
 
 
 @dataclass
@@ -512,57 +603,164 @@ def _build_bdrc_preprocess_overrides_ui(
     }
 
 
-def _run_donut_on_crop(
-    crop: np.ndarray,
-    donut_checkpoint: str,
-    device: str,
-    max_len: int,
-    bdrc_preprocess_overrides: Optional[Dict[str, Any]] = None,
-) -> Tuple[str, Dict[str, Any], np.ndarray, np.ndarray]:
-    pre_img, post_img, effective_preproc = _donut_preprocess_preview(
-        crop,
-        donut_checkpoint,
-        bdrc_preprocess_overrides=bdrc_preprocess_overrides,
-    )
-    _, pred, debug_json = run_donut_ocr_inference_ui(
-        image=crop,
-        model_root_or_model_dir=donut_checkpoint,
-        image_preprocess_pipeline="bdrc",
-        device_preference=device,
-        generation_max_length=int(max_len),
-        num_beams=1,
-        bdrc_preprocess_overrides=bdrc_preprocess_overrides,
-    )
+def _rgb_ui_defaults() -> Dict[str, Any]:
+    base: Dict[str, Any] = {}
     try:
-        dbg = json.loads(debug_json or "{}")
+        if RGBLinePreprocessConfig is not None:
+            base = dict(RGBLinePreprocessConfig.vit_defaults().to_dict())
     except Exception:
-        dbg = {"raw_debug": debug_json}
-    dbg_obj = dbg if isinstance(dbg, dict) else {"raw_debug": dbg}
-    dbg_obj.setdefault("effective_preprocess_preview", effective_preproc)
-    if bool(dbg_obj.get("ok")):
-        return str(pred or ""), dbg_obj, pre_img, post_img
+        base = {}
+    return {
+        "preserve_color": bool(base.get("preserve_color", True)),
+        "normalize_background": bool(base.get("normalize_background", True)),
+        "background_method": str(base.get("background_method", "shade_correct")),
+        "background_blur_ksize": int(base.get("background_blur_ksize", 0)),
+        "background_strength": float(base.get("background_strength", 0.35)),
+        "contrast": float(base.get("contrast", 1.0)),
+        "denoise": bool(base.get("denoise", False)),
+        "morph_close": bool(base.get("morph_close", False)),
+        "morph_close_kernel": int(base.get("morph_close_kernel", 3)),
+        "remove_small_components": bool(base.get("remove_small_components", False)),
+        "min_component_area": int(base.get("min_component_area", 12)),
+        "upscale_factor": float(base.get("upscale_factor", 1.0)),
+        "upscale_interpolation": str(base.get("upscale_interpolation", "lanczos")),
+        "ink_normalization": bool(base.get("ink_normalization", True)),
+        "ink_strength": float(base.get("ink_strength", 0.2)),
+    }
 
-    err_msg = str(dbg_obj.get("error", "") or "")
-    if "_strip_special_token_strings" in err_msg:
-        try:
-            text_fb, dbg_fb = _run_donut_on_crop_fallback(
-                crop,
-                donut_checkpoint,
-                device,
-                max_len,
-                bdrc_preprocess_overrides=bdrc_preprocess_overrides,
-            )
-            dbg_fb.setdefault("effective_preprocess_preview", effective_preproc)
-            return text_fb, dbg_fb, pre_img, post_img
-        except Exception as exc:
-            return str(pred or ""), {
-                "ok": False,
-                "error": err_msg,
-                "fallback_attempted": True,
-                "fallback_error": f"{type(exc).__name__}: {exc}",
-                "effective_preprocess_preview": effective_preproc,
-            }, pre_img, post_img
-    return str(pred or ""), dbg_obj, pre_img, post_img
+
+def _build_rgb_preprocess_overrides_ui(
+    preserve_color: bool,
+    normalize_background: bool,
+    background_method: str,
+    background_blur_ksize: int,
+    background_strength: float,
+    contrast: float,
+    denoise: bool,
+    morph_close: bool,
+    morph_close_kernel: int,
+    remove_small_components: bool,
+    min_component_area: int,
+    upscale_factor: float,
+    upscale_interpolation: str,
+    ink_normalization: bool,
+    ink_strength: float,
+) -> Dict[str, Any]:
+    bg_method = str(background_method or "shade_correct").strip().lower()
+    if bg_method not in {"none", "shade_correct", "rolling_ball_like", "top_hat"}:
+        bg_method = "shade_correct"
+
+    interp = str(upscale_interpolation or "lanczos").strip().lower()
+    if interp not in {"nearest", "linear", "cubic", "lanczos"}:
+        interp = "lanczos"
+
+    blur_k = int(max(0, int(background_blur_ksize)))
+    if blur_k > 0 and blur_k % 2 == 0:
+        blur_k += 1
+
+    close_k = int(max(0, int(morph_close_kernel)))
+    if close_k > 0 and close_k % 2 == 0:
+        close_k += 1
+
+    return {
+        "preserve_color": bool(preserve_color),
+        "normalize_background": bool(normalize_background),
+        "background_method": bg_method,
+        "background_blur_ksize": int(blur_k),
+        "background_strength": float(max(0.0, min(1.0, float(background_strength)))),
+        "contrast": float(max(0.5, min(2.5, float(contrast)))),
+        "denoise": bool(denoise),
+        "morph_close": bool(morph_close),
+        "morph_close_kernel": int(close_k),
+        "remove_small_components": bool(remove_small_components),
+        "min_component_area": int(max(0, int(min_component_area))),
+        "upscale_factor": float(max(1.0, float(upscale_factor))),
+        "upscale_interpolation": interp,
+        "ink_normalization": bool(ink_normalization),
+        "ink_strength": float(max(0.0, min(1.0, float(ink_strength)))),
+        # Keep deterministic preprocessing behavior.
+        "to_grayscale_prob": 0.0,
+    }
+
+
+def _compose_preprocess_ui_settings(
+    preprocess_preset: str,
+    *,
+    gray_mode: str,
+    normalize_background: bool,
+    background_blur_ksize: int,
+    background_strength: float,
+    upscale_factor: float,
+    upscale_interpolation: str,
+    binarize: bool,
+    threshold_method: str,
+    threshold_block_size: int,
+    threshold_c: int,
+    fixed_threshold: int,
+    morph_close: bool,
+    morph_close_kernel: int,
+    remove_small_components: bool,
+    min_component_area: int,
+    rgb_preserve_color: bool,
+    rgb_normalize_background: bool,
+    rgb_background_method: str,
+    rgb_background_blur_ksize: int,
+    rgb_background_strength: float,
+    rgb_contrast: float,
+    rgb_denoise: bool,
+    rgb_morph_close: bool,
+    rgb_morph_close_kernel: int,
+    rgb_remove_small_components: bool,
+    rgb_min_component_area: int,
+    rgb_upscale_factor: float,
+    rgb_upscale_interpolation: str,
+    rgb_ink_normalization: bool,
+    rgb_ink_strength: float,
+) -> Tuple[str, Optional[Dict[str, Any]], Optional[Dict[str, Any]]]:
+    preset = _normalize_preprocess_preset(preprocess_preset)
+    bdrc_overrides = _build_bdrc_preprocess_overrides_ui(
+        gray_mode=gray_mode,
+        normalize_background=normalize_background,
+        background_blur_ksize=int(background_blur_ksize),
+        background_strength=float(background_strength),
+        upscale_factor=float(upscale_factor),
+        upscale_interpolation=upscale_interpolation,
+        binarize=binarize,
+        threshold_method=threshold_method,
+        threshold_block_size=int(threshold_block_size),
+        threshold_c=int(threshold_c),
+        fixed_threshold=int(fixed_threshold),
+        morph_close=morph_close,
+        morph_close_kernel=int(morph_close_kernel),
+        remove_small_components=remove_small_components,
+        min_component_area=int(min_component_area),
+    )
+    rgb_overrides = _build_rgb_preprocess_overrides_ui(
+        preserve_color=rgb_preserve_color,
+        normalize_background=rgb_normalize_background,
+        background_method=rgb_background_method,
+        background_blur_ksize=int(rgb_background_blur_ksize),
+        background_strength=float(rgb_background_strength),
+        contrast=float(rgb_contrast),
+        denoise=rgb_denoise,
+        morph_close=rgb_morph_close,
+        morph_close_kernel=int(rgb_morph_close_kernel),
+        remove_small_components=rgb_remove_small_components,
+        min_component_area=int(rgb_min_component_area),
+        upscale_factor=float(rgb_upscale_factor),
+        upscale_interpolation=rgb_upscale_interpolation,
+        ink_normalization=rgb_ink_normalization,
+        ink_strength=float(rgb_ink_strength),
+    )
+
+    if preset == "rgb":
+        return preset, None, rgb_overrides
+    if preset == "gray":
+        gray_overrides = dict(bdrc_overrides)
+        gray_overrides["binarize"] = False
+        gray_overrides["gray_mode"] = "min_rgb"
+        return preset, gray_overrides, None
+    return preset, bdrc_overrides, None
 
 
 def _run_full_auto(
@@ -571,7 +769,9 @@ def _run_full_auto(
     layout_model: str,
     device: str,
     max_len: int,
+    preprocess_preset: str = "bdrc",
     bdrc_preprocess_overrides: Optional[Dict[str, Any]] = None,
+    rgb_preprocess_overrides: Optional[Dict[str, Any]] = None,
 ) -> Tuple[np.ndarray, str, str, Dict[str, Any], str, Optional[np.ndarray], Optional[np.ndarray]]:
     image = state.get("image")
     if image is None:
@@ -621,7 +821,9 @@ def _run_full_auto(
             donut_checkpoint,
             device,
             max_len,
+            preprocess_preset=preprocess_preset,
             bdrc_preprocess_overrides=bdrc_preprocess_overrides,
+            rgb_preprocess_overrides=rgb_preprocess_overrides,
         )
         last_pre, last_post = pre_img, post_img
         rows.append(
@@ -647,9 +849,20 @@ def _run_full_auto(
         "mode": "full_auto",
         "split_status": split_status,
         "line_count": len(rows),
+        "image_preprocess_pipeline": _normalize_preprocess_preset(preprocess_preset),
+        "preprocess_overrides": _effective_preprocess_overrides(
+            preprocess_preset=preprocess_preset,
+            bdrc_preprocess_overrides=bdrc_preprocess_overrides,
+            rgb_preprocess_overrides=rgb_preprocess_overrides,
+        ),
         "bdrc_preprocess_overrides": (
             dict(bdrc_preprocess_overrides)
             if isinstance(bdrc_preprocess_overrides, dict)
+            else None
+        ),
+        "rgb_preprocess_overrides": (
+            dict(rgb_preprocess_overrides)
+            if isinstance(rgb_preprocess_overrides, dict)
             else None
         ),
         "split_json": json.loads(split_json) if (split_json or "").strip().startswith("{") else split_json,
@@ -705,7 +918,9 @@ def _manual_click(
     layout_model: str,
     device: str,
     max_len: int,
+    preprocess_preset: str,
     bdrc_preprocess_overrides: Optional[Dict[str, Any]],
+    rgb_preprocess_overrides: Optional[Dict[str, Any]],
     evt: gr.SelectData,
 ) -> Tuple[np.ndarray, str, str, Dict[str, Any], str, Optional[np.ndarray], Optional[np.ndarray]]:
     image = state.get("image")
@@ -737,7 +952,9 @@ def _manual_click(
             donut_checkpoint,
             device,
             max_len,
+            preprocess_preset=preprocess_preset,
             bdrc_preprocess_overrides=bdrc_preprocess_overrides,
+            rgb_preprocess_overrides=rgb_preprocess_overrides,
         )
         new_row = dict(hit)
         new_row["text"] = text
@@ -775,7 +992,9 @@ def _manual_click(
         device,
         max_len,
         roi,
+        preprocess_preset=preprocess_preset,
         bdrc_preprocess_overrides=bdrc_preprocess_overrides,
+        rgb_preprocess_overrides=rgb_preprocess_overrides,
     )
 
 
@@ -785,7 +1004,9 @@ def _manual_process_roi(
     device: str,
     max_len: int,
     roi: Optional[List[int]],
+    preprocess_preset: str = "bdrc",
     bdrc_preprocess_overrides: Optional[Dict[str, Any]] = None,
+    rgb_preprocess_overrides: Optional[Dict[str, Any]] = None,
 ) -> Tuple[np.ndarray, str, str, Dict[str, Any], str, Optional[np.ndarray], Optional[np.ndarray]]:
     image = state.get("image")
     if image is None:
@@ -812,7 +1033,9 @@ def _manual_process_roi(
             donut_checkpoint,
             device,
             max_len,
+            preprocess_preset=preprocess_preset,
             bdrc_preprocess_overrides=bdrc_preprocess_overrides,
+            rgb_preprocess_overrides=rgb_preprocess_overrides,
         )
         last_pre, last_post = pre_img, post_img
         created_rows.append(
@@ -851,7 +1074,9 @@ def _manual_process_roi(
                 donut_checkpoint,
                 device,
                 max_len,
+                preprocess_preset=preprocess_preset,
                 bdrc_preprocess_overrides=bdrc_preprocess_overrides,
+                rgb_preprocess_overrides=rgb_preprocess_overrides,
             )
             last_pre, last_post = pre_img, post_img
             created_rows.append(
@@ -869,7 +1094,9 @@ def _manual_process_roi(
                 donut_checkpoint,
                 device,
                 max_len,
+                preprocess_preset=preprocess_preset,
                 bdrc_preprocess_overrides=bdrc_preprocess_overrides,
+                rgb_preprocess_overrides=rgb_preprocess_overrides,
             )
             last_pre, last_post = pre_img, post_img
             created_rows.append(
@@ -899,9 +1126,20 @@ def _manual_process_roi(
         "roi": roi,
         "new_rows": created_rows,
         "total_rows": len(rows),
+        "image_preprocess_pipeline": _normalize_preprocess_preset(preprocess_preset),
+        "preprocess_overrides": _effective_preprocess_overrides(
+            preprocess_preset=preprocess_preset,
+            bdrc_preprocess_overrides=bdrc_preprocess_overrides,
+            rgb_preprocess_overrides=rgb_preprocess_overrides,
+        ),
         "bdrc_preprocess_overrides": (
             dict(bdrc_preprocess_overrides)
             if isinstance(bdrc_preprocess_overrides, dict)
+            else None
+        ),
+        "rgb_preprocess_overrides": (
+            dict(rgb_preprocess_overrides)
+            if isinstance(rgb_preprocess_overrides, dict)
             else None
         ),
     }
@@ -922,7 +1160,9 @@ def _manual_full_image_roi(
     donut_s: str,
     device_s: str,
     max_len_s: int,
+    preprocess_preset: str = "bdrc",
     bdrc_preprocess_overrides: Optional[Dict[str, Any]] = None,
+    rgb_preprocess_overrides: Optional[Dict[str, Any]] = None,
 ) -> Tuple[np.ndarray, str, str, Dict[str, Any], str, Optional[np.ndarray], Optional[np.ndarray]]:
     if not _is_manual_mode(mode_s):
         img = state_s.get("image")
@@ -939,7 +1179,9 @@ def _manual_full_image_roi(
         device_s,
         int(max_len_s),
         [0, 0, w, h],
+        preprocess_preset=preprocess_preset,
         bdrc_preprocess_overrides=bdrc_preprocess_overrides,
+        rgb_preprocess_overrides=rgb_preprocess_overrides,
     )
 
 
@@ -1013,6 +1255,7 @@ def build_ui() -> gr.Blocks:
     donut_ckpt, donut_msg = _find_donut_checkpoint()
     layout_model, layout_msg = _find_layout_model()
     bdrc_defaults = _bdrc_ui_defaults()
+    rgb_defaults = _rgb_ui_defaults()
     ui_css = """
 #ocr_image_panel {
   min-height: 300px;
@@ -1085,11 +1328,18 @@ def build_ui() -> gr.Blocks:
         with gr.Row(visible=False) as advanced_runtime_row:
             device = gr.Dropdown(choices=["auto", "cuda:0", "cpu"], value="auto", label="Inference Device")
             max_len = gr.Number(label="DONUT generation_max_length", value=160, precision=0)
+        with gr.Row(visible=False) as advanced_preprocess_select_row:
+            preprocess_preset = gr.Dropdown(
+                choices=[("bdrc", "bdrc"), ("gray", "gray"), ("RGB", "rgb")],
+                value="bdrc",
+                label="Preprocess Preset",
+            )
         with gr.Row(visible=False) as advanced_bdrc_row:
-            with gr.Accordion("BDRC Preprocess 1-5 (DONUT Input)", open=False):
+            with gr.Accordion("BDRC / Gray Preprocess (DONUT Input)", open=False):
                 gr.Markdown(
                     "1) Background normalize  2) Thresholding  3) Morph close + tiny component filter  "
-                    "4) Upscale before binarization  5) Gray channel mode"
+                    "4) Upscale before binarization  5) Gray channel mode\n\n"
+                    "Gray preset uses this config with `binarize=false`."
                 )
                 with gr.Row():
                     bdrc_gray_mode = gr.Dropdown(
@@ -1173,6 +1423,94 @@ def build_ui() -> gr.Blocks:
                         precision=0,
                         label="3) min_component_area",
                     )
+        with gr.Row(visible=False) as advanced_rgb_row:
+            with gr.Accordion("RGB Preprocess (DONUT Input)", open=False):
+                gr.Markdown(
+                    "RGB pipeline keeps color cues and exposes background correction, denoising, "
+                    "ink normalization, morphology and upscale options."
+                )
+                with gr.Row():
+                    rgb_preserve_color = gr.Checkbox(
+                        value=bool(rgb_defaults["preserve_color"]),
+                        label="preserve_color",
+                    )
+                    rgb_normalize_bg = gr.Checkbox(
+                        value=bool(rgb_defaults["normalize_background"]),
+                        label="normalize_background",
+                    )
+                    rgb_background_method = gr.Dropdown(
+                        choices=["shade_correct", "rolling_ball_like", "top_hat", "none"],
+                        value=str(rgb_defaults["background_method"]),
+                        label="background_method",
+                    )
+                with gr.Row():
+                    rgb_bg_blur_ksize = gr.Number(
+                        value=int(rgb_defaults["background_blur_ksize"]),
+                        precision=0,
+                        label="background_blur_ksize (0=auto)",
+                    )
+                    rgb_bg_strength = gr.Slider(
+                        minimum=0.0,
+                        maximum=1.0,
+                        step=0.05,
+                        value=float(rgb_defaults["background_strength"]),
+                        label="background_strength",
+                    )
+                    rgb_contrast = gr.Slider(
+                        minimum=0.5,
+                        maximum=2.5,
+                        step=0.05,
+                        value=float(rgb_defaults["contrast"]),
+                        label="contrast",
+                    )
+                with gr.Row():
+                    rgb_denoise = gr.Checkbox(
+                        value=bool(rgb_defaults["denoise"]),
+                        label="denoise",
+                    )
+                    rgb_morph_close = gr.Checkbox(
+                        value=bool(rgb_defaults["morph_close"]),
+                        label="morph_close",
+                    )
+                    rgb_morph_close_kernel = gr.Number(
+                        value=int(rgb_defaults["morph_close_kernel"]),
+                        precision=0,
+                        label="morph_close_kernel (odd)",
+                    )
+                with gr.Row():
+                    rgb_remove_small_components = gr.Checkbox(
+                        value=bool(rgb_defaults["remove_small_components"]),
+                        label="remove_small_components",
+                    )
+                    rgb_min_component_area = gr.Number(
+                        value=int(rgb_defaults["min_component_area"]),
+                        precision=0,
+                        label="min_component_area",
+                    )
+                    rgb_ink_normalization = gr.Checkbox(
+                        value=bool(rgb_defaults["ink_normalization"]),
+                        label="ink_normalization",
+                    )
+                    rgb_ink_strength = gr.Slider(
+                        minimum=0.0,
+                        maximum=1.0,
+                        step=0.05,
+                        value=float(rgb_defaults["ink_strength"]),
+                        label="ink_strength",
+                    )
+                with gr.Row():
+                    rgb_upscale_factor = gr.Slider(
+                        minimum=1.0,
+                        maximum=3.0,
+                        step=0.1,
+                        value=float(rgb_defaults["upscale_factor"]),
+                        label="upscale_factor",
+                    )
+                    rgb_upscale_interp = gr.Dropdown(
+                        choices=["lanczos", "cubic", "linear", "nearest"],
+                        value=str(rgb_defaults["upscale_interpolation"]),
+                        label="upscale_interpolation",
+                    )
 
         status = gr.Textbox(label="Status", interactive=False)
         debug_json = gr.Code(label="Debug JSON", language="json", visible=False)
@@ -1238,6 +1576,7 @@ def build_ui() -> gr.Blocks:
             layout_s: str,
             device_s: str,
             max_len_s: int,
+            preprocess_preset_s: str,
             gray_mode_s: str,
             normalize_background_s: bool,
             background_blur_ksize_s: int,
@@ -1253,8 +1592,24 @@ def build_ui() -> gr.Blocks:
             morph_close_kernel_s: int,
             remove_small_components_s: bool,
             min_component_area_s: int,
+            rgb_preserve_color_s: bool,
+            rgb_normalize_bg_s: bool,
+            rgb_background_method_s: str,
+            rgb_bg_blur_ksize_s: int,
+            rgb_bg_strength_s: float,
+            rgb_contrast_s: float,
+            rgb_denoise_s: bool,
+            rgb_morph_close_s: bool,
+            rgb_morph_close_kernel_s: int,
+            rgb_remove_small_components_s: bool,
+            rgb_min_component_area_s: int,
+            rgb_upscale_factor_s: float,
+            rgb_upscale_interp_s: str,
+            rgb_ink_normalization_s: bool,
+            rgb_ink_strength_s: float,
         ):
-            bdrc_overrides = _build_bdrc_preprocess_overrides_ui(
+            preproc_mode, bdrc_overrides, rgb_overrides = _compose_preprocess_ui_settings(
+                preprocess_preset=preprocess_preset_s,
                 gray_mode=gray_mode_s,
                 normalize_background=normalize_background_s,
                 background_blur_ksize=int(background_blur_ksize_s),
@@ -1270,6 +1625,21 @@ def build_ui() -> gr.Blocks:
                 morph_close_kernel=int(morph_close_kernel_s),
                 remove_small_components=remove_small_components_s,
                 min_component_area=int(min_component_area_s),
+                rgb_preserve_color=rgb_preserve_color_s,
+                rgb_normalize_background=rgb_normalize_bg_s,
+                rgb_background_method=rgb_background_method_s,
+                rgb_background_blur_ksize=int(rgb_bg_blur_ksize_s),
+                rgb_background_strength=float(rgb_bg_strength_s),
+                rgb_contrast=float(rgb_contrast_s),
+                rgb_denoise=rgb_denoise_s,
+                rgb_morph_close=rgb_morph_close_s,
+                rgb_morph_close_kernel=int(rgb_morph_close_kernel_s),
+                rgb_remove_small_components=rgb_remove_small_components_s,
+                rgb_min_component_area=int(rgb_min_component_area_s),
+                rgb_upscale_factor=float(rgb_upscale_factor_s),
+                rgb_upscale_interpolation=rgb_upscale_interp_s,
+                rgb_ink_normalization=rgb_ink_normalization_s,
+                rgb_ink_strength=float(rgb_ink_strength_s),
             )
             if not _is_manual_mode(mode_s):
                 return _run_full_auto(
@@ -1278,14 +1648,23 @@ def build_ui() -> gr.Blocks:
                     layout_s,
                     device_s,
                     int(max_len_s),
+                    preprocess_preset=preproc_mode,
                     bdrc_preprocess_overrides=bdrc_overrides,
+                    rgb_preprocess_overrides=rgb_overrides,
                 )
             img = state_s.get("image")
             overlay = np.asarray(img).astype(np.uint8, copy=False) if img is not None else None
             debug = {
                 "ok": True,
                 "mode": "manual_waiting",
+                "image_preprocess_pipeline": preproc_mode,
+                "preprocess_overrides": _effective_preprocess_overrides(
+                    preprocess_preset=preproc_mode,
+                    bdrc_preprocess_overrides=bdrc_overrides,
+                    rgb_preprocess_overrides=rgb_overrides,
+                ),
                 "bdrc_preprocess_overrides": bdrc_overrides,
+                "rgb_preprocess_overrides": rgb_overrides,
             }
             return (
                 overlay,
@@ -1306,6 +1685,7 @@ def build_ui() -> gr.Blocks:
                 layout_path,
                 device,
                 max_len,
+                preprocess_preset,
                 bdrc_gray_mode,
                 bdrc_normalize_bg,
                 bdrc_bg_blur_ksize,
@@ -1321,6 +1701,21 @@ def build_ui() -> gr.Blocks:
                 bdrc_morph_close_kernel,
                 bdrc_remove_small_components,
                 bdrc_min_component_area,
+                rgb_preserve_color,
+                rgb_normalize_bg,
+                rgb_background_method,
+                rgb_bg_blur_ksize,
+                rgb_bg_strength,
+                rgb_contrast,
+                rgb_denoise,
+                rgb_morph_close,
+                rgb_morph_close_kernel,
+                rgb_remove_small_components,
+                rgb_min_component_area,
+                rgb_upscale_factor,
+                rgb_upscale_interp,
+                rgb_ink_normalization,
+                rgb_ink_strength,
             ],
             outputs=[image_view, transcript, status, state, debug_json, donut_input_before, donut_input_after],
         )
@@ -1337,6 +1732,7 @@ def build_ui() -> gr.Blocks:
             layout_s: str,
             device_s: str,
             max_len_s: int,
+            preprocess_preset_s: str,
             gray_mode_s: str,
             normalize_background_s: bool,
             background_blur_ksize_s: int,
@@ -1352,9 +1748,25 @@ def build_ui() -> gr.Blocks:
             morph_close_kernel_s: int,
             remove_small_components_s: bool,
             min_component_area_s: int,
+            rgb_preserve_color_s: bool,
+            rgb_normalize_bg_s: bool,
+            rgb_background_method_s: str,
+            rgb_bg_blur_ksize_s: int,
+            rgb_bg_strength_s: float,
+            rgb_contrast_s: float,
+            rgb_denoise_s: bool,
+            rgb_morph_close_s: bool,
+            rgb_morph_close_kernel_s: int,
+            rgb_remove_small_components_s: bool,
+            rgb_min_component_area_s: int,
+            rgb_upscale_factor_s: float,
+            rgb_upscale_interp_s: str,
+            rgb_ink_normalization_s: bool,
+            rgb_ink_strength_s: float,
             evt: gr.SelectData,
         ):
-            bdrc_overrides = _build_bdrc_preprocess_overrides_ui(
+            preproc_mode, bdrc_overrides, rgb_overrides = _compose_preprocess_ui_settings(
+                preprocess_preset=preprocess_preset_s,
                 gray_mode=gray_mode_s,
                 normalize_background=normalize_background_s,
                 background_blur_ksize=int(background_blur_ksize_s),
@@ -1370,6 +1782,21 @@ def build_ui() -> gr.Blocks:
                 morph_close_kernel=int(morph_close_kernel_s),
                 remove_small_components=remove_small_components_s,
                 min_component_area=int(min_component_area_s),
+                rgb_preserve_color=rgb_preserve_color_s,
+                rgb_normalize_background=rgb_normalize_bg_s,
+                rgb_background_method=rgb_background_method_s,
+                rgb_background_blur_ksize=int(rgb_bg_blur_ksize_s),
+                rgb_background_strength=float(rgb_bg_strength_s),
+                rgb_contrast=float(rgb_contrast_s),
+                rgb_denoise=rgb_denoise_s,
+                rgb_morph_close=rgb_morph_close_s,
+                rgb_morph_close_kernel=int(rgb_morph_close_kernel_s),
+                rgb_remove_small_components=rgb_remove_small_components_s,
+                rgb_min_component_area=int(rgb_min_component_area_s),
+                rgb_upscale_factor=float(rgb_upscale_factor_s),
+                rgb_upscale_interpolation=rgb_upscale_interp_s,
+                rgb_ink_normalization=rgb_ink_normalization_s,
+                rgb_ink_strength=float(rgb_ink_strength_s),
             )
             if not _is_manual_mode(mode_s):
                 image = state_s.get("image")
@@ -1446,7 +1873,9 @@ def build_ui() -> gr.Blocks:
                     donut_s,
                     device_s,
                     int(max_len_s),
+                    preprocess_preset=preproc_mode,
                     bdrc_preprocess_overrides=bdrc_overrides,
+                    rgb_preprocess_overrides=rgb_overrides,
                 )
                 new_row = dict(hit)
                 new_row["text"] = text
@@ -1463,7 +1892,14 @@ def build_ui() -> gr.Blocks:
                     "mode": str(mode_s),
                     "action": "clicked_detected_line_for_debug_preview",
                     "line_box": [x1, y1, x2, y2],
+                    "image_preprocess_pipeline": preproc_mode,
+                    "preprocess_overrides": _effective_preprocess_overrides(
+                        preprocess_preset=preproc_mode,
+                        bdrc_preprocess_overrides=bdrc_overrides,
+                        rgb_preprocess_overrides=rgb_overrides,
+                    ),
                     "bdrc_preprocess_overrides": bdrc_overrides,
+                    "rgb_preprocess_overrides": rgb_overrides,
                 }
                 return (
                     overlay,
@@ -1480,7 +1916,9 @@ def build_ui() -> gr.Blocks:
                 layout_s,
                 device_s,
                 int(max_len_s),
+                preproc_mode,
                 bdrc_overrides,
+                rgb_overrides,
                 evt,
             )
 
@@ -1493,6 +1931,7 @@ def build_ui() -> gr.Blocks:
                 layout_path,
                 device,
                 max_len,
+                preprocess_preset,
                 bdrc_gray_mode,
                 bdrc_normalize_bg,
                 bdrc_bg_blur_ksize,
@@ -1508,6 +1947,21 @@ def build_ui() -> gr.Blocks:
                 bdrc_morph_close_kernel,
                 bdrc_remove_small_components,
                 bdrc_min_component_area,
+                rgb_preserve_color,
+                rgb_normalize_bg,
+                rgb_background_method,
+                rgb_bg_blur_ksize,
+                rgb_bg_strength,
+                rgb_contrast,
+                rgb_denoise,
+                rgb_morph_close,
+                rgb_morph_close_kernel,
+                rgb_remove_small_components,
+                rgb_min_component_area,
+                rgb_upscale_factor,
+                rgb_upscale_interp,
+                rgb_ink_normalization,
+                rgb_ink_strength,
             ],
             outputs=[image_view, transcript, status, state, debug_json, donut_input_before, donut_input_after],
         )
@@ -1517,12 +1971,13 @@ def build_ui() -> gr.Blocks:
             outputs=[debug_text],
         )
 
-        def _manual_full_roi_with_bdrc(
+        def _manual_full_roi_with_preprocess(
             mode_s: str,
             state_s: Dict[str, Any],
             donut_s: str,
             device_s: str,
             max_len_s: int,
+            preprocess_preset_s: str,
             gray_mode_s: str,
             normalize_background_s: bool,
             background_blur_ksize_s: int,
@@ -1538,8 +1993,24 @@ def build_ui() -> gr.Blocks:
             morph_close_kernel_s: int,
             remove_small_components_s: bool,
             min_component_area_s: int,
+            rgb_preserve_color_s: bool,
+            rgb_normalize_bg_s: bool,
+            rgb_background_method_s: str,
+            rgb_bg_blur_ksize_s: int,
+            rgb_bg_strength_s: float,
+            rgb_contrast_s: float,
+            rgb_denoise_s: bool,
+            rgb_morph_close_s: bool,
+            rgb_morph_close_kernel_s: int,
+            rgb_remove_small_components_s: bool,
+            rgb_min_component_area_s: int,
+            rgb_upscale_factor_s: float,
+            rgb_upscale_interp_s: str,
+            rgb_ink_normalization_s: bool,
+            rgb_ink_strength_s: float,
         ):
-            bdrc_overrides = _build_bdrc_preprocess_overrides_ui(
+            preproc_mode, bdrc_overrides, rgb_overrides = _compose_preprocess_ui_settings(
+                preprocess_preset=preprocess_preset_s,
                 gray_mode=gray_mode_s,
                 normalize_background=normalize_background_s,
                 background_blur_ksize=int(background_blur_ksize_s),
@@ -1555,6 +2026,21 @@ def build_ui() -> gr.Blocks:
                 morph_close_kernel=int(morph_close_kernel_s),
                 remove_small_components=remove_small_components_s,
                 min_component_area=int(min_component_area_s),
+                rgb_preserve_color=rgb_preserve_color_s,
+                rgb_normalize_background=rgb_normalize_bg_s,
+                rgb_background_method=rgb_background_method_s,
+                rgb_background_blur_ksize=int(rgb_bg_blur_ksize_s),
+                rgb_background_strength=float(rgb_bg_strength_s),
+                rgb_contrast=float(rgb_contrast_s),
+                rgb_denoise=rgb_denoise_s,
+                rgb_morph_close=rgb_morph_close_s,
+                rgb_morph_close_kernel=int(rgb_morph_close_kernel_s),
+                rgb_remove_small_components=rgb_remove_small_components_s,
+                rgb_min_component_area=int(rgb_min_component_area_s),
+                rgb_upscale_factor=float(rgb_upscale_factor_s),
+                rgb_upscale_interpolation=rgb_upscale_interp_s,
+                rgb_ink_normalization=rgb_ink_normalization_s,
+                rgb_ink_strength=float(rgb_ink_strength_s),
             )
             return _manual_full_image_roi(
                 mode_s,
@@ -1562,17 +2048,20 @@ def build_ui() -> gr.Blocks:
                 donut_s,
                 device_s,
                 int(max_len_s),
+                preprocess_preset=preproc_mode,
                 bdrc_preprocess_overrides=bdrc_overrides,
+                rgb_preprocess_overrides=rgb_overrides,
             )
 
         _fullroi_evt = full_roi_btn.click(
-            fn=_manual_full_roi_with_bdrc,
+            fn=_manual_full_roi_with_preprocess,
             inputs=[
                 mode,
                 state,
                 donut_path,
                 device,
                 max_len,
+                preprocess_preset,
                 bdrc_gray_mode,
                 bdrc_normalize_bg,
                 bdrc_bg_blur_ksize,
@@ -1588,6 +2077,21 @@ def build_ui() -> gr.Blocks:
                 bdrc_morph_close_kernel,
                 bdrc_remove_small_components,
                 bdrc_min_component_area,
+                rgb_preserve_color,
+                rgb_normalize_bg,
+                rgb_background_method,
+                rgb_bg_blur_ksize,
+                rgb_bg_strength,
+                rgb_contrast,
+                rgb_denoise,
+                rgb_morph_close,
+                rgb_morph_close_kernel,
+                rgb_remove_small_components,
+                rgb_min_component_area,
+                rgb_upscale_factor,
+                rgb_upscale_interp,
+                rgb_ink_normalization,
+                rgb_ink_strength,
             ],
             outputs=[image_view, transcript, status, state, debug_json, donut_input_before, donut_input_after],
         )
@@ -1657,12 +2161,17 @@ def build_ui() -> gr.Blocks:
 """,
         )
 
-        def _toggle_advanced(show: bool):
+        def _toggle_advanced(show: bool, preprocess_preset_s: str):
             visible = bool(show)
+            preproc_mode = _normalize_preprocess_preset(preprocess_preset_s)
+            show_bdrc = visible and preproc_mode in {"bdrc", "gray"}
+            show_rgb = visible and preproc_mode == "rgb"
             return (
                 gr.update(visible=visible),
                 gr.update(visible=visible),
                 gr.update(visible=visible),
+                gr.update(visible=show_bdrc),
+                gr.update(visible=show_rgb),
                 gr.update(visible=visible),
                 gr.update(visible=visible),
                 gr.update(visible=visible),
@@ -1672,8 +2181,33 @@ def build_ui() -> gr.Blocks:
 
         advanced_view.change(
             fn=_toggle_advanced,
-            inputs=[advanced_view],
-            outputs=[advanced_scan_row, advanced_runtime_row, advanced_bdrc_row, debug_json, donut_input_before, donut_input_after, save_status, advanced_debug_text_row],
+            inputs=[advanced_view, preprocess_preset],
+            outputs=[
+                advanced_scan_row,
+                advanced_runtime_row,
+                advanced_preprocess_select_row,
+                advanced_bdrc_row,
+                advanced_rgb_row,
+                debug_json,
+                donut_input_before,
+                donut_input_after,
+                save_status,
+                advanced_debug_text_row,
+            ],
+        )
+
+        def _on_preprocess_preset_change(show_advanced: bool, preprocess_preset_s: str):
+            visible = bool(show_advanced)
+            preproc_mode = _normalize_preprocess_preset(preprocess_preset_s)
+            return (
+                gr.update(visible=visible and preproc_mode in {"bdrc", "gray"}),
+                gr.update(visible=visible and preproc_mode == "rgb"),
+            )
+
+        preprocess_preset.change(
+            fn=_on_preprocess_preset_change,
+            inputs=[advanced_view, preprocess_preset],
+            outputs=[advanced_bdrc_row, advanced_rgb_row],
         )
 
         mode.change(
