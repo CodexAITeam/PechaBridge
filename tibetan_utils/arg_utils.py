@@ -1076,6 +1076,8 @@ def add_train_donut_ocr_arguments(parser):
                        help='Maximum number of checkpoints to keep')
     parser.add_argument('--num_workers', type=int, default=4,
                        help='DataLoader workers')
+    parser.add_argument('--skip_image_file_check', '--skip-image-file-check', dest='skip_image_file_check', action='store_true',
+                       help='Skip filesystem is_file checks while parsing manifests (faster startup on slow mounts; missing images fail lazily at sample load time)')
     parser.add_argument('--profile_preprocess_pipeline', '--profile-preprocess-pipeline', dest='profile_preprocess_pipeline', action='store_true',
                        help='Enable per-sample timing logs for OCR dataset preprocessing/augmentation/image-processor pipeline')
     parser.add_argument('--profile_preprocess_every_n', '--profile-preprocess-every-n', dest='profile_preprocess_every_n', type=int, default=200,
@@ -1096,6 +1098,8 @@ def add_train_donut_ocr_arguments(parser):
                        help='Comma-separated trainer integrations (e.g. "trackio,tensorboard"); use "none" to disable')
     parser.add_argument('--run_name', type=str, default='',
                        help='Optional run name for experiment tracking backends')
+    parser.add_argument('--debug_forward', '--debug-forward', dest='debug_forward', action='store_true',
+                       help='Enable periodic forward/backward training-step logs (train_step/train_running/train_fwd_bwd)')
     parser.add_argument('--debug_train_decode_every_steps', '--debug-train-decode-every-steps', dest='debug_train_decode_every_steps', type=int, default=100,
                        help='Log compact train_decode preview every N train steps when enabled (default: 100)')
     parser.add_argument('--enable_train_decode_preview', '--enable-train-decode-preview', dest='enable_train_decode_preview', action='store_true',
@@ -1165,6 +1169,8 @@ def add_run_donut_ocr_workflow_arguments(parser):
                        help='Comma-separated trainer integrations for workflow train step (e.g. "trackio")')
     parser.add_argument('--run_name', type=str, default='',
                        help='Optional run name for workflow train step')
+    parser.add_argument('--debug_forward', '--debug-forward', dest='debug_forward', action='store_true',
+                       help='Enable periodic forward/backward training-step logs in workflow train step')
     parser.add_argument('--seed', type=int, default=42,
                        help='Random seed')
     parser.add_argument('--skip_generation', action='store_true',

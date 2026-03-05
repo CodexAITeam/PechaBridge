@@ -798,6 +798,7 @@ class DonutDebugSeq2SeqTrainer(Seq2SeqTrainer):
         *args,
         tokenizer_for_debug=None,
         metric_newline_token: str = "<NL>",
+        debug_forward: bool = False,
         debug_train_decode_preview: bool = True,
         debug_train_decode_every_steps: int = 1,
         debug_train_trace: bool = False,
@@ -809,6 +810,7 @@ class DonutDebugSeq2SeqTrainer(Seq2SeqTrainer):
         super().__init__(*args, **kwargs)
         self._debug_tokenizer = tokenizer_for_debug
         self._debug_metric_newline_token = str(metric_newline_token or "<NL>")
+        self._debug_forward = bool(debug_forward)
         self._debug_train_decode_preview = bool(debug_train_decode_preview)
         self._debug_train_decode_every_steps = max(1, int(debug_train_decode_every_steps or 1))
         self._debug_train_trace = bool(debug_train_trace)
@@ -875,7 +877,7 @@ class DonutDebugSeq2SeqTrainer(Seq2SeqTrainer):
         return out
 
     def training_step(self, model, inputs, *args, **kwargs):  # type: ignore[override]
-        if self.is_world_process_zero():
+        if self._debug_forward and self.is_world_process_zero():
             batch_idx = int(self._train_batches_seen) + 1
             if batch_idx == 1 or (batch_idx % int(self._train_running_log_every_batches) == 0):
                 LOGGER.info(
@@ -885,7 +887,7 @@ class DonutDebugSeq2SeqTrainer(Seq2SeqTrainer):
                     self._resolve_runtime_device(model, inputs if isinstance(inputs, dict) else None),
                 )
         out = super().training_step(model, inputs, *args, **kwargs)
-        if self.is_world_process_zero():
+        if self._debug_forward and self.is_world_process_zero():
             batch_idx_done = int(self._train_batches_seen)
             if batch_idx_done == 1 or (batch_idx_done % int(self._train_running_log_every_batches) == 0):
                 LOGGER.info(
@@ -918,6 +920,7 @@ class DonutDebugSeq2SeqTrainer(Seq2SeqTrainer):
     def compute_loss(self, model, inputs, return_outputs=False, **kwargs):  # type: ignore[override]
         if self.is_world_process_zero():
             self._train_batches_seen += 1
+        if self._debug_forward and self.is_world_process_zero():
             n = int(self._train_batches_seen)
             if n == 1 or (n % int(self._train_running_log_every_batches) == 0):
                 pixel_values = inputs.get("pixel_values") if isinstance(inputs, dict) else None
@@ -941,7 +944,7 @@ class DonutDebugSeq2SeqTrainer(Seq2SeqTrainer):
                 )
 
         out = super().compute_loss(model, inputs, return_outputs=True, **kwargs)
-        if self.is_world_process_zero():
+        if self._debug_forward and self.is_world_process_zero():
             n = int(self._train_batches_seen)
             if n == 1 or (n % int(self._train_running_log_every_batches) == 0):
                 LOGGER.info(
@@ -1731,23 +1734,41 @@ def _first_nonempty_str(row: Dict[str, object], keys: Sequence[str]) -> str:
     return ""
 
 
-def _resolve_manifest_image_path(image_value: str, manifest_path: Optional[Path]) -> Optional[Path]:
+def _safe_is_file(path: Path) -> bool:
+    try:
+        return bool(path.is_file())
+    except Exception as exc:
+        LOGGER.warning("Path check failed for %s: %s", path, exc)
+        return False
+
+
+def _resolve_manifest_image_path(
+    image_value: str,
+    manifest_path: Optional[Path],
+    *,
+    skip_file_check: bool = False,
+) -> Optional[Path]:
     raw = str(image_value or "").strip()
     if not raw:
         return None
     p = Path(raw).expanduser()
     if p.is_absolute():
-        rp = p.resolve()
-        return rp if rp.exists() else None
+        if bool(skip_file_check):
+            return p
+        return p if _safe_is_file(p) else None
     candidates: List[Path] = []
     if manifest_path is not None:
-        mp = Path(manifest_path).expanduser().resolve()
-        candidates.append((mp.parent / p).resolve())
-        candidates.append((mp.parent.parent / p).resolve())
-        candidates.append((mp.parent.parent.parent / p).resolve())
-    candidates.append((Path.cwd() / p).resolve())
+        mp = Path(manifest_path).expanduser()
+        candidates.append(mp.parent / p)
+        candidates.append(mp.parent.parent / p)
+        candidates.append(mp.parent.parent.parent / p)
+    candidates.append(Path.cwd() / p)
+    if bool(skip_file_check):
+        if candidates:
+            return candidates[0]
+        return p
     for cand in candidates:
-        if cand.exists() and cand.is_file():
+        if _safe_is_file(cand):
             return cand
     return None
 
@@ -1927,11 +1948,14 @@ class OCRLineDataset(Dataset):
         target_end_token_id: Optional[int] = None,
         manifest_path: Optional[Path] = None,
         is_train: bool = False,
+        skip_image_file_check: bool = False,
         profile_preprocess_pipeline: bool = False,
         profile_preprocess_every_n: int = 200,
         profile_preprocess_trace_n: int = 0,
         profile_preprocess_slow_ms: float = 800.0,
     ):
+        self.split = "train" if bool(is_train) else "val"
+        self.skip_image_file_check = bool(skip_image_file_check)
         self.samples: List[OCRSample] = []
         self.stats: Dict[str, int] = {
             "rows_total": 0,
@@ -1942,8 +1966,22 @@ class OCRLineDataset(Dataset):
         }
         self.example_row_keys: List[str] = []
         self.manifest_path = Path(manifest_path).expanduser().resolve() if manifest_path is not None else None
+        scan_started = time.perf_counter()
         for row in rows:
             self.stats["rows_total"] += 1
+            if self.stats["rows_total"] % 100000 == 0:
+                elapsed_s = float(time.perf_counter() - scan_started)
+                LOGGER.info(
+                    "manifest_scan_progress | split=%s rows=%d kept=%d miss_img=%d miss_txt=%d not_found=%d elapsed_s=%.1f skip_image_file_check=%s",
+                    self.split,
+                    int(self.stats["rows_total"]),
+                    int(self.stats["kept"]),
+                    int(self.stats["missing_image_field"]),
+                    int(self.stats["missing_text_field"]),
+                    int(self.stats["image_not_found"]),
+                    elapsed_s,
+                    bool(self.skip_image_file_check),
+                )
             if not self.example_row_keys and isinstance(row, dict):
                 self.example_row_keys = sorted(str(k) for k in row.keys())
             image_raw = _first_nonempty_str(
@@ -1980,12 +2018,27 @@ class OCRLineDataset(Dataset):
             if not text_raw:
                 self.stats["missing_text_field"] += 1
                 continue
-            image_path = _resolve_manifest_image_path(image_raw, self.manifest_path)
+            image_path = _resolve_manifest_image_path(
+                image_raw,
+                self.manifest_path,
+                skip_file_check=self.skip_image_file_check,
+            )
             if image_path is None:
                 self.stats["image_not_found"] += 1
                 continue
             self.samples.append(OCRSample(image_path=image_path, text=text_raw))
             self.stats["kept"] += 1
+        LOGGER.info(
+            "manifest_scan_done | split=%s rows=%d kept=%d miss_img=%d miss_txt=%d not_found=%d elapsed_s=%.1f skip_image_file_check=%s",
+            self.split,
+            int(self.stats["rows_total"]),
+            int(self.stats["kept"]),
+            int(self.stats["missing_image_field"]),
+            int(self.stats["missing_text_field"]),
+            int(self.stats["image_not_found"]),
+            float(time.perf_counter() - scan_started),
+            bool(self.skip_image_file_check),
+        )
         self.image_processor = image_processor
         self.tokenizer = tokenizer
         self.max_target_length = int(max_target_length)
@@ -1997,7 +2050,6 @@ class OCRLineDataset(Dataset):
             if target_end_token_id is not None
             else None
         )
-        self.split = "train" if bool(is_train) else "val"
         self._line_preprocess_cfg = RGBLinePreprocessConfig.vit_defaults()
         self._profile_preprocess_pipeline = bool(profile_preprocess_pipeline)
         self._profile_preprocess_every_n = max(1, int(profile_preprocess_every_n))
@@ -2710,6 +2762,7 @@ def run(args) -> Dict[str, object]:
         target_end_token_id=task_end_id,
         manifest_path=train_manifest,
         is_train=True,
+        skip_image_file_check=bool(getattr(args, "skip_image_file_check", False)),
         profile_preprocess_pipeline=bool(getattr(args, "profile_preprocess_pipeline", False)),
         profile_preprocess_every_n=int(getattr(args, "profile_preprocess_every_n", 200) or 200),
         profile_preprocess_trace_n=int(getattr(args, "profile_preprocess_trace_n", 0) or 0),
@@ -2726,6 +2779,7 @@ def run(args) -> Dict[str, object]:
         target_end_token_id=task_end_id,
         manifest_path=val_manifest,
         is_train=False,
+        skip_image_file_check=bool(getattr(args, "skip_image_file_check", False)),
         profile_preprocess_pipeline=bool(getattr(args, "profile_preprocess_pipeline", False)),
         profile_preprocess_every_n=int(getattr(args, "profile_preprocess_every_n", 200) or 200),
         profile_preprocess_trace_n=int(getattr(args, "profile_preprocess_trace_n", 0) or 0),
@@ -3116,12 +3170,18 @@ def run(args) -> Dict[str, object]:
     elif "processing_class" in trainer_sig.parameters:
         # Newer Transformers versions replaced `tokenizer=` with `processing_class=`.
         trainer_kwargs["processing_class"] = tokenizer
+    debug_forward = bool(getattr(args, "debug_forward", False))
     debug_train_decode_preview = bool(getattr(args, "enable_train_decode_preview", False))
     debug_train_decode_every_steps = int(getattr(args, "debug_train_decode_every_steps", 100) or 100)
     debug_train_trace = bool(getattr(args, "debug_train_trace", False))
     debug_train_trace_every_steps = int(getattr(args, "debug_train_trace_every_steps", 1) or 1)
     debug_train_trace_topk = int(getattr(args, "debug_train_trace_topk", 5) or 5)
     debug_train_trace_max_positions = int(getattr(args, "debug_train_trace_max_positions", 8) or 8)
+    if debug_forward:
+        LOGGER.warning(
+            "DONUT debug forward logging enabled (train_step/train_running/train_fwd_bwd logs every %d train batches).",
+            50,
+        )
     if (not debug_train_decode_preview) or debug_train_decode_every_steps > 1:
         LOGGER.info(
             "DONUT train decode preview: enabled=%s every_steps=%d",
@@ -3140,6 +3200,7 @@ def run(args) -> Dict[str, object]:
         **trainer_kwargs,
         tokenizer_for_debug=tokenizer,
         metric_newline_token=str(args.metric_newline_token),
+        debug_forward=debug_forward,
         debug_train_decode_preview=debug_train_decode_preview,
         debug_train_decode_every_steps=debug_train_decode_every_steps,
         debug_train_trace=debug_train_trace,
