@@ -1667,11 +1667,18 @@ def _configure_image_processor(image_processor, image_size: int):
     # Keep this conditional so non-Donut image processors keep their native flow.
     try:
         if hasattr(image_processor, "do_pad"):
-            if hasattr(image_processor, "do_resize"):
-                image_processor.do_resize = False
-            if hasattr(image_processor, "do_thumbnail"):
+            has_thumbnail = hasattr(image_processor, "do_thumbnail")
+            if has_thumbnail:
+                if hasattr(image_processor, "do_resize"):
+                    image_processor.do_resize = False
                 image_processor.do_thumbnail = True
-            image_processor.do_pad = True
+                image_processor.do_pad = True
+            else:
+                # Non-Donut processors: keep resize enabled for bounded compute.
+                if hasattr(image_processor, "do_resize"):
+                    image_processor.do_resize = True
+                if hasattr(image_processor, "do_pad"):
+                    image_processor.do_pad = False
             if hasattr(image_processor, "random_padding"):
                 image_processor.random_padding = False
     except Exception as exc:
