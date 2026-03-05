@@ -794,6 +794,81 @@ class DonutDebugSeq2SeqTrainer(Seq2SeqTrainer):
         self._debug_train_trace_every_steps = max(1, int(debug_train_trace_every_steps or 1))
         self._debug_train_trace_topk = max(1, int(debug_train_trace_topk or 5))
         self._debug_train_trace_max_positions = max(1, int(debug_train_trace_max_positions or 8))
+        self._inference_active = False
+        self._inference_phase = "eval"
+        self._inference_batches_seen = 0
+        self._inference_started_at = 0.0
+        self._inference_log_every_batches = 50
+
+    @staticmethod
+    def _resolve_runtime_device(model, inputs: Optional[Dict[str, object]] = None) -> str:
+        try:
+            if isinstance(inputs, dict):
+                for key in ("pixel_values", "decoder_input_ids", "input_ids", "labels"):
+                    val = inputs.get(key)
+                    if torch.is_tensor(val):
+                        return str(val.device)
+        except Exception:
+            pass
+        try:
+            if model is not None:
+                for p in model.parameters():
+                    return str(p.device)
+        except Exception:
+            pass
+        return "unknown"
+
+    def evaluate(self, *args, **kwargs):  # type: ignore[override]
+        phase = str(kwargs.get("metric_key_prefix", "eval") or "eval")
+        self._inference_active = True
+        self._inference_phase = phase
+        self._inference_batches_seen = 0
+        self._inference_started_at = time.perf_counter()
+        if self.is_world_process_zero():
+            LOGGER.info(
+                "inference_start | phase=%s train_global_step=%d predict_with_generate=%s device=%s",
+                phase,
+                int(getattr(self.state, "global_step", 0) or 0),
+                bool(getattr(self.args, "predict_with_generate", False)),
+                self._resolve_runtime_device(getattr(self, "model", None), None),
+            )
+        try:
+            out = super().evaluate(*args, **kwargs)
+        finally:
+            elapsed_ms = (time.perf_counter() - self._inference_started_at) * 1000.0
+            if self.is_world_process_zero():
+                LOGGER.info(
+                    "inference_done | phase=%s train_global_step=%d batches=%d elapsed_ms=%.2f device=%s",
+                    self._inference_phase,
+                    int(getattr(self.state, "global_step", 0) or 0),
+                    int(self._inference_batches_seen),
+                    float(elapsed_ms),
+                    self._resolve_runtime_device(getattr(self, "model", None), None),
+                )
+            self._inference_active = False
+            self._inference_phase = "eval"
+            self._inference_batches_seen = 0
+            self._inference_started_at = 0.0
+        return out
+
+    def prediction_step(self, model, inputs, prediction_loss_only, ignore_keys=None):  # type: ignore[override]
+        if self._inference_active and self.is_world_process_zero():
+            self._inference_batches_seen += 1
+            n = int(self._inference_batches_seen)
+            if n == 1 or (n % int(self._inference_log_every_batches) == 0):
+                LOGGER.info(
+                    "inference_running | phase=%s train_global_step=%d eval_batch=%d device=%s",
+                    self._inference_phase,
+                    int(getattr(self.state, "global_step", 0) or 0),
+                    n,
+                    self._resolve_runtime_device(model, inputs if isinstance(inputs, dict) else None),
+                )
+        return super().prediction_step(
+            model=model,
+            inputs=inputs,
+            prediction_loss_only=prediction_loss_only,
+            ignore_keys=ignore_keys,
+        )
 
     def compute_loss(self, model, inputs, return_outputs=False, **kwargs):  # type: ignore[override]
         out = super().compute_loss(model, inputs, return_outputs=True, **kwargs)
