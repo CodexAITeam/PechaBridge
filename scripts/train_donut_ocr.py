@@ -78,19 +78,36 @@ def _configure_determinism(seed: int) -> None:
         if hasattr(torch.backends.cuda.matmul, "allow_tf32"):
             torch.backends.cuda.matmul.allow_tf32 = False
 
+    det_warn_only = str(os.environ.get("PB_DETERMINISM_WARN_ONLY", "0")).strip().lower() in {
+        "1",
+        "true",
+        "yes",
+        "on",
+    }
     try:
-        torch.use_deterministic_algorithms(True, warn_only=False)
+        torch.use_deterministic_algorithms(True, warn_only=det_warn_only)
     except TypeError:
         # Older torch versions do not support warn_only.
-        torch.use_deterministic_algorithms(True)
+        if det_warn_only:
+            try:
+                torch.use_deterministic_algorithms(False)
+                LOGGER.warning(
+                    "PB_DETERMINISM_WARN_ONLY=1 requested, but this torch version has no warn_only mode; "
+                    "disabled strict deterministic algorithms to avoid hard runtime failures."
+                )
+            except Exception as exc:
+                LOGGER.warning("Could not adjust torch deterministic mode: %s", exc)
+        else:
+            torch.use_deterministic_algorithms(True)
     except Exception as exc:
         LOGGER.warning("Could not enable torch deterministic algorithms: %s", exc)
 
     # Keep transformers/accelerate internal seeding aligned with runtime seeding.
     set_seed(seed_i)
     LOGGER.info(
-        "Deterministic training enabled (seed=%d, CUBLAS_WORKSPACE_CONFIG=%s, cudnn_deterministic=%s, cudnn_benchmark=%s)",
+        "Deterministic training enabled (seed=%d, warn_only=%s, CUBLAS_WORKSPACE_CONFIG=%s, cudnn_deterministic=%s, cudnn_benchmark=%s)",
         seed_i,
+        bool(det_warn_only),
         os.environ.get("CUBLAS_WORKSPACE_CONFIG", ""),
         bool(getattr(getattr(torch.backends, "cudnn", object()), "deterministic", False)),
         bool(getattr(getattr(torch.backends, "cudnn", object()), "benchmark", False)),
@@ -2018,6 +2035,28 @@ def _encoder_supports_interpolate_pos_encoding(model) -> bool:
     return "interpolate_pos_encoding" in sig.parameters
 
 
+def _relax_determinism_for_interpolate_pos_encoding() -> None:
+    """Avoid hard crashes from non-deterministic bicubic backward in ViT pos-interpolation."""
+    try:
+        torch.use_deterministic_algorithms(True, warn_only=True)
+        LOGGER.warning(
+            "Set torch deterministic algorithms to warn_only because interpolate_pos_encoding "
+            "uses bicubic CUDA backward without deterministic implementation."
+        )
+    except TypeError:
+        # Older torch: no warn_only support.
+        try:
+            torch.use_deterministic_algorithms(False)
+            LOGGER.warning(
+                "Disabled strict torch deterministic algorithms because this torch version "
+                "does not support warn_only and interpolate_pos_encoding would otherwise fail."
+            )
+        except Exception as exc:
+            LOGGER.warning("Could not relax deterministic mode for interpolate_pos_encoding: %s", exc)
+    except Exception as exc:
+        LOGGER.warning("Could not relax deterministic mode for interpolate_pos_encoding: %s", exc)
+
+
 @dataclass
 class OCRSample:
     image_path: Path
@@ -2792,6 +2831,7 @@ def run(args) -> Dict[str, object]:
             "Enabled encoder positional interpolation for variable image size training/eval "
             "(interpolate_pos_encoding=True)."
         )
+        _relax_determinism_for_interpolate_pos_encoding()
     model.decoder.resize_token_embeddings(len(tokenizer))
     fixed_meta_buffers = _materialize_meta_buffers_inplace(model, device="cpu")
     if fixed_meta_buffers:
