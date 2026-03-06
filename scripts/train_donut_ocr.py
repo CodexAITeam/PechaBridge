@@ -805,6 +805,7 @@ class DonutDebugSeq2SeqTrainer(Seq2SeqTrainer):
         debug_train_trace_every_steps: int = 1,
         debug_train_trace_topk: int = 5,
         debug_train_trace_max_positions: int = 8,
+        force_interpolate_pos_encoding: bool = False,
         **kwargs,
     ):
         super().__init__(*args, **kwargs)
@@ -817,6 +818,7 @@ class DonutDebugSeq2SeqTrainer(Seq2SeqTrainer):
         self._debug_train_trace_every_steps = max(1, int(debug_train_trace_every_steps or 1))
         self._debug_train_trace_topk = max(1, int(debug_train_trace_topk or 5))
         self._debug_train_trace_max_positions = max(1, int(debug_train_trace_max_positions or 8))
+        self._force_interpolate_pos_encoding = bool(force_interpolate_pos_encoding)
         self._inference_active = False
         self._inference_phase = "eval"
         self._inference_batches_seen = 0
@@ -844,6 +846,9 @@ class DonutDebugSeq2SeqTrainer(Seq2SeqTrainer):
         return "unknown"
 
     def evaluate(self, *args, **kwargs):  # type: ignore[override]
+        if self._force_interpolate_pos_encoding:
+            kwargs = dict(kwargs)
+            kwargs.setdefault("interpolate_pos_encoding", True)
         phase = str(kwargs.get("metric_key_prefix", "eval") or "eval")
         self._inference_active = True
         self._inference_phase = phase
@@ -899,6 +904,15 @@ class DonutDebugSeq2SeqTrainer(Seq2SeqTrainer):
         return out
 
     def prediction_step(self, model, inputs, prediction_loss_only, ignore_keys=None):  # type: ignore[override]
+        if self._force_interpolate_pos_encoding:
+            try:
+                if isinstance(getattr(self, "_gen_kwargs", None), dict):
+                    self._gen_kwargs.setdefault("interpolate_pos_encoding", True)
+            except Exception:
+                pass
+            if isinstance(inputs, dict):
+                inputs = dict(inputs)
+                inputs.setdefault("interpolate_pos_encoding", True)
         if self._inference_active and self.is_world_process_zero():
             self._inference_batches_seen += 1
             n = int(self._inference_batches_seen)
@@ -920,6 +934,9 @@ class DonutDebugSeq2SeqTrainer(Seq2SeqTrainer):
     def compute_loss(self, model, inputs, return_outputs=False, **kwargs):  # type: ignore[override]
         if self.is_world_process_zero():
             self._train_batches_seen += 1
+        if self._force_interpolate_pos_encoding and isinstance(inputs, dict):
+            inputs = dict(inputs)
+            inputs.setdefault("interpolate_pos_encoding", True)
         if self._debug_forward and self.is_world_process_zero():
             n = int(self._train_batches_seen)
             if n == 1 or (n % int(self._train_running_log_every_batches) == 0):
@@ -1990,6 +2007,17 @@ def _apply_image_preprocess_pipeline(
     return out
 
 
+def _encoder_supports_interpolate_pos_encoding(model) -> bool:
+    enc = getattr(model, "encoder", None)
+    if enc is None:
+        return False
+    try:
+        sig = inspect.signature(enc.forward)
+    except Exception:
+        return False
+    return "interpolate_pos_encoding" in sig.parameters
+
+
 @dataclass
 class OCRSample:
     image_path: Path
@@ -2755,6 +2783,15 @@ def run(args) -> Dict[str, object]:
             model.encoder.config.image_size = [int(target_height), int(target_width)]
     except Exception:
         pass
+    force_interpolate_pos_encoding = bool(
+        enable_letterboxing
+        and _encoder_supports_interpolate_pos_encoding(model)
+    )
+    if force_interpolate_pos_encoding:
+        LOGGER.info(
+            "Enabled encoder positional interpolation for variable image size training/eval "
+            "(interpolate_pos_encoding=True)."
+        )
     model.decoder.resize_token_embeddings(len(tokenizer))
     fixed_meta_buffers = _materialize_meta_buffers_inplace(model, device="cpu")
     if fixed_meta_buffers:
@@ -3358,6 +3395,7 @@ def run(args) -> Dict[str, object]:
         debug_train_trace_every_steps=debug_train_trace_every_steps,
         debug_train_trace_topk=debug_train_trace_topk,
         debug_train_trace_max_positions=debug_train_trace_max_positions,
+        force_interpolate_pos_encoding=force_interpolate_pos_encoding,
     )
     try:
         trainer.remove_callback(ProgressCallback)
