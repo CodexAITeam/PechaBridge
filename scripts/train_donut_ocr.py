@@ -3337,6 +3337,12 @@ def run(args) -> Dict[str, object]:
         }
 
     has_eval = val_dataset is not None and len(val_dataset) > 0
+    det_warn_only_requested = str(os.environ.get("PB_DETERMINISM_WARN_ONLY", "0")).strip().lower() in {
+        "1",
+        "true",
+        "yes",
+        "on",
+    }
     report_to = _parse_report_to(getattr(args, "report_to", "none"))
     _validate_report_to_backends(report_to)
     run_name = str(getattr(args, "run_name", "") or "").strip()
@@ -3377,7 +3383,18 @@ def run(args) -> Dict[str, object]:
     if "data_seed" in ta_sig.parameters:
         ta_kwargs["data_seed"] = int(args.seed)
     if "full_determinism" in ta_sig.parameters:
-        ta_kwargs["full_determinism"] = True
+        enable_full_determinism = bool(
+            (not force_interpolate_pos_encoding)
+            and (not det_warn_only_requested)
+        )
+        ta_kwargs["full_determinism"] = enable_full_determinism
+        if not enable_full_determinism:
+            LOGGER.warning(
+                "Disabled TrainingArguments.full_determinism (force_interpolate_pos_encoding=%s, PB_DETERMINISM_WARN_ONLY=%s) "
+                "to avoid non-deterministic bicubic backward hard-failures.",
+                bool(force_interpolate_pos_encoding),
+                bool(det_warn_only_requested),
+            )
     if "evaluation_strategy" in ta_sig.parameters:
         ta_kwargs["evaluation_strategy"] = ("steps" if has_eval else "no")
     elif "eval_strategy" in ta_sig.parameters:
