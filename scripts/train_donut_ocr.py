@@ -1588,6 +1588,31 @@ def _load_ved_model_robust(model_name_or_path: str) -> VisionEncoderDecoderModel
 
     try:
         model = VisionEncoderDecoderModel.from_pretrained(model_name_or_path, **load_kwargs)
+    except RuntimeError as exc:
+        # Handle checkpoint/model geometry differences (e.g. ViT position embeddings
+        # after switching letterboxing geometry between runs).
+        msg = str(exc)
+        if (
+            "ignore_mismatched_sizes" in msg
+            or "position_embeddings" in msg
+            or "size mismatch" in msg
+        ):
+            retry_kwargs = dict(load_kwargs)
+            retry_kwargs["ignore_mismatched_sizes"] = True
+            LOGGER.warning(
+                "Retrying model load with ignore_mismatched_sizes=True due to shape mismatch "
+                "(typically encoder position embeddings after geometry change)."
+            )
+            try:
+                model = VisionEncoderDecoderModel.from_pretrained(model_name_or_path, **retry_kwargs)
+            except TypeError:
+                # Some transformers variants may reject low_cpu_mem_usage; keep only ignore flag.
+                model = VisionEncoderDecoderModel.from_pretrained(
+                    model_name_or_path,
+                    ignore_mismatched_sizes=True,
+                )
+        else:
+            raise
     except TypeError:
         # Older/newer variants may not accept the kwarg despite signature quirks.
         model = VisionEncoderDecoderModel.from_pretrained(model_name_or_path)
