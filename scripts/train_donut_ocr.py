@@ -1913,19 +1913,81 @@ def _validate_report_to_backends(report_to: Sequence[str]) -> None:
         )
 
 
-def _apply_image_preprocess_pipeline(image: Image.Image, pipeline: str) -> Image.Image:
+def finalize_pecha_geometry(image: Image.Image, target_w: int, target_h: int) -> Image.Image:
+    target_w = int(target_w)
+    target_h = int(target_h)
+    rgb = image.convert("RGB")
+    if target_w <= 0 or target_h <= 0:
+        return rgb
+
+    src_w, src_h = rgb.size
+    if src_w <= 0 or src_h <= 0:
+        return Image.new("RGB", (target_w, target_h), (255, 255, 255))
+
+    scale = float(target_h) / float(src_h)
+    if int(round(float(src_w) * scale)) > target_w:
+        scale = float(target_w) / float(src_w)
+    out_w = max(1, int(round(float(src_w) * scale)))
+    out_h = max(1, int(round(float(src_h) * scale)))
+    out_w = min(target_w, out_w)
+    out_h = min(target_h, out_h)
+
+    src_np = np.asarray(rgb, dtype=np.uint8)
+    border = int(max(1, min(5, src_np.shape[0], src_np.shape[1])))
+    border_mask = np.zeros((src_np.shape[0], src_np.shape[1]), dtype=bool)
+    border_mask[:border, :] = True
+    border_mask[-border:, :] = True
+    border_mask[:, :border] = True
+    border_mask[:, -border:] = True
+    edge_pixels = src_np[border_mask]
+    if edge_pixels.size == 0:
+        fill_rgb = (255, 255, 255)
+    else:
+        med = np.median(edge_pixels, axis=0)
+        fill_rgb = tuple(int(np.clip(round(float(c)), 0, 255)) for c in med.tolist())
+
+    resample_lanczos = getattr(getattr(Image, "Resampling", Image), "LANCZOS", Image.LANCZOS)
+    if (out_w, out_h) != (src_w, src_h):
+        scaled = rgb.resize((out_w, out_h), resample=resample_lanczos)
+    else:
+        scaled = rgb
+
+    canvas = Image.new("RGB", (target_w, target_h), fill_rgb)
+    paste_x = int((target_w - out_w) // 2)
+    paste_y = int((target_h - out_h) // 2)
+    canvas.paste(scaled, (paste_x, paste_y))
+    return canvas
+
+
+def _apply_image_preprocess_pipeline(
+    image: Image.Image,
+    pipeline: str,
+    *,
+    enable_letterboxing: bool = False,
+    target_width: int = 2560,
+    target_height: int = 320,
+) -> Image.Image:
     mode = str(pipeline or "none").strip().lower()
     if mode == "pb":
-        return preprocess_patch_image(image=image, config=PBPreprocessConfig()).convert("RGB")
-    if mode == "bdrc":
-        return preprocess_image_bdrc(image=image, config=BDRCPreprocessConfig.vit_defaults()).convert("RGB")
-    if mode in {"gray", "bdrc_no_bin"}:
+        out = preprocess_patch_image(image=image, config=PBPreprocessConfig()).convert("RGB")
+    elif mode == "bdrc":
+        out = preprocess_image_bdrc(image=image, config=BDRCPreprocessConfig.vit_defaults()).convert("RGB")
+    elif mode in {"gray", "bdrc_no_bin"}:
         cfg = BDRCPreprocessConfig.vit_defaults()
         cfg = BDRCPreprocessConfig.from_dict({**cfg.to_dict(), "binarize": False, "gray_mode": "min_rgb"})
-        return preprocess_image_bdrc(image=image, config=cfg).convert("RGB")
-    if mode == "rgb":
-        return preprocess_image_rgb_lines(image=image, config=RGBLinePreprocessConfig.vit_defaults()).convert("RGB")
-    return image.convert("RGB")
+        out = preprocess_image_bdrc(image=image, config=cfg).convert("RGB")
+    elif mode == "rgb":
+        out = preprocess_image_rgb_lines(image=image, config=RGBLinePreprocessConfig.vit_defaults()).convert("RGB")
+    else:
+        out = image.convert("RGB")
+
+    if bool(enable_letterboxing):
+        out = finalize_pecha_geometry(
+            out,
+            target_w=int(target_width),
+            target_h=int(target_height),
+        )
+    return out
 
 
 @dataclass
@@ -1953,6 +2015,9 @@ class OCRLineDataset(Dataset):
         profile_preprocess_every_n: int = 200,
         profile_preprocess_trace_n: int = 0,
         profile_preprocess_slow_ms: float = 800.0,
+        enable_letterboxing: bool = False,
+        target_width: int = 2560,
+        target_height: int = 320,
     ):
         self.split = "train" if bool(is_train) else "val"
         self.skip_image_file_check = bool(skip_image_file_check)
@@ -2050,7 +2115,10 @@ class OCRLineDataset(Dataset):
             if target_end_token_id is not None
             else None
         )
-        self._line_preprocess_cfg = RGBLinePreprocessConfig.vit_defaults()
+        self.enable_letterboxing = bool(enable_letterboxing)
+        self.target_width = max(1, int(target_width))
+        self.target_height = max(1, int(target_height))
+        self._grayscale_aug_mode = self.preprocess_mode in {"gray", "bdrc"}
         self._profile_preprocess_pipeline = bool(profile_preprocess_pipeline)
         self._profile_preprocess_every_n = max(1, int(profile_preprocess_every_n))
         self._profile_preprocess_trace_n = max(0, int(profile_preprocess_trace_n))
@@ -2131,32 +2199,68 @@ class OCRLineDataset(Dataset):
                 rotate_limit=1.0,
                 p=0.35,
             )
-
-            self.train_rgb_aug_steps = [
-                ("gaussian_blur", blur),
-                ("elastic_transform", elastic),
-                ("coarse_dropout", coarse_dropout),
-                ("hue_saturation_value", hue_sat_val),
-                ("random_brightness_contrast", rand_brightness_contrast),
-                ("gauss_noise", gauss_noise),
-                ("color_profile_shift", color_profile_shift),
-                ("shift_scale_rotate", mild_geometry),
-            ]
-            self.train_rgb_aug = A.Compose(
+            try:
+                downscale = A.Downscale(scale_min=0.3, scale_max=0.7, p=1.0)
+            except TypeError:
+                downscale = A.Downscale(scale_range=(0.3, 0.7), p=1.0)
+            resolution_invariance = A.OneOf(
                 [
-                    # 1) Ink texture and bleed.
-                    blur,
-                    elastic,
-                    coarse_dropout,
-                    # 2) Paper and background.
-                    hue_sat_val,
-                    rand_brightness_contrast,
-                    gauss_noise,
-                    color_profile_shift,
-                    # 3) Slight scan skew geometry (keep very mild).
-                    mild_geometry,
-                ]
+                    downscale,
+                    A.Blur(blur_limit=3, p=1.0),
+                ],
+                p=0.4,
             )
+
+            if self._grayscale_aug_mode:
+                self.train_rgb_aug_steps = [
+                    ("gaussian_blur", blur),
+                    ("elastic_transform", elastic),
+                    ("coarse_dropout", coarse_dropout),
+                    ("random_brightness_contrast", rand_brightness_contrast),
+                    ("gauss_noise", gauss_noise),
+                    ("resolution_invariance", resolution_invariance),
+                    ("shift_scale_rotate", mild_geometry),
+                ]
+                self.train_rgb_aug = A.Compose(
+                    [
+                        blur,
+                        elastic,
+                        coarse_dropout,
+                        rand_brightness_contrast,
+                        gauss_noise,
+                        resolution_invariance,
+                        mild_geometry,
+                    ]
+                )
+            else:
+                self.train_rgb_aug_steps = [
+                    ("gaussian_blur", blur),
+                    ("elastic_transform", elastic),
+                    ("coarse_dropout", coarse_dropout),
+                    ("hue_saturation_value", hue_sat_val),
+                    ("random_brightness_contrast", rand_brightness_contrast),
+                    ("gauss_noise", gauss_noise),
+                    ("color_profile_shift", color_profile_shift),
+                    ("resolution_invariance", resolution_invariance),
+                    ("shift_scale_rotate", mild_geometry),
+                ]
+                self.train_rgb_aug = A.Compose(
+                    [
+                        # 1) Ink texture and bleed.
+                        blur,
+                        elastic,
+                        coarse_dropout,
+                        # 2) Paper and background.
+                        hue_sat_val,
+                        rand_brightness_contrast,
+                        gauss_noise,
+                        color_profile_shift,
+                        # 3) Resolution-invariance for mixed-source scans/crops.
+                        resolution_invariance,
+                        # 4) Slight scan skew geometry (keep very mild).
+                        mild_geometry,
+                    ]
+                )
         elif self.split == "train":
             LOGGER.warning(
                 "Albumentations is not available; RGB train-time line augmentation is disabled."
@@ -2259,10 +2363,13 @@ class OCRLineDataset(Dataset):
             LOGGER.info("preproc_step_start | split=%s worker=%d idx=%d step=image_preprocess", self.split, int(worker_id), int(idx))
 
         t_pre = time.perf_counter() if self._profile_preprocess_pipeline else 0.0
-        if self.preprocess_mode == "rgb":
-            rgb = preprocess_image_rgb_lines(image=rgb, config=self._line_preprocess_cfg).convert("RGB")
-        else:
-            rgb = _apply_image_preprocess_pipeline(rgb, self.preprocess_mode)
+        rgb = _apply_image_preprocess_pipeline(
+            rgb,
+            self.preprocess_mode,
+            enable_letterboxing=self.enable_letterboxing,
+            target_width=self.target_width,
+            target_height=self.target_height,
+        )
         if self._profile_preprocess_pipeline:
             timings["image_preprocess_ms"] = (time.perf_counter() - t_pre) * 1000.0
         if trace_steps:
@@ -2271,7 +2378,7 @@ class OCRLineDataset(Dataset):
         if (
             self.split == "train"
             and self.train_rgb_aug is not None
-            and self.preprocess_mode in {"rgb", "gray"}
+            and self.preprocess_mode in {"rgb", "gray", "bdrc"}
         ):
             if trace_steps:
                 LOGGER.info("preproc_step_start | split=%s worker=%d idx=%d step=train_aug", self.split, int(worker_id), int(idx))
@@ -2608,17 +2715,46 @@ def run(args) -> Dict[str, object]:
         LOGGER.info("Tokenizer saved to %s", tokenizer_save_dir)
     _dist_barrier()
 
+    enable_letterboxing = bool(getattr(args, "enable_letterboxing", False))
+    target_width = max(1, int(getattr(args, "target_width", 2560) or 2560))
+    target_height = max(1, int(getattr(args, "target_height", 320) or 320))
+
     image_processor_source = args.image_processor_path or args.model_name_or_path
     image_processor = AutoImageProcessor.from_pretrained(image_processor_source)
     _configure_image_processor(image_processor, int(args.image_size))
+    if enable_letterboxing:
+        try:
+            image_processor.size = {"height": int(target_height), "width": int(target_width)}
+        except Exception as exc:
+            LOGGER.warning("Could not set image processor letterbox size to [%d,%d]: %s", int(target_height), int(target_width), exc)
     image_preproc_mode = _image_preprocess_pipeline_name(args)
     LOGGER.info("Donut OCR image preprocessing pipeline: %s", image_preproc_mode)
+    LOGGER.info(
+        "Donut OCR letterboxing: enabled=%s target_height=%d target_width=%d",
+        bool(enable_letterboxing),
+        int(target_height),
+        int(target_width),
+    )
     image_processor_dir = output_dir / "image_processor"
     if _is_primary_process_runtime():
         image_processor.save_pretrained(str(image_processor_dir))
     _dist_barrier()
 
     model = _load_ved_model_robust(args.model_name_or_path)
+    try:
+        model.config.encoder.image_size = [int(target_height), int(target_width)]
+    except Exception as exc:
+        LOGGER.warning(
+            "Could not set model.config.encoder.image_size to [%d,%d]: %s",
+            int(target_height),
+            int(target_width),
+            exc,
+        )
+    try:
+        if hasattr(model, "encoder") and hasattr(model.encoder, "config"):
+            model.encoder.config.image_size = [int(target_height), int(target_width)]
+    except Exception:
+        pass
     model.decoder.resize_token_embeddings(len(tokenizer))
     fixed_meta_buffers = _materialize_meta_buffers_inplace(model, device="cpu")
     if fixed_meta_buffers:
@@ -2767,6 +2903,9 @@ def run(args) -> Dict[str, object]:
         profile_preprocess_every_n=int(getattr(args, "profile_preprocess_every_n", 200) or 200),
         profile_preprocess_trace_n=int(getattr(args, "profile_preprocess_trace_n", 0) or 0),
         profile_preprocess_slow_ms=float(getattr(args, "profile_preprocess_slow_ms", 800.0) or 800.0),
+        enable_letterboxing=enable_letterboxing,
+        target_width=target_width,
+        target_height=target_height,
     )
     val_dataset = OCRLineDataset(
         val_rows,
@@ -2784,6 +2923,9 @@ def run(args) -> Dict[str, object]:
         profile_preprocess_every_n=int(getattr(args, "profile_preprocess_every_n", 200) or 200),
         profile_preprocess_trace_n=int(getattr(args, "profile_preprocess_trace_n", 0) or 0),
         profile_preprocess_slow_ms=float(getattr(args, "profile_preprocess_slow_ms", 800.0) or 800.0),
+        enable_letterboxing=enable_letterboxing,
+        target_width=target_width,
+        target_height=target_height,
     ) if val_rows else None
 
     LOGGER.info("Train dataset size: %d", len(train_dataset))
@@ -2803,6 +2945,15 @@ def run(args) -> Dict[str, object]:
 
     collator = OCRDataCollator(tokenizer)
     _repro_has_eval = (val_dataset is not None and len(val_dataset) > 0)
+    def _image_preprocess_runtime(image: Image.Image, pipeline: str) -> Image.Image:
+        return _apply_image_preprocess_pipeline(
+            image=image,
+            pipeline=pipeline,
+            enable_letterboxing=enable_letterboxing,
+            target_width=target_width,
+            target_height=target_height,
+        )
+
     repro_pack = ReproPack(
         args=args,
         tokenizer=tokenizer,
@@ -2812,7 +2963,7 @@ def run(args) -> Dict[str, object]:
         decode_for_metric_fn=_decode_for_metric,
         normalize_for_metric_fn=_normalize_for_metric,
         levenshtein_fn=_levenshtein,
-        image_preprocess_fn=_apply_image_preprocess_pipeline,
+        image_preprocess_fn=_image_preprocess_runtime,
         format_target_text_fn=_format_ocr_target_text,
         encode_target_ids_fn=_encode_target_ids_with_terminal_preservation,
         prepare_model_for_generate_fn=_prepare_model_for_generate_runtime,

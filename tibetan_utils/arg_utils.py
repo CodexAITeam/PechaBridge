@@ -1046,6 +1046,12 @@ def add_train_donut_ocr_arguments(parser):
     parser.add_argument('--image_preprocess_pipeline', '--image-preprocess-pipeline', dest='image_preprocess_pipeline', type=str,
                        default='none', choices=['none', 'pb', 'bdrc', 'gray', 'rgb'],
                        help='Optional deterministic image preprocessing before Donut image processor')
+    parser.add_argument('--enable_letterboxing', '--enable-letterboxing', dest='enable_letterboxing', action='store_true',
+                       help='Enable final fixed-size letterboxing after preprocessing')
+    parser.add_argument('--target_width', '--target-width', dest='target_width', type=int, default=2560,
+                       help='Target canvas width used for final letterboxing')
+    parser.add_argument('--target_height', '--target-height', dest='target_height', type=int, default=320,
+                       help='Target canvas height used for final letterboxing')
     parser.add_argument('--max_target_length', type=int, default=512,
                        help='Maximum target token length for training labels')
     parser.add_argument('--generation_max_length', type=int, default=512,
@@ -1157,6 +1163,12 @@ def add_run_donut_ocr_workflow_arguments(parser):
     parser.add_argument('--image_preprocess_pipeline', '--image-preprocess-pipeline', dest='image_preprocess_pipeline', type=str,
                        default='none', choices=['none', 'pb', 'bdrc', 'gray', 'rgb'],
                        help='Optional deterministic image preprocessing before Donut image processor in workflow train step')
+    parser.add_argument('--enable_letterboxing', '--enable-letterboxing', dest='enable_letterboxing', action='store_true',
+                       help='Enable final fixed-size letterboxing in workflow train step')
+    parser.add_argument('--target_width', '--target-width', dest='target_width', type=int, default=2560,
+                       help='Target canvas width used for final letterboxing in workflow train step')
+    parser.add_argument('--target_height', '--target-height', dest='target_height', type=int, default=320,
+                       help='Target canvas height used for final letterboxing in workflow train step')
     parser.add_argument('--profile_preprocess_pipeline', '--profile-preprocess-pipeline', dest='profile_preprocess_pipeline', action='store_true',
                        help='Enable per-sample timing logs for OCR dataset preprocessing in workflow train step')
     parser.add_argument('--profile_preprocess_every_n', '--profile-preprocess-every-n', dest='profile_preprocess_every_n', type=int, default=200,
