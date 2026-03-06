@@ -863,9 +863,6 @@ class DonutDebugSeq2SeqTrainer(Seq2SeqTrainer):
         return "unknown"
 
     def evaluate(self, *args, **kwargs):  # type: ignore[override]
-        if self._force_interpolate_pos_encoding:
-            kwargs = dict(kwargs)
-            kwargs.setdefault("interpolate_pos_encoding", True)
         phase = str(kwargs.get("metric_key_prefix", "eval") or "eval")
         self._inference_active = True
         self._inference_phase = phase
@@ -922,14 +919,21 @@ class DonutDebugSeq2SeqTrainer(Seq2SeqTrainer):
 
     def prediction_step(self, model, inputs, prediction_loss_only, ignore_keys=None):  # type: ignore[override]
         if self._force_interpolate_pos_encoding:
-            try:
-                if isinstance(getattr(self, "_gen_kwargs", None), dict):
-                    self._gen_kwargs.setdefault("interpolate_pos_encoding", True)
-            except Exception:
-                pass
             if isinstance(inputs, dict):
                 inputs = dict(inputs)
                 inputs.setdefault("interpolate_pos_encoding", True)
+            try:
+                # Avoid duplicate kwarg in `generate(**generation_inputs, **gen_kwargs)`.
+                if (
+                    isinstance(getattr(self, "_gen_kwargs", None), dict)
+                    and isinstance(inputs, dict)
+                    and "interpolate_pos_encoding" in inputs
+                    and "interpolate_pos_encoding" in self._gen_kwargs
+                ):
+                    self._gen_kwargs = dict(self._gen_kwargs)
+                    self._gen_kwargs.pop("interpolate_pos_encoding", None)
+            except Exception:
+                pass
         if self._inference_active and self.is_world_process_zero():
             self._inference_batches_seen += 1
             n = int(self._inference_batches_seen)
