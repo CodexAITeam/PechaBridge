@@ -127,6 +127,24 @@ def _encoder_supports_interpolate_pos_encoding(model) -> bool:
     return "interpolate_pos_encoding" in sig.parameters
 
 
+def _encoder_pos_embeddings_are_square_grid(model) -> bool:
+    enc = getattr(model, "encoder", None)
+    if enc is None:
+        return False
+    pos = None
+    try:
+        pos = getattr(getattr(enc, "embeddings", None), "position_embeddings", None)
+    except Exception:
+        pos = None
+    if not torch.is_tensor(pos) or pos.ndim != 3:
+        return False
+    n = int(pos.shape[1]) - 1
+    if n <= 0:
+        return False
+    s = int(round(float(n) ** 0.5))
+    return int(s * s) == int(n)
+
+
 def _sha256_file(path: Path, chunk_size: int = 1 << 20) -> str:
     h = hashlib.sha256()
     with path.open("rb") as f:
@@ -452,7 +470,7 @@ class ReproPack:
         was_training = bool(getattr(gen_model, "training", False))
         device = next(gen_model.parameters()).device
         gen_kwargs = self._generate_kwargs(gen_model)
-        if _encoder_supports_interpolate_pos_encoding(gen_model):
+        if _encoder_supports_interpolate_pos_encoding(gen_model) and _encoder_pos_embeddings_are_square_grid(gen_model):
             gen_kwargs.setdefault("interpolate_pos_encoding", True)
         newline_token = str(getattr(self.args, "metric_newline_token", "<NL>") or "<NL>")
         local_rows: List[Dict[str, Any]] = []

@@ -2064,6 +2064,52 @@ def _encoder_supports_interpolate_pos_encoding(model) -> bool:
     return "interpolate_pos_encoding" in sig.parameters
 
 
+def _encoder_pos_embeddings_are_square_grid(model) -> bool:
+    """ViT interpolate_pos_encoding expects a square source patch grid."""
+    enc = getattr(model, "encoder", None)
+    if enc is None:
+        return False
+    pos = None
+    try:
+        pos = getattr(getattr(enc, "embeddings", None), "position_embeddings", None)
+    except Exception:
+        pos = None
+    if not torch.is_tensor(pos) or pos.ndim != 3:
+        return False
+    # shape: [1, num_positions+1, dim], first token is CLS.
+    n = int(pos.shape[1]) - 1
+    if n <= 0:
+        return False
+    s = int(round(float(n) ** 0.5))
+    return int(s * s) == int(n)
+
+
+def _set_encoder_patch_image_size(model, target_h: int, target_w: int) -> None:
+    """Keep ViT patch embedding geometry in sync with letterboxed input size."""
+    enc = getattr(model, "encoder", None)
+    if enc is None:
+        return
+    patch_embeddings = getattr(getattr(enc, "embeddings", None), "patch_embeddings", None)
+    if patch_embeddings is None:
+        return
+    try:
+        patch_embeddings.image_size = (int(target_h), int(target_w))
+    except Exception:
+        return
+    try:
+        patch_size = getattr(patch_embeddings, "patch_size", (16, 16))
+        if isinstance(patch_size, int):
+            ph, pw = int(patch_size), int(patch_size)
+        else:
+            ph, pw = int(patch_size[0]), int(patch_size[1])
+        nh = max(1, int(target_h) // max(1, ph))
+        nw = max(1, int(target_w) // max(1, pw))
+        if hasattr(patch_embeddings, "num_patches"):
+            patch_embeddings.num_patches = int(nh * nw)
+    except Exception:
+        pass
+
+
 def _relax_determinism_for_interpolate_pos_encoding() -> None:
     """Avoid hard crashes from non-deterministic bicubic backward in ViT pos-interpolation."""
     try:
@@ -2851,10 +2897,19 @@ def run(args) -> Dict[str, object]:
             model.encoder.config.image_size = [int(target_height), int(target_width)]
     except Exception:
         pass
+    _set_encoder_patch_image_size(model, int(target_height), int(target_width))
+    encoder_supports_interp = _encoder_supports_interpolate_pos_encoding(model)
+    encoder_pos_is_square = _encoder_pos_embeddings_are_square_grid(model)
     force_interpolate_pos_encoding = bool(
         enable_letterboxing
-        and _encoder_supports_interpolate_pos_encoding(model)
+        and encoder_supports_interp
+        and encoder_pos_is_square
     )
+    if bool(enable_letterboxing) and bool(encoder_supports_interp) and not bool(encoder_pos_is_square):
+        LOGGER.info(
+            "Disabled interpolate_pos_encoding because loaded encoder position embeddings are non-square "
+            "(already adapted checkpoint)."
+        )
     if force_interpolate_pos_encoding:
         LOGGER.info(
             "Enabled encoder positional interpolation for variable image size training/eval "
