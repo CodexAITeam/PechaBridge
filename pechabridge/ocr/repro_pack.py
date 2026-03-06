@@ -116,6 +116,17 @@ def _write_jsonl(path: Path, rows: Iterable[Dict[str, Any]]) -> None:
             f.write(json.dumps(row, ensure_ascii=False) + "\n")
 
 
+def _encoder_supports_interpolate_pos_encoding(model) -> bool:
+    enc = getattr(model, "encoder", None)
+    if enc is None:
+        return False
+    try:
+        sig = inspect.signature(enc.forward)
+    except Exception:
+        return False
+    return "interpolate_pos_encoding" in sig.parameters
+
+
 def _sha256_file(path: Path, chunk_size: int = 1 << 20) -> str:
     h = hashlib.sha256()
     with path.open("rb") as f:
@@ -441,6 +452,8 @@ class ReproPack:
         was_training = bool(getattr(gen_model, "training", False))
         device = next(gen_model.parameters()).device
         gen_kwargs = self._generate_kwargs(gen_model)
+        if _encoder_supports_interpolate_pos_encoding(gen_model):
+            gen_kwargs.setdefault("interpolate_pos_encoding", True)
         newline_token = str(getattr(self.args, "metric_newline_token", "<NL>") or "<NL>")
         local_rows: List[Dict[str, Any]] = []
         local_edit_sum = 0
