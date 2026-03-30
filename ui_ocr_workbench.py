@@ -928,6 +928,117 @@ def _run_full_auto(
     )
 
 
+def _load_repro_ui_settings(ckpt_path: str) -> Tuple[str, str, Dict[str, Any], Dict[str, Any]]:
+    """Load preprocessing settings from a repro bundle and return UI-ready values.
+
+    Returns (preset, status_msg, bdrc_dict, rgb_dict).
+    The dicts contain all keys expected by the Advanced View sliders.
+    """
+    repro_pipeline = _read_repro_preprocess_pipeline(ckpt_path)
+    if repro_pipeline is None:
+        # No repro bundle — return current defaults
+        bdrc = _bdrc_ui_defaults()
+        rgb = _rgb_ui_defaults()
+        preset = "bdrc"
+        msg = f"No repro bundle found for {Path(ckpt_path).name}. Defaults loaded."
+        return preset, msg, bdrc, rgb
+
+    preset = _normalize_preprocess_preset(repro_pipeline)
+    msg = f"Loaded repro settings from {Path(ckpt_path).name}: pipeline={preset}"
+
+    # Reconstruct vit_defaults for the detected pipeline
+    bdrc = _bdrc_ui_defaults()
+    rgb = _rgb_ui_defaults()
+    if preset in {"bdrc", "gray"} and BDRCPreprocessConfig is not None:
+        try:
+            base = dict(BDRCPreprocessConfig.vit_defaults().to_dict())
+            if preset == "gray":
+                base["binarize"] = False
+                base["gray_mode"] = "min_rgb"
+            # Map to UI keys
+            bdrc = {
+                "gray_mode": str(base.get("gray_mode", "luma")),
+                "normalize_background": bool(base.get("normalize_background", False)),
+                "background_blur_ksize": int(base.get("background_blur_ksize", 0)),
+                "background_strength": float(base.get("background_strength", 1.0)),
+                "upscale_factor": float(base.get("upscale_factor", 1.0)),
+                "upscale_interpolation": str(base.get("upscale_interpolation", "lanczos")),
+                "binarize": bool(base.get("binarize", True)),
+                "threshold_method": str(base.get("threshold_method", "adaptive")),
+                "threshold_block_size": int(base.get("threshold_block_size", 51)),
+                "threshold_c": int(base.get("threshold_c", 13)),
+                "fixed_threshold": int(base.get("fixed_threshold", 120)),
+                "morph_close": bool(base.get("morph_close", False)),
+                "morph_close_kernel": int(base.get("morph_close_kernel", 2)),
+                "remove_small_components": bool(base.get("remove_small_components", False)),
+                "min_component_area": int(base.get("min_component_area", 12)),
+            }
+        except Exception:
+            pass
+    elif preset == "rgb" and RGBLinePreprocessConfig is not None:
+        try:
+            base = dict(RGBLinePreprocessConfig.vit_defaults().to_dict())
+            rgb = {
+                "preserve_color": bool(base.get("preserve_color", True)),
+                "normalize_background": bool(base.get("normalize_background", True)),
+                "background_method": str(base.get("background_method", "shade_correct")),
+                "background_blur_ksize": int(base.get("background_blur_ksize", 0)),
+                "background_strength": float(base.get("background_strength", 0.35)),
+                "contrast": float(base.get("contrast", 1.0)),
+                "denoise": bool(base.get("denoise", False)),
+                "morph_close": bool(base.get("morph_close", False)),
+                "morph_close_kernel": int(base.get("morph_close_kernel", 3)),
+                "remove_small_components": bool(base.get("remove_small_components", False)),
+                "min_component_area": int(base.get("min_component_area", 12)),
+                "upscale_factor": float(base.get("upscale_factor", 1.0)),
+                "upscale_interpolation": str(base.get("upscale_interpolation", "lanczos")),
+                "ink_normalization": bool(base.get("ink_normalization", True)),
+                "ink_strength": float(base.get("ink_strength", 0.2)),
+            }
+        except Exception:
+            pass
+    return preset, msg, bdrc, rgb
+
+
+def _resolve_effective_preprocess_config_dict(
+    preset: str,
+    pipeline_source: str,
+    bdrc_overrides: Optional[Dict[str, Any]],
+    rgb_overrides: Optional[Dict[str, Any]],
+) -> Dict[str, Any]:
+    """Return the full config dict that will actually be applied during inference.
+
+    For repro-bundle checkpoints the vit_defaults() are used (no UI overrides).
+    For UI-fallback checkpoints the current UI override dict is used.
+    """
+    mode = _normalize_preprocess_preset(preset)
+    if pipeline_source == "repro":
+        # Reconstruct vit_defaults to show exact training-time parameters
+        if mode in {"bdrc", "gray"} and BDRCPreprocessConfig is not None:
+            try:
+                base = dict(BDRCPreprocessConfig.vit_defaults().to_dict())
+                if mode == "gray":
+                    base["binarize"] = False
+                    base["gray_mode"] = "min_rgb"
+                return base
+            except Exception:
+                pass
+        if mode == "rgb" and RGBLinePreprocessConfig is not None:
+            try:
+                return dict(RGBLinePreprocessConfig.vit_defaults().to_dict())
+            except Exception:
+                pass
+        return {}
+    else:
+        # UI-configured overrides
+        effective = _effective_preprocess_overrides(
+            preprocess_preset=preset,
+            bdrc_preprocess_overrides=bdrc_overrides,
+            rgb_preprocess_overrides=rgb_overrides,
+        )
+        return dict(effective) if isinstance(effective, dict) else {}
+
+
 def _read_repro_preprocess_pipeline(ckpt_path: str) -> Optional[str]:
     """Read the image_preprocess pipeline name saved in a repro checkpoint bundle.
 
@@ -1051,7 +1162,15 @@ def _run_comparison(
         transcript = _line_text(rows)
         report_lines.append(f"Model: {model_name}")
         pipeline_note = "from repro bundle" if pipeline_source == "repro" else "from UI selection (no repro bundle)"
+        cfg_dict = _resolve_effective_preprocess_config_dict(
+            preset=effective_preset,
+            pipeline_source=pipeline_source,
+            bdrc_overrides=effective_bdrc_overrides,
+            rgb_overrides=effective_rgb_overrides,
+        )
+        cfg_str = ", ".join(f"{k}={v}" for k, v in sorted(cfg_dict.items())) if cfg_dict else "defaults"
         report_lines.append(f"Preprocessing: {effective_preset} ({pipeline_note})")
+        report_lines.append(f"Preprocessing config: {cfg_str}")
         report_lines.append(f"Text:\n{transcript}")
         report_lines.append("")
         ckpt_debug.append({
@@ -1637,6 +1756,7 @@ function() {
                 )
             with gr.Column(scale=1, min_width=110):
                 donut_refresh_btn = gr.Button("🔄 Refresh", variant="secondary")
+                load_repro_btn = gr.Button("📋 Load repro settings", variant="secondary")
             with gr.Column(scale=10):
                 layout_model_choices, layout_msg = _list_layout_models()
                 # choices = [(label, full_path), ...]; value = full_path string
@@ -2697,6 +2817,84 @@ function() {
             fn=_refresh_layout,
             inputs=[],
             outputs=[layout_path, layout_info],
+        )
+
+        def _on_load_repro(ckpt_path: str):
+            preset, msg, bdrc, rgb = _load_repro_ui_settings(ckpt_path or "")
+            return (
+                gr.update(value=preset),   # preprocess_preset
+                msg,                        # status
+                # BDRC sliders
+                gr.update(value=bdrc["gray_mode"]),
+                gr.update(value=bdrc["normalize_background"]),
+                gr.update(value=bdrc["background_blur_ksize"]),
+                gr.update(value=bdrc["background_strength"]),
+                gr.update(value=bdrc["upscale_factor"]),
+                gr.update(value=bdrc["upscale_interpolation"]),
+                gr.update(value=bdrc["binarize"]),
+                gr.update(value=bdrc["threshold_method"]),
+                gr.update(value=bdrc["threshold_block_size"]),
+                gr.update(value=bdrc["threshold_c"]),
+                gr.update(value=bdrc["fixed_threshold"]),
+                gr.update(value=bdrc["morph_close"]),
+                gr.update(value=bdrc["morph_close_kernel"]),
+                gr.update(value=bdrc["remove_small_components"]),
+                gr.update(value=bdrc["min_component_area"]),
+                # RGB sliders
+                gr.update(value=rgb["preserve_color"]),
+                gr.update(value=rgb["normalize_background"]),
+                gr.update(value=rgb["background_method"]),
+                gr.update(value=rgb["background_blur_ksize"]),
+                gr.update(value=rgb["background_strength"]),
+                gr.update(value=rgb["contrast"]),
+                gr.update(value=rgb["denoise"]),
+                gr.update(value=rgb["morph_close"]),
+                gr.update(value=rgb["morph_close_kernel"]),
+                gr.update(value=rgb["remove_small_components"]),
+                gr.update(value=rgb["min_component_area"]),
+                gr.update(value=rgb["upscale_factor"]),
+                gr.update(value=rgb["upscale_interpolation"]),
+                gr.update(value=rgb["ink_normalization"]),
+                gr.update(value=rgb["ink_strength"]),
+            )
+
+        load_repro_btn.click(
+            fn=_on_load_repro,
+            inputs=[donut_path],
+            outputs=[
+                preprocess_preset,
+                status,
+                bdrc_gray_mode,
+                bdrc_normalize_bg,
+                bdrc_bg_blur_ksize,
+                bdrc_bg_strength,
+                bdrc_upscale_factor,
+                bdrc_upscale_interp,
+                bdrc_binarize,
+                bdrc_threshold_method,
+                bdrc_threshold_block,
+                bdrc_threshold_c,
+                bdrc_fixed_threshold,
+                bdrc_morph_close,
+                bdrc_morph_close_kernel,
+                bdrc_remove_small_components,
+                bdrc_min_component_area,
+                rgb_preserve_color,
+                rgb_normalize_bg,
+                rgb_background_method,
+                rgb_bg_blur_ksize,
+                rgb_bg_strength,
+                rgb_contrast,
+                rgb_denoise,
+                rgb_morph_close,
+                rgb_morph_close_kernel,
+                rgb_remove_small_components,
+                rgb_min_component_area,
+                rgb_upscale_factor,
+                rgb_upscale_interp,
+                rgb_ink_normalization,
+                rgb_ink_strength,
+            ],
         )
 
     return demo
