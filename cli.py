@@ -19,6 +19,7 @@ from tibetan_utils.arg_utils import (
     create_texture_augment_parser,
     create_train_texture_lora_parser,
 )
+from pechabridge.cli.batch_ocr import create_parser as create_batch_ocr_parser, run as run_batch_ocr
 from pechabridge.cli.gen_patches import create_parser as create_gen_patches_parser, run as run_gen_patches
 from pechabridge.cli.mine_mnn_pairs import create_parser as create_mnn_pairs_parser, run as run_mnn_pairs
 from pechabridge.cli.weak_ocr_label import create_parser as create_weak_ocr_label_parser, run as run_weak_ocr_label
@@ -208,6 +209,15 @@ def _build_root_parser() -> argparse.ArgumentParser:
     )
     bosentencepiece_parser.set_defaults(handler=_run_download_bosentencepiece_tokenizer)
 
+    batch_ocr_parent = create_batch_ocr_parser(add_help=False)
+    batch_ocr_parser = subparsers.add_parser(
+        "batch-ocr",
+        parents=[batch_ocr_parent],
+        help="Batch OCR a folder of Pecha images using a DONUT OCR model and a YOLO layout model",
+        description=batch_ocr_parent.description,
+    )
+    batch_ocr_parser.set_defaults(handler=_run_batch_ocr)
+
     gen_patches_parent = create_gen_patches_parser(add_help=False)
     gen_patches_parser = subparsers.add_parser(
         "gen-patches",
@@ -367,6 +377,10 @@ def _run_download_bosentencepiece_tokenizer(args: argparse.Namespace) -> int:
     from scripts.download_bosentencepiece_tokenizer import run
 
     return int(run(args))
+
+
+def _run_batch_ocr(args: argparse.Namespace) -> int:
+    return int(run_batch_ocr(args))
 
 
 def _run_gen_patches(args: argparse.Namespace) -> int:
