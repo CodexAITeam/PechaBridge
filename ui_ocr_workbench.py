@@ -1305,21 +1305,35 @@ def build_ui() -> gr.Blocks:
     rgb_defaults = _rgb_ui_defaults()
     ui_css = """
 #ocr_image_panel {
-  min-height: 300px;
-  min-width: 320px;
-  resize: both;
-  overflow: auto;
+  width: 100% !important;
   border: 1px dashed #cbd5e1;
   border-radius: 8px;
+  overflow: auto;
 }
-#ocr_image_panel .image-container,
+#ocr_image_panel .image-container {
+  overflow: auto !important;
+  width: 100% !important;
+}
 #ocr_image_panel img {
+  max-width: none !important;
   max-height: none !important;
+  display: block;
+  transform-origin: top left;
+}
+#img_zoom_row {
+  display: flex;
+  align-items: center;
+  gap: 6px;
+  margin-bottom: 4px;
+}
+#img_zoom_minus, #img_zoom_plus, #img_zoom_reset {
+  min-width: 36px !important;
+  width: 36px !important;
+  padding: 0 !important;
 }
 #transcript_panel {
-  min-height: 300px;
-  min-width: 320px;
-  resize: both;
+  min-height: 200px;
+  resize: vertical;
   overflow: auto;
   border: 1px dashed #cbd5e1;
   border-radius: 8px;
@@ -1328,7 +1342,7 @@ def build_ui() -> gr.Blocks:
 #transcript_box textarea {
   font-size: 18px !important;
   line-height: 1.45 !important;
-  min-height: 300px !important;
+  min-height: 200px !important;
   resize: both !important;
   overflow: auto !important;
 }
@@ -1607,19 +1621,25 @@ def build_ui() -> gr.Blocks:
             full_roi_btn = gr.Button("Process Full Image as ROI", visible=False)
             save_btn = gr.Button("Save", variant="secondary")
 
+        # ── Image row (full width) ──────────────────────────────────────────
+        with gr.Row(elem_id="img_zoom_row"):
+            img_zoom_out_btn = gr.Button("🔍−", elem_id="img_zoom_minus", scale=0, min_width=36)
+            img_zoom_reset_btn = gr.Button("⊙", elem_id="img_zoom_reset", scale=0, min_width=36)
+            img_zoom_in_btn = gr.Button("🔍+", elem_id="img_zoom_plus", scale=0, min_width=36)
         with gr.Row():
             image_view = gr.Image(
                 label="Image / Overlay",
                 type="numpy",
                 interactive=True,
-                height=300,
                 elem_id="ocr_image_panel",
                 show_label=False,
-                scale=3,
             )
-            with gr.Column(elem_id="transcript_panel", scale=7):
+
+        # ── Transcript row (full width) ─────────────────────────────────────
+        with gr.Row():
+            with gr.Column(elem_id="transcript_panel"):
                 with gr.Row():
-                    transcript = gr.Textbox(label="", lines=28, elem_id="transcript_box", show_label=False, scale=36)
+                    transcript = gr.Textbox(label="", lines=14, elem_id="transcript_box", show_label=False, scale=36)
                     with gr.Column(elem_id="font_ctrl_col", scale=1, min_width=24):
                         font_plus_btn = gr.Button("+", elem_id="font_btn_plus")
                         font_minus_btn = gr.Button("−", elem_id="font_btn_minus")
@@ -2200,6 +2220,38 @@ def build_ui() -> gr.Blocks:
 }
 """,
         )
+
+        _ZOOM_JS = """
+() => {
+  const img = document.querySelector('#ocr_image_panel img');
+  if (!img) return;
+  const cur = parseFloat(img.style.transform.replace('scale(','').replace(')','')) || 1.0;
+  const next = Math.min(8.0, Math.round((cur + 0.25) * 100) / 100);
+  img.style.transform = `scale(${next})`;
+  img.style.transformOrigin = 'top left';
+}
+"""
+        _ZOOM_OUT_JS = """
+() => {
+  const img = document.querySelector('#ocr_image_panel img');
+  if (!img) return;
+  const cur = parseFloat(img.style.transform.replace('scale(','').replace(')','')) || 1.0;
+  const next = Math.max(0.25, Math.round((cur - 0.25) * 100) / 100);
+  img.style.transform = `scale(${next})`;
+  img.style.transformOrigin = 'top left';
+}
+"""
+        _ZOOM_RESET_JS = """
+() => {
+  const img = document.querySelector('#ocr_image_panel img');
+  if (!img) return;
+  img.style.transform = 'scale(1)';
+  img.style.transformOrigin = 'top left';
+}
+"""
+        img_zoom_in_btn.click(fn=None, js=_ZOOM_JS)
+        img_zoom_out_btn.click(fn=None, js=_ZOOM_OUT_JS)
+        img_zoom_reset_btn.click(fn=None, js=_ZOOM_RESET_JS)
 
         debug_font_plus_btn.click(
             fn=None,
