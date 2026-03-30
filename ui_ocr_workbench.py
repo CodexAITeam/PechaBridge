@@ -2283,16 +2283,6 @@ def build_ui() -> gr.Blocks:
             outputs=[full_roi_btn],
         )
 
-        def _on_device_change(device_s: str, donut_s: str):
-            _rt, msg = _ensure_donut_runtime_loaded(donut_s, device_s)
-            return msg
-
-        device.change(
-            fn=_on_device_change,
-            inputs=[device, donut_path],
-            outputs=[status],
-        )
-
         def _refresh_donut():
             choices, msg = _list_donut_checkpoints()
             # choices = [(label, full_path), ...]; pass full_path as value
@@ -2320,13 +2310,6 @@ def build_ui() -> gr.Blocks:
 
 
 if __name__ == "__main__":
-    # Warm-load DONUT runtime on startup (prefer GPU).
-    try:
-        _ckpt, _ = _find_donut_checkpoint()
-        if _ckpt:
-            _ensure_donut_runtime_loaded(_ckpt, "cuda:0")
-    except Exception:
-        pass
     app = build_ui()
     host = os.environ.get("UI_HOST", "127.0.0.1")
     try:
