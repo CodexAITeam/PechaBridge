@@ -1650,6 +1650,11 @@ def build_ui() -> gr.Blocks:
 #donut_input_after {
   margin-top: 10px !important;
   margin-bottom: 10px !important;
+  padding-top: 10px !important;
+}
+#donut_input_before .image-container,
+#donut_input_after .image-container {
+  padding-top: 10px !important;
 }
 """
 
