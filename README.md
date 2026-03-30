@@ -28,7 +28,7 @@ The primary entrypoint for end-to-end usage is the **Workbench UI** (`ui_workben
 - **Detection training and inference**: Provides Ultralytics YOLO training, validation, and inference workflows for local data and SBB pages.
 - **Pseudo-labeling and rule-based filtering**: Supports VLM-assisted layout extraction plus post-filtering before annotation review.
 - **Donut-style OCR workflow (Label 1)**: Runs generation, manifest preparation, tokenizer handling, and Vision Transformer encoder + autoregressive decoder training.
-- **Standalone DONUT/TroCR OCR training**: Trains OCR directly on OpenPecha/BDRC line manifests (`train-donut-ocr`) with `none|pb|bdrc` image preprocessing and CER evaluation.
+- **Standalone DONUT/TroCR OCR training**: Trains OCR directly on OpenPecha/BDRC line manifests (`train-donut-ocr`) with `none|pb|gray|bdrc|rgb` image preprocessing and CER evaluation.
 - **Diffusion texture adaptation**: Includes SDXL/SD2.1 + ControlNet augmentation and optional LoRA integration for more realistic page textures.
 - **Patch retrieval dataset generation**: Generates line sub-patches (`datasets/text_patches`) with parquet metadata for retrieval training.
 - **Weak supervision for retrieval**: Supports weak OCR labels and robust MNN mining for cross-page positives.
@@ -79,8 +79,15 @@ pip install -r requirements.txt
 
 Legacy files `requirements-ui.txt`, `requirements-vlm.txt`, and `requirements-lora.txt` remain as compatibility wrappers.
 
+## Start Here: DONUT OCR Training
+
+If your focus is DONUT/TroCR OCR training, start with this detailed guide:
+
+- [docs/donut_training_guide.md](docs/donut_training_guide.md) (tiny pretraining workflow, anti-collapse diagnostics, full-run recipes for `gray` and `rgb`)
+
 ## Documentation Guide
 
+- NEW: Full DONUT OCR training playbook (Tiny-Pretraining, Anti-Collapse, Full-Run recipes): [docs/donut_training_guide.md](docs/donut_training_guide.md)
 - CLI command reference and end-to-end examples: [README_CLI.md](README_CLI.md)
 - Pseudo-labeling and Label Studio workflow: [README_PSEUDO_LABELING_LABEL_STUDIO.md](README_PSEUDO_LABELING_LABEL_STUDIO.md)
 - Patch dataset generation (YOLO textbox -> lines -> sub-patches): [docs/dataset_generation.md](docs/dataset_generation.md)
@@ -88,6 +95,7 @@ Legacy files `requirements-ui.txt`, `requirements-vlm.txt`, and `requirements-lo
 - Retrieval training with mp-InfoNCE (MNN/OCR weak positives): [docs/retrieval_mpnce_training.md](docs/retrieval_mpnce_training.md)
 - DONUT/TroCR OCR training (OpenPecha/BDRC manifests, CER, checkpoints): [README_DONUT_OCR.md](README_DONUT_OCR.md)
 - Line-CLIP dual vision-text encoder training (DINOv2 + text encoder): [README_LINE_CLIP_DUAL_ENCODER.md](README_LINE_CLIP_DUAL_ENCODER.md)
+- line_clip cache warmup + in-split/cross-split probing & evaluation guide: [docs/line_clip_dual_encoder_probe_guide.md](docs/line_clip_dual_encoder_probe_guide.md)
 - Weak OCR labeling for patch datasets: [docs/weak_ocr.md](docs/weak_ocr.md)
 - Diffusion + LoRA details: [docs/texture_augmentation.md](docs/texture_augmentation.md)
 - Retrieval roadmap: [docs/tibetan_ngram_retrieval_plan.md](docs/tibetan_ngram_retrieval_plan.md)
@@ -201,14 +209,29 @@ python cli.py train-text-hierarchy-vit \
   --text-encoder-name-or-path google/byt5-small \
   --image-preprocess-pipeline bdrc
 
+# Warm line_clip workbench corpus cache (best model auto-selected)
+python cli.py warm-line-clip-workbench-cache \
+  --models-dir ./models \
+  --dataset-root ./datasets/openpecha_ocr_lines \
+  --splits eval,test \
+  --only both \
+  --device cpu
+
+# Probe best line_clip model on random samples (in-split and/or cross-split)
+python cli.py probe-line-clip-workbench-random-samples \
+  --dataset-root ./datasets/openpecha_ocr_lines \
+  --cross-split eval:test \
+  --samples-per-split 200 \
+  --summary-only
+
 # Train Donut/TroCR OCR directly on line manifests (with CER on eval split)
 python cli.py train-donut-ocr \
   --train_manifest ./datasets/openpecha_ocr_lines/train/meta/lines.jsonl \
   --val_manifest ./datasets/openpecha_ocr_lines/eval/meta/lines.jsonl \
-  --output_dir ./models/donut_openpecha_bdrc \
+  --output_dir ./models/donut_openpecha_rgb \
   --model_name_or_path microsoft/trocr-base-stage1 \
   --tokenizer_path openpecha/BoSentencePiece \
-  --image_preprocess_pipeline bdrc
+  --image_preprocess_pipeline rgb
 
 # Cross-page FAISS evaluation from exported embeddings
 python cli.py eval-faiss-crosspage \

@@ -703,7 +703,7 @@ def add_train_text_hierarchy_vit_arguments(parser):
     parser.add_argument('--freeze_text_encoder', '--freeze-text-encoder', dest='freeze_text_encoder',
                        action='store_true', help='Freeze text encoder in patch_clip mode and train projection heads only')
     parser.add_argument('--image_preprocess_pipeline', '--image-preprocess-pipeline', dest='image_preprocess_pipeline', type=str,
-                       default='none', choices=['none', 'pb', 'bdrc'],
+                       default='none', choices=['none', 'pb', 'bdrc', 'gray'],
                        help='Optional deterministic pre-processing pipeline applied to images before ViT normalization')
     parser.add_argument('--patch_meta_parquet', '--patch-meta-parquet', dest='patch_meta_parquet', type=str, default='',
                        help='Optional explicit path to patch metadata parquet (default: <dataset>/meta/patches.parquet)')
@@ -1044,8 +1044,14 @@ def add_train_donut_ocr_arguments(parser):
     parser.add_argument('--image_size', type=int, default=384,
                        help='Square resize used by image processor')
     parser.add_argument('--image_preprocess_pipeline', '--image-preprocess-pipeline', dest='image_preprocess_pipeline', type=str,
-                       default='none', choices=['none', 'pb', 'bdrc'],
+                       default='none', choices=['none', 'pb', 'bdrc', 'gray', 'rgb'],
                        help='Optional deterministic image preprocessing before Donut image processor')
+    parser.add_argument('--enable_letterboxing', '--enable-letterboxing', dest='enable_letterboxing', action='store_true',
+                       help='Enable final fixed-size letterboxing after preprocessing')
+    parser.add_argument('--target_width', '--target-width', dest='target_width', type=int, default=2560,
+                       help='Target canvas width used for final letterboxing')
+    parser.add_argument('--target_height', '--target-height', dest='target_height', type=int, default=320,
+                       help='Target canvas height used for final letterboxing')
     parser.add_argument('--max_target_length', type=int, default=512,
                        help='Maximum target token length for training labels')
     parser.add_argument('--generation_max_length', type=int, default=512,
@@ -1076,6 +1082,16 @@ def add_train_donut_ocr_arguments(parser):
                        help='Maximum number of checkpoints to keep')
     parser.add_argument('--num_workers', type=int, default=4,
                        help='DataLoader workers')
+    parser.add_argument('--skip_image_file_check', '--skip-image-file-check', dest='skip_image_file_check', action='store_true',
+                       help='Skip filesystem is_file checks while parsing manifests (faster startup on slow mounts; missing images fail lazily at sample load time)')
+    parser.add_argument('--profile_preprocess_pipeline', '--profile-preprocess-pipeline', dest='profile_preprocess_pipeline', action='store_true',
+                       help='Enable per-sample timing logs for OCR dataset preprocessing/augmentation/image-processor pipeline')
+    parser.add_argument('--profile_preprocess_every_n', '--profile-preprocess-every-n', dest='profile_preprocess_every_n', type=int, default=200,
+                       help='Emit averaged preprocess timing stats every N samples (when profiling is enabled)')
+    parser.add_argument('--profile_preprocess_trace_n', '--profile-preprocess-trace-n', dest='profile_preprocess_trace_n', type=int, default=0,
+                       help='For first N samples, emit step start/done trace logs to identify hangs')
+    parser.add_argument('--profile_preprocess_slow_ms', '--profile-preprocess-slow-ms', dest='profile_preprocess_slow_ms', type=float, default=800.0,
+                       help='Warn when a sample preprocessing pipeline exceeds this duration in milliseconds')
     parser.add_argument('--seed', type=int, default=42,
                        help='Random seed')
     parser.add_argument('--fp16', action='store_true',
@@ -1084,6 +1100,12 @@ def add_train_donut_ocr_arguments(parser):
                        help='Enable bf16 training')
     parser.add_argument('--metric_newline_token', type=str, choices=['<NL>', '\\n'], default='<NL>',
                        help='Newline token normalization used for CER computation')
+    parser.add_argument('--report_to', type=str, default='none',
+                       help='Comma-separated trainer integrations (e.g. "trackio,tensorboard"); use "none" to disable')
+    parser.add_argument('--run_name', type=str, default='',
+                       help='Optional run name for experiment tracking backends')
+    parser.add_argument('--debug_forward', '--debug-forward', dest='debug_forward', action='store_true',
+                       help='Enable periodic forward/backward training-step logs (train_step/train_running/train_fwd_bwd)')
     parser.add_argument('--debug_train_decode_every_steps', '--debug-train-decode-every-steps', dest='debug_train_decode_every_steps', type=int, default=100,
                        help='Log compact train_decode preview every N train steps when enabled (default: 100)')
     parser.add_argument('--enable_train_decode_preview', '--enable-train-decode-preview', dest='enable_train_decode_preview', action='store_true',
@@ -1139,8 +1161,28 @@ def add_run_donut_ocr_workflow_arguments(parser):
     parser.add_argument('--image_size', type=int, default=384,
                        help='Image size for OCR model input')
     parser.add_argument('--image_preprocess_pipeline', '--image-preprocess-pipeline', dest='image_preprocess_pipeline', type=str,
-                       default='none', choices=['none', 'pb', 'bdrc'],
+                       default='none', choices=['none', 'pb', 'bdrc', 'gray', 'rgb'],
                        help='Optional deterministic image preprocessing before Donut image processor in workflow train step')
+    parser.add_argument('--enable_letterboxing', '--enable-letterboxing', dest='enable_letterboxing', action='store_true',
+                       help='Enable final fixed-size letterboxing in workflow train step')
+    parser.add_argument('--target_width', '--target-width', dest='target_width', type=int, default=2560,
+                       help='Target canvas width used for final letterboxing in workflow train step')
+    parser.add_argument('--target_height', '--target-height', dest='target_height', type=int, default=320,
+                       help='Target canvas height used for final letterboxing in workflow train step')
+    parser.add_argument('--profile_preprocess_pipeline', '--profile-preprocess-pipeline', dest='profile_preprocess_pipeline', action='store_true',
+                       help='Enable per-sample timing logs for OCR dataset preprocessing in workflow train step')
+    parser.add_argument('--profile_preprocess_every_n', '--profile-preprocess-every-n', dest='profile_preprocess_every_n', type=int, default=200,
+                       help='Emit averaged preprocess timing stats every N samples in workflow train step')
+    parser.add_argument('--profile_preprocess_trace_n', '--profile-preprocess-trace-n', dest='profile_preprocess_trace_n', type=int, default=0,
+                       help='For first N samples, emit per-step start/done trace logs in workflow train step')
+    parser.add_argument('--profile_preprocess_slow_ms', '--profile-preprocess-slow-ms', dest='profile_preprocess_slow_ms', type=float, default=800.0,
+                       help='Warn when sample preprocessing exceeds this duration in ms in workflow train step')
+    parser.add_argument('--report_to', type=str, default='none',
+                       help='Comma-separated trainer integrations for workflow train step (e.g. "trackio")')
+    parser.add_argument('--run_name', type=str, default='',
+                       help='Optional run name for workflow train step')
+    parser.add_argument('--debug_forward', '--debug-forward', dest='debug_forward', action='store_true',
+                       help='Enable periodic forward/backward training-step logs in workflow train step')
     parser.add_argument('--seed', type=int, default=42,
                        help='Random seed')
     parser.add_argument('--skip_generation', action='store_true',

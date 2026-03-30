@@ -4,11 +4,13 @@
 from __future__ import annotations
 
 import argparse
+import csv
 import json
+import re
 import sys
 from pathlib import Path
 from types import SimpleNamespace
-from typing import Dict, List, Sequence
+from typing import Dict, List, Sequence, Tuple
 
 import numpy as np
 import torch
@@ -20,19 +22,22 @@ if str(REPO_ROOT) not in sys.path:
     sys.path.insert(0, str(REPO_ROOT))
 
 import scripts.train_donut_ocr as train_mod
+from pechabridge.ocr.repro_pack import FrozenValSubsetDataset, frozen_val_collate, load_checkpoint_bundle
 
 
 def _parse_args() -> argparse.Namespace:
     p = argparse.ArgumentParser(description="Compare OCR checkpoints on a fixed val subset")
     p.add_argument("--val_manifest", type=str, required=True, help="Validation JSONL manifest")
-    p.add_argument("--checkpoints", type=str, required=True, help="Comma-separated checkpoint/model dirs")
-    p.add_argument("--tokenizer_path", type=str, default="/home/ubuntu/data/PechaBridge/ext/BoSentencePiece")
+    p.add_argument("--checkpoints", type=str, default="", help="Comma-separated checkpoint/model dirs")
+    p.add_argument("--checkpoints_dir", type=str, default="", help="Directory containing checkpoint-* folders")
+    p.add_argument("--checkpoint_pattern", type=str, default="checkpoint-[0-9]*", help="Glob pattern used inside --checkpoints_dir")
+    p.add_argument("--tokenizer_path", type=str, default="openpecha/BoSentencePiece")
     p.add_argument("--image_processor_path", type=str, default="microsoft/trocr-base-stage1")
-    p.add_argument("--image_preprocess_pipeline", type=str, default="bdrc", choices=["none", "pb", "bdrc"])
+    p.add_argument("--image_preprocess_pipeline", type=str, default="none", choices=["none", "pb", "bdrc", "gray", "rgb"])
     p.add_argument("--image_size", type=int, default=384)
-    p.add_argument("--max_target_length", type=int, default=160)
-    p.add_argument("--generation_max_length", type=int, default=160)
-    p.add_argument("--generation_min_new_tokens", type=int, default=16)
+    p.add_argument("--max_target_length", type=int, default=512)
+    p.add_argument("--generation_max_length", type=int, default=512)
+    p.add_argument("--generation_min_new_tokens", type=int, default=0)
     p.add_argument("--decoder_start_token", type=str, default="<s_ocr>")
     p.add_argument("--extra_special_tokens", type=str, default="<NL>,<s_ocr>,</s_ocr>,<s_cls1>")
     p.add_argument("--metric_newline_token", type=str, default="<NL>", choices=["<NL>", "\\n"])
@@ -41,7 +46,34 @@ def _parse_args() -> argparse.Namespace:
     p.add_argument("--batch_size", type=int, default=8)
     p.add_argument("--device", type=str, default="cuda:0" if torch.cuda.is_available() else "cpu")
     p.add_argument("--show_examples", type=int, default=5, help="How many best/worst examples to print per checkpoint")
+    p.add_argument("--use_repro_bundle", action="store_true", help="Load tokenizer/image_processor/generate config/val subset from checkpoint-*/repro for 1:1 CER reproduction")
+    p.add_argument("--output_json", type=str, default="", help="Optional path to write full comparison JSON")
+    p.add_argument("--output_csv", type=str, default="", help="Optional path to write comparison CSV")
     return p.parse_args()
+
+
+def _checkpoint_sort_key(p: Path) -> Tuple[int, str]:
+    m = re.search(r"checkpoint-(\d+)", p.name)
+    if m:
+        return (int(m.group(1)), p.name)
+    return (10**18, p.name)
+
+
+def _resolve_checkpoints(args: argparse.Namespace) -> List[str]:
+    from_list = [s.strip() for s in str(args.checkpoints or "").split(",") if s.strip()]
+    found: List[Path] = [Path(s).expanduser().resolve() for s in from_list]
+
+    if args.checkpoints_dir:
+        root = Path(str(args.checkpoints_dir)).expanduser().resolve()
+        for p in sorted(root.glob(str(args.checkpoint_pattern)), key=_checkpoint_sort_key):
+            if p.is_dir():
+                found.append(p.resolve())
+
+    dedup: Dict[str, Path] = {}
+    for p in found:
+        dedup[str(p)] = p
+    out = [str(p) for p in sorted(dedup.values(), key=_checkpoint_sort_key)]
+    return out
 
 
 def _build_tokenizer(args: argparse.Namespace):
@@ -79,15 +111,21 @@ def _sample_subset(ds, n: int, seed: int):
 
 
 def _configure_model_for_eval(model, tokenizer, decoder_start_token: str, generation_max_length: int, generation_min_new_tokens: int):
-    decoder_start_id = int(tokenizer.convert_tokens_to_ids(decoder_start_token))
+    decoder_start_id = train_mod._resolve_single_token_id_no_mutation(tokenizer, decoder_start_token)
+    if decoder_start_id is None:
+        raise ValueError(f"decoder_start_token not found in tokenizer: {decoder_start_token!r}")
     task_end_token = train_mod._paired_end_token_for_start(decoder_start_token)
     task_end_id = None
     if task_end_token:
-        cid = tokenizer.convert_tokens_to_ids(task_end_token)
-        if cid is not None and int(cid) >= 0 and (tokenizer.unk_token_id is None or int(cid) != int(tokenizer.unk_token_id)):
-            task_end_id = int(cid)
+        task_end_id = train_mod._resolve_single_token_id_no_mutation(tokenizer, task_end_token)
+        if task_end_id is None:
+            raise ValueError(
+                f"paired end token not found in tokenizer: start={decoder_start_token!r} end={task_end_token!r}"
+            )
     effective_eos = int(task_end_id) if task_end_id is not None else (int(tokenizer.eos_token_id) if tokenizer.eos_token_id is not None else None)
-    model.config.decoder_start_token_id = decoder_start_id
+    if tokenizer.pad_token_id is None:
+        raise ValueError("Tokenizer pad_token_id is None.")
+    model.config.decoder_start_token_id = int(decoder_start_id)
     model.config.pad_token_id = int(tokenizer.pad_token_id)
     if effective_eos is not None:
         model.config.eos_token_id = int(effective_eos)
@@ -167,9 +205,11 @@ def _run_checkpoint(
     empty_ref_count = sum(1 for r in refs_all if not r)
     empty_pred_count = sum(1 for p, r in zip(preds_all, refs_all) if (not p) and r)
     cer = train_mod._char_error_rate([p for p, _ in valid_pairs], [r for _, r in valid_pairs], args.metric_newline_token) if valid_pairs else 1.0
+    cer_vals: List[float] = []
     for row in sample_rows:
         if row["ref"]:
             row["cer"] = train_mod._sample_cer(str(row["pred"]), str(row["ref"]))
+            cer_vals.append(float(row["cer"]))
         else:
             row["cer"] = None
     worst = [r for r in sample_rows if r["cer"] is not None]
@@ -180,6 +220,9 @@ def _run_checkpoint(
         "checkpoint": str(ckpt_path),
         "cer": float(cer),
         "cer_percent": float(cer) * 100.0,
+        "cer_min": float(min(cer_vals)) if cer_vals else None,
+        "cer_max": float(max(cer_vals)) if cer_vals else None,
+        "cer_std": float(np.std(cer_vals)) if cer_vals else None,
         "valid_n": int(len(valid_pairs)),
         "empty_ref_count": int(empty_ref_count),
         "empty_pred_count": int(empty_pred_count),
@@ -188,28 +231,152 @@ def _run_checkpoint(
     }
 
 
+def _run_checkpoint_with_repro_bundle(
+    ckpt_path: str,
+    *,
+    args: argparse.Namespace,
+    device: torch.device,
+) -> Dict[str, object]:
+    ckpt = Path(ckpt_path).expanduser().resolve()
+    model, tokenizer, image_processor, generate_cfg, norm_cfg, records, saved_cer_record = load_checkpoint_bundle(
+        ckpt,
+        tokenizer_loader=train_mod._load_tokenizer_robust,
+        model_loader=train_mod._load_ved_model_robust,
+    )
+    image_preprocess_contract = json.loads((ckpt / "repro" / "image_preprocess.json").read_text(encoding="utf-8"))
+    image_preprocess_pipeline = str(image_preprocess_contract.get("pipeline", "none") or "none")
+    newline_token = str(norm_cfg.get("metric_newline_token", "<NL>") or "<NL>")
+
+    ds = FrozenValSubsetDataset(
+        records,
+        image_processor=image_processor,
+        image_preprocess_fn=train_mod._apply_image_preprocess_pipeline,
+        image_preprocess_pipeline=image_preprocess_pipeline,
+    )
+    dl = DataLoader(ds, batch_size=int(args.batch_size), shuffle=False, collate_fn=frozen_val_collate)
+
+    model.to(device)
+    model.eval()
+
+    gkwargs: Dict[str, object] = {}
+    for k in [
+        "decoder_start_token_id",
+        "bos_token_id",
+        "eos_token_id",
+        "pad_token_id",
+        "max_length",
+        "max_new_tokens",
+        "min_new_tokens",
+        "num_beams",
+        "do_sample",
+        "temperature",
+        "top_p",
+        "repetition_penalty",
+        "no_repeat_ngram_size",
+        "length_penalty",
+        "early_stopping",
+        "use_cache",
+        "bad_words_ids",
+        "forced_bos_token_id",
+        "forced_eos_token_id",
+    ]:
+        v = generate_cfg.get(k)
+        if v is not None:
+            gkwargs[k] = v
+
+    preds_all: List[str] = []
+    refs_all: List[str] = []
+    sample_rows: List[Dict[str, object]] = []
+    with torch.no_grad():
+        for batch in dl:
+            pixel_values = batch["pixel_values"].to(device)
+            gen_ids = model.generate(pixel_values=pixel_values, **gkwargs)
+            pred_norms = train_mod._decode_for_metric(tokenizer, gen_ids.detach().cpu().numpy(), newline_token=newline_token)
+            for meta, p in zip(batch["meta"], pred_norms):
+                pred = str(p or "")
+                ref = str(meta.get("gt_text_metric_norm", "") or "")
+                preds_all.append(pred)
+                refs_all.append(ref)
+                sample_rows.append(
+                    {
+                        "i": int(meta.get("idx", len(sample_rows))),
+                        "id": str(meta.get("id", "")),
+                        "pred": pred,
+                        "ref": ref,
+                        "pred_len": len(pred),
+                        "ref_len": len(ref),
+                        "empty_pred": int(not pred),
+                        "empty_ref": int(not ref),
+                    }
+                )
+
+    valid_pairs = [(p, r) for p, r in zip(preds_all, refs_all) if r]
+    empty_ref_count = sum(1 for r in refs_all if not r)
+    empty_pred_count = sum(1 for p, r in zip(preds_all, refs_all) if (not p) and r)
+    cer = train_mod._char_error_rate([p for p, _ in valid_pairs], [r for _, r in valid_pairs], newline_token) if valid_pairs else 1.0
+    cer_vals: List[float] = []
+    for row in sample_rows:
+        if row["ref"]:
+            row["cer"] = train_mod._sample_cer(str(row["pred"]), str(row["ref"]))
+            cer_vals.append(float(row["cer"]))
+        else:
+            row["cer"] = None
+    worst = [r for r in sample_rows if r["cer"] is not None]
+    worst.sort(key=lambda x: float(x["cer"]), reverse=True)
+    best = [r for r in worst if float(r["cer"]) <= 1.0]
+    best.sort(key=lambda x: float(x["cer"]))
+    out = {
+        "checkpoint": str(ckpt),
+        "cer": float(cer),
+        "cer_percent": float(cer) * 100.0,
+        "cer_min": float(min(cer_vals)) if cer_vals else None,
+        "cer_max": float(max(cer_vals)) if cer_vals else None,
+        "cer_std": float(np.std(cer_vals)) if cer_vals else None,
+        "valid_n": int(len(valid_pairs)),
+        "empty_ref_count": int(empty_ref_count),
+        "empty_pred_count": int(empty_pred_count),
+        "worst_examples": worst[: max(0, int(args.show_examples))],
+        "best_examples": best[: max(0, int(args.show_examples))],
+        "repro_bundle": True,
+        "repro_saved_cer": saved_cer_record.get("repro_cer"),
+        "repro_saved_valid_n": saved_cer_record.get("repro_valid_n"),
+    }
+    return out
+
+
 def main() -> int:
     args = _parse_args()
     torch.manual_seed(int(args.seed))
     device = torch.device(args.device)
-    ckpts = [s.strip() for s in str(args.checkpoints).split(",") if s.strip()]
+    ckpts = _resolve_checkpoints(args)
     if not ckpts:
-        raise SystemExit("No checkpoints provided")
+        raise SystemExit("No checkpoints found. Provide --checkpoints and/or --checkpoints_dir.")
 
-    tokenizer = _build_tokenizer(args)
-    ds, _, _ = _build_dataset(args, tokenizer)
-    subset, sampled_idx = _sample_subset(ds, int(args.num_samples), int(args.seed))
-    collator = train_mod.OCRDataCollator(tokenizer)
-
-    print(f"Using {len(subset)} validation samples (seed={args.seed})")
-    print(f"Sample indices head: {sampled_idx[:10]}")
-    print(f"Device: {device}")
-    print("")
+    tokenizer = None
+    subset = None
+    collator = None
+    if not args.use_repro_bundle:
+        tokenizer = _build_tokenizer(args)
+        ds, _, _ = _build_dataset(args, tokenizer)
+        subset, sampled_idx = _sample_subset(ds, int(args.num_samples), int(args.seed))
+        collator = train_mod.OCRDataCollator(tokenizer)
+        print(f"Using {len(subset)} validation samples (seed={args.seed})")
+        print(f"Sample indices head: {sampled_idx[:10]}")
+        print(f"Device: {device}")
+        print("")
+    else:
+        print("Using checkpoint repro bundles (val_subset + tokenizer + image_processor + generate_config from checkpoint-*/repro)")
+        print(f"Device: {device}")
+        print("")
 
     results: List[Dict[str, object]] = []
     for ckpt in ckpts:
         print(f"=== {ckpt} ===")
-        res = _run_checkpoint(ckpt, subset=subset, tokenizer=tokenizer, collator=collator, args=args, device=device)
+        if args.use_repro_bundle:
+            res = _run_checkpoint_with_repro_bundle(ckpt, args=args, device=device)
+        else:
+            assert subset is not None and tokenizer is not None and collator is not None
+            res = _run_checkpoint(ckpt, subset=subset, tokenizer=tokenizer, collator=collator, args=args, device=device)
         results.append(res)
         print(
             json.dumps(
@@ -217,9 +384,13 @@ def main() -> int:
                     "checkpoint": res["checkpoint"],
                     "cer": round(float(res["cer"]), 4),
                     "cer_percent": round(float(res["cer_percent"]), 2),
+                    "cer_min": round(float(res["cer_min"]), 4) if res.get("cer_min") is not None else None,
+                    "cer_max": round(float(res["cer_max"]), 4) if res.get("cer_max") is not None else None,
+                    "cer_std": round(float(res["cer_std"]), 4) if res.get("cer_std") is not None else None,
                     "valid_n": res["valid_n"],
                     "empty_ref_count": res["empty_ref_count"],
                     "empty_pred_count": res["empty_pred_count"],
+                    **({"repro_saved_cer": res.get("repro_saved_cer"), "repro_saved_valid_n": res.get("repro_saved_valid_n")} if args.use_repro_bundle else {}),
                 },
                 ensure_ascii=False,
             )
@@ -238,7 +409,52 @@ def main() -> int:
 
     print("=== summary (sorted by CER) ===")
     for r in sorted(results, key=lambda x: float(x["cer"])):
-        print(f"{float(r['cer_percent']):6.2f}% | {r['checkpoint']}")
+        cmin = r.get("cer_min")
+        cmax = r.get("cer_max")
+        cstd = r.get("cer_std")
+        cmin_s = f"{float(cmin):.4f}" if cmin is not None else "n/a"
+        cmax_s = f"{float(cmax):.4f}" if cmax is not None else "n/a"
+        cstd_s = f"{float(cstd):.4f}" if cstd is not None else "n/a"
+        print(
+            f"{float(r['cer_percent']):6.2f}% | min={cmin_s} max={cmax_s} std={cstd_s} | {r['checkpoint']}"
+        )
+
+    if args.output_json:
+        out_json = Path(str(args.output_json)).expanduser().resolve()
+        out_json.parent.mkdir(parents=True, exist_ok=True)
+        payload = {
+            "num_checkpoints": len(results),
+            "num_samples": None if args.use_repro_bundle else int(args.num_samples),
+            "seed": int(args.seed),
+            "use_repro_bundle": bool(args.use_repro_bundle),
+            "results": results,
+        }
+        out_json.write_text(json.dumps(payload, ensure_ascii=False, indent=2), encoding="utf-8")
+        print(f"Wrote JSON: {out_json}")
+
+    if args.output_csv:
+        out_csv = Path(str(args.output_csv)).expanduser().resolve()
+        out_csv.parent.mkdir(parents=True, exist_ok=True)
+        fields = [
+            "checkpoint",
+            "cer",
+            "cer_percent",
+            "cer_min",
+            "cer_max",
+            "cer_std",
+            "valid_n",
+            "empty_ref_count",
+            "empty_pred_count",
+            "repro_bundle",
+            "repro_saved_cer",
+            "repro_saved_valid_n",
+        ]
+        with out_csv.open("w", encoding="utf-8", newline="") as f:
+            w = csv.DictWriter(f, fieldnames=fields)
+            w.writeheader()
+            for r in results:
+                w.writerow({k: r.get(k) for k in fields})
+        print(f"Wrote CSV: {out_csv}")
     return 0
 
 

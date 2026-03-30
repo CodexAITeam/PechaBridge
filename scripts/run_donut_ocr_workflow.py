@@ -164,6 +164,10 @@ def run(args) -> Dict[str, object]:
             decoder_start_token="<s_ocr>",
             image_size=int(args.image_size),
             image_preprocess_pipeline=str(getattr(args, "image_preprocess_pipeline", "none") or "none"),
+            profile_preprocess_pipeline=bool(getattr(args, "profile_preprocess_pipeline", False)),
+            profile_preprocess_every_n=int(getattr(args, "profile_preprocess_every_n", 200) or 200),
+            profile_preprocess_trace_n=int(getattr(args, "profile_preprocess_trace_n", 0) or 0),
+            profile_preprocess_slow_ms=float(getattr(args, "profile_preprocess_slow_ms", 800.0) or 800.0),
             max_target_length=int(args.max_target_length),
             generation_max_length=int(args.max_target_length),
             per_device_train_batch_size=int(args.per_device_train_batch_size),
@@ -182,6 +186,9 @@ def run(args) -> Dict[str, object]:
             fp16=False,
             bf16=False,
             metric_newline_token="<NL>" if str(args.target_newline_token) == "<NL>" else "\\n",
+            report_to=str(getattr(args, "report_to", "none") or "none"),
+            run_name=str(getattr(args, "run_name", "") or ""),
+            debug_forward=bool(getattr(args, "debug_forward", False)),
             resume_from_checkpoint="",
         )
         train_summary = run_train_donut_ocr(train_args)
