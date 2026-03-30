@@ -106,55 +106,90 @@ def _is_plain_checkpoint_with_runtime_assets(p: Path) -> bool:
     return bool(has_parent_assets or has_local_gen_cfg)
 
 
-def _find_donut_checkpoint() -> Tuple[str, str]:
+def _pretty_model_label(full_path: str) -> str:
+    """Return a short human-readable label for a model path.
+
+    Shows the path relative to the project root's ``models/`` directory so the
+    dropdown stays compact.  Falls back to the last two path components when the
+    path is outside the models tree.
+    """
+    try:
+        p = Path(full_path)
+        models_root = (ROOT / "models").resolve()
+        rel = p.relative_to(models_root)
+        return str(rel)
+    except ValueError:
+        p = Path(full_path)
+        parts = p.parts
+        return str(Path(*parts[-2:])) if len(parts) >= 2 else p.name
+
+
+def _list_donut_checkpoints() -> Tuple[List[Tuple[str, str]], str]:
+    """Return ([(label, full_path), ...] sorted best-first, status_message)."""
     preferred = (ROOT / "models" / "ocr").resolve()
     fallback_root = (ROOT / "models").resolve()
     repro_candidates: List[Path] = []
     plain_candidates: List[Path] = []
 
-    if preferred.exists():
-        for p in sorted(preferred.rglob("checkpoint-*")):
+    def _scan_dir(base: Path) -> None:
+        if not base.exists():
+            return
+        for p in sorted(base.rglob("checkpoint-*")):
             if _is_repro_checkpoint(p):
                 repro_candidates.append(p.resolve())
             elif _is_plain_checkpoint_with_runtime_assets(p):
                 plain_candidates.append(p.resolve())
         if not repro_candidates and not plain_candidates:
-            for p in sorted(preferred.rglob("*")):
+            for p in sorted(base.rglob("*")):
                 if p.is_dir() and _is_repro_checkpoint(p):
                     repro_candidates.append(p.resolve())
                 elif p.is_dir() and _is_plain_checkpoint_with_runtime_assets(p):
                     plain_candidates.append(p.resolve())
 
-    if not repro_candidates and not plain_candidates and fallback_root.exists():
-        for p in sorted(fallback_root.rglob("checkpoint-*")):
-            if _is_repro_checkpoint(p):
-                repro_candidates.append(p.resolve())
-            elif _is_plain_checkpoint_with_runtime_assets(p):
-                plain_candidates.append(p.resolve())
-        if not repro_candidates and not plain_candidates:
-            for p in sorted(fallback_root.rglob("*")):
-                if p.is_dir() and _is_repro_checkpoint(p):
-                    repro_candidates.append(p.resolve())
-                elif p.is_dir() and _is_plain_checkpoint_with_runtime_assets(p):
-                    plain_candidates.append(p.resolve())
+    _scan_dir(preferred)
+    if not repro_candidates and not plain_candidates:
+        _scan_dir(fallback_root)
 
-    if repro_candidates:
-        repro_candidates = sorted(repro_candidates, key=_checkpoint_step, reverse=True)
-        return str(repro_candidates[0]), f"Auto-selected DONUT checkpoint (repro): {repro_candidates[0]}"
+    # Deduplicate while preserving order
+    seen: set = set()
+    all_repro: List[Path] = []
+    for p in repro_candidates:
+        if str(p) not in seen:
+            seen.add(str(p))
+            all_repro.append(p)
+    all_plain: List[Path] = []
+    for p in plain_candidates:
+        if str(p) not in seen:
+            seen.add(str(p))
+            all_plain.append(p)
 
-    if plain_candidates:
-        plain_candidates = sorted(plain_candidates, key=_checkpoint_step, reverse=True)
-        return (
-            str(plain_candidates[0]),
-            "Auto-selected DONUT checkpoint (without repro, using parent tokenizer/image_processor): "
-            f"{plain_candidates[0]}",
-        )
+    all_repro = sorted(all_repro, key=_checkpoint_step, reverse=True)
+    all_plain = sorted(all_plain, key=_checkpoint_step, reverse=True)
 
-    return "", "No DONUT checkpoint found (expected under models/ocr/ or models/)."
+    # repro checkpoints first, then plain; label shows short relative path
+    ordered: List[Tuple[str, str]] = [
+        (_pretty_model_label(str(p)) + " ✓", str(p)) for p in all_repro
+    ] + [
+        (_pretty_model_label(str(p)), str(p)) for p in all_plain
+    ]
+
+    if not ordered:
+        return [], "No DONUT checkpoint found (expected under models/ocr/ or models/)."
+
+    tag = "repro" if all_repro else "plain"
+    msg = f"Found {len(ordered)} DONUT checkpoint(s). Auto-selected ({tag}): {ordered[0][1]}"
+    return ordered, msg
 
 
-def _find_layout_model() -> Tuple[str, str]:
-    preferred = (ROOT / "models" / "layoutAnalysis").resolve()
+def _find_donut_checkpoint() -> Tuple[str, str]:
+    """Return (best_checkpoint_path, status_message) — kept for backward compat."""
+    choices, msg = _list_donut_checkpoints()
+    return (choices[0][1] if choices else ""), msg
+
+
+def _list_layout_models() -> Tuple[List[Tuple[str, str]], str]:
+    """Return ([(label, full_path), ...] sorted, status_message)."""
+    preferred = (ROOT / "models" / "layout").resolve()
     fallback_root = (ROOT / "models").resolve()
     model_exts = {".pt", ".onnx", ".torchscript"}
     candidates: List[Path] = []
@@ -167,6 +202,9 @@ def _find_layout_model() -> Tuple[str, str]:
                 continue
             if p.suffix.lower() not in model_exts:
                 continue
+            # Skip macOS resource-fork files (._*)
+            if p.name.startswith("._"):
+                continue
             candidates.append(p.resolve())
 
     _scan(preferred)
@@ -174,8 +212,19 @@ def _find_layout_model() -> Tuple[str, str]:
         _scan(fallback_root)
 
     if not candidates:
-        return "", "No layout analysis model found (expected under models/layoutAnalysis/)."
-    return str(candidates[0]), f"Auto-selected layout model: {candidates[0]}"
+        return [], "No layout analysis model found (expected under models/layout/)."
+
+    ordered: List[Tuple[str, str]] = [
+        (_pretty_model_label(str(p)), str(p)) for p in candidates
+    ]
+    msg = f"Found {len(ordered)} layout model(s). Auto-selected: {ordered[0][1]}"
+    return ordered, msg
+
+
+def _find_layout_model() -> Tuple[str, str]:
+    """Return (best_model_path, status_message) — kept for backward compat."""
+    choices, msg = _list_layout_models()
+    return (choices[0][1] if choices else ""), msg
 
 
 def _normalize_box(box: List[int], w: int, h: int) -> Optional[List[int]]:
@@ -1252,8 +1301,6 @@ def _save_results(
 
 
 def build_ui() -> gr.Blocks:
-    donut_ckpt, donut_msg = _find_donut_checkpoint()
-    layout_model, layout_msg = _find_layout_model()
     bdrc_defaults = _bdrc_ui_defaults()
     rgb_defaults = _rgb_ui_defaults()
     ui_css = """
@@ -1317,8 +1364,28 @@ def build_ui() -> gr.Blocks:
         advanced_view = gr.Checkbox(label="Advanced View", value=False)
 
         with gr.Row():
-            donut_path = gr.Textbox(label="DONUT Checkpoint", value=donut_ckpt)
-            layout_path = gr.Textbox(label="Layout Analysis Model", value=layout_model)
+            with gr.Column(scale=10):
+                donut_ckpt_choices, donut_msg = _list_donut_checkpoints()
+                # choices = [(label, full_path), ...]; value = full_path string
+                donut_path = gr.Dropdown(
+                    label="DONUT Checkpoint",
+                    choices=donut_ckpt_choices,
+                    value=donut_ckpt_choices[0][1] if donut_ckpt_choices else "",
+                    allow_custom_value=True,
+                )
+            with gr.Column(scale=1, min_width=110):
+                donut_refresh_btn = gr.Button("🔄 Refresh", variant="secondary")
+            with gr.Column(scale=10):
+                layout_model_choices, layout_msg = _list_layout_models()
+                # choices = [(label, full_path), ...]; value = full_path string
+                layout_path = gr.Dropdown(
+                    label="Layout Analysis Model",
+                    choices=layout_model_choices,
+                    value=layout_model_choices[0][1] if layout_model_choices else "",
+                    allow_custom_value=True,
+                )
+            with gr.Column(scale=1, min_width=110):
+                layout_refresh_btn = gr.Button("🔄 Refresh", variant="secondary")
         with gr.Row(visible=False) as advanced_scan_row:
             donut_info = gr.Textbox(label="DONUT Auto-Scan", value=donut_msg, interactive=False)
             layout_info = gr.Textbox(label="Layout Auto-Scan", value=layout_msg, interactive=False)
@@ -2224,6 +2291,29 @@ def build_ui() -> gr.Blocks:
             fn=_on_device_change,
             inputs=[device, donut_path],
             outputs=[status],
+        )
+
+        def _refresh_donut():
+            choices, msg = _list_donut_checkpoints()
+            # choices = [(label, full_path), ...]; pass full_path as value
+            best = choices[0][1] if choices else ""
+            return gr.update(choices=choices, value=best), msg
+
+        def _refresh_layout():
+            choices, msg = _list_layout_models()
+            best = choices[0][1] if choices else ""
+            return gr.update(choices=choices, value=best), msg
+
+        donut_refresh_btn.click(
+            fn=_refresh_donut,
+            inputs=[],
+            outputs=[donut_path, donut_info],
+        )
+
+        layout_refresh_btn.click(
+            fn=_refresh_layout,
+            inputs=[],
+            outputs=[layout_path, layout_info],
         )
 
     return demo
