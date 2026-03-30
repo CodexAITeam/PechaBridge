@@ -928,6 +928,166 @@ def _run_full_auto(
     )
 
 
+def _read_repro_preprocess_pipeline(ckpt_path: str) -> Optional[str]:
+    """Read the image_preprocess pipeline name saved in a repro checkpoint bundle.
+
+    Returns the pipeline string (e.g. 'bdrc', 'gray', 'rgb') or None if not available.
+    """
+    try:
+        repro = Path(ckpt_path) / "repro" / "image_preprocess.json"
+        if repro.exists():
+            data = json.loads(repro.read_text(encoding="utf-8"))
+            pipeline = str(data.get("pipeline", "") or "").strip().lower()
+            if pipeline and pipeline != "none":
+                return pipeline
+    except Exception:
+        pass
+    return None
+
+
+def _run_comparison(
+    state: Dict[str, Any],
+    layout_model: str,
+    device: str,
+    max_len: int,
+    preprocess_preset: str = "bdrc",
+    bdrc_preprocess_overrides: Optional[Dict[str, Any]] = None,
+    rgb_preprocess_overrides: Optional[Dict[str, Any]] = None,
+) -> Tuple[np.ndarray, str, str, Dict[str, Any], str, Optional[np.ndarray], Optional[np.ndarray]]:
+    """Run all discovered DONUT checkpoints sequentially and write a comparison report.
+
+    For each checkpoint the preprocessing pipeline is auto-detected from the
+    repro bundle (``repro/image_preprocess.json``).  When no repro bundle is
+    present the globally selected UI preset is used as a fallback.
+    """
+    image = state.get("image")
+    if image is None:
+        return None, "", "Please upload an image first.", state, "{}", None, None
+    if not layout_model.strip():
+        return np.asarray(image).astype(np.uint8, copy=False), "", "Layout model is missing.", state, "{}", None, None
+
+    checkpoints, scan_msg = _list_donut_checkpoints()
+    if not checkpoints:
+        return np.asarray(image).astype(np.uint8, copy=False), "", f"No DONUT checkpoints found. {scan_msg}", state, "{}", None, None
+
+    # Run layout detection once, shared across all models
+    src = np.asarray(image).astype(np.uint8, copy=False)
+    split_out = run_tibetan_text_line_split_classical(
+        image=src,
+        model_path=layout_model,
+        conf=0.25,
+        imgsz=1024,
+        device=device if device != "auto" else "",
+        min_line_height=10,
+        projection_smooth=9,
+        projection_threshold_rel=0.20,
+        merge_gap_px=5,
+        draw_parent_boxes=True,
+        detect_red_text=False,
+        red_min_redness=26,
+        red_min_saturation=35,
+        red_column_fill_rel=0.07,
+        red_merge_gap_px=14,
+        red_min_width_px=18,
+        draw_red_boxes=False,
+    )
+    overlay, split_status, split_json, _, _, _, _, _, click_state = split_out
+    line_records_raw = []
+    if isinstance(click_state, dict):
+        line_records_raw = click_state.get("line_boxes") or []
+
+    h, w = src.shape[:2]
+    image_name = str(state.get("image_name") or "image")
+
+    report_lines: List[str] = [f"Image: {image_name}", ""]
+    last_overlay = _render_overlay(src, [])
+    ckpt_debug: List[Dict[str, Any]] = []
+
+    for label, ckpt_path in checkpoints:
+        p = Path(ckpt_path)
+        model_name = f"{p.parent.name}/{p.name}"
+
+        # Auto-detect preprocessing pipeline from repro bundle; fall back to UI preset.
+        repro_pipeline = _read_repro_preprocess_pipeline(ckpt_path)
+        if repro_pipeline is not None:
+            effective_preset = repro_pipeline
+            # Use vit_defaults for the repro pipeline — no UI overrides applied,
+            # matching the exact training-time configuration.
+            effective_bdrc_overrides: Optional[Dict[str, Any]] = None
+            effective_rgb_overrides: Optional[Dict[str, Any]] = None
+            pipeline_source = "repro"
+        else:
+            effective_preset = preprocess_preset
+            effective_bdrc_overrides = bdrc_preprocess_overrides
+            effective_rgb_overrides = rgb_preprocess_overrides
+            pipeline_source = "ui_fallback"
+
+        rows: List[Dict[str, Any]] = []
+        for rec in line_records_raw:
+            box = _normalize_box(rec.get("line_box") or [], w, h)
+            if box is None:
+                continue
+            x1, y1, x2, y2 = box
+            crop = src[y1:y2, x1:x2]
+            try:
+                text, _dbg, _pre, _post = _run_donut_on_crop(
+                    crop,
+                    ckpt_path,
+                    device,
+                    max_len,
+                    preprocess_preset=effective_preset,
+                    bdrc_preprocess_overrides=effective_bdrc_overrides,
+                    rgb_preprocess_overrides=effective_rgb_overrides,
+                )
+            except Exception as exc:
+                text = f"[ERROR: {exc}]"
+            rows.append({
+                "line_id": int(rec.get("line_id", len(rows) + 1)),
+                "line_box": box,
+                "text": text,
+                "source": "comparison",
+            })
+        rows = _sort_lines(rows)
+        transcript = _line_text(rows)
+        report_lines.append(f"Model: {model_name}")
+        pipeline_note = "from repro bundle" if pipeline_source == "repro" else "from UI selection (no repro bundle)"
+        report_lines.append(f"Preprocessing: {effective_preset} ({pipeline_note})")
+        report_lines.append(f"Text:\n{transcript}")
+        report_lines.append("")
+        ckpt_debug.append({
+            "checkpoint": ckpt_path,
+            "model_name": model_name,
+            "preprocess_pipeline": effective_preset,
+            "pipeline_source": pipeline_source,
+            "line_count": len(rows),
+        })
+        # Unload model from cache to free memory before loading next
+        _DONUT_ACTIVE_RUNTIME["checkpoint"] = ""
+        _DONUT_ACTIVE_RUNTIME["runtime"] = None
+
+    full_report = "\n".join(report_lines).strip()
+    state["line_rows"] = []
+    state["last_mode"] = "comparison"
+    state["last_debug_text"] = ""
+    debug = {
+        "ok": True,
+        "mode": "comparison",
+        "checkpoints_compared": len(checkpoints),
+        "split_status": split_status,
+        "line_count": len(line_records_raw),
+        "checkpoints": ckpt_debug,
+    }
+    return (
+        last_overlay,
+        full_report,
+        f"Comparison done: {len(checkpoints)} model(s), {len(line_records_raw)} line(s).",
+        state,
+        json.dumps(debug, ensure_ascii=False, indent=2),
+        None,
+        None,
+    )
+
+
 def _find_line_hit(rows: List[Dict[str, Any]], x: int, y: int) -> Optional[Dict[str, Any]]:
     hits: List[Tuple[int, Dict[str, Any]]] = []
     for rec in rows:
@@ -1705,6 +1865,7 @@ function() {
         state = gr.State(_base_state())
         with gr.Row():
             run_btn = gr.Button("Run OCR", variant="primary")
+            compare_btn = gr.Button("⚖ Compare All Models", variant="secondary")
             full_roi_btn = gr.Button("Process Full Image as ROI", visible=False)
             save_btn = gr.Button("Save", variant="secondary")
 
@@ -2272,6 +2433,128 @@ function() {
             fn=lambda st: str((st or {}).get("last_debug_text", "") if isinstance(st, dict) else ""),
             inputs=[state],
             outputs=[debug_text],
+        )
+
+        def _compare(
+            state_s: Dict[str, Any],
+            layout_s: str,
+            device_s: str,
+            max_len_s: int,
+            preprocess_preset_s: str,
+            gray_mode_s: str,
+            normalize_background_s: bool,
+            background_blur_ksize_s: int,
+            background_strength_s: float,
+            upscale_factor_s: float,
+            upscale_interpolation_s: str,
+            binarize_s: bool,
+            threshold_method_s: str,
+            threshold_block_size_s: int,
+            threshold_c_s: int,
+            fixed_threshold_s: int,
+            morph_close_s: bool,
+            morph_close_kernel_s: int,
+            remove_small_components_s: bool,
+            min_component_area_s: int,
+            rgb_preserve_color_s: bool,
+            rgb_normalize_bg_s: bool,
+            rgb_background_method_s: str,
+            rgb_bg_blur_ksize_s: int,
+            rgb_bg_strength_s: float,
+            rgb_contrast_s: float,
+            rgb_denoise_s: bool,
+            rgb_morph_close_s: bool,
+            rgb_morph_close_kernel_s: int,
+            rgb_remove_small_components_s: bool,
+            rgb_min_component_area_s: int,
+            rgb_upscale_factor_s: float,
+            rgb_upscale_interp_s: str,
+            rgb_ink_normalization_s: bool,
+            rgb_ink_strength_s: float,
+        ):
+            preproc_mode, bdrc_overrides, rgb_overrides = _compose_preprocess_ui_settings(
+                preprocess_preset=preprocess_preset_s,
+                gray_mode=gray_mode_s,
+                normalize_background=normalize_background_s,
+                background_blur_ksize=int(background_blur_ksize_s),
+                background_strength=float(background_strength_s),
+                upscale_factor=float(upscale_factor_s),
+                upscale_interpolation=upscale_interpolation_s,
+                binarize=binarize_s,
+                threshold_method=threshold_method_s,
+                threshold_block_size=int(threshold_block_size_s),
+                threshold_c=int(threshold_c_s),
+                fixed_threshold=int(fixed_threshold_s),
+                morph_close=morph_close_s,
+                morph_close_kernel=int(morph_close_kernel_s),
+                remove_small_components=remove_small_components_s,
+                min_component_area=int(min_component_area_s),
+                rgb_preserve_color=rgb_preserve_color_s,
+                rgb_normalize_background=rgb_normalize_bg_s,
+                rgb_background_method=rgb_background_method_s,
+                rgb_background_blur_ksize=int(rgb_bg_blur_ksize_s),
+                rgb_background_strength=float(rgb_bg_strength_s),
+                rgb_contrast=float(rgb_contrast_s),
+                rgb_denoise=rgb_denoise_s,
+                rgb_morph_close=rgb_morph_close_s,
+                rgb_morph_close_kernel=int(rgb_morph_close_kernel_s),
+                rgb_remove_small_components=rgb_remove_small_components_s,
+                rgb_min_component_area=int(rgb_min_component_area_s),
+                rgb_upscale_factor=float(rgb_upscale_factor_s),
+                rgb_upscale_interpolation=rgb_upscale_interp_s,
+                rgb_ink_normalization=rgb_ink_normalization_s,
+                rgb_ink_strength=float(rgb_ink_strength_s),
+            )
+            return _run_comparison(
+                state_s,
+                layout_s,
+                device_s,
+                int(max_len_s),
+                preprocess_preset=preproc_mode,
+                bdrc_preprocess_overrides=bdrc_overrides,
+                rgb_preprocess_overrides=rgb_overrides,
+            )
+
+        compare_btn.click(
+            fn=_compare,
+            inputs=[
+                state,
+                layout_path,
+                device,
+                max_len,
+                preprocess_preset,
+                bdrc_gray_mode,
+                bdrc_normalize_bg,
+                bdrc_bg_blur_ksize,
+                bdrc_bg_strength,
+                bdrc_upscale_factor,
+                bdrc_upscale_interp,
+                bdrc_binarize,
+                bdrc_threshold_method,
+                bdrc_threshold_block,
+                bdrc_threshold_c,
+                bdrc_fixed_threshold,
+                bdrc_morph_close,
+                bdrc_morph_close_kernel,
+                bdrc_remove_small_components,
+                bdrc_min_component_area,
+                rgb_preserve_color,
+                rgb_normalize_bg,
+                rgb_background_method,
+                rgb_bg_blur_ksize,
+                rgb_bg_strength,
+                rgb_contrast,
+                rgb_denoise,
+                rgb_morph_close,
+                rgb_morph_close_kernel,
+                rgb_remove_small_components,
+                rgb_min_component_area,
+                rgb_upscale_factor,
+                rgb_upscale_interp,
+                rgb_ink_normalization,
+                rgb_ink_strength,
+            ],
+            outputs=[image_view, transcript, status, state, debug_json, donut_input_before, donut_input_after],
         )
 
         save_btn.click(
