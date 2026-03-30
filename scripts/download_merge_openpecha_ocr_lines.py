@@ -31,9 +31,13 @@ import json
 import logging
 import math
 import os
+import urllib.error
+import urllib.parse
+import urllib.request
 from collections import Counter, defaultdict
+from concurrent.futures import FIRST_COMPLETED, Future, ThreadPoolExecutor, wait
 from pathlib import Path
-from typing import Any, Dict, Iterable, List, Mapping, MutableMapping, Optional, Sequence, Tuple
+from typing import Any, Dict, Iterable, List, Mapping, MutableMapping, Optional, Sequence, Set, Tuple
 
 import pandas as pd
 from PIL import Image, ImageOps
@@ -63,6 +67,13 @@ IMAGE_COLUMN_CANDIDATES: Tuple[str, ...] = (
     "line_img",
     "crop",
     "line",
+)
+IMAGE_URL_COLUMN_CANDIDATES: Tuple[str, ...] = (
+    "url",
+    "image_url",
+    "img_url",
+    "image-uri",
+    "image_uri",
 )
 TEXT_COLUMN_CANDIDATES: Tuple[str, ...] = (
     "text",
@@ -159,7 +170,13 @@ def _detect_image_column(
     explicit: Optional[str] = None,
 ) -> Optional[str]:
     if explicit:
-        return explicit if explicit in set(column_names) else None
+        if explicit in set(column_names):
+            return explicit
+        LOGGER.warning(
+            "Explicit --image-column=%r not found in columns=%s. Falling back to auto-detection.",
+            str(explicit),
+            list(column_names),
+        )
     if features:
         for name, feat in features.items():
             if name in column_names and _is_hf_image_feature(feat):
@@ -171,9 +188,36 @@ def _detect_image_column(
     return None
 
 
+def _detect_image_url_column(column_names: Sequence[str], explicit: Optional[str] = None) -> Optional[str]:
+    if explicit:
+        if explicit in set(column_names):
+            return explicit
+        LOGGER.warning(
+            "Explicit --image-url-column=%r not found in columns=%s. Falling back to auto-detection.",
+            str(explicit),
+            list(column_names),
+        )
+    lower_map = {str(c).lower(): str(c) for c in column_names}
+    for cand in IMAGE_URL_COLUMN_CANDIDATES:
+        if cand.lower() in lower_map:
+            return lower_map[cand.lower()]
+    # Fallback: any column that looks like a URL-ish image pointer.
+    for col in column_names:
+        low = str(col).lower()
+        if "url" in low and ("image" in low or "img" in low or low == "url"):
+            return str(col)
+    return None
+
+
 def _detect_text_column(column_names: Sequence[str], explicit: Optional[str] = None) -> Optional[str]:
     if explicit:
-        return explicit if explicit in set(column_names) else None
+        if explicit in set(column_names):
+            return explicit
+        LOGGER.warning(
+            "Explicit --text-column=%r not found in columns=%s. Falling back to auto-detection.",
+            str(explicit),
+            list(column_names),
+        )
     lower_map = {str(c).lower(): str(c) for c in column_names}
     for cand in TEXT_COLUMN_CANDIDATES:
         if cand.lower() in lower_map:
@@ -249,6 +293,13 @@ def _coerce_pil_image(value: Any) -> Optional[Image.Image]:
         return None
     if isinstance(value, Image.Image):
         return value.copy()
+    if isinstance(value, str):
+        raw = value.strip()
+        if raw:
+            p = Path(raw).expanduser()
+            if p.exists() and p.is_file():
+                with Image.open(p) as im:
+                    return im.copy()
     if isinstance(value, Mapping):
         path_val = value.get("path")
         bytes_val = value.get("bytes")
@@ -268,8 +319,57 @@ def _coerce_pil_image(value: Any) -> Optional[Image.Image]:
     return None
 
 
-def _save_line_png(image_value: Any, out_png: Path) -> Tuple[bool, Dict[str, Any]]:
+def _maybe_hf_resolve_url(
+    raw: str,
+    *,
+    dataset_id: str,
+    revision: str,
+) -> Optional[str]:
+    candidate = str(raw or "").strip()
+    if not candidate:
+        return None
+    low = candidate.lower()
+    if low.startswith("http://") or low.startswith("https://"):
+        return candidate
+    if "://" in candidate:
+        return None
+    # Ignore obvious non-image payloads.
+    if "." not in candidate:
+        return None
+    repo_path = candidate.lstrip("/")
+    repo_path_q = urllib.parse.quote(repo_path, safe="/:@")
+    ds_q = urllib.parse.quote(str(dataset_id), safe="/")
+    rev_q = urllib.parse.quote(str(revision or "main"), safe="")
+    return f"https://huggingface.co/datasets/{ds_q}/resolve/{rev_q}/{repo_path_q}"
+
+
+def _download_image_from_url(url: str, *, timeout_s: float = 20.0) -> Optional[Image.Image]:
+    raw = str(url or "").strip()
+    if not raw:
+        return None
+    if not (raw.startswith("http://") or raw.startswith("https://")):
+        return None
+    req = urllib.request.Request(
+        raw,
+        headers={
+            "User-Agent": "PechaBridge-OCR-Downloader/1.0 (+https://github.com/openpecha)"
+        },
+    )
+    with urllib.request.urlopen(req, timeout=float(timeout_s)) as resp:
+        data = resp.read()
+    with Image.open(io.BytesIO(data)) as im:
+        return im.copy()
+
+
+def _save_line_png(image_value: Any, out_png: Path, *, url_timeout_s: float = 20.0) -> Tuple[bool, Dict[str, Any]]:
     pil = _coerce_pil_image(image_value)
+    if pil is None and isinstance(image_value, str):
+        try:
+            pil = _download_image_from_url(image_value, timeout_s=float(url_timeout_s))
+        except urllib.error.URLError as exc:
+            return False, {"error": f"url_download_failed:{type(exc).__name__}"}
+        except Exception as exc:
+            return False, {"error": f"url_download_failed:{type(exc).__name__}"}
     if pil is None:
         return False, {"error": "unsupported_image_value"}
     pil = ImageOps.exif_transpose(pil)
@@ -436,6 +536,40 @@ def _write_parquet_from_jsonl(jsonl_path: Path, parquet_path: Path) -> None:
         df.to_parquet(parquet_path, index=False)
 
 
+def _load_existing_line_paths(jsonl_path: Path) -> Set[str]:
+    existing: Set[str] = set()
+    if not jsonl_path.exists() or jsonl_path.stat().st_size <= 0:
+        return existing
+    with jsonl_path.open("r", encoding="utf-8") as fp:
+        for line in fp:
+            raw = line.strip()
+            if not raw:
+                continue
+            try:
+                obj = json.loads(raw)
+            except Exception:
+                continue
+            if not isinstance(obj, Mapping):
+                continue
+            rel = str(obj.get("line_path", "") or "").strip()
+            if rel:
+                existing.add(rel)
+    return existing
+
+
+def _probe_existing_png_meta(path: Path) -> Dict[str, Any]:
+    try:
+        with Image.open(path) as im:
+            im = ImageOps.exif_transpose(im)
+            return {
+                "width_px": int(im.width),
+                "height_px": int(im.height),
+                "image_mode": str(im.mode),
+            }
+    except Exception:
+        return {"width_px": -1, "height_px": -1, "image_mode": ""}
+
+
 def create_parser(add_help: bool = True) -> argparse.ArgumentParser:
     parser = argparse.ArgumentParser(
         description="Download and merge OpenPecha OCR HF datasets into a TextHierarchy-style line dataset.",
@@ -462,6 +596,7 @@ def create_parser(add_help: bool = True) -> argparse.ArgumentParser:
         help="Optional split filter (repeatable), e.g. --split train --split validation.",
     )
     parser.add_argument("--image-column", type=str, default="", help="Explicit image column name.")
+    parser.add_argument("--image-url-column", type=str, default="", help="Explicit URL column for image download (HTTP/HTTPS).")
     parser.add_argument("--text-column", type=str, default="", help="Explicit text column name.")
     parser.add_argument("--doc-column", type=str, default="", help="Explicit doc-id source column name.")
     parser.add_argument("--page-column", type=str, default="", help="Explicit page-id source column name.")
@@ -470,9 +605,18 @@ def create_parser(add_help: bool = True) -> argparse.ArgumentParser:
     parser.add_argument("--revision", type=str, default="", help="Optional dataset revision/commit.")
     parser.add_argument("--token", type=str, default=os.environ.get("HF_TOKEN", ""), help="HF token (or set HF_TOKEN).")
     parser.add_argument("--max-rows-per-split", type=int, default=0, help="Debug cap per split (0 = no cap).")
+    parser.add_argument("--max-images", type=int, default=0, help="Cap on images saved per canonical split (train/eval/test); 0 = no cap.")
+    parser.add_argument("--num-workers", type=int, default=8, help="Parallel workers for image decode/download+save (1 disables parallelism).")
+    parser.add_argument("--max-pending-tasks", type=int, default=0, help="Cap in-flight tasks per split (0 = 4x num-workers).")
+    parser.add_argument("--url-timeout-seconds", type=float, default=20.0, help="Timeout for downloading images from URL columns.")
     parser.add_argument("--trust-remote-code", action="store_true", help="Pass trust_remote_code=True to datasets.")
     parser.add_argument("--streaming", action="store_true", help="Use HF streaming mode.")
     parser.add_argument("--all-configs", action="store_true", help="Try to load all dataset configs if present.")
+    parser.add_argument(
+        "--resume",
+        action="store_true",
+        help="Continue into an existing output dir: keep existing metadata/images and append only missing rows.",
+    )
     parser.add_argument("--skip-parquet", action="store_true", help="Only write lines.jsonl (skip parquet conversion).")
     parser.add_argument("--verbose", action="store_true", help="Verbose logging.")
     return parser
@@ -508,6 +652,9 @@ def run(args: argparse.Namespace) -> Dict[str, Any]:
             "rows_saved": 0,
             "rows_skipped_no_image_column": 0,
             "rows_skipped_image_decode": 0,
+            "rows_skipped_image_download": 0,
+            "rows_skipped_already_present": 0,
+            "rows_resumed_from_existing_image": 0,
             "splits_skipped_by_filter": 0,
             "canonical_splits_created": 0,
         }
@@ -515,9 +662,26 @@ def run(args: argparse.Namespace) -> Dict[str, Any]:
     counts_by_dataset: Dict[str, Counter] = defaultdict(Counter)
     counts_by_canonical_split: Dict[str, Counter] = defaultdict(Counter)
     split_outputs: Dict[str, Dict[str, Any]] = {}
+    existing_line_paths_by_split: Dict[str, Set[str]] = {}
+
+    if bool(args.resume) and out_dir.exists():
+        for split_dir in out_dir.iterdir():
+            if not split_dir.is_dir():
+                continue
+            split_jsonl = split_dir / "meta" / "lines.jsonl"
+            if not split_jsonl.exists():
+                continue
+            existing_line_paths_by_split[str(split_dir.name)] = _load_existing_line_paths(split_jsonl)
+        loaded_total = sum(len(v) for v in existing_line_paths_by_split.values())
+        LOGGER.info(
+            "Resume enabled: loaded %d existing line_path entries across %d split(s).",
+            int(loaded_total),
+            int(len(existing_line_paths_by_split)),
+        )
 
     with contextlib.ExitStack() as stack:
-        root_fp = stack.enter_context(root_jsonl_path.open("w", encoding="utf-8"))
+        root_mode = "a" if bool(args.resume) and root_jsonl_path.exists() else "w"
+        root_fp = stack.enter_context(root_jsonl_path.open(root_mode, encoding="utf-8"))
 
         def _ensure_split_output(canonical_split: str) -> Dict[str, Any]:
             state = split_outputs.get(canonical_split)
@@ -530,7 +694,8 @@ def run(args: argparse.Namespace) -> Dict[str, Any]:
             split_meta_dir.mkdir(parents=True, exist_ok=True)
             split_jsonl_path = split_meta_dir / "lines.jsonl"
             split_parquet_path = split_meta_dir / "lines.parquet"
-            split_fp = stack.enter_context(split_jsonl_path.open("w", encoding="utf-8"))
+            split_mode = "a" if bool(args.resume) and split_jsonl_path.exists() else "w"
+            split_fp = stack.enter_context(split_jsonl_path.open(split_mode, encoding="utf-8"))
             state = {
                 "root": split_root,
                 "text_root": split_text_root,
@@ -583,6 +748,7 @@ def run(args: argparse.Namespace) -> Dict[str, Any]:
                     column_names = list(getattr(split_ds, "column_names", []) or [])
                     features = getattr(split_ds, "features", None)
                     image_col = _detect_image_column(column_names, features, explicit=(args.image_column or None))
+                    image_url_col = _detect_image_url_column(column_names, explicit=(args.image_url_column or None))
                     text_col = _detect_text_column(column_names, explicit=(args.text_column or None))
 
                     source_key = f"{dataset_id}::{config_label or 'default'}::{split_name}"
@@ -594,12 +760,13 @@ def run(args: argparse.Namespace) -> Dict[str, Any]:
                         "canonical_split": canonical_split,
                         "columns": column_names,
                         "image_column_detected": image_col or "",
+                        "image_url_column_detected": image_url_col or "",
                         "text_column_detected": text_col or "",
                     }
 
-                    if not image_col:
+                    if not image_col and not image_url_col:
                         LOGGER.warning(
-                            "No image column detected for %s (columns=%s). Skipping split.",
+                            "No image column or image-url column detected for %s (columns=%s). Skipping split.",
                             source_key,
                             column_names,
                         )
@@ -607,97 +774,198 @@ def run(args: argparse.Namespace) -> Dict[str, Any]:
                         totals["rows_skipped_no_image_column"] += int(getattr(split_ds, "num_rows", 0) or 0)
                         continue
 
+                    num_workers = max(1, int(args.num_workers or 1))
+                    max_pending_tasks = int(args.max_pending_tasks or 0)
+                    if max_pending_tasks <= 0:
+                        max_pending_tasks = max(1, num_workers * 4)
+                    max_images_for_split = int(args.max_images or 0)
+
                     progress = tqdm(
                         enumerate(split_ds),
                         total=getattr(split_ds, "num_rows", None),
                         desc=f"{dataset_short}:{split_name}->{canonical_split}",
                     )
-                    for row_idx, row in progress:
-                        if int(args.max_rows_per_split) > 0 and row_idx >= int(args.max_rows_per_split):
-                            break
-                        totals["rows_seen"] += 1
-                        counts_by_dataset[dataset_id]["rows_seen"] += 1
+                    with ThreadPoolExecutor(max_workers=num_workers) as executor:
+                        pending: Dict[Future, Tuple[str, Dict[str, Any]]] = {}
 
-                        if not isinstance(row, Mapping):
-                            row = {"value": row}
+                        def _drain_pending(*, block: bool) -> None:
+                            if not pending:
+                                return
+                            done, _ = wait(
+                                set(pending.keys()),
+                                timeout=None if block else 0.0,
+                                return_when=FIRST_COMPLETED,
+                            )
+                            if not done:
+                                return
+                            for fut in done:
+                                canonical_split_done, rec = pending.pop(fut)
+                                try:
+                                    ok, img_meta = fut.result()
+                                except Exception as exc:
+                                    ok, img_meta = False, {"error": f"save_exception:{type(exc).__name__}"}
+                                if not ok:
+                                    err_s = str(img_meta.get("error", ""))
+                                    if err_s.startswith("url_download_failed"):
+                                        totals["rows_skipped_image_download"] += 1
+                                        counts_by_dataset[dataset_id]["rows_skipped_image_download"] += 1
+                                    else:
+                                        totals["rows_skipped_image_decode"] += 1
+                                        counts_by_dataset[dataset_id]["rows_skipped_image_decode"] += 1
+                                    continue
 
-                        image_value = row.get(image_col)
-                        if image_value is None:
-                            totals["rows_skipped_image_decode"] += 1
-                            counts_by_dataset[dataset_id]["rows_skipped_image_decode"] += 1
-                            continue
+                                rec["width_px"] = int(img_meta.get("width_px", -1))
+                                rec["height_px"] = int(img_meta.get("height_px", -1))
+                                rec["image_mode"] = str(img_meta.get("image_mode", ""))
+                                _safe_jsonl_write_line(root_fp, rec)
+                                _safe_jsonl_write_line(split_outputs[canonical_split_done]["fp"], rec)
+                                existing_line_paths_by_split.setdefault(canonical_split_done, set()).add(
+                                    str(rec.get("line_path", ""))
+                                )
 
-                        doc_id, page_id, line_id, id_meta = _build_ids(
-                            row,
-                            dataset_short=dataset_short,
-                            split_name=split_name,
-                            row_idx=int(row_idx),
-                            doc_col_override=(args.doc_column or None),
-                            page_col_override=(args.page_column or None),
-                            line_col_override=(args.line_column or None),
-                            line_counters=line_counters,
-                        )
+                                totals["rows_saved"] += 1
+                                counts_by_dataset[dataset_id]["rows_saved"] += 1
+                                counts_by_dataset[dataset_id][f"split::{split_name}"] += 1
+                                counts_by_canonical_split[canonical_split_done]["rows_saved"] += 1
+                                counts_by_canonical_split[canonical_split_done][f"source_split::{split_name}"] += 1
 
-                        collision_key = (dataset_short, canonical_split, doc_id, page_id, int(line_id))
-                        dup_idx = int(path_collision_counters[collision_key])
-                        path_collision_counters[collision_key] += 1
+                        for row_idx, row in progress:
+                            if max_images_for_split > 0:
+                                while pending and (
+                                    int(counts_by_canonical_split[canonical_split]["rows_saved"]) + len(pending)
+                                ) >= max_images_for_split:
+                                    _drain_pending(block=True)
+                                if int(counts_by_canonical_split[canonical_split]["rows_saved"]) >= max_images_for_split:
+                                    LOGGER.info(
+                                        "Reached --max-images=%d for split=%s (saved=%d). Skipping remaining rows in this split.",
+                                        max_images_for_split,
+                                        canonical_split,
+                                        int(counts_by_canonical_split[canonical_split]["rows_saved"]),
+                                    )
+                                    break
 
-                        split_state = _ensure_split_output(canonical_split)
-                        line_dir_name = f"line_{int(line_id):06d}" if dup_idx == 0 else f"line_{int(line_id):06d}_dup{dup_idx:03d}"
-                        line_dir = (
-                            Path(split_state["text_root"])
-                            / f"dataset={dataset_short}"
-                            / f"doc={doc_id}"
-                            / f"page={page_id}"
-                            / line_dir_name
-                        )
-                        line_png = line_dir / "line.png"
-                        ok, img_meta = _save_line_png(image_value, line_png)
-                        if not ok:
-                            totals["rows_skipped_image_decode"] += 1
-                            counts_by_dataset[dataset_id]["rows_skipped_image_decode"] += 1
-                            continue
+                            while len(pending) >= max_pending_tasks:
+                                _drain_pending(block=True)
+                            _drain_pending(block=False)
 
-                        line_rel_path = str(line_png.relative_to(out_dir))
-                        source_record: Dict[str, Any] = {}
-                        for key, value in row.items():
-                            pref_key = f"src__{key}"
-                            if key == image_col:
-                                source_record[pref_key] = line_rel_path
-                            else:
-                                source_record[pref_key] = _serialize_source_value(value)
+                            if int(args.max_rows_per_split) > 0 and row_idx >= int(args.max_rows_per_split):
+                                break
+                            totals["rows_seen"] += 1
+                            counts_by_dataset[dataset_id]["rows_seen"] += 1
 
-                        text_value = _safe_text(row.get(text_col, "")) if text_col else ""
-                        rec: Dict[str, Any] = {
-                            "split": canonical_split,
-                            "canonical_split": canonical_split,
-                            "source_dataset": dataset_id,
-                            "source_dataset_short": dataset_short,
-                            "source_config": config_label,
-                            "source_split": split_name,
-                            "row_idx": int(row_idx),
-                            "doc_id": doc_id,
-                            "page_id": page_id,
-                            "line_id": int(line_id),
-                            "line_path": line_rel_path,
-                            "text": text_value,
-                            "image_column": image_col,
-                            "text_column": text_col or "",
-                            "line_folder_dup_idx": int(dup_idx),
-                            "width_px": int(img_meta.get("width_px", -1)),
-                            "height_px": int(img_meta.get("height_px", -1)),
-                            "image_mode": str(img_meta.get("image_mode", "")),
-                            **id_meta,
-                            **source_record,
-                        }
-                        _safe_jsonl_write_line(root_fp, rec)
-                        _safe_jsonl_write_line(split_state["fp"], rec)
+                            if not isinstance(row, Mapping):
+                                row = {"value": row}
 
-                        totals["rows_saved"] += 1
-                        counts_by_dataset[dataset_id]["rows_saved"] += 1
-                        counts_by_dataset[dataset_id][f"split::{split_name}"] += 1
-                        counts_by_canonical_split[canonical_split]["rows_saved"] += 1
-                        counts_by_canonical_split[canonical_split][f"source_split::{split_name}"] += 1
+                            image_source_col = image_col if image_col else image_url_col
+                            image_value = row.get(image_source_col) if image_source_col else None
+                            if image_value is None:
+                                totals["rows_skipped_image_decode"] += 1
+                                counts_by_dataset[dataset_id]["rows_skipped_image_decode"] += 1
+                                continue
+                            if image_source_col and image_source_col == image_url_col and isinstance(image_value, str):
+                                # Some datasets expose repo-relative paths in `url` columns.
+                                # Convert to a resolvable HF URL when needed.
+                                hf_url = _maybe_hf_resolve_url(
+                                    image_value,
+                                    dataset_id=dataset_id,
+                                    revision=str(args.revision or "main"),
+                                )
+                                if hf_url is not None:
+                                    image_value = hf_url
+
+                            doc_id, page_id, line_id, id_meta = _build_ids(
+                                row,
+                                dataset_short=dataset_short,
+                                split_name=split_name,
+                                row_idx=int(row_idx),
+                                doc_col_override=(args.doc_column or None),
+                                page_col_override=(args.page_column or None),
+                                line_col_override=(args.line_column or None),
+                                line_counters=line_counters,
+                            )
+
+                            collision_key = (dataset_short, canonical_split, doc_id, page_id, int(line_id))
+                            dup_idx = int(path_collision_counters[collision_key])
+                            path_collision_counters[collision_key] += 1
+
+                            split_state = _ensure_split_output(canonical_split)
+                            line_dir_name = (
+                                f"line_{int(line_id):06d}" if dup_idx == 0 else f"line_{int(line_id):06d}_dup{dup_idx:03d}"
+                            )
+                            line_dir = (
+                                Path(split_state["text_root"])
+                                / f"dataset={dataset_short}"
+                                / f"doc={doc_id}"
+                                / f"page={page_id}"
+                                / line_dir_name
+                            )
+                            line_png = line_dir / "line.png"
+                            line_rel_path = str(line_png.relative_to(out_dir))
+                            existing_paths = existing_line_paths_by_split.setdefault(canonical_split, set())
+                            if line_rel_path in existing_paths:
+                                totals["rows_skipped_already_present"] += 1
+                                counts_by_dataset[dataset_id]["rows_skipped_already_present"] += 1
+                                counts_by_canonical_split[canonical_split]["rows_skipped_already_present"] += 1
+                                continue
+
+                            source_record: Dict[str, Any] = {}
+                            for key, value in row.items():
+                                pref_key = f"src__{key}"
+                                if image_source_col and key == image_source_col:
+                                    source_record[pref_key] = line_rel_path
+                                else:
+                                    source_record[pref_key] = _serialize_source_value(value)
+
+                            text_value = _safe_text(row.get(text_col, "")) if text_col else ""
+                            rec: Dict[str, Any] = {
+                                "split": canonical_split,
+                                "canonical_split": canonical_split,
+                                "source_dataset": dataset_id,
+                                "source_dataset_short": dataset_short,
+                                "source_config": config_label,
+                                "source_split": split_name,
+                                "row_idx": int(row_idx),
+                                "doc_id": doc_id,
+                                "page_id": page_id,
+                                "line_id": int(line_id),
+                                "line_path": line_rel_path,
+                                "text": text_value,
+                                "image_column": image_source_col or "",
+                                "text_column": text_col or "",
+                                "line_folder_dup_idx": int(dup_idx),
+                                "width_px": -1,
+                                "height_px": -1,
+                                "image_mode": "",
+                                **id_meta,
+                                **source_record,
+                            }
+                            if bool(args.resume) and line_png.exists():
+                                img_meta = _probe_existing_png_meta(line_png)
+                                rec["width_px"] = int(img_meta.get("width_px", -1))
+                                rec["height_px"] = int(img_meta.get("height_px", -1))
+                                rec["image_mode"] = str(img_meta.get("image_mode", ""))
+                                _safe_jsonl_write_line(root_fp, rec)
+                                _safe_jsonl_write_line(split_outputs[canonical_split]["fp"], rec)
+                                existing_paths.add(line_rel_path)
+                                totals["rows_saved"] += 1
+                                totals["rows_resumed_from_existing_image"] += 1
+                                counts_by_dataset[dataset_id]["rows_saved"] += 1
+                                counts_by_dataset[dataset_id]["rows_resumed_from_existing_image"] += 1
+                                counts_by_dataset[dataset_id][f"split::{split_name}"] += 1
+                                counts_by_canonical_split[canonical_split]["rows_saved"] += 1
+                                counts_by_canonical_split[canonical_split]["rows_resumed_from_existing_image"] += 1
+                                counts_by_canonical_split[canonical_split][f"source_split::{split_name}"] += 1
+                                continue
+                            fut = executor.submit(
+                                _save_line_png,
+                                image_value,
+                                line_png,
+                                url_timeout_s=float(args.url_timeout_seconds),
+                            )
+                            pending[fut] = (canonical_split, rec)
+
+                        while pending:
+                            _drain_pending(block=True)
 
     if not bool(args.skip_parquet):
         try:
