@@ -1234,19 +1234,23 @@ def _manual_full_image_roi(
     )
 
 
-def _on_upload(file_obj: Any, state: Dict[str, Any]) -> Tuple[np.ndarray, str, Dict[str, Any], str]:
-    if file_obj is None:
+def _on_upload(img_array: Any, state: Dict[str, Any]) -> Tuple[np.ndarray, str, Dict[str, Any], str]:
+    """Accept a numpy array from gr.Image upload."""
+    if img_array is None:
         return None, "", _base_state(), "No image loaded."
-    path = getattr(file_obj, "name", "") or str(file_obj)
-    p = Path(path).expanduser().resolve()
-    if not p.exists():
-        return None, "", _base_state(), f"Datei nicht gefunden: {p}"
-    img = _to_rgb_uint8(str(p))
+    try:
+        img = np.asarray(img_array).astype(np.uint8)
+        if img.ndim == 2:
+            img = np.stack([img] * 3, axis=-1)
+        elif img.shape[2] == 4:
+            img = img[:, :, :3]
+    except Exception as exc:
+        return None, "", _base_state(), f"Failed to load image: {exc}"
     new_state = _base_state()
-    new_state["image_path"] = str(p)
-    new_state["image_name"] = p.name
+    new_state["image_path"] = ""
+    new_state["image_name"] = "uploaded_image.png"
     new_state["image"] = img
-    return img, "", new_state, f"Image loaded: {p.name}"
+    return img, "", new_state, "Image loaded."
 
 
 def _save_results(
@@ -1370,7 +1374,91 @@ def build_ui() -> gr.Blocks:
 }
 """
 
-    with gr.Blocks(title="OCR Workbench (DONUT)", css=ui_css) as demo:
+    _image_zoom_js = """
+function() {
+  function initImageZoom() {
+    const panel = document.querySelector('#ocr_image_panel');
+    if (!panel || panel._zoomInit) return;
+    panel._zoomInit = true;
+
+    let scale = 1.0;
+    let originX = 0, originY = 0;   // transform-origin in px relative to img
+    let panX = 0, panY = 0;          // translate offset
+    let isPanning = false;
+    let panStartX = 0, panStartY = 0;
+    let panOriginX = 0, panOriginY = 0;
+
+    function getImg() { return panel.querySelector('img'); }
+
+    function applyTransform() {
+      const img = getImg();
+      if (!img) return;
+      img.style.transformOrigin = `${originX}px ${originY}px`;
+      img.style.transform = `translate(${panX}px, ${panY}px) scale(${scale})`;
+      img.style.maxWidth = 'none';
+      img.style.maxHeight = 'none';
+      img.style.display = 'block';
+    }
+
+    // Wheel zoom centered on cursor
+    panel.addEventListener('wheel', function(e) {
+      const img = getImg();
+      if (!img) return;
+      e.preventDefault();
+      const rect = img.getBoundingClientRect();
+      // cursor position relative to the image element (before transform)
+      const mouseX = (e.clientX - rect.left) / scale;
+      const mouseY = (e.clientY - rect.top)  / scale;
+      const delta = e.deltaY < 0 ? 1.15 : 1 / 1.15;
+      const newScale = Math.min(16, Math.max(0.1, scale * delta));
+      // Adjust pan so the point under the cursor stays fixed
+      panX = e.clientX - rect.left - mouseX * newScale + panX - (e.clientX - rect.left - mouseX * scale);
+      panY = e.clientY - rect.top  - mouseY * newScale + panY - (e.clientY - rect.top  - mouseY * scale);
+      originX = mouseX;
+      originY = mouseY;
+      scale = newScale;
+      applyTransform();
+    }, { passive: false });
+
+    // Middle-click or Alt+left-click drag to pan
+    panel.addEventListener('mousedown', function(e) {
+      if (e.button === 1 || (e.button === 0 && e.altKey)) {
+        e.preventDefault();
+        isPanning = true;
+        panStartX = e.clientX;
+        panStartY = e.clientY;
+        panOriginX = panX;
+        panOriginY = panY;
+        panel.style.cursor = 'grabbing';
+      }
+    });
+    window.addEventListener('mousemove', function(e) {
+      if (!isPanning) return;
+      panX = panOriginX + (e.clientX - panStartX);
+      panY = panOriginY + (e.clientY - panStartY);
+      applyTransform();
+    });
+    window.addEventListener('mouseup', function(e) {
+      if (isPanning) {
+        isPanning = false;
+        panel.style.cursor = '';
+      }
+    });
+
+    // Expose reset/zoom for the buttons
+    panel._zoomReset = function() { scale=1; panX=0; panY=0; originX=0; originY=0; applyTransform(); };
+    panel._zoomIn    = function() { scale=Math.min(16, Math.round((scale+0.25)*100)/100); applyTransform(); };
+    panel._zoomOut   = function() { scale=Math.max(0.1, Math.round((scale-0.25)*100)/100); applyTransform(); };
+  }
+
+  // Re-init whenever Gradio re-renders the image
+  const observer = new MutationObserver(initImageZoom);
+  observer.observe(document.body, { childList: true, subtree: true });
+  initImageZoom();
+}
+"""
+
+    with gr.Blocks(title="OCR Workbench (DONUT)", css=ui_css, js=_image_zoom_js) as demo:
         gr.Markdown("## OCR Workbench (DONUT + Layout)")
         gr.Markdown(
             "Automatic mode: layout -> line detection -> OCR. Manual mode: click an existing line or define an ROI with two clicks."
@@ -1616,7 +1704,6 @@ def build_ui() -> gr.Blocks:
 
         state = gr.State(_base_state())
         with gr.Row():
-            image_file = gr.File(label="Upload Image", file_types=["image"])
             run_btn = gr.Button("Run OCR", variant="primary")
             full_roi_btn = gr.Button("Process Full Image as ROI", visible=False)
             save_btn = gr.Button("Save", variant="secondary")
@@ -1628,11 +1715,10 @@ def build_ui() -> gr.Blocks:
             img_zoom_in_btn = gr.Button("🔍+", elem_id="img_zoom_plus", scale=0, min_width=36)
         with gr.Row():
             image_view = gr.Image(
-                label="Image / Overlay",
+                label="Drop image here or click to upload",
                 type="numpy",
                 interactive=True,
                 elem_id="ocr_image_panel",
-                show_label=False,
             )
 
         # ── Transcript row (full width) ─────────────────────────────────────
@@ -1645,9 +1731,9 @@ def build_ui() -> gr.Blocks:
                         font_minus_btn = gr.Button("−", elem_id="font_btn_minus")
         save_status = gr.Textbox(label="Save Status", interactive=False, visible=False)
 
-        _upload_evt = image_file.change(
+        _upload_evt = image_view.upload(
             fn=_on_upload,
-            inputs=[image_file, state],
+            inputs=[image_view, state],
             outputs=[image_view, transcript, state, status],
         )
         _upload_evt.then(
@@ -2221,37 +2307,9 @@ def build_ui() -> gr.Blocks:
 """,
         )
 
-        _ZOOM_JS = """
-() => {
-  const img = document.querySelector('#ocr_image_panel img');
-  if (!img) return;
-  const cur = parseFloat(img.style.transform.replace('scale(','').replace(')','')) || 1.0;
-  const next = Math.min(8.0, Math.round((cur + 0.25) * 100) / 100);
-  img.style.transform = `scale(${next})`;
-  img.style.transformOrigin = 'top left';
-}
-"""
-        _ZOOM_OUT_JS = """
-() => {
-  const img = document.querySelector('#ocr_image_panel img');
-  if (!img) return;
-  const cur = parseFloat(img.style.transform.replace('scale(','').replace(')','')) || 1.0;
-  const next = Math.max(0.25, Math.round((cur - 0.25) * 100) / 100);
-  img.style.transform = `scale(${next})`;
-  img.style.transformOrigin = 'top left';
-}
-"""
-        _ZOOM_RESET_JS = """
-() => {
-  const img = document.querySelector('#ocr_image_panel img');
-  if (!img) return;
-  img.style.transform = 'scale(1)';
-  img.style.transformOrigin = 'top left';
-}
-"""
-        img_zoom_in_btn.click(fn=None, js=_ZOOM_JS)
-        img_zoom_out_btn.click(fn=None, js=_ZOOM_OUT_JS)
-        img_zoom_reset_btn.click(fn=None, js=_ZOOM_RESET_JS)
+        img_zoom_in_btn.click(fn=None, js="() => { const p = document.querySelector('#ocr_image_panel'); if (p && p._zoomIn) p._zoomIn(); }")
+        img_zoom_out_btn.click(fn=None, js="() => { const p = document.querySelector('#ocr_image_panel'); if (p && p._zoomOut) p._zoomOut(); }")
+        img_zoom_reset_btn.click(fn=None, js="() => { const p = document.querySelector('#ocr_image_panel'); if (p && p._zoomReset) p._zoomReset(); }")
 
         debug_font_plus_btn.click(
             fn=None,
