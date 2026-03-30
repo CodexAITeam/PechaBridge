@@ -944,7 +944,6 @@ def _load_repro_ui_settings(ckpt_path: str) -> Tuple[str, str, Dict[str, Any], D
         return preset, msg, bdrc, rgb
 
     preset = _normalize_preprocess_preset(repro_pipeline)
-    msg = f"Loaded repro settings from {Path(ckpt_path).name}: pipeline={preset}"
 
     # Reconstruct vit_defaults for the detected pipeline
     bdrc = _bdrc_ui_defaults()
@@ -973,8 +972,9 @@ def _load_repro_ui_settings(ckpt_path: str) -> Tuple[str, str, Dict[str, Any], D
                 "remove_small_components": bool(base.get("remove_small_components", False)),
                 "min_component_area": int(base.get("min_component_area", 12)),
             }
+            cfg_summary = ", ".join(f"{k}={v}" for k, v in sorted(bdrc.items()))
         except Exception:
-            pass
+            cfg_summary = "(could not read config)"
     elif preset == "rgb" and RGBLinePreprocessConfig is not None:
         try:
             base = dict(RGBLinePreprocessConfig.vit_defaults().to_dict())
@@ -995,8 +995,15 @@ def _load_repro_ui_settings(ckpt_path: str) -> Tuple[str, str, Dict[str, Any], D
                 "ink_normalization": bool(base.get("ink_normalization", True)),
                 "ink_strength": float(base.get("ink_strength", 0.2)),
             }
+            cfg_summary = ", ".join(f"{k}={v}" for k, v in sorted(rgb.items()))
         except Exception:
-            pass
+            cfg_summary = "(could not read config)"
+    else:
+        cfg_summary = "defaults"
+
+    p = Path(ckpt_path)
+    model_label = f"{p.parent.name}/{p.name}"
+    msg = f"Loaded repro settings from {model_label}: pipeline={preset} | {cfg_summary}"
     return preset, msg, bdrc, rgb
 
 
@@ -1648,13 +1655,13 @@ def build_ui() -> gr.Blocks:
 }
 #donut_input_before,
 #donut_input_after {
-  margin-top: 10px !important;
-  margin-bottom: 10px !important;
-  padding-top: 10px !important;
+  margin-top: 15px !important;
+  margin-bottom: 15px !important;
+  padding-top: 15px !important;
 }
 #donut_input_before .image-container,
 #donut_input_after .image-container {
-  padding-top: 10px !important;
+  padding-top: 15px !important;
 }
 """
 
@@ -1967,7 +1974,8 @@ function() {
                     )
 
         status = gr.Textbox(label="Status", interactive=False)
-        debug_json = gr.Code(label="Debug JSON", language="json", visible=False)
+        with gr.Accordion("Debug JSON", open=False, visible=False) as debug_json_accordion:
+            debug_json = gr.Code(language="json")
         with gr.Column():
             donut_input_before = gr.Image(
                 label="DONUT Input (Before Preprocess)",
@@ -1982,7 +1990,7 @@ function() {
                 elem_id="donut_input_after",
             )
         with gr.Row(visible=False) as advanced_debug_text_row:
-            debug_text = gr.Textbox(label="Debug Transcription", lines=4, elem_id="debug_text_box")
+            debug_text = gr.Textbox(label="Debug Transcription", lines=4, elem_id="debug_text_box", interactive=True)
             with gr.Column(elem_id="debug_font_ctrl_col", scale=1, min_width=24):
                 debug_font_plus_btn = gr.Button("+")
                 debug_font_minus_btn = gr.Button("−")
@@ -2773,7 +2781,7 @@ function() {
                 advanced_preprocess_select_row,
                 advanced_bdrc_row,
                 advanced_rgb_row,
-                debug_json,
+                debug_json_accordion,
                 donut_input_before,
                 donut_input_after,
                 save_status,
@@ -2824,11 +2832,66 @@ function() {
             outputs=[layout_path, layout_info],
         )
 
-        def _on_load_repro(ckpt_path: str):
+        def _on_load_repro(
+            ckpt_path: str,
+            cur_preset: str,
+            cur_gray_mode: str, cur_normalize_bg: bool, cur_bg_blur: int,
+            cur_bg_strength: float, cur_upscale: float, cur_upscale_interp: str,
+            cur_binarize: bool, cur_threshold_method: str, cur_threshold_block: int,
+            cur_threshold_c: int, cur_fixed_threshold: int, cur_morph_close: bool,
+            cur_morph_kernel: int, cur_remove_small: bool, cur_min_area: int,
+            cur_rgb_preserve: bool, cur_rgb_norm_bg: bool, cur_rgb_bg_method: str,
+            cur_rgb_bg_blur: int, cur_rgb_bg_strength: float, cur_rgb_contrast: float,
+            cur_rgb_denoise: bool, cur_rgb_morph: bool, cur_rgb_morph_kernel: int,
+            cur_rgb_remove_small: bool, cur_rgb_min_area: int, cur_rgb_upscale: float,
+            cur_rgb_upscale_interp: str, cur_rgb_ink_norm: bool, cur_rgb_ink_strength: float,
+        ):
             preset, msg, bdrc, rgb = _load_repro_ui_settings(ckpt_path or "")
+
+            # Build current state dicts for diffing
+            cur_bdrc = {
+                "gray_mode": cur_gray_mode, "normalize_background": cur_normalize_bg,
+                "background_blur_ksize": cur_bg_blur, "background_strength": cur_bg_strength,
+                "upscale_factor": cur_upscale, "upscale_interpolation": cur_upscale_interp,
+                "binarize": cur_binarize, "threshold_method": cur_threshold_method,
+                "threshold_block_size": cur_threshold_block, "threshold_c": cur_threshold_c,
+                "fixed_threshold": cur_fixed_threshold, "morph_close": cur_morph_close,
+                "morph_close_kernel": cur_morph_kernel, "remove_small_components": cur_remove_small,
+                "min_component_area": cur_min_area,
+            }
+            cur_rgb = {
+                "preserve_color": cur_rgb_preserve, "normalize_background": cur_rgb_norm_bg,
+                "background_method": cur_rgb_bg_method, "background_blur_ksize": cur_rgb_bg_blur,
+                "background_strength": cur_rgb_bg_strength, "contrast": cur_rgb_contrast,
+                "denoise": cur_rgb_denoise, "morph_close": cur_rgb_morph,
+                "morph_close_kernel": cur_rgb_morph_kernel, "remove_small_components": cur_rgb_remove_small,
+                "min_component_area": cur_rgb_min_area, "upscale_factor": cur_rgb_upscale,
+                "upscale_interpolation": cur_rgb_upscale_interp, "ink_normalization": cur_rgb_ink_norm,
+                "ink_strength": cur_rgb_ink_strength,
+            }
+
+            # Compute diff
+            changes = []
+            if str(cur_preset) != str(preset):
+                changes.append(f"preset: {cur_preset} → {preset}")
+            for k, new_v in bdrc.items():
+                old_v = cur_bdrc.get(k)
+                if str(old_v) != str(new_v):
+                    changes.append(f"{k}: {old_v} → {new_v}")
+            for k, new_v in rgb.items():
+                old_v = cur_rgb.get(k)
+                if str(old_v) != str(new_v):
+                    changes.append(f"{k}: {old_v} → {new_v}")
+
+            if changes:
+                diff_str = " | ".join(changes)
+                status_msg = f"{msg} | Changed: {diff_str}"
+            else:
+                status_msg = f"{msg} | No changes (already matching)."
+
             return (
-                gr.update(value=preset),   # preprocess_preset
-                msg,                        # status
+                gr.update(value=preset),
+                status_msg,
                 # BDRC sliders
                 gr.update(value=bdrc["gray_mode"]),
                 gr.update(value=bdrc["normalize_background"]),
@@ -2865,7 +2928,20 @@ function() {
 
         load_repro_btn.click(
             fn=_on_load_repro,
-            inputs=[donut_path],
+            inputs=[
+                donut_path,
+                preprocess_preset,
+                bdrc_gray_mode, bdrc_normalize_bg, bdrc_bg_blur_ksize,
+                bdrc_bg_strength, bdrc_upscale_factor, bdrc_upscale_interp,
+                bdrc_binarize, bdrc_threshold_method, bdrc_threshold_block,
+                bdrc_threshold_c, bdrc_fixed_threshold, bdrc_morph_close,
+                bdrc_morph_close_kernel, bdrc_remove_small_components, bdrc_min_component_area,
+                rgb_preserve_color, rgb_normalize_bg, rgb_background_method,
+                rgb_bg_blur_ksize, rgb_bg_strength, rgb_contrast,
+                rgb_denoise, rgb_morph_close, rgb_morph_close_kernel,
+                rgb_remove_small_components, rgb_min_component_area, rgb_upscale_factor,
+                rgb_upscale_interp, rgb_ink_normalization, rgb_ink_strength,
+            ],
             outputs=[
                 preprocess_preset,
                 status,
