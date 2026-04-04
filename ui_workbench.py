@@ -9489,6 +9489,54 @@ def _line_runs_from_threshold_mask(
     return merged
 
 
+def _filter_line_boxes_by_mean_height(
+    line_boxes: List[Tuple[int, int, int, int]],
+    *,
+    tolerance_ratio: float = 0.50,
+) -> List[Tuple[int, int, int, int]]:
+    if not line_boxes:
+        return []
+
+    valid_boxes = [box for box in line_boxes if int(box[3]) > int(box[1])]
+    if not valid_boxes:
+        return []
+
+    heights = np.asarray([int(y2) - int(y1) for _, y1, _, y2 in valid_boxes], dtype=np.float32)
+    mean_height = float(np.mean(heights)) if heights.size > 0 else 0.0
+    if mean_height <= 0.0:
+        return valid_boxes
+
+    tol = max(0.0, float(tolerance_ratio))
+    min_height = mean_height * max(0.0, 1.0 - tol)
+    max_height = mean_height * (1.0 + tol)
+    return [
+        box
+        for box in valid_boxes
+        if min_height <= float(int(box[3]) - int(box[1])) <= max_height
+    ]
+
+
+def _expand_line_boxes_vertically(
+    line_boxes: List[Tuple[int, int, int, int]],
+    *,
+    image_height: int,
+    pad_ratio: float = 0.25,
+) -> List[Tuple[int, int, int, int]]:
+    if not line_boxes:
+        return []
+
+    out: List[Tuple[int, int, int, int]] = []
+    max_h = max(1, int(image_height))
+    for x1, y1, x2, y2 in line_boxes:
+        height = max(1, int(y2) - int(y1))
+        pad = max(1, int(math.ceil(float(height) * max(0.0, float(pad_ratio)))))
+        ny1 = max(0, int(y1) - pad)
+        ny2 = min(max_h, int(y2) + pad)
+        if int(x2) > int(x1) and ny2 > ny1:
+            out.append((int(x1), ny1, int(x2), ny2))
+    return out
+
+
 def _segment_lines_in_text_crop(
     crop_rgb: np.ndarray,
     min_line_height: int,
@@ -9616,7 +9664,10 @@ def _segment_lines_in_text_crop(
         if tx2 > tx1 and ty2 > ty1:
             tightened.append((tx1, ty1, tx2, ty2))
 
-    return tightened
+    filtered = _filter_line_boxes_by_mean_height(tightened, tolerance_ratio=0.50)
+    if not filtered:
+        return []
+    return _expand_line_boxes_vertically(filtered, image_height=h, pad_ratio=0.25)
 
 
 def _segment_red_runs_in_line_crop(
