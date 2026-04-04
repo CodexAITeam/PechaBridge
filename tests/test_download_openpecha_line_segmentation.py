@@ -30,7 +30,7 @@ def test_make_output_stem_uses_work_id_source_name_and_hash():
     assert len(stem.split("__")[-1]) == 10
 
 
-def test_downloader_default_pipeline_is_gray():
+def test_downloader_no_longer_exposes_image_preprocess_pipeline():
     parser = create_parser()
     args = parser.parse_args(["--output-dir", "/tmp/test-line-seg"])
-    assert args.image_preprocess_pipeline == "gray"
+    assert not hasattr(args, "image_preprocess_pipeline")

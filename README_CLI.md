@@ -225,23 +225,24 @@ Download the Hugging Face line-coordinate dataset and convert it into an Ultraly
 
 ```bash
 python cli.py download-openpecha-line-segmentation \
-  --output-dir ./datasets/openpecha_line_segmentation \
-  --image-preprocess-pipeline gray
+  --output-dir ./datasets/openpecha_line_segmentation
 ```
 
-Train a YOLO segmentation model on the converted dataset:
+Train a YOLO segmentation model on the converted dataset. The line-image preprocessing now belongs to the
+training run, not to the downloader:
 
 ```bash
 python cli.py train-line-segmentation \
   --dataset ./datasets/openpecha_line_segmentation/data.yaml \
   --model yolo11n-seg.pt \
+  --image-preprocess-pipeline gray \
   --epochs 100 \
   --project ./runs/segment \
   --name tibetan-line-seg
 ```
 
 The OCR Workbench can then switch between `Classical CV` line splitting and `Pretrained YOLO Model`.
-The downloader defaults to `gray`, matching the DONUT OCR `gray` preprocessing semantics (`min_rgb`, `binarize=false`).
+The training command defaults to `gray`, matching the DONUT OCR `gray` preprocessing semantics (`min_rgb`, `binarize=false`), while the downloaded dataset stays raw.
 
 ### 7) Patch Retrieval Dataset + mp-InfoNCE ViT Training (current)
 
