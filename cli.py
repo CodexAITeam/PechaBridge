@@ -27,10 +27,14 @@ from pechabridge.eval.eval_faiss_crosspage import run as run_eval_faiss_crosspag
 from scripts.download_merge_openpecha_ocr_lines import (
     create_parser as create_download_openpecha_ocr_lines_parser,
 )
+from scripts.download_openpecha_line_segmentation import (
+    create_parser as create_download_openpecha_line_segmentation_parser,
+)
 from scripts.download_bosentencepiece_tokenizer import (
     create_parser as create_download_bosentencepiece_tokenizer_parser,
 )
 from scripts.eval_ocr_tokenizer import create_parser as create_eval_ocr_tokenizer_parser
+from scripts.train_line_segmentation import create_parser as create_train_line_segmentation_parser
 from scripts.warm_line_clip_workbench_cache import (
     create_parser as create_warm_line_clip_workbench_cache_parser,
 )
@@ -198,6 +202,25 @@ def _build_root_parser() -> argparse.ArgumentParser:
     )
     openpecha_ocr_parser.set_defaults(handler=_run_download_openpecha_ocr_lines)
 
+    openpecha_line_seg_parent = create_download_openpecha_line_segmentation_parser(add_help=False)
+    openpecha_line_seg_parser = subparsers.add_parser(
+        "download-openpecha-line-segmentation",
+        aliases=["download-openpecha-tibetan-line-segmentation"],
+        parents=[openpecha_line_seg_parent],
+        help="Download the OpenPecha Tibetan line segmentation dataset as Ultralytics segment data",
+        description=openpecha_line_seg_parent.description,
+    )
+    openpecha_line_seg_parser.set_defaults(handler=_run_download_openpecha_line_segmentation)
+
+    train_line_seg_parent = create_train_line_segmentation_parser(add_help=False)
+    train_line_seg_parser = subparsers.add_parser(
+        "train-line-segmentation",
+        parents=[train_line_seg_parent],
+        help="Train a YOLO line segmentation model on an Ultralytics segment dataset",
+        description=train_line_seg_parent.description,
+    )
+    train_line_seg_parser.set_defaults(handler=_run_train_line_segmentation)
+
     bosentencepiece_parent = create_download_bosentencepiece_tokenizer_parser(add_help=False)
     bosentencepiece_parser = subparsers.add_parser(
         "download-bosentencepiece-tokenizer",
@@ -358,6 +381,20 @@ def _run_export_text_hierarchy(args: argparse.Namespace) -> int:
 
 def _run_download_openpecha_ocr_lines(args: argparse.Namespace) -> int:
     from scripts.download_merge_openpecha_ocr_lines import run
+
+    run(args)
+    return 0
+
+
+def _run_download_openpecha_line_segmentation(args: argparse.Namespace) -> int:
+    from scripts.download_openpecha_line_segmentation import run
+
+    run(args)
+    return 0
+
+
+def _run_train_line_segmentation(args: argparse.Namespace) -> int:
+    from scripts.train_line_segmentation import run
 
     run(args)
     return 0

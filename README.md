@@ -130,9 +130,9 @@ Then open `http://127.0.0.1:7860` on your laptop.
 
 1. `Synthetic Data` / `PPN Downloader`: build or ingest page images.
 2. `Ultralytics Training` + `Model Inference`: train and validate layout detection (YOLO).
-3. `Workbench Preview Tabs`: inspect detected text blocks, line segmentation, and hierarchy overlays on real pecha pages.
+3. `Workbench Preview Tabs`: inspect detected text blocks, classical line segmentation, model-based line segmentation, and hierarchy overlays on real pecha pages.
 4. `Label Studio Export` / pseudo-label workflow: generate reviewable labels when needed.
-5. `gen-patches` (CLI): build `datasets/text_patches` from page images using YOLO textbox detection + classical line segmentation.
+5. `gen-patches` (CLI): build `datasets/text_patches` from page images using YOLO textbox detection + classical or model-based line segmentation.
 6. `weak-ocr-label` (CLI, optional): create weak OCR labels on patch crops.
 7. `mine-mnn-pairs` (CLI): mine robust cross-page positives for retrieval training.
 8. `train-text-hierarchy-vit` (CLI): train patch retrieval encoder with mp-InfoNCE using `MNN`, `OCR`, or `both`.

@@ -20,6 +20,11 @@ from ui_workbench import (
     _segment_lines_in_text_crop,
     run_tibetan_text_line_split_classical,
 )
+from pechabridge.ocr.line_segmentation import (
+    DEFAULT_LINE_SEGMENTATION_CONF,
+    DEFAULT_LINE_SEGMENTATION_IMGSZ,
+    predict_line_regions,
+)
 try:
     from pechabridge.ocr.preprocess_bdrc import (
         BDRCPreprocessConfig,
@@ -47,11 +52,20 @@ except Exception:
 ROOT = Path(__file__).resolve().parent
 MODE_AUTO = "Fully Automatic OCR"
 MODE_MANUAL = "Manual Mode"
+LINE_SEG_CLASSICAL = "Classical CV"
+LINE_SEG_YOLO = "Pretrained YOLO Model"
 _DONUT_ACTIVE_RUNTIME: Dict[str, Any] = {"checkpoint": "", "runtime": None}
 
 
 def _is_manual_mode(mode: str) -> bool:
     return str(mode or "").strip() == MODE_MANUAL
+
+
+def _normalize_line_segmentation_mode(mode: str) -> str:
+    raw = str(mode or "").strip()
+    if raw == LINE_SEG_YOLO:
+        return LINE_SEG_YOLO
+    return LINE_SEG_CLASSICAL
 
 
 def _load_font() -> ImageFont.ImageFont:
@@ -227,6 +241,39 @@ def _find_layout_model() -> Tuple[str, str]:
     return (choices[0][1] if choices else ""), msg
 
 
+def _list_line_segmentation_models() -> Tuple[List[Tuple[str, str]], str]:
+    """Return ([(label, full_path), ...] sorted, status_message)."""
+    preferred = (ROOT / "models" / "line_segmentation").resolve()
+    fallback_root = (ROOT / "models").resolve()
+    model_exts = {".pt", ".onnx", ".torchscript"}
+    candidates: List[Path] = []
+
+    def _scan(base: Path) -> None:
+        if not base.exists():
+            return
+        for p in sorted(base.rglob("*")):
+            if not p.is_file():
+                continue
+            if p.suffix.lower() not in model_exts:
+                continue
+            if p.name.startswith("._"):
+                continue
+            candidates.append(p.resolve())
+
+    _scan(preferred)
+    if not candidates:
+        _scan(fallback_root)
+
+    if not candidates:
+        return [], "No line segmentation model found (expected under models/line_segmentation/)."
+
+    ordered: List[Tuple[str, str]] = [
+        (_pretty_model_label(str(p)), str(p)) for p in candidates
+    ]
+    msg = f"Found {len(ordered)} line segmentation model(s). Auto-selected: {ordered[0][1]}"
+    return ordered, msg
+
+
 def _normalize_box(box: List[int], w: int, h: int) -> Optional[List[int]]:
     if not isinstance(box, (list, tuple)) or len(box) != 4:
         return None
@@ -245,6 +292,160 @@ def _normalize_box(box: List[int], w: int, h: int) -> Optional[List[int]]:
 
 def _sort_lines(rows: List[Dict[str, Any]]) -> List[Dict[str, Any]]:
     return sorted(rows, key=lambda r: (int(r["line_box"][1]), int(r["line_box"][0]), int(r["line_id"])))
+
+
+def _rows_from_line_predictions(
+    predictions: List[Any],
+    *,
+    image_w: int,
+    image_h: int,
+    offset_x: int = 0,
+    offset_y: int = 0,
+    source: str,
+) -> List[Dict[str, Any]]:
+    rows: List[Dict[str, Any]] = []
+    for idx, pred in enumerate(predictions, start=1):
+        box = _normalize_box(
+            [
+                int(offset_x) + int(pred.box[0]),
+                int(offset_y) + int(pred.box[1]),
+                int(offset_x) + int(pred.box[2]),
+                int(offset_y) + int(pred.box[3]),
+            ],
+            image_w,
+            image_h,
+        )
+        if box is None:
+            continue
+        polygon = [
+            [int(offset_x) + int(x), int(offset_y) + int(y)]
+            for x, y in list(getattr(pred, "polygon", []) or [])
+        ]
+        rows.append(
+            {
+                "line_id": idx,
+                "line_box": box,
+                "line_polygon": polygon,
+                "line_confidence": float(getattr(pred, "confidence", 0.0)),
+                "line_label": str(getattr(pred, "label", "line")),
+                "line_class": int(getattr(pred, "class_id", 0)),
+                "source": source,
+            }
+        )
+    return _sort_lines(rows)
+
+
+def _segment_full_image_lines(
+    image: np.ndarray,
+    *,
+    line_segmentation_mode: str,
+    layout_model: str,
+    line_model: str,
+    device: str,
+) -> Tuple[List[Dict[str, Any]], str, Dict[str, Any]]:
+    src = np.asarray(image).astype(np.uint8, copy=False)
+    h, w = src.shape[:2]
+    mode = _normalize_line_segmentation_mode(line_segmentation_mode)
+
+    if mode == LINE_SEG_YOLO:
+        if not (line_model or "").strip():
+            return [], "Line segmentation model is missing.", {"ok": False, "backend": "yolo_line_model", "reason": "missing_model"}
+        try:
+            predictions = predict_line_regions(
+                src,
+                model_path=line_model,
+                conf=DEFAULT_LINE_SEGMENTATION_CONF,
+                imgsz=DEFAULT_LINE_SEGMENTATION_IMGSZ,
+                device=device,
+            )
+        except Exception as exc:
+            return [], f"Line segmentation inference failed: {type(exc).__name__}: {exc}", {
+                "ok": False,
+                "backend": "yolo_line_model",
+                "reason": f"{type(exc).__name__}: {exc}",
+            }
+        rows = _rows_from_line_predictions(
+            predictions,
+            image_w=w,
+            image_h=h,
+            source="full_auto_yolo_line_model",
+        )
+        status = f"Detected {len(rows)} line(s) with the pretrained line segmentation model."
+        debug = {
+            "ok": True,
+            "backend": "yolo_line_model",
+            "line_segmentation_mode": mode,
+            "line_segmentation_model": str(line_model or ""),
+            "line_count": len(rows),
+            "predict_conf": float(DEFAULT_LINE_SEGMENTATION_CONF),
+            "predict_imgsz": int(DEFAULT_LINE_SEGMENTATION_IMGSZ),
+            "predictions": [
+                {
+                    "line_box": list(rec.get("line_box") or []),
+                    "line_polygon": rec.get("line_polygon") or [],
+                    "confidence": float(rec.get("line_confidence", 0.0)),
+                    "label": str(rec.get("line_label", "line")),
+                    "class": int(rec.get("line_class", 0)),
+                }
+                for rec in rows[:256]
+            ],
+        }
+        return rows, status, debug
+
+    split_out = run_tibetan_text_line_split_classical(
+        image=src,
+        model_path=layout_model,
+        conf=0.25,
+        imgsz=1024,
+        device=device if device != "auto" else "",
+        min_line_height=10,
+        projection_smooth=9,
+        projection_threshold_rel=0.20,
+        merge_gap_px=5,
+        draw_parent_boxes=True,
+        detect_red_text=False,
+        red_min_redness=26,
+        red_min_saturation=35,
+        red_column_fill_rel=0.07,
+        red_merge_gap_px=14,
+        red_min_width_px=18,
+        draw_red_boxes=False,
+    )
+    _, split_status, split_json, _, _, _, _, _, click_state = split_out
+    line_records_raw = []
+    if isinstance(click_state, dict):
+        line_records_raw = list(click_state.get("line_boxes") or [])
+    rows: List[Dict[str, Any]] = []
+    for rec in line_records_raw:
+        box = _normalize_box(rec.get("line_box") or [], w, h)
+        if box is None:
+            continue
+        x1, y1, x2, y2 = box
+        rows.append(
+            {
+                "line_id": int(rec.get("line_id", len(rows) + 1)),
+                "line_box": box,
+                "line_polygon": [[x1, y1], [x2 - 1, y1], [x2 - 1, y2 - 1], [x1, y2 - 1]],
+                "line_confidence": 1.0,
+                "line_label": "classical_line",
+                "line_class": 0,
+                "source": "full_auto_classical",
+            }
+        )
+    debug: Dict[str, Any]
+    try:
+        debug = json.loads(split_json) if (split_json or "").strip().startswith("{") else {"raw": split_json}
+    except Exception:
+        debug = {"raw": split_json}
+    debug = {
+        "ok": True,
+        "backend": "classical_cv",
+        "line_segmentation_mode": mode,
+        "layout_model": str(layout_model or ""),
+        "split_status": split_status,
+        "split_debug": debug,
+    }
+    return _sort_lines(rows), split_status, debug
 
 
 def _render_overlay(image: np.ndarray, lines: List[Dict[str, Any]], roi: Optional[List[int]] = None) -> np.ndarray:
@@ -816,6 +1017,8 @@ def _run_full_auto(
     state: Dict[str, Any],
     donut_checkpoint: str,
     layout_model: str,
+    line_segmentation_mode: str,
+    line_model: str,
     device: str,
     max_len: int,
     preprocess_preset: str = "bdrc",
@@ -827,35 +1030,21 @@ def _run_full_auto(
         return None, "", "Please upload an image first.", state, "{}", state.get("last_donut_pre"), state.get("last_donut_post")
     if not donut_checkpoint.strip():
         return image, "", "DONUT checkpoint is missing.", state, "{}", state.get("last_donut_pre"), state.get("last_donut_post")
-    if not layout_model.strip():
+    mode = _normalize_line_segmentation_mode(line_segmentation_mode)
+    if mode == LINE_SEG_CLASSICAL and not layout_model.strip():
         return image, "", "Layout model is missing.", state, "{}", state.get("last_donut_pre"), state.get("last_donut_post")
-
-    split_out = run_tibetan_text_line_split_classical(
-        image=np.asarray(image).astype(np.uint8, copy=False),
-        model_path=layout_model,
-        conf=0.25,
-        imgsz=1024,
-        device=device if device != "auto" else "",
-        min_line_height=10,
-        projection_smooth=9,
-        projection_threshold_rel=0.20,
-        merge_gap_px=5,
-        draw_parent_boxes=True,
-        detect_red_text=False,
-        red_min_redness=26,
-        red_min_saturation=35,
-        red_column_fill_rel=0.07,
-        red_merge_gap_px=14,
-        red_min_width_px=18,
-        draw_red_boxes=False,
-    )
-    overlay, split_status, split_json, _, _, _, _, _, click_state = split_out
-    line_records_raw = []
-    if isinstance(click_state, dict):
-        line_records_raw = click_state.get("line_boxes") or []
+    if mode == LINE_SEG_YOLO and not (line_model or "").strip():
+        return image, "", "Line segmentation model is missing.", state, "{}", state.get("last_donut_pre"), state.get("last_donut_post")
 
     src = np.asarray(image).astype(np.uint8, copy=False)
     h, w = src.shape[:2]
+    line_records_raw, split_status, split_debug = _segment_full_image_lines(
+        src,
+        line_segmentation_mode=mode,
+        layout_model=layout_model,
+        line_model=line_model,
+        device=device if device != "auto" else "",
+    )
     rows: List[Dict[str, Any]] = []
     last_pre: Optional[np.ndarray] = None
     last_post: Optional[np.ndarray] = None
@@ -879,9 +1068,13 @@ def _run_full_auto(
             {
                 "line_id": int(rec.get("line_id", len(rows) + 1)),
                 "line_box": box,
+                "line_polygon": rec.get("line_polygon") or None,
+                "line_confidence": float(rec.get("line_confidence", 0.0)),
+                "line_label": str(rec.get("line_label", "line")),
+                "line_class": int(rec.get("line_class", 0)),
                 "text": text,
                 "ocr_debug": dbg,
-                "source": "full_auto",
+                "source": str(rec.get("source") or "full_auto"),
             }
         )
 
@@ -898,6 +1091,8 @@ def _run_full_auto(
         "mode": "full_auto",
         "split_status": split_status,
         "line_count": len(rows),
+        "line_segmentation_mode": mode,
+        "line_segmentation_model": (str(line_model or "") if mode == LINE_SEG_YOLO else ""),
         "image_preprocess_pipeline": _normalize_preprocess_preset(preprocess_preset),
         "preprocess_overrides": _effective_preprocess_overrides(
             preprocess_preset=preprocess_preset,
@@ -914,7 +1109,7 @@ def _run_full_auto(
             if isinstance(rgb_preprocess_overrides, dict)
             else None
         ),
-        "split_json": json.loads(split_json) if (split_json or "").strip().startswith("{") else split_json,
+        "split_json": split_debug,
     }
     strong_overlay = _render_overlay(src, rows)
     return (
@@ -1066,6 +1261,8 @@ def _read_repro_preprocess_pipeline(ckpt_path: str) -> Optional[str]:
 def _run_comparison(
     state: Dict[str, Any],
     layout_model: str,
+    line_segmentation_mode: str,
+    line_model: str,
     device: str,
     max_len: int,
     preprocess_preset: str = "bdrc",
@@ -1081,44 +1278,30 @@ def _run_comparison(
     image = state.get("image")
     if image is None:
         return None, "", "Please upload an image first.", state, "{}", None, None
-    if not layout_model.strip():
+    mode = _normalize_line_segmentation_mode(line_segmentation_mode)
+    if mode == LINE_SEG_CLASSICAL and not layout_model.strip():
         return np.asarray(image).astype(np.uint8, copy=False), "", "Layout model is missing.", state, "{}", None, None
+    if mode == LINE_SEG_YOLO and not (line_model or "").strip():
+        return np.asarray(image).astype(np.uint8, copy=False), "", "Line segmentation model is missing.", state, "{}", None, None
 
     checkpoints, scan_msg = _list_donut_checkpoints()
     if not checkpoints:
         return np.asarray(image).astype(np.uint8, copy=False), "", f"No DONUT checkpoints found. {scan_msg}", state, "{}", None, None
 
-    # Run layout detection once, shared across all models
     src = np.asarray(image).astype(np.uint8, copy=False)
-    split_out = run_tibetan_text_line_split_classical(
-        image=src,
-        model_path=layout_model,
-        conf=0.25,
-        imgsz=1024,
+    line_records_raw, split_status, split_debug = _segment_full_image_lines(
+        src,
+        line_segmentation_mode=mode,
+        layout_model=layout_model,
+        line_model=line_model,
         device=device if device != "auto" else "",
-        min_line_height=10,
-        projection_smooth=9,
-        projection_threshold_rel=0.20,
-        merge_gap_px=5,
-        draw_parent_boxes=True,
-        detect_red_text=False,
-        red_min_redness=26,
-        red_min_saturation=35,
-        red_column_fill_rel=0.07,
-        red_merge_gap_px=14,
-        red_min_width_px=18,
-        draw_red_boxes=False,
     )
-    overlay, split_status, split_json, _, _, _, _, _, click_state = split_out
-    line_records_raw = []
-    if isinstance(click_state, dict):
-        line_records_raw = click_state.get("line_boxes") or []
 
     h, w = src.shape[:2]
     image_name = str(state.get("image_name") or "image")
 
     report_lines: List[str] = [f"Image: {image_name}", ""]
-    last_overlay = _render_overlay(src, [])
+    last_overlay = _render_overlay(src, line_records_raw)
     ckpt_debug: List[Dict[str, Any]] = []
 
     for label, ckpt_path in checkpoints:
@@ -1200,7 +1383,10 @@ def _run_comparison(
         "mode": "comparison",
         "checkpoints_compared": len(checkpoints),
         "split_status": split_status,
+        "line_segmentation_mode": mode,
+        "line_segmentation_model": (str(line_model or "") if mode == LINE_SEG_YOLO else ""),
         "line_count": len(line_records_raw),
+        "split_json": split_debug,
         "checkpoints": ckpt_debug,
     }
     return (
@@ -1251,6 +1437,8 @@ def _manual_click(
     state: Dict[str, Any],
     donut_checkpoint: str,
     layout_model: str,
+    line_segmentation_mode: str,
+    line_model: str,
     device: str,
     max_len: int,
     preprocess_preset: str,
@@ -1324,6 +1512,8 @@ def _manual_click(
     return _manual_process_roi(
         state,
         donut_checkpoint,
+        line_segmentation_mode,
+        line_model,
         device,
         max_len,
         roi,
@@ -1336,6 +1526,8 @@ def _manual_click(
 def _manual_process_roi(
     state: Dict[str, Any],
     donut_checkpoint: str,
+    line_segmentation_mode: str,
+    line_model: str,
     device: str,
     max_len: int,
     roi: Optional[List[int]],
@@ -1362,6 +1554,7 @@ def _manual_process_roi(
     created_rows: List[Dict[str, Any]] = []
     last_pre: Optional[np.ndarray] = None
     last_post: Optional[np.ndarray] = None
+    mode = _normalize_line_segmentation_mode(line_segmentation_mode)
     if _roi_is_single_line(roi_w, roi_h):
         text, dbg, pre_img, post_img = _run_donut_on_crop(
             roi_crop,
@@ -1384,20 +1577,57 @@ def _manual_process_roi(
         )
         action = "roi_direct_line"
     else:
-        line_state = _compute_line_projection_state(
-            crop_rgb=roi_crop,
-            projection_smooth=9,
-            projection_threshold_rel=0.20,
-        )
-        line_boxes_local = _segment_lines_in_text_crop(
-            crop_rgb=roi_crop,
-            min_line_height=10,
-            projection_smooth=9,
-            projection_threshold_rel=0.20,
-            merge_gap_px=5,
-            projection_state=line_state,
-        )
-        for bx1, by1, bx2, by2 in line_boxes_local:
+        line_rows_local: List[Dict[str, Any]] = []
+        if mode == LINE_SEG_YOLO and (line_model or "").strip():
+            try:
+                predictions = predict_line_regions(
+                    roi_crop,
+                    model_path=line_model,
+                    conf=DEFAULT_LINE_SEGMENTATION_CONF,
+                    imgsz=DEFAULT_LINE_SEGMENTATION_IMGSZ,
+                    device=device,
+                )
+                line_rows_local = _rows_from_line_predictions(
+                    predictions,
+                    image_w=roi_w,
+                    image_h=roi_h,
+                    source="manual_roi_yolo_line_model",
+                )
+            except Exception:
+                line_rows_local = []
+        elif mode == LINE_SEG_CLASSICAL:
+            line_state = _compute_line_projection_state(
+                crop_rgb=roi_crop,
+                projection_smooth=9,
+                projection_threshold_rel=0.20,
+            )
+            line_boxes_local = _segment_lines_in_text_crop(
+                crop_rgb=roi_crop,
+                min_line_height=10,
+                projection_smooth=9,
+                projection_threshold_rel=0.20,
+                merge_gap_px=5,
+                projection_state=line_state,
+            )
+            for bx1, by1, bx2, by2 in line_boxes_local:
+                line_rows_local.append(
+                    {
+                        "line_box": [int(bx1), int(by1), int(bx2), int(by2)],
+                        "line_polygon": [
+                            [int(bx1), int(by1)],
+                            [int(bx2) - 1, int(by1)],
+                            [int(bx2) - 1, int(by2) - 1],
+                            [int(bx1), int(by2) - 1],
+                        ],
+                        "source": "manual_roi_line_split",
+                    }
+                )
+
+        for local_rec in line_rows_local:
+            local_box = local_rec.get("line_box") or []
+            if len(local_box) != 4:
+                continue
+            bx1, by1, bx2, by2 = [int(v) for v in local_box]
             gx1, gy1, gx2, gy2 = rx1 + int(bx1), ry1 + int(by1), rx1 + int(bx2), ry1 + int(by2)
             gbox = _normalize_box([gx1, gy1, gx2, gy2], w, h)
             if gbox is None:
@@ -1418,9 +1648,16 @@ def _manual_process_roi(
                 {
                     "line_id": len(rows) + len(created_rows) + 1,
                     "line_box": gbox,
+                    "line_polygon": [
+                        [int(rx1) + int(x), int(ry1) + int(y)]
+                        for x, y in list(local_rec.get("line_polygon") or [])
+                    ] or None,
+                    "line_confidence": float(local_rec.get("line_confidence", 0.0)),
+                    "line_label": str(local_rec.get("line_label", "line")),
+                    "line_class": int(local_rec.get("line_class", 0)),
                     "text": text,
                     "ocr_debug": dbg,
-                    "source": "manual_roi_line_split",
+                    "source": str(local_rec.get("source") or "manual_roi_line_split"),
                 }
             )
         if not created_rows:
@@ -1443,7 +1680,7 @@ def _manual_process_roi(
                     "source": "manual_roi_fallback_direct",
                 }
             )
-        action = "roi_line_split"
+        action = ("roi_line_split_yolo_model" if mode == LINE_SEG_YOLO else "roi_line_split")
 
     for rec in created_rows:
         rows = _add_or_update_line(rows, rec)
@@ -1461,6 +1698,8 @@ def _manual_process_roi(
         "roi": roi,
         "new_rows": created_rows,
         "total_rows": len(rows),
+        "line_segmentation_mode": mode,
+        "line_segmentation_model": (str(line_model or "") if mode == LINE_SEG_YOLO else ""),
         "image_preprocess_pipeline": _normalize_preprocess_preset(preprocess_preset),
         "preprocess_overrides": _effective_preprocess_overrides(
             preprocess_preset=preprocess_preset,
@@ -1493,6 +1732,8 @@ def _manual_full_image_roi(
     mode_s: str,
     state_s: Dict[str, Any],
     donut_s: str,
+    line_segmentation_mode_s: str,
+    line_model_s: str,
     device_s: str,
     max_len_s: int,
     preprocess_preset: str = "bdrc",
@@ -1511,6 +1752,8 @@ def _manual_full_image_roi(
     return _manual_process_roi(
         state_s,
         donut_s,
+        line_segmentation_mode_s,
+        line_model_s,
         device_s,
         int(max_len_s),
         [0, 0, w, h],
@@ -1544,6 +1787,8 @@ def _save_results(
     transcript_text: str,
     donut_checkpoint: str,
     layout_model: str,
+    line_segmentation_mode: str,
+    line_model: str,
 ) -> str:
     image = state.get("image")
     if image is None:
@@ -1583,6 +1828,8 @@ def _save_results(
         "image_path": str(state.get("image_path") or ""),
         "donut_checkpoint": str(donut_checkpoint or ""),
         "layout_model": str(layout_model or ""),
+        "line_segmentation_mode": _normalize_line_segmentation_mode(line_segmentation_mode),
+        "line_segmentation_model": str(line_model or ""),
         "line_count": len(saved_rows),
         "lines": saved_rows,
     }
@@ -1752,7 +1999,7 @@ function() {
     with gr.Blocks(title="OCR Workbench (DONUT)", css=ui_css, js=_image_zoom_js) as demo:
         gr.Markdown("## OCR Workbench (DONUT + Layout)")
         gr.Markdown(
-            "Automatic mode: layout -> line detection -> OCR. Manual mode: click an existing line or define an ROI with two clicks."
+            "Automatic mode: choose classical CV line splitting or a pretrained YOLO line model, then run OCR. Manual mode: click an existing line or define an ROI with two clicks."
         )
         advanced_view = gr.Checkbox(label="Advanced View", value=False)
 
@@ -1780,9 +2027,27 @@ function() {
                 )
             with gr.Column(scale=1, min_width=110):
                 layout_refresh_btn = gr.Button("🔄 Refresh", variant="secondary")
+        with gr.Row():
+            line_segmentation_mode = gr.Radio(
+                choices=[LINE_SEG_CLASSICAL, LINE_SEG_YOLO],
+                value=LINE_SEG_CLASSICAL,
+                label="Line Segmentation",
+            )
+        with gr.Row():
+            with gr.Column(scale=10):
+                line_model_choices, line_model_msg = _list_line_segmentation_models()
+                line_model_path = gr.Dropdown(
+                    label="Line Segmentation Model",
+                    choices=line_model_choices,
+                    value=line_model_choices[0][1] if line_model_choices else "",
+                    allow_custom_value=True,
+                )
+            with gr.Column(scale=1, min_width=110):
+                line_model_refresh_btn = gr.Button("🔄 Refresh", variant="secondary")
         with gr.Row(visible=False) as advanced_scan_row:
             donut_info = gr.Textbox(label="DONUT Auto-Scan", value=donut_msg, interactive=False)
             layout_info = gr.Textbox(label="Layout Auto-Scan", value=layout_msg, interactive=False)
+            line_model_info = gr.Textbox(label="Line Model Auto-Scan", value=line_model_msg, interactive=False)
 
         with gr.Row():
             mode = gr.Radio(choices=[MODE_AUTO, MODE_MANUAL], value=MODE_AUTO, label="Mode")
@@ -2041,6 +2306,8 @@ function() {
             state_s: Dict[str, Any],
             donut_s: str,
             layout_s: str,
+            line_segmentation_mode_s: str,
+            line_model_s: str,
             device_s: str,
             max_len_s: int,
             preprocess_preset_s: str,
@@ -2113,6 +2380,8 @@ function() {
                     state_s,
                     donut_s,
                     layout_s,
+                    line_segmentation_mode_s,
+                    line_model_s,
                     device_s,
                     int(max_len_s),
                     preprocess_preset=preproc_mode,
@@ -2124,6 +2393,8 @@ function() {
             debug = {
                 "ok": True,
                 "mode": "manual_waiting",
+                "line_segmentation_mode": _normalize_line_segmentation_mode(line_segmentation_mode_s),
+                "line_segmentation_model": str(line_model_s or ""),
                 "image_preprocess_pipeline": preproc_mode,
                 "preprocess_overrides": _effective_preprocess_overrides(
                     preprocess_preset=preproc_mode,
@@ -2150,6 +2421,8 @@ function() {
                 state,
                 donut_path,
                 layout_path,
+                line_segmentation_mode,
+                line_model_path,
                 device,
                 max_len,
                 preprocess_preset,
@@ -2197,6 +2470,8 @@ function() {
             state_s: Dict[str, Any],
             donut_s: str,
             layout_s: str,
+            line_segmentation_mode_s: str,
+            line_model_s: str,
             device_s: str,
             max_len_s: int,
             preprocess_preset_s: str,
@@ -2359,6 +2634,8 @@ function() {
                     "mode": str(mode_s),
                     "action": "clicked_detected_line_for_debug_preview",
                     "line_box": [x1, y1, x2, y2],
+                    "line_segmentation_mode": _normalize_line_segmentation_mode(line_segmentation_mode_s),
+                    "line_segmentation_model": str(line_model_s or ""),
                     "image_preprocess_pipeline": preproc_mode,
                     "preprocess_overrides": _effective_preprocess_overrides(
                         preprocess_preset=preproc_mode,
@@ -2381,6 +2658,8 @@ function() {
                 state_s,
                 donut_s,
                 layout_s,
+                line_segmentation_mode_s,
+                line_model_s,
                 device_s,
                 int(max_len_s),
                 preproc_mode,
@@ -2396,6 +2675,8 @@ function() {
                 state,
                 donut_path,
                 layout_path,
+                line_segmentation_mode,
+                line_model_path,
                 device,
                 max_len,
                 preprocess_preset,
@@ -2442,6 +2723,8 @@ function() {
             mode_s: str,
             state_s: Dict[str, Any],
             donut_s: str,
+            line_segmentation_mode_s: str,
+            line_model_s: str,
             device_s: str,
             max_len_s: int,
             preprocess_preset_s: str,
@@ -2513,6 +2796,8 @@ function() {
                 mode_s,
                 state_s,
                 donut_s,
+                line_segmentation_mode_s,
+                line_model_s,
                 device_s,
                 int(max_len_s),
                 preprocess_preset=preproc_mode,
@@ -2526,6 +2811,8 @@ function() {
                 mode,
                 state,
                 donut_path,
+                line_segmentation_mode,
+                line_model_path,
                 device,
                 max_len,
                 preprocess_preset,
@@ -2571,6 +2858,8 @@ function() {
         def _compare(
             state_s: Dict[str, Any],
             layout_s: str,
+            line_segmentation_mode_s: str,
+            line_model_s: str,
             device_s: str,
             max_len_s: int,
             preprocess_preset_s: str,
@@ -2641,6 +2930,8 @@ function() {
             return _run_comparison(
                 state_s,
                 layout_s,
+                line_segmentation_mode_s,
+                line_model_s,
                 device_s,
                 int(max_len_s),
                 preprocess_preset=preproc_mode,
@@ -2653,6 +2944,8 @@ function() {
             inputs=[
                 state,
                 layout_path,
+                line_segmentation_mode,
+                line_model_path,
                 device,
                 max_len,
                 preprocess_preset,
@@ -2692,7 +2985,7 @@ function() {
 
         save_btn.click(
             fn=_save_results,
-            inputs=[state, transcript, donut_path, layout_path],
+            inputs=[state, transcript, donut_path, layout_path, line_segmentation_mode, line_model_path],
             outputs=[save_status],
         )
 
@@ -2820,6 +3113,11 @@ function() {
             best = choices[0][1] if choices else ""
             return gr.update(choices=choices, value=best), msg
 
+        def _refresh_line_model():
+            choices, msg = _list_line_segmentation_models()
+            best = choices[0][1] if choices else ""
+            return gr.update(choices=choices, value=best), msg
+
         donut_refresh_btn.click(
             fn=_refresh_donut,
             inputs=[],
@@ -2830,6 +3128,12 @@ function() {
             fn=_refresh_layout,
             inputs=[],
             outputs=[layout_path, layout_info],
+        )
+
+        line_model_refresh_btn.click(
+            fn=_refresh_line_model,
+            inputs=[],
+            outputs=[line_model_path, line_model_info],
         )
 
         def _on_load_repro(
