@@ -2,6 +2,7 @@ from scripts.download_openpecha_line_segmentation import (
     _assign_canonical_split,
     _make_output_stem,
     _parse_image_size,
+    create_parser,
 )
 
 
@@ -27,3 +28,9 @@ def test_make_output_stem_uses_work_id_source_name_and_hash():
     )
     assert stem.startswith("W24769__38460539__")
     assert len(stem.split("__")[-1]) == 10
+
+
+def test_downloader_default_pipeline_is_gray():
+    parser = create_parser()
+    args = parser.parse_args(["--output-dir", "/tmp/test-line-seg"])
+    assert args.image_preprocess_pipeline == "gray"

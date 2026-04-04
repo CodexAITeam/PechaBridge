@@ -23,6 +23,8 @@ from ui_workbench import (
 from pechabridge.ocr.line_segmentation import (
     DEFAULT_LINE_SEGMENTATION_CONF,
     DEFAULT_LINE_SEGMENTATION_IMGSZ,
+    DEFAULT_LINE_SEGMENTATION_PREPROCESS,
+    normalize_line_segmentation_preprocess_pipeline,
     predict_line_regions,
 )
 try:
@@ -339,6 +341,7 @@ def _segment_full_image_lines(
     image: np.ndarray,
     *,
     line_segmentation_mode: str,
+    line_segmentation_preprocess: str,
     layout_model: str,
     line_model: str,
     device: str,
@@ -350,12 +353,14 @@ def _segment_full_image_lines(
     if mode == LINE_SEG_YOLO:
         if not (line_model or "").strip():
             return [], "Line segmentation model is missing.", {"ok": False, "backend": "yolo_line_model", "reason": "missing_model"}
+        preprocess_mode = normalize_line_segmentation_preprocess_pipeline(line_segmentation_preprocess)
         try:
             predictions = predict_line_regions(
                 src,
                 model_path=line_model,
                 conf=DEFAULT_LINE_SEGMENTATION_CONF,
                 imgsz=DEFAULT_LINE_SEGMENTATION_IMGSZ,
+                preprocess_pipeline=preprocess_mode,
                 device=device,
             )
         except Exception as exc:
@@ -376,6 +381,7 @@ def _segment_full_image_lines(
             "backend": "yolo_line_model",
             "line_segmentation_mode": mode,
             "line_segmentation_model": str(line_model or ""),
+            "line_segmentation_preprocess": preprocess_mode,
             "line_count": len(rows),
             "predict_conf": float(DEFAULT_LINE_SEGMENTATION_CONF),
             "predict_imgsz": int(DEFAULT_LINE_SEGMENTATION_IMGSZ),
@@ -441,6 +447,7 @@ def _segment_full_image_lines(
         "ok": True,
         "backend": "classical_cv",
         "line_segmentation_mode": mode,
+        "line_segmentation_preprocess": "none",
         "layout_model": str(layout_model or ""),
         "split_status": split_status,
         "split_debug": debug,
@@ -1018,6 +1025,7 @@ def _run_full_auto(
     donut_checkpoint: str,
     layout_model: str,
     line_segmentation_mode: str,
+    line_segmentation_preprocess: str,
     line_model: str,
     device: str,
     max_len: int,
@@ -1041,6 +1049,7 @@ def _run_full_auto(
     line_records_raw, split_status, split_debug = _segment_full_image_lines(
         src,
         line_segmentation_mode=mode,
+        line_segmentation_preprocess=line_segmentation_preprocess,
         layout_model=layout_model,
         line_model=line_model,
         device=device if device != "auto" else "",
@@ -1092,6 +1101,11 @@ def _run_full_auto(
         "split_status": split_status,
         "line_count": len(rows),
         "line_segmentation_mode": mode,
+        "line_segmentation_preprocess": (
+            normalize_line_segmentation_preprocess_pipeline(line_segmentation_preprocess)
+            if mode == LINE_SEG_YOLO
+            else "none"
+        ),
         "line_segmentation_model": (str(line_model or "") if mode == LINE_SEG_YOLO else ""),
         "image_preprocess_pipeline": _normalize_preprocess_preset(preprocess_preset),
         "preprocess_overrides": _effective_preprocess_overrides(
@@ -1262,6 +1276,7 @@ def _run_comparison(
     state: Dict[str, Any],
     layout_model: str,
     line_segmentation_mode: str,
+    line_segmentation_preprocess: str,
     line_model: str,
     device: str,
     max_len: int,
@@ -1292,6 +1307,7 @@ def _run_comparison(
     line_records_raw, split_status, split_debug = _segment_full_image_lines(
         src,
         line_segmentation_mode=mode,
+        line_segmentation_preprocess=line_segmentation_preprocess,
         layout_model=layout_model,
         line_model=line_model,
         device=device if device != "auto" else "",
@@ -1384,6 +1400,11 @@ def _run_comparison(
         "checkpoints_compared": len(checkpoints),
         "split_status": split_status,
         "line_segmentation_mode": mode,
+        "line_segmentation_preprocess": (
+            normalize_line_segmentation_preprocess_pipeline(line_segmentation_preprocess)
+            if mode == LINE_SEG_YOLO
+            else "none"
+        ),
         "line_segmentation_model": (str(line_model or "") if mode == LINE_SEG_YOLO else ""),
         "line_count": len(line_records_raw),
         "split_json": split_debug,
@@ -1438,6 +1459,7 @@ def _manual_click(
     donut_checkpoint: str,
     layout_model: str,
     line_segmentation_mode: str,
+    line_segmentation_preprocess: str,
     line_model: str,
     device: str,
     max_len: int,
@@ -1513,6 +1535,7 @@ def _manual_click(
         state,
         donut_checkpoint,
         line_segmentation_mode,
+        line_segmentation_preprocess,
         line_model,
         device,
         max_len,
@@ -1527,6 +1550,7 @@ def _manual_process_roi(
     state: Dict[str, Any],
     donut_checkpoint: str,
     line_segmentation_mode: str,
+    line_segmentation_preprocess: str,
     line_model: str,
     device: str,
     max_len: int,
@@ -1579,12 +1603,14 @@ def _manual_process_roi(
     else:
         line_rows_local: List[Dict[str, Any]] = []
         if mode == LINE_SEG_YOLO and (line_model or "").strip():
+            preprocess_mode = normalize_line_segmentation_preprocess_pipeline(line_segmentation_preprocess)
             try:
                 predictions = predict_line_regions(
                     roi_crop,
                     model_path=line_model,
                     conf=DEFAULT_LINE_SEGMENTATION_CONF,
                     imgsz=DEFAULT_LINE_SEGMENTATION_IMGSZ,
+                    preprocess_pipeline=preprocess_mode,
                     device=device,
                 )
                 line_rows_local = _rows_from_line_predictions(
@@ -1699,6 +1725,11 @@ def _manual_process_roi(
         "new_rows": created_rows,
         "total_rows": len(rows),
         "line_segmentation_mode": mode,
+        "line_segmentation_preprocess": (
+            normalize_line_segmentation_preprocess_pipeline(line_segmentation_preprocess)
+            if mode == LINE_SEG_YOLO
+            else "none"
+        ),
         "line_segmentation_model": (str(line_model or "") if mode == LINE_SEG_YOLO else ""),
         "image_preprocess_pipeline": _normalize_preprocess_preset(preprocess_preset),
         "preprocess_overrides": _effective_preprocess_overrides(
@@ -1733,6 +1764,7 @@ def _manual_full_image_roi(
     state_s: Dict[str, Any],
     donut_s: str,
     line_segmentation_mode_s: str,
+    line_segmentation_preprocess_s: str,
     line_model_s: str,
     device_s: str,
     max_len_s: int,
@@ -1753,6 +1785,7 @@ def _manual_full_image_roi(
         state_s,
         donut_s,
         line_segmentation_mode_s,
+        line_segmentation_preprocess_s,
         line_model_s,
         device_s,
         int(max_len_s),
@@ -1788,6 +1821,7 @@ def _save_results(
     donut_checkpoint: str,
     layout_model: str,
     line_segmentation_mode: str,
+    line_segmentation_preprocess: str,
     line_model: str,
 ) -> str:
     image = state.get("image")
@@ -1829,6 +1863,11 @@ def _save_results(
         "donut_checkpoint": str(donut_checkpoint or ""),
         "layout_model": str(layout_model or ""),
         "line_segmentation_mode": _normalize_line_segmentation_mode(line_segmentation_mode),
+        "line_segmentation_preprocess": (
+            normalize_line_segmentation_preprocess_pipeline(line_segmentation_preprocess)
+            if _normalize_line_segmentation_mode(line_segmentation_mode) == LINE_SEG_YOLO
+            else "none"
+        ),
         "line_segmentation_model": str(line_model or ""),
         "line_count": len(saved_rows),
         "lines": saved_rows,
@@ -2059,6 +2098,11 @@ function() {
                 choices=[("bdrc", "bdrc"), ("gray", "gray"), ("RGB", "rgb")],
                 value="bdrc",
                 label="Preprocess Preset",
+            )
+            line_model_preprocess = gr.Dropdown(
+                choices=[("none", "none"), ("bdrc", "bdrc"), ("gray", "gray"), ("RGB", "rgb")],
+                value=DEFAULT_LINE_SEGMENTATION_PREPROCESS,
+                label="Line Model Preprocess",
             )
         with gr.Row(visible=False) as advanced_bdrc_row:
             with gr.Accordion("BDRC / Gray Preprocess (DONUT Input)", open=False):
@@ -2307,6 +2351,7 @@ function() {
             donut_s: str,
             layout_s: str,
             line_segmentation_mode_s: str,
+            line_segmentation_preprocess_s: str,
             line_model_s: str,
             device_s: str,
             max_len_s: int,
@@ -2381,6 +2426,7 @@ function() {
                     donut_s,
                     layout_s,
                     line_segmentation_mode_s,
+                    line_segmentation_preprocess_s,
                     line_model_s,
                     device_s,
                     int(max_len_s),
@@ -2394,6 +2440,7 @@ function() {
                 "ok": True,
                 "mode": "manual_waiting",
                 "line_segmentation_mode": _normalize_line_segmentation_mode(line_segmentation_mode_s),
+                "line_segmentation_preprocess": normalize_line_segmentation_preprocess_pipeline(line_segmentation_preprocess_s),
                 "line_segmentation_model": str(line_model_s or ""),
                 "image_preprocess_pipeline": preproc_mode,
                 "preprocess_overrides": _effective_preprocess_overrides(
@@ -2422,6 +2469,7 @@ function() {
                 donut_path,
                 layout_path,
                 line_segmentation_mode,
+                line_model_preprocess,
                 line_model_path,
                 device,
                 max_len,
@@ -2471,6 +2519,7 @@ function() {
             donut_s: str,
             layout_s: str,
             line_segmentation_mode_s: str,
+            line_segmentation_preprocess_s: str,
             line_model_s: str,
             device_s: str,
             max_len_s: int,
@@ -2635,6 +2684,7 @@ function() {
                     "action": "clicked_detected_line_for_debug_preview",
                     "line_box": [x1, y1, x2, y2],
                     "line_segmentation_mode": _normalize_line_segmentation_mode(line_segmentation_mode_s),
+                    "line_segmentation_preprocess": normalize_line_segmentation_preprocess_pipeline(line_segmentation_preprocess_s),
                     "line_segmentation_model": str(line_model_s or ""),
                     "image_preprocess_pipeline": preproc_mode,
                     "preprocess_overrides": _effective_preprocess_overrides(
@@ -2659,6 +2709,7 @@ function() {
                 donut_s,
                 layout_s,
                 line_segmentation_mode_s,
+                line_segmentation_preprocess_s,
                 line_model_s,
                 device_s,
                 int(max_len_s),
@@ -2676,6 +2727,7 @@ function() {
                 donut_path,
                 layout_path,
                 line_segmentation_mode,
+                line_model_preprocess,
                 line_model_path,
                 device,
                 max_len,
@@ -2724,6 +2776,7 @@ function() {
             state_s: Dict[str, Any],
             donut_s: str,
             line_segmentation_mode_s: str,
+            line_segmentation_preprocess_s: str,
             line_model_s: str,
             device_s: str,
             max_len_s: int,
@@ -2797,6 +2850,7 @@ function() {
                 state_s,
                 donut_s,
                 line_segmentation_mode_s,
+                line_segmentation_preprocess_s,
                 line_model_s,
                 device_s,
                 int(max_len_s),
@@ -2812,6 +2866,7 @@ function() {
                 state,
                 donut_path,
                 line_segmentation_mode,
+                line_model_preprocess,
                 line_model_path,
                 device,
                 max_len,
@@ -2859,6 +2914,7 @@ function() {
             state_s: Dict[str, Any],
             layout_s: str,
             line_segmentation_mode_s: str,
+            line_segmentation_preprocess_s: str,
             line_model_s: str,
             device_s: str,
             max_len_s: int,
@@ -2931,6 +2987,7 @@ function() {
                 state_s,
                 layout_s,
                 line_segmentation_mode_s,
+                line_segmentation_preprocess_s,
                 line_model_s,
                 device_s,
                 int(max_len_s),
@@ -2945,6 +3002,7 @@ function() {
                 state,
                 layout_path,
                 line_segmentation_mode,
+                line_model_preprocess,
                 line_model_path,
                 device,
                 max_len,
@@ -2985,7 +3043,7 @@ function() {
 
         save_btn.click(
             fn=_save_results,
-            inputs=[state, transcript, donut_path, layout_path, line_segmentation_mode, line_model_path],
+            inputs=[state, transcript, donut_path, layout_path, line_segmentation_mode, line_model_preprocess, line_model_path],
             outputs=[save_status],
         )
 

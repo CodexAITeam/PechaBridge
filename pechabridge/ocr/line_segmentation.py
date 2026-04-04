@@ -8,9 +8,23 @@ from pathlib import Path
 from typing import Any, Iterable, List, Optional, Sequence, Tuple
 
 import numpy as np
+from PIL import Image
+
+try:
+    from .preprocess_bdrc import BDRCPreprocessConfig, preprocess_image_bdrc
+except Exception:  # pragma: no cover - optional at import time
+    BDRCPreprocessConfig = None
+    preprocess_image_bdrc = None
+
+try:
+    from .preprocess_rgb import RGBLinePreprocessConfig, preprocess_image_rgb_lines
+except Exception:  # pragma: no cover - optional at import time
+    RGBLinePreprocessConfig = None
+    preprocess_image_rgb_lines = None
 
 DEFAULT_LINE_SEGMENTATION_IMGSZ = 1280
 DEFAULT_LINE_SEGMENTATION_CONF = 0.25
+DEFAULT_LINE_SEGMENTATION_PREPROCESS = "gray"
 
 
 @dataclass(frozen=True)
@@ -46,6 +60,49 @@ def _coerce_rgb_u8(image: np.ndarray) -> np.ndarray:
     if arr.dtype != np.uint8:
         arr = np.clip(arr, 0, 255).astype(np.uint8)
     return arr
+
+
+def normalize_line_segmentation_preprocess_pipeline(pipeline: str) -> str:
+    mode = str(pipeline or "none").strip().lower()
+    if mode == "bdrc_no_bin":
+        mode = "gray"
+    if mode not in {"none", "bdrc", "gray", "rgb"}:
+        return "none"
+    return mode
+
+
+def apply_line_segmentation_preprocess(
+    image: Any,
+    *,
+    pipeline: str = DEFAULT_LINE_SEGMENTATION_PREPROCESS,
+) -> np.ndarray:
+    """Apply the same named preprocessing modes used by DONUT OCR training."""
+
+    mode = normalize_line_segmentation_preprocess_pipeline(pipeline)
+    if isinstance(image, Image.Image):
+        pil = image.convert("RGB")
+    else:
+        pil = Image.fromarray(_coerce_rgb_u8(np.asarray(image)), mode="RGB")
+
+    if mode == "none":
+        out = pil
+    elif mode == "bdrc":
+        if preprocess_image_bdrc is None or BDRCPreprocessConfig is None:
+            raise RuntimeError("BDRC preprocessing is unavailable in this environment.")
+        out = preprocess_image_bdrc(image=pil, config=BDRCPreprocessConfig.vit_defaults()).convert("RGB")
+    elif mode == "gray":
+        if preprocess_image_bdrc is None or BDRCPreprocessConfig is None:
+            raise RuntimeError("Gray preprocessing is unavailable because BDRC preprocessing could not be imported.")
+        cfg = BDRCPreprocessConfig.vit_defaults()
+        cfg = BDRCPreprocessConfig.from_dict({**cfg.to_dict(), "binarize": False, "gray_mode": "min_rgb"})
+        out = preprocess_image_bdrc(image=pil, config=cfg).convert("RGB")
+    elif mode == "rgb":
+        if preprocess_image_rgb_lines is None or RGBLinePreprocessConfig is None:
+            raise RuntimeError("RGB line preprocessing is unavailable in this environment.")
+        out = preprocess_image_rgb_lines(image=pil, config=RGBLinePreprocessConfig.vit_defaults()).convert("RGB")
+    else:  # pragma: no cover - guarded by normalization
+        out = pil
+    return np.asarray(out, dtype=np.uint8)
 
 
 def _clip_box(raw_box: Sequence[float], *, width: int, height: int) -> Optional[Tuple[int, int, int, int]]:
@@ -173,12 +230,15 @@ def predict_line_regions(
     model_path: str,
     conf: float = DEFAULT_LINE_SEGMENTATION_CONF,
     imgsz: int = DEFAULT_LINE_SEGMENTATION_IMGSZ,
+    preprocess_pipeline: str = "none",
     device: str = "",
     max_det: int = 512,
 ) -> List[LinePrediction]:
     """Run a YOLO segmentation/detection model and return line predictions."""
 
-    rgb = _coerce_rgb_u8(image)
+    rgb_raw = _coerce_rgb_u8(image)
+    mode = normalize_line_segmentation_preprocess_pipeline(preprocess_pipeline)
+    rgb = apply_line_segmentation_preprocess(rgb_raw, pipeline=mode) if mode != "none" else rgb_raw
     height, width = rgb.shape[:2]
 
     model_file = Path(model_path).expanduser().resolve()
@@ -246,8 +306,11 @@ def predict_line_regions(
 __all__ = [
     "DEFAULT_LINE_SEGMENTATION_CONF",
     "DEFAULT_LINE_SEGMENTATION_IMGSZ",
+    "DEFAULT_LINE_SEGMENTATION_PREPROCESS",
     "LinePrediction",
+    "apply_line_segmentation_preprocess",
     "coerce_polygon_points",
+    "normalize_line_segmentation_preprocess_pipeline",
     "polygon_to_box",
     "polygon_to_yolo_segment_line",
     "predict_line_regions",

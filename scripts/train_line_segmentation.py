@@ -83,6 +83,29 @@ def _normalize_dataset_yaml_for_ultralytics(yaml_path: Path) -> Path:
     return tmp_path
 
 
+def _read_dataset_summary(dataset_yaml: Path) -> Dict[str, Any]:
+    with dataset_yaml.open("r", encoding="utf-8") as fp:
+        cfg = yaml.safe_load(fp) or {}
+    if not isinstance(cfg, dict):
+        return {}
+
+    raw_root = cfg.get("path", "")
+    if raw_root:
+        root = Path(str(raw_root)).expanduser()
+        if not root.is_absolute():
+            root = (dataset_yaml.parent / root).resolve()
+    else:
+        root = dataset_yaml.parent.resolve()
+
+    summary_path = root / "meta" / "summary.json"
+    if not summary_path.exists():
+        return {}
+    try:
+        return json.loads(summary_path.read_text(encoding="utf-8"))
+    except Exception:
+        return {}
+
+
 def create_parser(add_help: bool = True) -> argparse.ArgumentParser:
     parser = argparse.ArgumentParser(
         description="Train a YOLO segmentation model for Tibetan line segmentation.",
@@ -119,9 +142,13 @@ def run(args: argparse.Namespace) -> Dict[str, Any]:
 
     dataset_yaml = _resolve_dataset_yaml(args.dataset)
     normalized_yaml = _normalize_dataset_yaml_for_ultralytics(dataset_yaml)
+    dataset_summary = _read_dataset_summary(dataset_yaml)
     LOGGER.info("Using dataset YAML: %s", dataset_yaml)
     if normalized_yaml != dataset_yaml:
         LOGGER.info("Using normalized dataset YAML with absolute paths: %s", normalized_yaml)
+    preprocess_pipeline = str(dataset_summary.get("image_preprocess_pipeline", "") or "").strip()
+    if preprocess_pipeline:
+        LOGGER.info("Dataset image preprocessing pipeline: %s", preprocess_pipeline)
 
     model_name = str(args.model or "").strip()
     if model_name and "-seg" not in model_name.lower() and not Path(model_name).expanduser().exists():
@@ -176,6 +203,7 @@ def run(args: argparse.Namespace) -> Dict[str, Any]:
         "export_path": export_path or "",
         "results_dir": str(getattr(results, "save_dir", run_dir)),
         "model": model_name,
+        "image_preprocess_pipeline": preprocess_pipeline,
         "epochs": int(args.epochs),
         "imgsz": int(args.imgsz),
         "batch": int(args.batch),

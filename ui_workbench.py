@@ -208,7 +208,7 @@ def _list_datasets(base_dir: str) -> List[str]:
         return []
     out = []
     for child in sorted([c for c in p.iterdir() if c.is_dir()]):
-        if (child / "train").exists() or (child / "val").exists():
+        if _is_supported_yolo_dataset_root(child):
             out.append(str(child))
     return out
 
@@ -219,12 +219,129 @@ def _list_dataset_names(base_dir: str) -> List[str]:
         return []
     out = []
     for child in sorted([c for c in p.iterdir() if c.is_dir()]):
-        if (child / "train").exists() or (child / "val").exists():
+        if _is_supported_yolo_dataset_root(child):
             out.append(child.name)
     # Also include YAML dataset configs created at base level
     for yml in sorted([c for c in p.iterdir() if c.is_file() and c.suffix.lower() in {".yaml", ".yml"}]):
-        out.append(yml.name)
+        if _resolve_yolo_split_io_dirs(yml, "train")[0] is not None or _resolve_yolo_split_io_dirs(yml, "val")[0] is not None:
+            out.append(yml.name)
     return out
+
+
+def _read_yaml_mapping(path: Path) -> Dict[str, Any]:
+    try:
+        payload = yaml.safe_load(path.read_text(encoding="utf-8")) or {}
+    except Exception:
+        return {}
+    return payload if isinstance(payload, dict) else {}
+
+
+def _resolve_dataset_root_from_yaml(yaml_path: Path) -> Path:
+    cfg = _read_yaml_mapping(yaml_path)
+    raw_root = cfg.get("path", "")
+    if raw_root:
+        root = Path(str(raw_root)).expanduser()
+        if not root.is_absolute():
+            root = (yaml_path.parent / root).resolve()
+        return root.resolve()
+    return yaml_path.parent.resolve()
+
+
+def _dataset_yaml_candidates(dataset_ref: Path) -> List[Path]:
+    candidates: List[Path] = []
+    if dataset_ref.is_file() and dataset_ref.suffix.lower() in {".yaml", ".yml"}:
+        candidates.append(dataset_ref.resolve())
+        return candidates
+    if dataset_ref.is_dir():
+        for name in ("data.yml", "data.yaml"):
+            cand = (dataset_ref / name).resolve()
+            if cand.exists():
+                candidates.append(cand)
+    return candidates
+
+
+def _resolve_dataset_yaml_path(dataset: str) -> Optional[Path]:
+    raw_txt = (dataset or "").strip()
+    if not raw_txt:
+        return None
+
+    raw = Path(raw_txt).expanduser()
+    candidates: List[Path] = []
+    if raw.is_absolute():
+        candidates.append(raw)
+    else:
+        candidates.append((Path.cwd() / raw).resolve())
+        candidates.append((ROOT / raw).resolve())
+        candidates.append((ROOT / "datasets" / raw).resolve())
+        if raw.suffix.lower() not in {".yaml", ".yml"}:
+            candidates.append((ROOT / "datasets" / f"{raw_txt}.yml").resolve())
+            candidates.append((ROOT / "datasets" / f"{raw_txt}.yaml").resolve())
+
+    seen: Dict[str, Path] = {}
+    for cand in candidates:
+        for yaml_path in _dataset_yaml_candidates(cand):
+            seen[str(yaml_path)] = yaml_path
+    ordered = list(seen.values())
+    return ordered[0] if ordered else None
+
+
+def _derive_labels_dir_from_images_dir(images_dir: Path) -> Path:
+    if images_dir.name == "images":
+        return (images_dir.parent / "labels").resolve()
+    if images_dir.parent.name == "images":
+        return (images_dir.parent.parent / "labels" / images_dir.name).resolve()
+    return (images_dir.parent / "labels").resolve()
+
+
+def _resolve_yolo_split_io_dirs(dataset_ref: Any, split: str) -> Tuple[Optional[Path], Optional[Path], Optional[Path]]:
+    split_name = (split or "").strip()
+    if not split_name:
+        return None, None, None
+
+    base = Path(str(dataset_ref)).expanduser().resolve()
+    dataset_root = base
+    yaml_path: Optional[Path] = None
+    if base.is_file() and base.suffix.lower() in {".yaml", ".yml"}:
+        yaml_path = base
+        dataset_root = _resolve_dataset_root_from_yaml(base)
+    elif base.is_dir():
+        yaml_path = _resolve_dataset_yaml_path(str(base))
+
+    image_candidates: List[Path] = []
+    if dataset_root.exists():
+        image_candidates.append((dataset_root / split_name / "images").resolve())
+        image_candidates.append((dataset_root / "images" / split_name).resolve())
+
+    if yaml_path is not None and yaml_path.exists():
+        cfg = _read_yaml_mapping(yaml_path)
+        split_value = str(cfg.get(split_name, "") or "").strip()
+        if split_value:
+            img_dir = Path(split_value).expanduser()
+            if not img_dir.is_absolute():
+                img_dir = (_resolve_dataset_root_from_yaml(yaml_path) / img_dir).resolve()
+            image_candidates.insert(0, img_dir.resolve())
+
+    seen: Dict[str, Path] = {}
+    for cand in image_candidates:
+        seen[str(cand)] = cand
+    unique_candidates = list(seen.values())
+    for image_dir in unique_candidates:
+        if image_dir.exists():
+            return image_dir, _derive_labels_dir_from_images_dir(image_dir), dataset_root
+
+    if unique_candidates:
+        guessed = unique_candidates[0]
+        return guessed, _derive_labels_dir_from_images_dir(guessed), dataset_root
+    return None, None, dataset_root if dataset_root else None
+
+
+def _is_supported_yolo_dataset_root(dataset_root: Path) -> bool:
+    for split in ("train", "val", "test"):
+        images_dir, labels_dir, _ = _resolve_yolo_split_io_dirs(dataset_root, split)
+        if images_dir is not None and images_dir.exists():
+            if labels_dir is None or labels_dir.exists():
+                return True
+    return False
 
 
 def _list_images(split_images_dir: Path) -> List[str]:
@@ -374,7 +491,7 @@ def _draw_yolo_boxes(image_path: Path, label_path: Path) -> Tuple[np.ndarray, st
     }
     class_names = dict(DEFAULT_LAYOUT_CLASS_NAMES)
     try:
-        # label path pattern: <dataset>/<split>/labels/<file>.txt
+        # Supports both <dataset>/<split>/labels/<file>.txt and <dataset>/labels/<split>/<file>.txt.
         split_dir = label_path.parent.parent
         dataset_root = split_dir.parent
         classes_file = dataset_root / "classes.txt"
@@ -382,6 +499,20 @@ def _draw_yolo_boxes(image_path: Path, label_path: Path) -> Tuple[np.ndarray, st
             lines = [ln.strip() for ln in classes_file.read_text(encoding="utf-8", errors="replace").splitlines() if ln.strip()]
             for i, name in enumerate(lines):
                 class_names[i] = name
+        else:
+            yaml_path = _resolve_dataset_yaml_path(str(dataset_root))
+            if yaml_path is not None and yaml_path.exists():
+                cfg = _read_yaml_mapping(yaml_path)
+                names = cfg.get("names")
+                if isinstance(names, dict):
+                    for k, v in names.items():
+                        try:
+                            class_names[int(k)] = str(v)
+                        except Exception:
+                            continue
+                elif isinstance(names, list):
+                    for i, name in enumerate(names):
+                        class_names[i] = str(name)
     except Exception:
         pass
 
@@ -720,8 +851,7 @@ def _resolve_ls_export_split_from_path_or_zip(ls_export_dir: str, ls_export_zip:
     return _resolve_ls_export_split(ls_export_dir)
 
 
-def _inspect_label_format(split_dir: Path) -> Dict[str, int]:
-    labels_dir = split_dir / "labels"
+def _inspect_label_dir_format(labels_dir: Path) -> Dict[str, int]:
     stats = {"files": 0, "rows": 0, "bbox_rows": 0, "polygon_rows": 0, "invalid_rows": 0}
     if not labels_dir.exists():
         return stats
@@ -742,6 +872,10 @@ def _inspect_label_format(split_dir: Path) -> Dict[str, int]:
             else:
                 stats["invalid_rows"] += 1
     return stats
+
+
+def _inspect_label_format(split_dir: Path) -> Dict[str, int]:
+    return _inspect_label_dir_format(split_dir / "labels")
 
 
 def _label_format_summary(stats: Dict[str, int]) -> str:
@@ -766,6 +900,27 @@ def _label_format_summary(stats: Dict[str, int]) -> str:
         f"Label format check: {fmt} "
         f"(files={files}, rows={rows}, bbox={bbox_rows}, polygon={poly_rows}, invalid={invalid_rows})"
     )
+
+
+def _infer_ultralytics_task(dataset: str, model: str) -> str:
+    model_name = Path(str(model or "")).name.lower()
+    if "-seg" in model_name:
+        return "segment"
+
+    yaml_path = _resolve_dataset_yaml_path(str(dataset or ""))
+    if yaml_path is None:
+        return "detect"
+
+    for split_name in ("train", "val", "test"):
+        _, labels_dir, _ = _resolve_yolo_split_io_dirs(yaml_path, split_name)
+        if labels_dir is None:
+            continue
+        stats = _inspect_label_dir_format(labels_dir)
+        if int(stats.get("polygon_rows", 0)) > 0 and int(stats.get("bbox_rows", 0)) == 0 and int(stats.get("invalid_rows", 0)) == 0:
+            return "segment"
+        if int(stats.get("bbox_rows", 0)) > 0:
+            return "detect"
+    return "detect"
 
 
 def run_generate_synthetic(
@@ -5422,7 +5577,9 @@ def run_line_clip_dataset_debug_retrieval_ui(
 
 
 def refresh_image_list(dataset_dir: str, split: str):
-    split_images = Path(dataset_dir).expanduser().resolve() / split / "images"
+    split_images, _, _ = _resolve_yolo_split_io_dirs(dataset_dir, split)
+    if split_images is None:
+        return gr.update(choices=[], value=None), f"Could not resolve image split for dataset={dataset_dir!r} split={split!r}"
     images = _list_images(split_images)
     value = images[0] if images else None
     return gr.update(choices=images, value=value), f"{len(images)} image(s) found in {split_images}"
@@ -5431,8 +5588,11 @@ def refresh_image_list(dataset_dir: str, split: str):
 def preview_sample(dataset_dir: str, split: str, image_name: str):
     if not dataset_dir or not image_name:
         return None, "Select dataset/split/image first."
-    image_path = Path(dataset_dir).expanduser().resolve() / split / "images" / image_name
-    label_path = Path(dataset_dir).expanduser().resolve() / split / "labels" / f"{Path(image_name).stem}.txt"
+    split_images, split_labels, _ = _resolve_yolo_split_io_dirs(dataset_dir, split)
+    if split_images is None or split_labels is None:
+        return None, f"Could not resolve dataset split for dataset={dataset_dir!r} split={split!r}"
+    image_path = split_images / image_name
+    label_path = split_labels / f"{Path(image_name).stem}.txt"
     if not image_path.exists():
         return None, f"Image not found: {image_path}"
     rendered, summary = _draw_yolo_boxes(image_path, label_path)
@@ -5440,7 +5600,9 @@ def preview_sample(dataset_dir: str, split: str, image_name: str):
 
 
 def preview_adjacent_sample(dataset_dir: str, split: str, current_image: str, step: int):
-    split_images = Path(dataset_dir).expanduser().resolve() / split / "images"
+    split_images, _, _ = _resolve_yolo_split_io_dirs(dataset_dir, split)
+    if split_images is None:
+        return gr.update(choices=[], value=None), None, "No images found."
     images = _list_images(split_images)
     if not images:
         return gr.update(choices=[], value=None), None, "No images found."
@@ -6679,11 +6841,17 @@ def _archive_layout_best_model(
     run_tok = _sanitize_slug(name, default="run")
     ts = time.strftime("%Y%m%d-%H%M%S")
 
-    target_dir = (ROOT / "models" / "layoutModels").resolve()
+    task = _infer_ultralytics_task(dataset=dataset, model=model)
+    if task == "segment":
+        target_dir = (ROOT / "models" / "line_segmentation").resolve()
+        prefix = "line_seg"
+    else:
+        target_dir = (ROOT / "models" / "layoutModels").resolve()
+        prefix = "layout"
     target_dir.mkdir(parents=True, exist_ok=True)
 
     filename = (
-        f"layout_{dataset_tok}_{model_tok}_lr{lr0}_ep{int(epochs)}_bs{int(batch)}_"
+        f"{prefix}_{dataset_tok}_{model_tok}_lr{lr0}_ep{int(epochs)}_bs{int(batch)}_"
         f"sz{int(imgsz)}_pat{int(patience)}_{run_tok}_{ts}.pt"
     )
     target = target_dir / filename
@@ -6863,6 +7031,11 @@ def _ultralytics_model_presets() -> List[str]:
         "yolo26m.pt",
         "yolo26l.pt",
         "yolo26x.pt",
+        "yolo11n-seg.pt",
+        "yolo11s-seg.pt",
+        "yolo11m-seg.pt",
+        "yolo11l-seg.pt",
+        "yolo11x-seg.pt",
     ]
 
 
@@ -10914,12 +11087,12 @@ def build_ui() -> gr.Blocks:
 
         # 4) Visual QA
         with gr.Tab("4. Dataset Preview"):
-            gr.Markdown("Inspect generated dataset and render YOLO label boxes.")
+            gr.Markdown("Inspect YOLO detect/segment datasets and render bounding boxes or polygons.")
             with gr.Row():
                 dataset_base = gr.Textbox(label="Datasets Base Directory", value=default_dataset_base)
                 scan_datasets_btn = gr.Button("Scan Datasets")
             dataset_select = gr.Dropdown(label="Dataset Directory", choices=[default_dataset], value=default_dataset)
-            split_select = gr.Dropdown(label="Split", choices=["train", "val"], value="train")
+            split_select = gr.Dropdown(label="Split", choices=["train", "val", "test"], value="train")
             with gr.Row():
                 refresh_images_btn = gr.Button("Refresh Image List")
                 image_select = gr.Dropdown(label="Image", choices=[])
@@ -10955,7 +11128,7 @@ def build_ui() -> gr.Blocks:
 
         # 5) Training
         with gr.Tab("5. Ultralytics Training"):
-            gr.Markdown("Train a detection model via `train_model.py`.")
+            gr.Markdown("Train a YOLO detection or segmentation model via `train_model.py`.")
             train_dataset_choices = _list_dataset_names(default_dataset_base)
             default_train_dataset = train_dataset_choices[0] if train_dataset_choices else "tibetan-yolo"
             train_model_presets = _ultralytics_model_presets()

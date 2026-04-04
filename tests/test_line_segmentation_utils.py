@@ -1,7 +1,11 @@
 import pytest
+import numpy as np
+from PIL import Image
 
 from pechabridge.ocr.line_segmentation import (
     LinePrediction,
+    apply_line_segmentation_preprocess,
+    normalize_line_segmentation_preprocess_pipeline,
     polygon_to_box,
     polygon_to_yolo_segment_line,
     sort_line_predictions,
@@ -46,3 +50,15 @@ def test_sort_line_predictions_orders_top_to_bottom_then_left_to_right():
         (70, 20, 120, 40),
         (100, 80, 150, 100),
     ]
+
+
+def test_normalize_line_segmentation_preprocess_pipeline_maps_alias():
+    assert normalize_line_segmentation_preprocess_pipeline("bdrc_no_bin") == "gray"
+    assert normalize_line_segmentation_preprocess_pipeline("weird") == "none"
+
+
+def test_apply_line_segmentation_preprocess_gray_preserves_rgb_shape():
+    image = Image.fromarray(np.full((12, 18, 3), 200, dtype=np.uint8), mode="RGB")
+    out = apply_line_segmentation_preprocess(image, pipeline="gray")
+    assert out.shape == (12, 18, 3)
+    assert out.dtype == np.uint8

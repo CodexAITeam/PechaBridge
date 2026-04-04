@@ -21,7 +21,10 @@ from PIL import Image, ImageOps
 from tqdm.auto import tqdm
 
 from pechabridge.ocr.line_segmentation import (
+    DEFAULT_LINE_SEGMENTATION_PREPROCESS,
+    apply_line_segmentation_preprocess,
     coerce_polygon_points,
+    normalize_line_segmentation_preprocess_pipeline,
     polygon_to_box,
     polygon_to_yolo_segment_line,
 )
@@ -149,6 +152,7 @@ def _download_image_to_png(
     *,
     timeout_s: float,
     target_size: Optional[Tuple[int, int]],
+    preprocess_pipeline: str,
     resume: bool,
 ) -> Dict[str, Any]:
     if bool(resume):
@@ -168,6 +172,9 @@ def _download_image_to_png(
             im = im.convert("RGB")
         if target_size is not None and tuple(im.size) != tuple(target_size):
             im = im.resize(tuple(int(v) for v in target_size), Image.Resampling.BICUBIC)
+        mode = normalize_line_segmentation_preprocess_pipeline(preprocess_pipeline)
+        if mode != "none":
+            im = Image.fromarray(apply_line_segmentation_preprocess(im, pipeline=mode), mode="RGB")
         out_path.parent.mkdir(parents=True, exist_ok=True)
         im.save(out_path, format="PNG")
         return {
@@ -227,6 +234,13 @@ def create_parser(add_help: bool = True) -> argparse.ArgumentParser:
     parser.add_argument("--url-timeout-seconds", type=float, default=20.0, help="HTTP timeout for image downloads.")
     parser.add_argument("--resume", action="store_true", help="Reuse already-downloaded PNGs when present.")
     parser.add_argument("--class-name", type=str, default=DEFAULT_CLASS_NAME, help="Ultralytics class name.")
+    parser.add_argument(
+        "--image-preprocess-pipeline",
+        type=str,
+        default=DEFAULT_LINE_SEGMENTATION_PREPROCESS,
+        choices=["none", "bdrc", "gray", "rgb"],
+        help="Preprocess images before writing the segmentation dataset. Default: gray.",
+    )
     parser.add_argument("--verbose", action="store_true", help="Verbose logging.")
     return parser
 
@@ -260,6 +274,9 @@ def run(args: argparse.Namespace) -> Dict[str, Any]:
     meta_root.mkdir(parents=True, exist_ok=True)
 
     datasets_to_process = [d.strip() for d in (args.datasets or []) if str(d).strip()] or [DEFAULT_DATASET_ID]
+    preprocess_pipeline = normalize_line_segmentation_preprocess_pipeline(
+        str(getattr(args, "image_preprocess_pipeline", DEFAULT_LINE_SEGMENTATION_PREPROCESS))
+    )
     load_kwargs = {
         "cache_dir": args.cache_dir or None,
         "revision": args.revision or None,
@@ -384,6 +401,7 @@ def run(args: argparse.Namespace) -> Dict[str, Any]:
                 image_path,
                 timeout_s=float(args.url_timeout_seconds),
                 target_size=(int(page["width_px"]), int(page["height_px"])),
+                preprocess_pipeline=preprocess_pipeline,
                 resume=bool(args.resume),
             )
         except (urllib.error.URLError, urllib.error.HTTPError) as exc:
@@ -432,6 +450,7 @@ def run(args: argparse.Namespace) -> Dict[str, Any]:
                     "source_format": str(page["source_format"]),
                     "width_px": int(page["width_px"]),
                     "height_px": int(page["height_px"]),
+                    "image_preprocess_pipeline": preprocess_pipeline,
                 }
             )
 
@@ -462,6 +481,7 @@ def run(args: argparse.Namespace) -> Dict[str, Any]:
                 "line_count": int(page_line_count),
                 "annotation_method": str(page["annotation_method"]),
                 "source_format": str(page["source_format"]),
+                "image_preprocess_pipeline": preprocess_pipeline,
             }
         )
         totals["pages_saved"] += 1
@@ -490,6 +510,7 @@ def run(args: argparse.Namespace) -> Dict[str, Any]:
         "dataset_ids": datasets_to_process,
         "data_yaml": str((output_dir / "data.yaml").resolve()),
         "class_name": str(args.class_name or DEFAULT_CLASS_NAME),
+        "image_preprocess_pipeline": preprocess_pipeline,
         "totals": dict(totals),
         "pages_per_split": dict(split_counts),
         "lines_per_split": dict(line_split_counts),
