@@ -228,6 +228,16 @@ python cli.py download-openpecha-line-segmentation \
   --output-dir ./datasets/openpecha_line_segmentation
 ```
 
+If you want to create a second dataset with vertically expanded line polygons, you can derive it from the raw base dataset:
+
+```bash
+python cli.py expand-line-segmentation-dataset \
+  --dataset ./datasets/openpecha_line_segmentation/data.yaml \
+  --output-dir ./datasets/openpecha_line_segmentation_padded \
+  --top-ratio 0.20 \
+  --bottom-ratio 0.20
+```
+
 Train a YOLO segmentation model on the converted dataset. The line-image preprocessing now belongs to the
 training run, not to the downloader:
 

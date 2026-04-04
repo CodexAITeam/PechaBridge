@@ -31,6 +31,9 @@ from scripts.download_merge_openpecha_ocr_lines import (
 from scripts.download_openpecha_line_segmentation import (
     create_parser as create_download_openpecha_line_segmentation_parser,
 )
+from scripts.expand_line_segmentation_dataset import (
+    create_parser as create_expand_line_segmentation_dataset_parser,
+)
 from scripts.download_bosentencepiece_tokenizer import (
     create_parser as create_download_bosentencepiece_tokenizer_parser,
 )
@@ -212,6 +215,16 @@ def _build_root_parser() -> argparse.ArgumentParser:
         description=openpecha_line_seg_parent.description,
     )
     openpecha_line_seg_parser.set_defaults(handler=_run_download_openpecha_line_segmentation)
+
+    expand_line_seg_parent = create_expand_line_segmentation_dataset_parser(add_help=False)
+    expand_line_seg_parser = subparsers.add_parser(
+        "expand-line-segmentation-dataset",
+        aliases=["expand-line-seg-dataset", "inflate-line-segmentation-dataset"],
+        parents=[expand_line_seg_parent],
+        help="Write a new Ultralytics line-segmentation dataset with vertically expanded polygons",
+        description=expand_line_seg_parent.description,
+    )
+    expand_line_seg_parser.set_defaults(handler=_run_expand_line_segmentation_dataset)
 
     train_line_seg_parent = create_train_line_segmentation_parser(add_help=False)
     train_line_seg_parser = subparsers.add_parser(
@@ -409,6 +422,13 @@ def _run_download_openpecha_ocr_lines(args: argparse.Namespace) -> int:
 
 def _run_download_openpecha_line_segmentation(args: argparse.Namespace) -> int:
     from scripts.download_openpecha_line_segmentation import run
+
+    run(args)
+    return 0
+
+
+def _run_expand_line_segmentation_dataset(args: argparse.Namespace) -> int:
+    from scripts.expand_line_segmentation_dataset import run
 
     run(args)
     return 0
