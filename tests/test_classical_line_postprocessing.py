@@ -19,11 +19,12 @@ def test_filter_line_boxes_by_mean_height_removes_large_outlier() -> None:
     ]
 
 
-def test_expand_line_boxes_vertically_adds_quarter_height_above_and_below() -> None:
+def test_expand_line_boxes_vertically_adds_thirty_percent_only_above() -> None:
     expanded = ui_workbench._expand_line_boxes_vertically(
         [(5, 10, 25, 20)],
         image_height=100,
-        pad_ratio=0.25,
+        top_pad_ratio=0.30,
+        bottom_pad_ratio=0.0,
     )
 
-    assert expanded == [(5, 7, 25, 23)]
+    assert expanded == [(5, 7, 25, 20)]

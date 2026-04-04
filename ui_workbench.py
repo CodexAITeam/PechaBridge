@@ -9520,7 +9520,8 @@ def _expand_line_boxes_vertically(
     line_boxes: List[Tuple[int, int, int, int]],
     *,
     image_height: int,
-    pad_ratio: float = 0.25,
+    top_pad_ratio: float = 0.30,
+    bottom_pad_ratio: float = 0.0,
 ) -> List[Tuple[int, int, int, int]]:
     if not line_boxes:
         return []
@@ -9529,9 +9530,10 @@ def _expand_line_boxes_vertically(
     max_h = max(1, int(image_height))
     for x1, y1, x2, y2 in line_boxes:
         height = max(1, int(y2) - int(y1))
-        pad = max(1, int(math.ceil(float(height) * max(0.0, float(pad_ratio)))))
-        ny1 = max(0, int(y1) - pad)
-        ny2 = min(max_h, int(y2) + pad)
+        top_pad = max(1, int(math.ceil(float(height) * max(0.0, float(top_pad_ratio)))))
+        bottom_pad = max(0, int(math.ceil(float(height) * max(0.0, float(bottom_pad_ratio)))))
+        ny1 = max(0, int(y1) - top_pad)
+        ny2 = min(max_h, int(y2) + bottom_pad)
         if int(x2) > int(x1) and ny2 > ny1:
             out.append((int(x1), ny1, int(x2), ny2))
     return out
@@ -9667,7 +9669,12 @@ def _segment_lines_in_text_crop(
     filtered = _filter_line_boxes_by_mean_height(tightened, tolerance_ratio=0.50)
     if not filtered:
         return []
-    return _expand_line_boxes_vertically(filtered, image_height=h, pad_ratio=0.25)
+    return _expand_line_boxes_vertically(
+        filtered,
+        image_height=h,
+        top_pad_ratio=0.30,
+        bottom_pad_ratio=0.0,
+    )
 
 
 def _segment_red_runs_in_line_crop(
