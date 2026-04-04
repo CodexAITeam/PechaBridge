@@ -9,11 +9,17 @@ import logging
 import os
 import shutil
 import tempfile
+from concurrent.futures import ThreadPoolExecutor, as_completed
 from pathlib import Path
 from typing import Any, Dict, Optional, Sequence, Tuple
 
 import yaml
 from PIL import Image
+
+try:
+    from tqdm.auto import tqdm
+except Exception:  # pragma: no cover - optional progress dependency
+    tqdm = None
 
 from pechabridge.ocr.line_segmentation import (
     DEFAULT_LINE_SEGMENTATION_PREPROCESS,
@@ -148,11 +154,82 @@ def _copy_tree_if_exists(src: Optional[Path], dst: Path) -> int:
     return count
 
 
+def _preprocess_and_save_training_image(
+    image_path: Path,
+    target: Path,
+    *,
+    pipeline: str,
+) -> None:
+    target.parent.mkdir(parents=True, exist_ok=True)
+    with Image.open(image_path) as im:
+        rgb = im.convert("RGB")
+        processed = Image.fromarray(apply_line_segmentation_preprocess(rgb, pipeline=pipeline), mode="RGB")
+        processed.save(target)
+
+
+def _make_tqdm(total: int, *, desc: str) -> Any:
+    if tqdm is None or int(total) <= 0:
+        return None
+    return tqdm(total=int(total), desc=desc, unit="img", dynamic_ncols=True)
+
+
+def _preprocess_image_batch(
+    image_paths: Sequence[Path],
+    *,
+    images_dir: Path,
+    out_images_dir: Path,
+    pipeline: str,
+    preprocess_workers: int,
+    split_name: str,
+) -> int:
+    if not image_paths:
+        return 0
+
+    worker_count = max(1, int(preprocess_workers))
+    progress = _make_tqdm(len(image_paths), desc=f"Preprocess {split_name}")
+    try:
+        if worker_count <= 1 or len(image_paths) <= 1:
+            for image_path in image_paths:
+                rel = image_path.relative_to(images_dir)
+                target = out_images_dir / rel
+                _preprocess_and_save_training_image(
+                    image_path,
+                    target,
+                    pipeline=pipeline,
+                )
+                if progress is not None:
+                    progress.update(1)
+            return len(image_paths)
+
+        with ThreadPoolExecutor(max_workers=min(worker_count, len(image_paths))) as executor:
+            futures = []
+            for image_path in image_paths:
+                rel = image_path.relative_to(images_dir)
+                target = out_images_dir / rel
+                futures.append(
+                    executor.submit(
+                        _preprocess_and_save_training_image,
+                        image_path,
+                        target,
+                        pipeline=pipeline,
+                    )
+                )
+            for future in as_completed(futures):
+                future.result()
+                if progress is not None:
+                    progress.update(1)
+        return len(image_paths)
+    finally:
+        if progress is not None:
+            progress.close()
+
+
 def _build_preprocessed_training_dataset(
     source_yaml: Path,
     *,
     output_dir: Path,
     pipeline: str,
+    preprocess_workers: int = 1,
 ) -> Tuple[Path, Dict[str, Any]]:
     mode = normalize_line_segmentation_preprocess_pipeline(pipeline)
     if mode == "none":
@@ -194,16 +271,22 @@ def _build_preprocessed_training_dataset(
         out_images_dir.mkdir(parents=True, exist_ok=True)
         out_labels_dir.mkdir(parents=True, exist_ok=True)
 
-        image_count = 0
-        for image_path in _iter_image_files(images_dir):
-            rel = image_path.relative_to(images_dir)
-            target = out_images_dir / rel
-            target.parent.mkdir(parents=True, exist_ok=True)
-            with Image.open(image_path) as im:
-                rgb = im.convert("RGB")
-                processed = Image.fromarray(apply_line_segmentation_preprocess(rgb, pipeline=mode), mode="RGB")
-                processed.save(target)
-            image_count += 1
+        image_paths = list(_iter_image_files(images_dir))
+        LOGGER.info(
+            "Preprocessing split=%s images=%d pipeline=%s workers=%d",
+            split_name,
+            len(image_paths),
+            mode,
+            max(1, int(preprocess_workers)),
+        )
+        image_count = _preprocess_image_batch(
+            image_paths,
+            images_dir=images_dir,
+            out_images_dir=out_images_dir,
+            pipeline=mode,
+            preprocess_workers=max(1, int(preprocess_workers)),
+            split_name=split_name,
+        )
 
         label_file_count = _copy_tree_if_exists(labels_dir, out_labels_dir)
         out_cfg[split_name] = f"images/{split_name}"
@@ -212,6 +295,7 @@ def _build_preprocessed_training_dataset(
             "source_labels_dir": str(labels_dir) if labels_dir is not None else "",
             "image_count": int(image_count),
             "label_file_count": int(label_file_count),
+            "preprocess_workers": int(max(1, int(preprocess_workers))),
         }
 
     yaml_path = output_root / "data.yaml"
@@ -253,7 +337,12 @@ def create_parser(add_help: bool = True) -> argparse.ArgumentParser:
     parser.add_argument("--epochs", type=int, default=100, help="Training epochs.")
     parser.add_argument("--imgsz", type=int, default=1280, help="Training image size.")
     parser.add_argument("--batch", type=int, default=8, help="Batch size.")
-    parser.add_argument("--workers", type=int, default=8, help="Data loader workers.")
+    parser.add_argument(
+        "--workers",
+        type=int,
+        default=8,
+        help="Worker count for temporary image preprocessing and the later Ultralytics data loader.",
+    )
     parser.add_argument("--device", type=str, default="", help="Training device, e.g. cpu, cuda:0.")
     parser.add_argument("--project", type=str, default="runs/segment", help="Ultralytics project directory.")
     parser.add_argument("--name", type=str, default="tibetan_line_segmentation", help="Run name.")
@@ -325,6 +414,7 @@ def run(args: argparse.Namespace) -> Dict[str, Any]:
             dataset_yaml,
             output_dir=Path(temporary_dataset_dir.name),
             pipeline=requested_preprocess_pipeline,
+            preprocess_workers=max(1, int(getattr(args, "workers", 1) or 1)),
         )
         LOGGER.info(
             "Built temporary preprocessed training dataset: %s",

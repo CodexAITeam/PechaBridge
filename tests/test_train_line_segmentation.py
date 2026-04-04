@@ -50,6 +50,7 @@ def test_build_preprocessed_training_dataset_writes_temp_segment_dataset(tmp_pat
         source_yaml,
         output_dir=tmp_path / "prepared",
         pipeline="gray",
+        preprocess_workers=2,
     )
 
     prepared_image = tmp_path / "prepared" / "images" / "train" / "sample.png"
@@ -59,4 +60,5 @@ def test_build_preprocessed_training_dataset_writes_temp_segment_dataset(tmp_pat
     assert prepared_label.exists()
     assert summary["image_preprocess_pipeline"] == "gray"
     assert summary["splits"]["train"]["image_count"] == 1
+    assert summary["splits"]["train"]["preprocess_workers"] == 2
     assert prepared_label.read_text(encoding="utf-8").startswith("0 ")
