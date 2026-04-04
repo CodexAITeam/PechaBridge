@@ -36,6 +36,11 @@ try:
 except Exception:  # pragma: no cover - optional at import time
     pyewts = None
 
+try:
+    from scipy.ndimage import map_coordinates
+except Exception:  # pragma: no cover - optional at import time
+    map_coordinates = None
+
 from .preprocess_bdrc import (
     BDRCPreprocessConfig,
     bdrc_image_to_normalized_tensor,
@@ -48,6 +53,9 @@ DEFAULT_BDRC_LINE_THRESHOLD = 0.9
 DEFAULT_BDRC_LAYOUT_THRESHOLD = 0.8
 DEFAULT_BDRC_LINE_K_FACTOR = 2.5
 DEFAULT_BDRC_LINE_BBOX_TOLERANCE = 3.0
+DEFAULT_BDRC_LINE_TPS_THRESHOLD = 0.25
+DEFAULT_BDRC_LINE_USE_TPS = True
+DEFAULT_BDRC_TPS_ALPHA = 0.5
 
 
 @dataclass(frozen=True)
@@ -97,6 +105,23 @@ class BDRCLinePrediction:
         }
 
 
+@dataclass(frozen=True)
+class _ThinPlateSplineMapping:
+    control_points: np.ndarray
+    weights: np.ndarray
+    affine: np.ndarray
+
+    def transform(self, points: np.ndarray) -> np.ndarray:
+        pts = np.asarray(points, dtype=np.float64).reshape(-1, 2)
+        if pts.size == 0:
+            return np.zeros((0, 2), dtype=np.float64)
+        deltas = pts[:, None, :] - self.control_points[None, :, :]
+        sq_dist = np.sum(deltas * deltas, axis=-1)
+        kernel = _tps_kernel(sq_dist)
+        design = np.concatenate([np.ones((pts.shape[0], 1), dtype=np.float64), pts], axis=1)
+        return kernel @ self.weights + design @ self.affine
+
+
 def _require_cv2() -> None:
     if cv2 is None:  # pragma: no cover - dependency guard
         raise RuntimeError("opencv-python is required for BDRC inference helpers.")
@@ -107,6 +132,14 @@ def _require_onnxruntime() -> None:
         raise RuntimeError(
             "onnxruntime is required for BDRC inference helpers. "
             "Install it with `pip install onnxruntime` or `onnxruntime-gpu`."
+        )
+
+
+def _require_scipy_tps() -> None:
+    if map_coordinates is None:  # pragma: no cover - dependency guard
+        raise RuntimeError(
+            "scipy is required for BDRC TPS/dewarping support. "
+            "Install it with `pip install scipy`."
         )
 
 
@@ -307,6 +340,220 @@ def _softmax(logits: np.ndarray, axis: int = -1) -> np.ndarray:
     denom = np.sum(exp, axis=axis, keepdims=True)
     denom = np.where(denom == 0, 1.0, denom)
     return exp / denom
+
+
+def _tps_kernel(sq_dist: np.ndarray) -> np.ndarray:
+    sq = np.asarray(sq_dist, dtype=np.float64)
+    with np.errstate(divide="ignore", invalid="ignore"):
+        out = sq * np.log(np.where(sq > 0.0, sq, 1.0))
+    out[~np.isfinite(out)] = 0.0
+    out[sq <= 0.0] = 0.0
+    return out
+
+
+def _tps_corners(height: int, width: int) -> np.ndarray:
+    h = max(1, int(height)) - 1
+    w = max(1, int(width)) - 1
+    return np.asarray(
+        [
+            [0.0, 0.0],
+            [0.0, float(w)],
+            [float(h), 0.0],
+            [float(h), float(w)],
+        ],
+        dtype=np.float64,
+    )
+
+
+def _fit_tps_mapping(
+    input_pts: Sequence[Sequence[float]],
+    output_pts: Sequence[Sequence[float]],
+    *,
+    height: int,
+    width: int,
+    add_corners: bool = True,
+    alpha: float = DEFAULT_BDRC_TPS_ALPHA,
+) -> _ThinPlateSplineMapping:
+    _require_scipy_tps()
+    src = np.asarray(input_pts, dtype=np.float64).reshape(-1, 2)
+    dst = np.asarray(output_pts, dtype=np.float64).reshape(-1, 2)
+    if src.shape != dst.shape or src.shape[0] < 3:
+        raise ValueError("TPS requires at least 3 matching control points.")
+    if add_corners:
+        corners = _tps_corners(height, width)
+        src = np.concatenate([src, corners], axis=0)
+        dst = np.concatenate([dst, corners], axis=0)
+    n = int(src.shape[0])
+    deltas = src[:, None, :] - src[None, :, :]
+    sq_dist = np.sum(deltas * deltas, axis=-1)
+    kernel = _tps_kernel(sq_dist)
+    if float(alpha) > 0.0:
+        kernel = kernel + (np.eye(n, dtype=np.float64) * float(alpha))
+    design = np.concatenate([np.ones((n, 1), dtype=np.float64), src], axis=1)
+    lhs = np.block(
+        [
+            [kernel, design],
+            [design.T, np.zeros((3, 3), dtype=np.float64)],
+        ]
+    )
+    rhs = np.concatenate([dst, np.zeros((3, 2), dtype=np.float64)], axis=0)
+    params, *_ = np.linalg.lstsq(lhs, rhs, rcond=None)
+    return _ThinPlateSplineMapping(
+        control_points=src,
+        weights=params[:n],
+        affine=params[n:],
+    )
+
+
+def _run_tps(
+    image: np.ndarray,
+    input_pts: Sequence[Sequence[float]],
+    output_pts: Sequence[Sequence[float]],
+    *,
+    add_corners: bool = True,
+    alpha: float = DEFAULT_BDRC_TPS_ALPHA,
+) -> Tuple[np.ndarray, _ThinPlateSplineMapping]:
+    _require_scipy_tps()
+    src = _coerce_rgb_u8(image)
+    height, width = src.shape[:2]
+    mapping = _fit_tps_mapping(
+        input_pts=input_pts,
+        output_pts=output_pts,
+        height=height,
+        width=width,
+        add_corners=add_corners,
+        alpha=alpha,
+    )
+    output_indices = np.indices((height, width), dtype=np.float64).transpose(1, 2, 0).reshape(-1, 2)
+    input_indices = mapping.transform(output_indices).reshape(height, width, 2)
+    warped = np.concatenate(
+        [
+            map_coordinates(
+                src[..., channel].astype(np.float64),
+                [input_indices[..., 0], input_indices[..., 1]],
+                order=1,
+                mode="constant",
+                cval=0.0,
+            )[..., None]
+            for channel in (0, 1, 2)
+        ],
+        axis=-1,
+    )
+    warped = np.clip(np.rint(warped), 0.0, 255.0).astype(np.uint8)
+    return warped, mapping
+
+
+def _get_global_center(slice_image: np.ndarray, start_x: int, bbox_y: int) -> Tuple[int, int, int]:
+    _require_cv2()
+    contours, _ = cv2.findContours(slice_image, cv2.RETR_LIST, cv2.CHAIN_APPROX_SIMPLE)
+    if not contours:
+        center_x = max(0, int(slice_image.shape[1] // 2))
+        center_y = max(0, int(slice_image.shape[0] // 2))
+        bbox_h = max(1, int(slice_image.shape[0]))
+        return int(start_x + center_x), int(bbox_y + center_y), int(bbox_h)
+    areas = [float(cv2.contourArea(x)) for x in contours]
+    biggest = contours[int(np.argmax(areas))]
+    _, _, _, bbox_h = cv2.boundingRect(biggest)
+    center, _, _ = cv2.minAreaRect(biggest)
+    return int(start_x + int(center[0])), int(bbox_y + int(center[1])), int(bbox_h)
+
+
+def _check_line_tps(
+    image: np.ndarray,
+    contour: np.ndarray,
+    *,
+    slice_width: int = 40,
+) -> Tuple[bool, Optional[List[List[int]]], Optional[List[List[int]]], float]:
+    _require_cv2()
+    mask = np.zeros(image.shape, dtype=np.uint8)
+    x, y, w, h = cv2.boundingRect(contour)
+    cv2.drawContours(mask, [contour], contourIdx=0, color=(255, 255, 255), thickness=-1)
+
+    steps = [
+        (x, x + slice_width),
+        (x + (w // 4) - slice_width, x + (w // 4)),
+        (x + (w // 2), x + (w // 2) + slice_width),
+        (x + (w // 2) + (w // 4), x + (w // 2) + (w // 4) + slice_width),
+        (x + w - slice_width, x + w),
+    ]
+    all_bboxes: List[int] = []
+    all_centers: List[int] = []
+    input_pts: List[List[int]] = []
+    output_pts: List[List[int]] = []
+    for start_x, end_x in steps:
+        sx = max(0, min(int(mask.shape[1]), int(start_x)))
+        ex = max(sx + 1, min(int(mask.shape[1]), int(end_x)))
+        sl = mask[y : y + h, sx:ex, 0]
+        center_x, center_y, bbox_h = _get_global_center(sl, sx, y)
+        all_bboxes.append(int(bbox_h))
+        all_centers.append(int(center_y))
+        input_pts.append([int(center_y), int(center_x)])
+    min_value = min(all_centers) if all_centers else 0
+    max_value = max(all_centers) if all_centers else 0
+    max_ydelta = float(max_value - min_value)
+    mean_bbox_h = float(np.mean(all_bboxes)) if all_bboxes else 0.0
+    mean_center_y = float(np.mean(all_centers)) if all_centers else 0.0
+    if max_ydelta > mean_bbox_h and input_pts:
+        target_y = int(round(mean_center_y))
+        output_pts = [[target_y, int(pt[1])] for pt in input_pts]
+        return True, input_pts, output_pts, max_ydelta
+    return False, None, None, 0.0
+
+
+def _check_for_tps(image: np.ndarray, line_contours: Sequence[np.ndarray]) -> Tuple[float, List[Dict[str, Any]]]:
+    line_data: List[Dict[str, Any]] = []
+    for line_cnt in list(line_contours):
+        tps_status, input_pts, output_pts, max_yd = _check_line_tps(image, line_cnt)
+        line_data.append(
+            {
+                "contour": line_cnt,
+                "tps": bool(tps_status),
+                "input_pts": input_pts,
+                "output_pts": output_pts,
+                "max_yd": float(max_yd),
+            }
+        )
+    if not line_contours:
+        return 0.0, line_data
+    do_tps = [x for x in line_data if bool(x.get("tps"))]
+    ratio = float(len(do_tps)) / float(max(1, len(line_contours)))
+    return ratio, line_data
+
+
+def _get_global_tps_line(line_data: Sequence[Mapping[str, Any]]) -> int:
+    all_y_deltas: List[float] = []
+    for line in line_data:
+        if bool(line.get("tps")):
+            all_y_deltas.append(float(line.get("max_yd", 0.0)))
+        else:
+            all_y_deltas.append(0.0)
+    positive = [x for x in all_y_deltas if x > 0.0]
+    if not positive:
+        raise ValueError("No curved line available for global TPS selection.")
+    mean_delta = float(np.mean(all_y_deltas)) if all_y_deltas else 0.0
+    best_diff = max(positive)
+    best_y = positive[0]
+    for yd in positive:
+        delta = abs(mean_delta - float(yd))
+        if delta < best_diff:
+            best_diff = delta
+            best_y = float(yd)
+    return int(all_y_deltas.index(best_y))
+
+
+def _apply_global_tps(
+    image: np.ndarray,
+    line_mask: np.ndarray,
+    line_data: Sequence[Mapping[str, Any]],
+) -> Tuple[np.ndarray, np.ndarray, _ThinPlateSplineMapping]:
+    best_idx = _get_global_tps_line(line_data)
+    output_pts = line_data[best_idx].get("output_pts")
+    input_pts = line_data[best_idx].get("input_pts")
+    if not input_pts or not output_pts:
+        raise ValueError("Selected TPS line does not contain usable control points.")
+    warped_img, mapping = _run_tps(image, output_pts, input_pts)
+    warped_mask, _ = _run_tps(line_mask, output_pts, input_pts)
+    return warped_img, warped_mask, mapping
 
 
 def _resize_to_width(image: np.ndarray, target_width: int) -> Tuple[np.ndarray, float]:
@@ -700,6 +947,8 @@ def predict_bdrc_line_regions(
     group_lines: bool = True,
     k_factor: float = DEFAULT_BDRC_LINE_K_FACTOR,
     bbox_tolerance: float = DEFAULT_BDRC_LINE_BBOX_TOLERANCE,
+    use_tps: bool = DEFAULT_BDRC_LINE_USE_TPS,
+    tps_threshold: float = DEFAULT_BDRC_LINE_TPS_THRESHOLD,
 ) -> Tuple[List[BDRCLinePrediction], Dict[str, Any]]:
     """Run a BDRC line/layout ONNX model plus the BDRC contour postprocessing chain."""
 
@@ -724,15 +973,77 @@ def predict_bdrc_line_regions(
     else:
         line_mask = prediction_mask
 
-    rot_img, rot_mask, line_contours, page_angle = _build_raw_line_data(src, line_mask)
-    filtered = _filter_line_contours(rot_mask, line_contours)
-    grouped, line_threshold = _sort_and_group_contours(rot_mask, filtered, group_lines=bool(group_lines))
-    line_images = _extract_line_images(rot_img, grouped, default_k=float(k_factor), bbox_tolerance=float(bbox_tolerance))
+    base_rot_img, base_rot_mask, line_contours, page_angle = _build_raw_line_data(src, line_mask)
+    filtered = _filter_line_contours(base_rot_mask, line_contours)
+    working_img = base_rot_img
+    working_mask = base_rot_mask
+    working_filtered = list(filtered)
+    dewarped_to_base_mapping: Optional[_ThinPlateSplineMapping] = None
+    dewarp_angle = 0.0
+    tps_ratio = 0.0
+    tps_applied = False
+    tps_error: Optional[str] = None
+    if bool(use_tps) and working_filtered:
+        try:
+            tps_ratio, tps_line_data = _check_for_tps(base_rot_img, working_filtered)
+            if tps_ratio > float(tps_threshold):
+                dewarped_img, dewarped_mask, dewarped_to_base_mapping = _apply_global_tps(
+                    base_rot_img,
+                    base_rot_mask,
+                    tps_line_data,
+                )
+                dewarped_mask_gray = dewarped_mask
+                if dewarped_mask_gray.ndim == 3:
+                    dewarped_mask_gray = cv2.cvtColor(dewarped_mask_gray, cv2.COLOR_RGB2GRAY)
+                working_img, working_mask, dew_contours, dewarp_angle = _build_raw_line_data(
+                    dewarped_img,
+                    dewarped_mask_gray,
+                )
+                working_filtered = _filter_line_contours(working_mask, dew_contours)
+                if working_filtered:
+                    tps_applied = True
+                else:
+                    working_img = base_rot_img
+                    working_mask = base_rot_mask
+                    working_filtered = list(filtered)
+                    dewarped_to_base_mapping = None
+            else:
+                dewarped_to_base_mapping = None
+        except Exception as exc:
+            dewarped_to_base_mapping = None
+            working_img = base_rot_img
+            working_mask = base_rot_mask
+            working_filtered = list(filtered)
+            tps_error = f"{type(exc).__name__}: {exc}"
+
+    grouped, line_threshold = _sort_and_group_contours(
+        working_mask,
+        working_filtered,
+        group_lines=bool(group_lines),
+    )
+    line_images = _extract_line_images(
+        working_img,
+        grouped,
+        default_k=float(k_factor),
+        bbox_tolerance=float(bbox_tolerance),
+    )
 
     predictions: List[BDRCLinePrediction] = []
+    work_h, work_w = working_img.shape[:2]
     for idx, contour in enumerate(grouped):
         pts = contour.reshape(-1, 2)
-        orig_pts = _inverse_rotate_points(pts, angle=page_angle, width=w, height=h)
+        pts_for_projection = pts.astype(np.float32)
+        if tps_applied:
+            pts_for_projection = _inverse_rotate_points(
+                pts_for_projection,
+                angle=dewarp_angle,
+                width=work_w,
+                height=work_h,
+            )
+            if dewarped_to_base_mapping is None:
+                continue
+            pts_for_projection = dewarped_to_base_mapping.transform(pts_for_projection).astype(np.float32)
+        orig_pts = _inverse_rotate_points(pts_for_projection, angle=page_angle, width=w, height=h)
         polygon = _clip_polygon(orig_pts, width=w, height=h)
         if not polygon:
             continue
@@ -764,12 +1075,19 @@ def predict_bdrc_line_regions(
         "classes": list(cfg.classes),
         "device": _device_provider_key(device),
         "page_angle": float(page_angle),
+        "dewarp_angle": float(dewarp_angle),
         "line_threshold": float(line_threshold),
         "group_lines": bool(group_lines),
         "k_factor": float(k_factor),
         "bbox_tolerance": float(bbox_tolerance),
+        "use_tps": bool(use_tps),
+        "tps_threshold": float(tps_threshold),
+        "tps_ratio": float(tps_ratio),
+        "tps_applied": bool(tps_applied),
+        "tps_error": tps_error,
         "raw_contours": int(len(line_contours)),
         "filtered_contours": int(len(filtered)),
+        "working_filtered_contours": int(len(working_filtered)),
         "grouped_contours": int(len(grouped)),
         "line_count": int(len(predictions)),
         "detection": det_debug,
@@ -909,8 +1227,10 @@ __all__ = [
     "BDRCLinePrediction",
     "DEFAULT_BDRC_LINE_BBOX_TOLERANCE",
     "DEFAULT_BDRC_LINE_K_FACTOR",
+    "DEFAULT_BDRC_LINE_TPS_THRESHOLD",
     "DEFAULT_BDRC_LAYOUT_THRESHOLD",
     "DEFAULT_BDRC_LINE_THRESHOLD",
+    "DEFAULT_BDRC_LINE_USE_TPS",
     "find_bdrc_line_model_dirs",
     "find_bdrc_ocr_model_dirs",
     "is_bdrc_line_model_dir",

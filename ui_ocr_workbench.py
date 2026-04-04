@@ -30,6 +30,10 @@ from pechabridge.ocr.line_segmentation import (
 )
 from pechabridge.ocr.bdrc_inference import (
     BDRCLinePrediction,
+    DEFAULT_BDRC_LINE_BBOX_TOLERANCE,
+    DEFAULT_BDRC_LINE_K_FACTOR,
+    DEFAULT_BDRC_LINE_TPS_THRESHOLD,
+    DEFAULT_BDRC_LINE_USE_TPS,
     find_bdrc_line_model_dirs,
     find_bdrc_ocr_model_dirs,
     predict_bdrc_line_regions,
@@ -72,6 +76,7 @@ LINE_SEG_YOLO = "Pretrained YOLO Model"
 LINE_SEG_BDRC = "BDRC Line Model"
 OCR_ENGINE_DONUT = "DONUT"
 OCR_ENGINE_BDRC = "BDRC OCR"
+DEFAULT_BDRC_LINE_MERGE_LINES = True
 _DONUT_ACTIVE_RUNTIME: Dict[str, Any] = {"checkpoint": "", "runtime": None}
 
 _IMAGE_EXTENSIONS = {".jpg", ".jpeg", ".png", ".tif", ".tiff", ".bmp", ".webp"}
@@ -449,6 +454,20 @@ def _ensure_default_bdrc_ocr_model_path(current_path: str) -> Tuple[str, Optiona
     return str(chosen), note
 
 
+def _pending_bdrc_setup_messages(
+    ocr_engine: str,
+    bdrc_ocr_model: str,
+    line_segmentation_mode: str,
+    bdrc_line_model: str,
+) -> List[str]:
+    notes: List[str] = []
+    if _normalize_ocr_engine(ocr_engine) == OCR_ENGINE_BDRC and not str(bdrc_ocr_model or "").strip():
+        notes.append("Preparing default BDRC OCR model...")
+    if _normalize_line_segmentation_mode(line_segmentation_mode) == LINE_SEG_BDRC and not str(bdrc_line_model or "").strip():
+        notes.append("Preparing default BDRC line model...")
+    return notes
+
+
 def _normalize_box(box: List[int], w: int, h: int) -> Optional[List[int]]:
     if not isinstance(box, (list, tuple)) or len(box) != 4:
         return None
@@ -574,6 +593,11 @@ def _segment_full_image_lines(
     layout_model: str,
     line_model: str,
     bdrc_line_model: str,
+    bdrc_line_merge_lines: bool,
+    bdrc_line_k_factor: float,
+    bdrc_line_bbox_tolerance: float,
+    bdrc_line_use_tps: bool,
+    bdrc_line_tps_threshold: float,
     device: str,
 ) -> Tuple[List[Dict[str, Any]], str, Dict[str, Any]]:
     src = np.asarray(image).astype(np.uint8, copy=False)
@@ -636,6 +660,11 @@ def _segment_full_image_lines(
                 src,
                 model_path=bdrc_line_model,
                 device=device,
+                group_lines=bool(bdrc_line_merge_lines),
+                k_factor=float(bdrc_line_k_factor),
+                bbox_tolerance=float(bdrc_line_bbox_tolerance),
+                use_tps=bool(bdrc_line_use_tps),
+                tps_threshold=float(bdrc_line_tps_threshold),
             )
         except Exception as exc:
             return [], f"BDRC line inference failed: {type(exc).__name__}: {exc}", {
@@ -650,6 +679,8 @@ def _segment_full_image_lines(
             source="full_auto_bdrc_line_model",
         )
         status = f"Detected {len(rows)} line(s) with the BDRC line model."
+        if bool((bdrc_debug or {}).get("tps_applied")):
+            status += " TPS dewarping applied."
         debug = dict(bdrc_debug)
         debug.update(
             {
@@ -1353,6 +1384,11 @@ def _run_full_auto(
     line_segmentation_preprocess: str,
     line_model: str,
     bdrc_line_model: str,
+    bdrc_line_merge_lines: bool,
+    bdrc_line_k_factor: float,
+    bdrc_line_bbox_tolerance: float,
+    bdrc_line_use_tps: bool,
+    bdrc_line_tps_threshold: float,
     device: str,
     max_len: int,
     preprocess_preset: str = "bdrc",
@@ -1399,6 +1435,11 @@ def _run_full_auto(
         layout_model=layout_model,
         line_model=line_model,
         bdrc_line_model=bdrc_line_model,
+        bdrc_line_merge_lines=bdrc_line_merge_lines,
+        bdrc_line_k_factor=bdrc_line_k_factor,
+        bdrc_line_bbox_tolerance=bdrc_line_bbox_tolerance,
+        bdrc_line_use_tps=bdrc_line_use_tps,
+        bdrc_line_tps_threshold=bdrc_line_tps_threshold,
         device=device if device != "auto" else "",
     )
     rows: List[Dict[str, Any]] = []
@@ -1639,6 +1680,11 @@ def _run_comparison(
     line_segmentation_preprocess: str,
     line_model: str,
     bdrc_line_model: str,
+    bdrc_line_merge_lines: bool,
+    bdrc_line_k_factor: float,
+    bdrc_line_bbox_tolerance: float,
+    bdrc_line_use_tps: bool,
+    bdrc_line_tps_threshold: float,
     device: str,
     max_len: int,
     preprocess_preset: str = "bdrc",
@@ -1683,6 +1729,11 @@ def _run_comparison(
         layout_model=layout_model,
         line_model=line_model,
         bdrc_line_model=bdrc_line_model,
+        bdrc_line_merge_lines=bdrc_line_merge_lines,
+        bdrc_line_k_factor=bdrc_line_k_factor,
+        bdrc_line_bbox_tolerance=bdrc_line_bbox_tolerance,
+        bdrc_line_use_tps=bdrc_line_use_tps,
+        bdrc_line_tps_threshold=bdrc_line_tps_threshold,
         device=device if device != "auto" else "",
     )
 
@@ -1846,6 +1897,11 @@ def _manual_click(
     line_segmentation_preprocess: str,
     line_model: str,
     bdrc_line_model: str,
+    bdrc_line_merge_lines: bool,
+    bdrc_line_k_factor: float,
+    bdrc_line_bbox_tolerance: float,
+    bdrc_line_use_tps: bool,
+    bdrc_line_tps_threshold: float,
     device: str,
     max_len: int,
     preprocess_preset: str,
@@ -1940,6 +1996,11 @@ def _manual_click(
         line_segmentation_preprocess,
         line_model,
         bdrc_line_model,
+        bdrc_line_merge_lines,
+        bdrc_line_k_factor,
+        bdrc_line_bbox_tolerance,
+        bdrc_line_use_tps,
+        bdrc_line_tps_threshold,
         device,
         max_len,
         roi,
@@ -1958,6 +2019,11 @@ def _manual_process_roi(
     line_segmentation_preprocess: str,
     line_model: str,
     bdrc_line_model: str,
+    bdrc_line_merge_lines: bool,
+    bdrc_line_k_factor: float,
+    bdrc_line_bbox_tolerance: float,
+    bdrc_line_use_tps: bool,
+    bdrc_line_tps_threshold: float,
     device: str,
     max_len: int,
     roi: Optional[List[int]],
@@ -2051,6 +2117,11 @@ def _manual_process_roi(
                     roi_crop,
                     model_path=bdrc_line_model,
                     device=device,
+                    group_lines=bool(bdrc_line_merge_lines),
+                    k_factor=float(bdrc_line_k_factor),
+                    bbox_tolerance=float(bdrc_line_bbox_tolerance),
+                    use_tps=bool(bdrc_line_use_tps),
+                    tps_threshold=float(bdrc_line_tps_threshold),
                 )
                 line_rows_local = _rows_from_bdrc_line_predictions(
                     predictions,
@@ -2228,6 +2299,11 @@ def _manual_full_image_roi(
     line_segmentation_preprocess_s: str,
     line_model_s: str,
     bdrc_line_model_s: str,
+    bdrc_line_merge_lines_s: bool,
+    bdrc_line_k_factor_s: float,
+    bdrc_line_bbox_tolerance_s: float,
+    bdrc_line_use_tps_s: bool,
+    bdrc_line_tps_threshold_s: float,
     device_s: str,
     max_len_s: int,
     preprocess_preset: str = "bdrc",
@@ -2252,6 +2328,11 @@ def _manual_full_image_roi(
         line_segmentation_preprocess_s,
         line_model_s,
         bdrc_line_model_s,
+        bdrc_line_merge_lines_s,
+        float(bdrc_line_k_factor_s),
+        float(bdrc_line_bbox_tolerance_s),
+        bool(bdrc_line_use_tps_s),
+        float(bdrc_line_tps_threshold_s),
         device_s,
         int(max_len_s),
         [0, 0, w, h],
@@ -2687,6 +2768,37 @@ function() {
         with gr.Row(visible=False) as advanced_runtime_row:
             device = gr.Dropdown(choices=["auto", "cuda:0", "cpu"], value="auto", label="Inference Device")
             max_len = gr.Number(label="OCR generation_max_length (DONUT only)", value=160, precision=0)
+        with gr.Row(visible=False) as advanced_bdrc_line_row:
+            bdrc_line_merge_lines = gr.Checkbox(
+                value=DEFAULT_BDRC_LINE_MERGE_LINES,
+                label="BDRC merge_lines",
+            )
+            bdrc_line_use_tps = gr.Checkbox(
+                value=bool(DEFAULT_BDRC_LINE_USE_TPS),
+                label="BDRC dewarp (TPS)",
+            )
+            bdrc_line_tps_threshold = gr.Slider(
+                minimum=0.0,
+                maximum=1.0,
+                step=0.01,
+                value=float(DEFAULT_BDRC_LINE_TPS_THRESHOLD),
+                label="BDRC tps_threshold",
+            )
+        with gr.Row(visible=False) as advanced_bdrc_line_crop_row:
+            bdrc_line_k_factor = gr.Slider(
+                minimum=0.5,
+                maximum=5.0,
+                step=0.1,
+                value=float(DEFAULT_BDRC_LINE_K_FACTOR),
+                label="BDRC k_factor",
+            )
+            bdrc_line_bbox_tolerance = gr.Slider(
+                minimum=1.0,
+                maximum=6.0,
+                step=0.1,
+                value=float(DEFAULT_BDRC_LINE_BBOX_TOLERANCE),
+                label="BDRC bbox_tolerance",
+            )
         with gr.Row(visible=False) as advanced_preprocess_select_row:
             preprocess_preset = gr.Dropdown(
                 choices=[("bdrc", "bdrc"), ("gray", "gray"), ("RGB", "rgb")],
@@ -2950,6 +3062,11 @@ function() {
             line_segmentation_preprocess_s: str,
             line_model_s: str,
             bdrc_line_model_s: str,
+            bdrc_line_merge_lines_s: bool,
+            bdrc_line_k_factor_s: float,
+            bdrc_line_bbox_tolerance_s: float,
+            bdrc_line_use_tps_s: bool,
+            bdrc_line_tps_threshold_s: float,
             device_s: str,
             max_len_s: int,
             preprocess_preset_s: str,
@@ -3028,6 +3145,11 @@ function() {
                     line_segmentation_preprocess_s,
                     line_model_s,
                     bdrc_line_model_s,
+                    bool(bdrc_line_merge_lines_s),
+                    float(bdrc_line_k_factor_s),
+                    float(bdrc_line_bbox_tolerance_s),
+                    bool(bdrc_line_use_tps_s),
+                    float(bdrc_line_tps_threshold_s),
                     device_s,
                     int(max_len_s),
                     preprocess_preset=preproc_mode,
@@ -3075,8 +3197,125 @@ function() {
                 state_s.get("last_donut_post"),
             )
 
+        def _run_with_status(
+            mode_s: str,
+            state_s: Dict[str, Any],
+            ocr_engine_s: str,
+            donut_s: str,
+            bdrc_ocr_model_s: str,
+            layout_s: str,
+            line_segmentation_mode_s: str,
+            line_segmentation_preprocess_s: str,
+            line_model_s: str,
+            bdrc_line_model_s: str,
+            bdrc_line_merge_lines_s: bool,
+            bdrc_line_k_factor_s: float,
+            bdrc_line_bbox_tolerance_s: float,
+            bdrc_line_use_tps_s: bool,
+            bdrc_line_tps_threshold_s: float,
+            device_s: str,
+            max_len_s: int,
+            preprocess_preset_s: str,
+            gray_mode_s: str,
+            normalize_background_s: bool,
+            background_blur_ksize_s: int,
+            background_strength_s: float,
+            upscale_factor_s: float,
+            upscale_interpolation_s: str,
+            binarize_s: bool,
+            threshold_method_s: str,
+            threshold_block_size_s: int,
+            threshold_c_s: int,
+            fixed_threshold_s: int,
+            morph_close_s: bool,
+            morph_close_kernel_s: int,
+            remove_small_components_s: bool,
+            min_component_area_s: int,
+            rgb_preserve_color_s: bool,
+            rgb_normalize_bg_s: bool,
+            rgb_background_method_s: str,
+            rgb_bg_blur_ksize_s: int,
+            rgb_bg_strength_s: float,
+            rgb_contrast_s: float,
+            rgb_denoise_s: bool,
+            rgb_morph_close_s: bool,
+            rgb_morph_close_kernel_s: int,
+            rgb_remove_small_components_s: bool,
+            rgb_min_component_area_s: int,
+            rgb_upscale_factor_s: float,
+            rgb_upscale_interp_s: str,
+            rgb_ink_normalization_s: bool,
+            rgb_ink_strength_s: float,
+        ):
+            pending_notes = _pending_bdrc_setup_messages(
+                ocr_engine=ocr_engine_s,
+                bdrc_ocr_model=bdrc_ocr_model_s,
+                line_segmentation_mode=line_segmentation_mode_s,
+                bdrc_line_model=bdrc_line_model_s,
+            )
+            status_msg = " ".join(pending_notes) if pending_notes else "Running OCR..."
+            yield (
+                gr.update(),
+                gr.update(),
+                status_msg,
+                state_s,
+                gr.update(),
+                gr.update(),
+                gr.update(),
+            )
+            yield _run(
+                mode_s,
+                state_s,
+                ocr_engine_s,
+                donut_s,
+                bdrc_ocr_model_s,
+                layout_s,
+                line_segmentation_mode_s,
+                line_segmentation_preprocess_s,
+                line_model_s,
+                bdrc_line_model_s,
+                bdrc_line_merge_lines_s,
+                bdrc_line_k_factor_s,
+                bdrc_line_bbox_tolerance_s,
+                bdrc_line_use_tps_s,
+                bdrc_line_tps_threshold_s,
+                device_s,
+                max_len_s,
+                preprocess_preset_s,
+                gray_mode_s,
+                normalize_background_s,
+                background_blur_ksize_s,
+                background_strength_s,
+                upscale_factor_s,
+                upscale_interpolation_s,
+                binarize_s,
+                threshold_method_s,
+                threshold_block_size_s,
+                threshold_c_s,
+                fixed_threshold_s,
+                morph_close_s,
+                morph_close_kernel_s,
+                remove_small_components_s,
+                min_component_area_s,
+                rgb_preserve_color_s,
+                rgb_normalize_bg_s,
+                rgb_background_method_s,
+                rgb_bg_blur_ksize_s,
+                rgb_bg_strength_s,
+                rgb_contrast_s,
+                rgb_denoise_s,
+                rgb_morph_close_s,
+                rgb_morph_close_kernel_s,
+                rgb_remove_small_components_s,
+                rgb_min_component_area_s,
+                rgb_upscale_factor_s,
+                rgb_upscale_interp_s,
+                rgb_ink_normalization_s,
+                rgb_ink_strength_s,
+            )
+
         _run_evt = run_btn.click(
-            fn=_run,
+            fn=_run_with_status,
             inputs=[
                 mode,
                 state,
@@ -3088,6 +3327,11 @@ function() {
                 line_model_preprocess,
                 line_model_path,
                 bdrc_line_model_path,
+                bdrc_line_merge_lines,
+                bdrc_line_k_factor,
+                bdrc_line_bbox_tolerance,
+                bdrc_line_use_tps,
+                bdrc_line_tps_threshold,
                 device,
                 max_len,
                 preprocess_preset,
@@ -3141,6 +3385,11 @@ function() {
             line_segmentation_preprocess_s: str,
             line_model_s: str,
             bdrc_line_model_s: str,
+            bdrc_line_merge_lines_s: bool,
+            bdrc_line_k_factor_s: float,
+            bdrc_line_bbox_tolerance_s: float,
+            bdrc_line_use_tps_s: bool,
+            bdrc_line_tps_threshold_s: float,
             device_s: str,
             max_len_s: int,
             preprocess_preset_s: str,
@@ -3369,6 +3618,11 @@ function() {
                 line_segmentation_preprocess_s,
                 line_model_s,
                 bdrc_line_model_s,
+                bool(bdrc_line_merge_lines_s),
+                float(bdrc_line_k_factor_s),
+                float(bdrc_line_bbox_tolerance_s),
+                bool(bdrc_line_use_tps_s),
+                float(bdrc_line_tps_threshold_s),
                 device_s,
                 int(max_len_s),
                 preproc_mode,
@@ -3390,6 +3644,11 @@ function() {
                 line_model_preprocess,
                 line_model_path,
                 bdrc_line_model_path,
+                bdrc_line_merge_lines,
+                bdrc_line_k_factor,
+                bdrc_line_bbox_tolerance,
+                bdrc_line_use_tps,
+                bdrc_line_tps_threshold,
                 device,
                 max_len,
                 preprocess_preset,
@@ -3442,6 +3701,11 @@ function() {
             line_segmentation_preprocess_s: str,
             line_model_s: str,
             bdrc_line_model_s: str,
+            bdrc_line_merge_lines_s: bool,
+            bdrc_line_k_factor_s: float,
+            bdrc_line_bbox_tolerance_s: float,
+            bdrc_line_use_tps_s: bool,
+            bdrc_line_tps_threshold_s: float,
             device_s: str,
             max_len_s: int,
             preprocess_preset_s: str,
@@ -3519,6 +3783,11 @@ function() {
                 line_segmentation_preprocess_s,
                 line_model_s,
                 bdrc_line_model_s,
+                bool(bdrc_line_merge_lines_s),
+                float(bdrc_line_k_factor_s),
+                float(bdrc_line_bbox_tolerance_s),
+                bool(bdrc_line_use_tps_s),
+                float(bdrc_line_tps_threshold_s),
                 device_s,
                 int(max_len_s),
                 preprocess_preset=preproc_mode,
@@ -3538,6 +3807,11 @@ function() {
                 line_model_preprocess,
                 line_model_path,
                 bdrc_line_model_path,
+                bdrc_line_merge_lines,
+                bdrc_line_k_factor,
+                bdrc_line_bbox_tolerance,
+                bdrc_line_use_tps,
+                bdrc_line_tps_threshold,
                 device,
                 max_len,
                 preprocess_preset,
@@ -3588,6 +3862,11 @@ function() {
             line_segmentation_preprocess_s: str,
             line_model_s: str,
             bdrc_line_model_s: str,
+            bdrc_line_merge_lines_s: bool,
+            bdrc_line_k_factor_s: float,
+            bdrc_line_bbox_tolerance_s: float,
+            bdrc_line_use_tps_s: bool,
+            bdrc_line_tps_threshold_s: float,
             device_s: str,
             max_len_s: int,
             preprocess_preset_s: str,
@@ -3663,6 +3942,11 @@ function() {
                 line_segmentation_preprocess_s,
                 line_model_s,
                 bdrc_line_model_s,
+                bool(bdrc_line_merge_lines_s),
+                float(bdrc_line_k_factor_s),
+                float(bdrc_line_bbox_tolerance_s),
+                bool(bdrc_line_use_tps_s),
+                float(bdrc_line_tps_threshold_s),
                 device_s,
                 int(max_len_s),
                 preprocess_preset=preproc_mode,
@@ -3680,6 +3964,11 @@ function() {
                 line_model_preprocess,
                 line_model_path,
                 bdrc_line_model_path,
+                bdrc_line_merge_lines,
+                bdrc_line_k_factor,
+                bdrc_line_bbox_tolerance,
+                bdrc_line_use_tps,
+                bdrc_line_tps_threshold,
                 device,
                 max_len,
                 preprocess_preset,
@@ -3803,6 +4092,8 @@ function() {
                 gr.update(visible=visible),       # advanced_bdrc_model_row
                 gr.update(visible=visible),       # advanced_scan_row
                 gr.update(visible=visible),       # advanced_runtime_row
+                gr.update(visible=visible),       # advanced_bdrc_line_row
+                gr.update(visible=visible),       # advanced_bdrc_line_crop_row
                 gr.update(visible=visible),       # advanced_preprocess_select_row
                 gr.update(visible=show_bdrc),     # advanced_bdrc_row
                 gr.update(visible=show_rgb),      # advanced_rgb_row
@@ -3822,6 +4113,8 @@ function() {
                 advanced_bdrc_model_row,
                 advanced_scan_row,
                 advanced_runtime_row,
+                advanced_bdrc_line_row,
+                advanced_bdrc_line_crop_row,
                 advanced_preprocess_select_row,
                 advanced_bdrc_row,
                 advanced_rgb_row,
@@ -3871,34 +4164,40 @@ function() {
         def _refresh_bdrc_ocr_model():
             choices, msg = _list_bdrc_ocr_models()
             best = choices[0][1] if choices else ""
-            return gr.update(choices=choices, value=best), msg
+            return gr.update(choices=choices, value=best), msg, msg
 
         def _refresh_bdrc_line_model():
             choices, msg = _list_bdrc_line_models()
             best = choices[0][1] if choices else ""
-            return gr.update(choices=choices, value=best), msg
+            return gr.update(choices=choices, value=best), msg, msg
 
         def _maybe_auto_download_bdrc_ocr_models(engine_s: str, current_path: str):
             if _normalize_ocr_engine(engine_s) != OCR_ENGINE_BDRC:
-                return gr.update(), gr.update()
+                yield gr.update(), gr.update(), gr.update()
+                return
+            yield gr.update(), gr.update(), "Preparing default BDRC OCR model..."
             try:
                 chosen, note = _ensure_default_bdrc_ocr_model_path(current_path)
                 choices, msg = _list_bdrc_ocr_models()
-                status = msg if not note else f"{msg} | {note}"
-                return gr.update(choices=choices, value=chosen), status
+                status_msg = msg if not note else f"{msg} | {note}"
+                yield gr.update(choices=choices, value=chosen), status_msg, status_msg
             except Exception as exc:
-                return gr.update(), f"BDRC OCR auto-download failed: {type(exc).__name__}: {exc}"
+                error_msg = f"BDRC OCR auto-download failed: {type(exc).__name__}: {exc}"
+                yield gr.update(), error_msg, error_msg
 
         def _maybe_auto_download_bdrc_line_models(mode_s: str, current_path: str):
             if _normalize_line_segmentation_mode(mode_s) != LINE_SEG_BDRC:
-                return gr.update(), gr.update()
+                yield gr.update(), gr.update(), gr.update()
+                return
+            yield gr.update(), gr.update(), "Preparing default BDRC line model..."
             try:
                 chosen, note = _ensure_default_bdrc_line_model_path(current_path)
                 choices, msg = _list_bdrc_line_models()
-                status = msg if not note else f"{msg} | {note}"
-                return gr.update(choices=choices, value=chosen), status
+                status_msg = msg if not note else f"{msg} | {note}"
+                yield gr.update(choices=choices, value=chosen), status_msg, status_msg
             except Exception as exc:
-                return gr.update(), f"BDRC line auto-download failed: {type(exc).__name__}: {exc}"
+                error_msg = f"BDRC line auto-download failed: {type(exc).__name__}: {exc}"
+                yield gr.update(), error_msg, error_msg
 
         donut_refresh_btn.click(
             fn=_refresh_donut,
@@ -3921,25 +4220,25 @@ function() {
         bdrc_ocr_refresh_btn.click(
             fn=_refresh_bdrc_ocr_model,
             inputs=[],
-            outputs=[bdrc_ocr_model_path, bdrc_ocr_info],
+            outputs=[bdrc_ocr_model_path, bdrc_ocr_info, status],
         )
 
         bdrc_line_model_refresh_btn.click(
             fn=_refresh_bdrc_line_model,
             inputs=[],
-            outputs=[bdrc_line_model_path, bdrc_line_model_info],
+            outputs=[bdrc_line_model_path, bdrc_line_model_info, status],
         )
 
         ocr_engine.change(
             fn=_maybe_auto_download_bdrc_ocr_models,
             inputs=[ocr_engine, bdrc_ocr_model_path],
-            outputs=[bdrc_ocr_model_path, bdrc_ocr_info],
+            outputs=[bdrc_ocr_model_path, bdrc_ocr_info, status],
         )
 
         line_segmentation_mode.change(
             fn=_maybe_auto_download_bdrc_line_models,
             inputs=[line_segmentation_mode, bdrc_line_model_path],
-            outputs=[bdrc_line_model_path, bdrc_line_model_info],
+            outputs=[bdrc_line_model_path, bdrc_line_model_info, status],
         )
 
         # ── Auto-load repro settings whenever the DONUT checkpoint changes ──
@@ -4172,6 +4471,11 @@ function() {
             line_segmentation_preprocess_s: str,
             line_model_s: str,
             bdrc_line_model_s: str,
+            bdrc_line_merge_lines_s: bool,
+            bdrc_line_k_factor_s: float,
+            bdrc_line_bbox_tolerance_s: float,
+            bdrc_line_use_tps_s: bool,
+            bdrc_line_tps_threshold_s: float,
             device_s: str,
             max_len_s: int,
             preprocess_preset_s: str,
@@ -4274,6 +4578,11 @@ function() {
                 line_segmentation_preprocess_s,
                 line_model_s,
                 bdrc_line_model_s,
+                bool(bdrc_line_merge_lines_s),
+                float(bdrc_line_k_factor_s),
+                float(bdrc_line_bbox_tolerance_s),
+                bool(bdrc_line_use_tps_s),
+                float(bdrc_line_tps_threshold_s),
                 device_s,
                 int(max_len_s),
                 preprocess_preset=preproc_mode,
@@ -4294,6 +4603,11 @@ function() {
                 line_model_preprocess,
                 line_model_path,
                 bdrc_line_model_path,
+                bdrc_line_merge_lines,
+                bdrc_line_k_factor,
+                bdrc_line_bbox_tolerance,
+                bdrc_line_use_tps,
+                bdrc_line_tps_threshold,
                 device,
                 max_len,
                 preprocess_preset,

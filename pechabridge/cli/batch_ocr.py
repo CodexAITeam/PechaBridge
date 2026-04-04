@@ -553,6 +553,9 @@ def _detect_lines_bdrc(
     k_factor: float,
     bbox_tolerance: float,
     class_threshold: float,
+    merge_lines: bool,
+    use_tps: bool,
+    tps_threshold: float,
 ) -> List[Dict[str, Any]]:
     from pechabridge.ocr.bdrc_inference import predict_bdrc_line_regions
 
@@ -561,9 +564,11 @@ def _detect_lines_bdrc(
         model_path=bdrc_line_model_path,
         device=device,
         class_threshold=class_threshold,
-        group_lines=True,
+        group_lines=bool(merge_lines),
         k_factor=k_factor,
         bbox_tolerance=bbox_tolerance,
+        use_tps=bool(use_tps),
+        tps_threshold=float(tps_threshold),
     )
     records: List[Dict[str, Any]] = []
     for idx, pred in enumerate(predictions, start=1):
@@ -705,6 +710,9 @@ def _ocr_image(
     bdrc_line_k_factor: float = 2.5,
     bdrc_line_bbox_tolerance: float = 3.0,
     bdrc_line_class_threshold: float = 0.0,
+    bdrc_line_merge_lines: bool = True,
+    bdrc_line_use_tps: bool = True,
+    bdrc_line_tps_threshold: float = 0.25,
 ) -> Tuple[str, int]:
     """Run full OCR on a single image.
 
@@ -741,6 +749,9 @@ def _ocr_image(
             k_factor=bdrc_line_k_factor,
             bbox_tolerance=bdrc_line_bbox_tolerance,
             class_threshold=bdrc_line_class_threshold,
+            merge_lines=bdrc_line_merge_lines,
+            use_tps=bdrc_line_use_tps,
+            tps_threshold=bdrc_line_tps_threshold,
         )
     else:
         line_records = _detect_lines_classical(img_np, layout_model_path, device)
@@ -881,6 +892,9 @@ def run(args: argparse.Namespace) -> int:
     bdrc_line_k_factor = float(getattr(args, "bdrc_line_k_factor", 2.5) or 2.5)
     bdrc_line_bbox_tolerance = float(getattr(args, "bdrc_line_bbox_tolerance", 3.0) or 3.0)
     bdrc_line_class_threshold = float(getattr(args, "bdrc_line_class_threshold", 0.0) or 0.0)
+    bdrc_line_merge_lines = bool(getattr(args, "bdrc_line_merge_lines", True))
+    bdrc_line_use_tps = bool(getattr(args, "bdrc_line_use_tps", True))
+    bdrc_line_tps_threshold = float(getattr(args, "bdrc_line_tps_threshold", 0.25) or 0.25)
 
     # Tesseract OCR-specific args
     tess_lang = str(getattr(args, "tess_lang", "bod") or "bod").strip()
@@ -1113,7 +1127,10 @@ def run(args: argparse.Namespace) -> int:
             "--bdrc-line-k-factor", str(bdrc_line_k_factor),
             "--bdrc-line-bbox-tolerance", str(bdrc_line_bbox_tolerance),
             "--bdrc-line-class-threshold", str(bdrc_line_class_threshold),
+            "--bdrc-line-tps-threshold", str(bdrc_line_tps_threshold),
         ]
+        cli_argv_repro += ["--bdrc-line-merge-lines"] if bdrc_line_merge_lines else ["--bdrc-line-no-merge-lines"]
+        cli_argv_repro += ["--bdrc-line-use-tps"] if bdrc_line_use_tps else ["--bdrc-line-no-use-tps"]
     if engine == "tesseract":
         cli_argv_repro += [
             "--tess-lang", tess_lang,
@@ -1183,6 +1200,9 @@ def run(args: argparse.Namespace) -> int:
                 bdrc_line_k_factor=bdrc_line_k_factor,
                 bdrc_line_bbox_tolerance=bdrc_line_bbox_tolerance,
                 bdrc_line_class_threshold=bdrc_line_class_threshold,
+                bdrc_line_merge_lines=bdrc_line_merge_lines,
+                bdrc_line_use_tps=bdrc_line_use_tps,
+                bdrc_line_tps_threshold=bdrc_line_tps_threshold,
             )
             total_lines += n_lines
         except Exception as exc:
@@ -1336,6 +1356,44 @@ def create_parser(add_help: bool = True) -> argparse.ArgumentParser:
             "Optional explicit class threshold for BDRC line/layout ONNX inference. "
             "0.0 means use backend defaults."
         ),
+    )
+    parser.add_argument(
+        "--bdrc-line-merge-lines",
+        "--bdrc_line_merge_lines",
+        dest="bdrc_line_merge_lines",
+        action="store_true",
+        default=True,
+        help="Merge fragmented BDRC contours into single lines before OCR. Default: enabled.",
+    )
+    parser.add_argument(
+        "--bdrc-line-no-merge-lines",
+        "--bdrc_line_no_merge_lines",
+        dest="bdrc_line_merge_lines",
+        action="store_false",
+        help="Disable contour grouping for BDRC line detection.",
+    )
+    parser.add_argument(
+        "--bdrc-line-use-tps",
+        "--bdrc_line_use_tps",
+        dest="bdrc_line_use_tps",
+        action="store_true",
+        default=True,
+        help="Enable BDRC global TPS dewarping before final line extraction. Default: enabled.",
+    )
+    parser.add_argument(
+        "--bdrc-line-no-use-tps",
+        "--bdrc_line_no_use_tps",
+        dest="bdrc_line_use_tps",
+        action="store_false",
+        help="Disable BDRC global TPS dewarping.",
+    )
+    parser.add_argument(
+        "--bdrc-line-tps-threshold",
+        "--bdrc_line_tps_threshold",
+        dest="bdrc_line_tps_threshold",
+        type=float,
+        default=0.25,
+        help="Minimum curved-line ratio required before BDRC TPS dewarping is applied. Default: 0.25.",
     )
     parser.add_argument(
         "--input-dir",

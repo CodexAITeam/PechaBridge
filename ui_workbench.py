@@ -101,12 +101,20 @@ except Exception:
 
 try:
     from pechabridge.ocr.bdrc_inference import (
+        DEFAULT_BDRC_LINE_BBOX_TOLERANCE as _DEFAULT_BDRC_LINE_BBOX_TOLERANCE,
+        DEFAULT_BDRC_LINE_K_FACTOR as _DEFAULT_BDRC_LINE_K_FACTOR,
+        DEFAULT_BDRC_LINE_TPS_THRESHOLD as _DEFAULT_BDRC_LINE_TPS_THRESHOLD,
+        DEFAULT_BDRC_LINE_USE_TPS as _DEFAULT_BDRC_LINE_USE_TPS,
         find_bdrc_line_model_dirs as _find_bdrc_line_model_dirs,
         find_bdrc_ocr_model_dirs as _find_bdrc_ocr_model_dirs,
         predict_bdrc_line_regions as _predict_bdrc_line_regions,
         run_bdrc_ocr as _run_bdrc_ocr,
     )
 except Exception:
+    _DEFAULT_BDRC_LINE_BBOX_TOLERANCE = 3.0
+    _DEFAULT_BDRC_LINE_K_FACTOR = 2.5
+    _DEFAULT_BDRC_LINE_TPS_THRESHOLD = 0.25
+    _DEFAULT_BDRC_LINE_USE_TPS = True
     _find_bdrc_line_model_dirs = None
     _find_bdrc_ocr_model_dirs = None
     _predict_bdrc_line_regions = None
@@ -125,6 +133,7 @@ except Exception:
 
 
 ROOT = Path(__file__).resolve().parent
+_DEFAULT_BDRC_LINE_MERGE_LINES = True
 DEFAULT_TEXTURE_PROMPT = (
     "scanned printed Tibetan pecha page, paper texture, ink bleed, aged grayscale scan, "
     "realistic Tibetan glyph stroke thickness, subtle hand-written-like ink edge variation"
@@ -4093,6 +4102,11 @@ def run_page_line_donut_ocr_preview_ui(
     yolo_line_model_path: str,
     yolo_line_preproc: str,
     bdrc_line_model_path: str,
+    bdrc_line_merge_lines: bool,
+    bdrc_line_k_factor: float,
+    bdrc_line_bbox_tolerance: float,
+    bdrc_line_use_tps: bool,
+    bdrc_line_tps_threshold: float,
     line_conf: float,
     line_imgsz: int,
     line_device: str,
@@ -4304,6 +4318,11 @@ def run_page_line_donut_ocr_preview_ui(
                 src,
                 model_path=bdrc_line_model_path,
                 device=line_device_norm,
+                group_lines=bool(bdrc_line_merge_lines),
+                k_factor=float(bdrc_line_k_factor),
+                bbox_tolerance=float(bdrc_line_bbox_tolerance),
+                use_tps=bool(bdrc_line_use_tps),
+                tps_threshold=float(bdrc_line_tps_threshold),
             )
             for idx, pred in enumerate(predictions, start=1):
                 box = list(getattr(pred, "box", []) or [])
@@ -4322,6 +4341,8 @@ def run_page_line_donut_ocr_preview_ui(
                     rec["ocr_crop"] = np.asarray(crop_image).astype(np.uint8, copy=False)
                 parsed_lines.append(rec)
             split_status = f"Detected {len(parsed_lines)} line(s) with BDRC line model."
+            if bool((split_json_obj or {}).get("tps_applied")):
+                split_status += " TPS dewarping applied."
         except Exception as exc:
             debug = {"ok": False, "mode": mode, "ocr_engine": engine, "line_backend": backend, "error": f"{type(exc).__name__}: {exc}"}
             return overlay, f"BDRC line inference failed: {exc}", "", empty_html, json.dumps(debug, ensure_ascii=False, indent=2)
@@ -11137,6 +11158,37 @@ def build_ui() -> gr.Blocks:
                             label="line_device",
                         )
                         with gr.Row():
+                            lineocr_bdrc_merge_lines = gr.Checkbox(
+                                label="bdrc_merge_lines",
+                                value=_DEFAULT_BDRC_LINE_MERGE_LINES,
+                            )
+                            lineocr_bdrc_use_tps = gr.Checkbox(
+                                label="bdrc_use_tps",
+                                value=bool(_DEFAULT_BDRC_LINE_USE_TPS),
+                            )
+                            lineocr_bdrc_tps_threshold = gr.Slider(
+                                0.0,
+                                1.0,
+                                value=float(_DEFAULT_BDRC_LINE_TPS_THRESHOLD),
+                                step=0.01,
+                                label="bdrc_tps_threshold",
+                            )
+                        with gr.Row():
+                            lineocr_bdrc_k_factor = gr.Slider(
+                                0.5,
+                                5.0,
+                                value=float(_DEFAULT_BDRC_LINE_K_FACTOR),
+                                step=0.1,
+                                label="bdrc_k_factor",
+                            )
+                            lineocr_bdrc_bbox_tolerance = gr.Slider(
+                                1.0,
+                                6.0,
+                                value=float(_DEFAULT_BDRC_LINE_BBOX_TOLERANCE),
+                                step=0.1,
+                                label="bdrc_bbox_tolerance",
+                            )
+                        with gr.Row():
                             lineocr_min_line_height = gr.Number(label="min_line_height_px", value=10, precision=0)
                             lineocr_merge_gap = gr.Number(label="line_merge_gap_px", value=5, precision=0)
                         with gr.Row():
@@ -11275,6 +11327,11 @@ def build_ui() -> gr.Blocks:
                     lineocr_yolo_line_model,
                     lineocr_yolo_line_preproc,
                     lineocr_bdrc_line_model,
+                    lineocr_bdrc_merge_lines,
+                    lineocr_bdrc_k_factor,
+                    lineocr_bdrc_bbox_tolerance,
+                    lineocr_bdrc_use_tps,
+                    lineocr_bdrc_tps_threshold,
                     lineocr_line_conf,
                     lineocr_line_imgsz,
                     lineocr_line_device,

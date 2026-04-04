@@ -41,6 +41,7 @@ DEFAULT_BDRC_LINE_SHA256 = "4862ced821dbac199608dbc0463fd984b7cb2ab202ecfdf3ca95
 DEFAULT_BDRC_LAYOUT_SHA256 = "645da1c27058c11adfbe254ef9b364f64c95748d2c94d4f9265294e4e83b033e"
 DEFAULT_BDRC_LINE_SIZE = 89724544
 DEFAULT_BDRC_LAYOUT_SIZE = 90467862
+DEFAULT_BDRC_DOWNLOAD_TIMEOUT = 30.0
 
 DEFAULT_BDRC_LINE_CONFIG = {
     "onnx-model": "PhotiLines.onnx",
@@ -86,6 +87,7 @@ def _download_url_to_path(
     *,
     expected_sha256: str | None = None,
     expected_size: int | None = None,
+    timeout: float = DEFAULT_BDRC_DOWNLOAD_TIMEOUT,
 ) -> Path:
     dest = dest.expanduser().resolve()
     dest.parent.mkdir(parents=True, exist_ok=True)
@@ -94,7 +96,7 @@ def _download_url_to_path(
         tmp.unlink()
 
     req = Request(str(url), headers={"User-Agent": "PechaBridge/1.0"})
-    with urlopen(req) as resp, tmp.open("wb") as fh:
+    with urlopen(req, timeout=float(timeout)) as resp, tmp.open("wb") as fh:
         while True:
             chunk = resp.read(1024 * 1024)
             if not chunk:

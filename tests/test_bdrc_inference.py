@@ -3,6 +3,9 @@ from __future__ import annotations
 import json
 from pathlib import Path
 
+import numpy as np
+
+import pechabridge.ocr.bdrc_inference as bdrc_inference
 from pechabridge.ocr.bdrc_inference import (
     find_bdrc_line_model_dirs,
     find_bdrc_ocr_model_dirs,
@@ -126,3 +129,29 @@ def test_find_bdrc_ocr_model_dirs(tmp_path: Path) -> None:
 
     found = find_bdrc_ocr_model_dirs(tmp_path)
     assert [p.name for p in found] == ["Pecha"]
+
+
+def test_run_tps_identity_mapping_preserves_image_geometry() -> None:
+    image = np.zeros((12, 16, 3), dtype=np.uint8)
+    image[2:10, 4:12, 0] = 180
+    image[5:8, 6:10, 1] = 255
+    ctrl = np.asarray(
+        [
+            [1.0, 1.0],
+            [1.0, 14.0],
+            [10.0, 1.0],
+            [10.0, 14.0],
+            [6.0, 8.0],
+        ],
+        dtype=np.float64,
+    )
+
+    warped, mapping = bdrc_inference._run_tps(image, ctrl, ctrl)
+
+    assert warped.shape == image.shape
+    assert warped.dtype == np.uint8
+    assert np.max(np.abs(warped.astype(np.int16) - image.astype(np.int16))) <= 1
+
+    pts = np.asarray([[6.0, 8.0], [3.0, 5.0]], dtype=np.float64)
+    mapped = mapping.transform(pts)
+    assert np.allclose(mapped, pts, atol=1e-3)
