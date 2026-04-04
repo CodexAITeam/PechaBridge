@@ -28,3 +28,16 @@ def test_expand_line_boxes_vertically_adds_thirty_percent_only_above() -> None:
     )
 
     assert expanded == [(5, 7, 25, 20)]
+
+
+def test_filter_margin_vertical_boxes_removes_tall_narrow_edge_boxes() -> None:
+    filtered = ui_workbench._filter_margin_vertical_boxes(
+        [
+            (0, 0, 14, 42),
+            (30, 10, 150, 24),
+            (186, 2, 198, 38),
+        ],
+        image_width=200,
+    )
+
+    assert filtered == [(30, 10, 150, 24)]

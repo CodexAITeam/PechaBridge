@@ -9539,6 +9539,35 @@ def _expand_line_boxes_vertically(
     return out
 
 
+def _filter_margin_vertical_boxes(
+    line_boxes: List[Tuple[int, int, int, int]],
+    *,
+    image_width: int,
+    edge_ratio: float = 0.08,
+    max_width_ratio: float = 0.20,
+    min_height_width_ratio: float = 1.15,
+) -> List[Tuple[int, int, int, int]]:
+    if not line_boxes:
+        return []
+
+    width_px = max(1, int(image_width))
+    edge_margin = max(6, int(math.ceil(width_px * max(0.0, float(edge_ratio)))))
+    max_box_width = max(12, int(math.ceil(width_px * max(0.0, float(max_width_ratio)))))
+    min_aspect = max(1.0, float(min_height_width_ratio))
+
+    kept: List[Tuple[int, int, int, int]] = []
+    for x1, y1, x2, y2 in line_boxes:
+        box_w = max(1, int(x2) - int(x1))
+        box_h = max(1, int(y2) - int(y1))
+        touches_margin = int(x1) <= edge_margin or int(x2) >= (width_px - edge_margin)
+        looks_vertical = box_h >= float(box_w) * min_aspect
+        looks_short = box_w <= max_box_width
+        if touches_margin and looks_vertical and looks_short:
+            continue
+        kept.append((int(x1), int(y1), int(x2), int(y2)))
+    return kept
+
+
 def _segment_lines_in_text_crop(
     crop_rgb: np.ndarray,
     min_line_height: int,
@@ -9667,6 +9696,9 @@ def _segment_lines_in_text_crop(
             tightened.append((tx1, ty1, tx2, ty2))
 
     filtered = _filter_line_boxes_by_mean_height(tightened, tolerance_ratio=0.50)
+    if not filtered:
+        return []
+    filtered = _filter_margin_vertical_boxes(filtered, image_width=w)
     if not filtered:
         return []
     return _expand_line_boxes_vertically(
