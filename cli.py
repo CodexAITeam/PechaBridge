@@ -34,6 +34,9 @@ from scripts.download_openpecha_line_segmentation import (
 from scripts.expand_line_segmentation_dataset import (
     create_parser as create_expand_line_segmentation_dataset_parser,
 )
+from scripts.filter_line_segmentation_dataset import (
+    create_parser as create_filter_line_segmentation_dataset_parser,
+)
 from scripts.download_bosentencepiece_tokenizer import (
     create_parser as create_download_bosentencepiece_tokenizer_parser,
 )
@@ -225,6 +228,16 @@ def _build_root_parser() -> argparse.ArgumentParser:
         description=expand_line_seg_parent.description,
     )
     expand_line_seg_parser.set_defaults(handler=_run_expand_line_segmentation_dataset)
+
+    filter_line_seg_parent = create_filter_line_segmentation_dataset_parser(add_help=False)
+    filter_line_seg_parser = subparsers.add_parser(
+        "filter-line-segmentation-dataset",
+        aliases=["filter-line-seg-dataset", "prune-line-segmentation-dataset"],
+        parents=[filter_line_seg_parent],
+        help="Write a new Ultralytics line-segmentation dataset with tall/narrow polygons removed",
+        description=filter_line_seg_parent.description,
+    )
+    filter_line_seg_parser.set_defaults(handler=_run_filter_line_segmentation_dataset)
 
     train_line_seg_parent = create_train_line_segmentation_parser(add_help=False)
     train_line_seg_parser = subparsers.add_parser(
@@ -429,6 +442,13 @@ def _run_download_openpecha_line_segmentation(args: argparse.Namespace) -> int:
 
 def _run_expand_line_segmentation_dataset(args: argparse.Namespace) -> int:
     from scripts.expand_line_segmentation_dataset import run
+
+    run(args)
+    return 0
+
+
+def _run_filter_line_segmentation_dataset(args: argparse.Namespace) -> int:
+    from scripts.filter_line_segmentation_dataset import run
 
     run(args)
     return 0

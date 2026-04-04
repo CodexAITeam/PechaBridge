@@ -238,6 +238,15 @@ python cli.py expand-line-segmentation-dataset \
   --bottom-ratio 0.20
 ```
 
+If you want to remove tall/narrow line polygons into a separate dataset root, use the dedicated filter CLI:
+
+```bash
+python cli.py filter-line-segmentation-dataset \
+  --dataset ./datasets/openpecha_line_segmentation_padded/data.yaml \
+  --output-dir ./datasets/openpecha_line_segmentation_padded_filtered \
+  --min-width-height-ratio 1.0
+```
+
 Train a YOLO segmentation model on the converted dataset. The line-image preprocessing now belongs to the
 training run, not to the downloader:
 
