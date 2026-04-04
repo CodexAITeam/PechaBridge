@@ -8,6 +8,7 @@ from datetime import datetime
 from pathlib import Path
 from typing import Any, Dict, List, Optional, Tuple
 
+
 import gradio as gr
 import numpy as np
 from PIL import Image, ImageDraw, ImageFont
@@ -48,6 +49,31 @@ ROOT = Path(__file__).resolve().parent
 MODE_AUTO = "Fully Automatic OCR"
 MODE_MANUAL = "Manual Mode"
 _DONUT_ACTIVE_RUNTIME: Dict[str, Any] = {"checkpoint": "", "runtime": None}
+
+_IMAGE_EXTENSIONS = {".jpg", ".jpeg", ".png", ".tif", ".tiff", ".bmp", ".webp"}
+
+
+def _scan_folder_for_images(folder_path: str) -> Tuple[List[str], str]:
+    """Scan *folder_path* for image files and return (sorted_paths, status_msg)."""
+    p = Path(folder_path).expanduser()
+    if not folder_path.strip():
+        return [], "Please enter a folder path."
+    if not p.exists():
+        return [], f"Folder not found: {folder_path}"
+    if not p.is_dir():
+        return [], f"Not a directory: {folder_path}"
+    found: List[str] = []
+    for child in sorted(p.iterdir()):
+        if child.is_file() and child.suffix.lower() in _IMAGE_EXTENSIONS:
+            found.append(str(child.resolve()))
+    if not found:
+        return [], f"No images found in {folder_path}"
+    return found, f"Found {len(found)} image(s) in {p.name}"
+
+
+def _make_thumbnails(image_paths: List[str]) -> List[Tuple[str, str]]:
+    """Return a list of (path, caption) tuples suitable for gr.Gallery."""
+    return [(p, Path(p).name) for p in image_paths]
 
 
 def _is_manual_mode(mode: str) -> bool:
@@ -124,12 +150,50 @@ def _pretty_model_label(full_path: str) -> str:
         return str(Path(*parts[-2:])) if len(parts) >= 2 else p.name
 
 
+def _resolve_best_symlink(candidate: Path) -> Optional[Path]:
+    """Resolve a ``best`` or ``best.pt`` symlink/path to a usable checkpoint path.
+
+    Handles three cases:
+    - ``best/``  — directory (real or symlink) → use as-is after resolving
+    - ``best.pt`` → symlink/file that resolves to a *directory* → use that directory
+    - ``best.pt`` → regular ``.pt`` weight file → use its parent directory
+    """
+    if not candidate.exists():
+        return None
+    try:
+        resolved = candidate.resolve()
+    except Exception:
+        return None
+    if resolved.is_dir():
+        return resolved
+    if resolved.is_file():
+        # Could be a symlink pointing to a .pt file; treat parent as checkpoint dir
+        return resolved.parent
+    return None
+
+
 def _list_donut_checkpoints() -> Tuple[List[Tuple[str, str]], str]:
-    """Return ([(label, full_path), ...] sorted best-first, status_message)."""
+    """Return ([(label, full_path), ...] sorted best-first, status_message).
+
+    Priority order:
+    1. ``models/ocr/best`` or ``models/ocr/best.pt`` (symlink or real file/dir)
+    2. All other repro checkpoints under ``models/ocr/`` (highest step first)
+    3. All other plain checkpoints under ``models/ocr/``
+    4. Same scan under ``models/`` as fallback
+    """
     preferred = (ROOT / "models" / "ocr").resolve()
     fallback_root = (ROOT / "models").resolve()
     repro_candidates: List[Path] = []
     plain_candidates: List[Path] = []
+
+    # ── Check for explicit best / best.pt shortcut (symlinks supported) ──
+    best_path: Optional[Path] = None
+    for _name in ("best", "best.pt"):
+        candidate = preferred / _name
+        resolved = _resolve_best_symlink(candidate)
+        if resolved is not None:
+            best_path = resolved
+            break
 
     def _scan_dir(base: Path) -> None:
         if not base.exists():
@@ -173,10 +237,18 @@ def _list_donut_checkpoints() -> Tuple[List[Tuple[str, str]], str]:
         (_pretty_model_label(str(p)), str(p)) for p in all_plain
     ]
 
+    # Prepend best entry at the front (remove duplicate if rglob already found it)
+    if best_path is not None:
+        best_str = str(best_path)
+        is_repro = _is_repro_checkpoint(best_path)
+        best_label = "ocr/best ✓" if is_repro else "ocr/best"
+        ordered = [(lbl, pth) for lbl, pth in ordered if pth != best_str]
+        ordered.insert(0, (best_label, best_str))
+
     if not ordered:
         return [], "No DONUT checkpoint found (expected under models/ocr/ or models/)."
 
-    tag = "repro" if all_repro else "plain"
+    tag = "best" if best_path is not None else ("repro" if all_repro else "plain")
     msg = f"Found {len(ordered)} DONUT checkpoint(s). Auto-selected ({tag}): {ordered[0][1]}"
     return ordered, msg
 
@@ -188,11 +260,25 @@ def _find_donut_checkpoint() -> Tuple[str, str]:
 
 
 def _list_layout_models() -> Tuple[List[Tuple[str, str]], str]:
-    """Return ([(label, full_path), ...] sorted, status_message)."""
+    """Return ([(label, full_path), ...] sorted, status_message).
+
+    ``models/layout/best.pt`` (real file or symlink) is always placed first.
+    """
     preferred = (ROOT / "models" / "layout").resolve()
     fallback_root = (ROOT / "models").resolve()
     model_exts = {".pt", ".onnx", ".torchscript"}
     candidates: List[Path] = []
+
+    # ── Explicit best.pt shortcut (symlinks supported) ────────────────────
+    best_path: Optional[Path] = None
+    _best_candidate = preferred / "best.pt"
+    if _best_candidate.exists() or _best_candidate.is_symlink():
+        try:
+            _resolved = _best_candidate.resolve()
+            if _resolved.is_file():
+                best_path = _resolved
+        except Exception:
+            pass
 
     def _scan(base: Path) -> None:
         if not base.exists():
@@ -211,12 +297,22 @@ def _list_layout_models() -> Tuple[List[Tuple[str, str]], str]:
     if not candidates:
         _scan(fallback_root)
 
-    if not candidates:
+    if not candidates and best_path is None:
         return [], "No layout analysis model found (expected under models/layout/)."
 
     ordered: List[Tuple[str, str]] = [
         (_pretty_model_label(str(p)), str(p)) for p in candidates
     ]
+
+    # Ensure best.pt is at the front (remove duplicate if rglob already found it)
+    if best_path is not None:
+        best_str = str(best_path)
+        ordered = [(lbl, pth) for lbl, pth in ordered if pth != best_str]
+        ordered.insert(0, ("layout/best.pt", best_str))
+
+    if not ordered:
+        return [], "No layout analysis model found (expected under models/layout/)."
+
     msg = f"Found {len(ordered)} layout model(s). Auto-selected: {ordered[0][1]}"
     return ordered, msg
 
@@ -1591,9 +1687,36 @@ def _save_results(
 
 
 def build_ui() -> gr.Blocks:
-    bdrc_defaults = _bdrc_ui_defaults()
-    rgb_defaults = _rgb_ui_defaults()
+    # ── Compute startup defaults ─────────────────────────────────────────
+    # Discover the best checkpoint first so we can load its repro pack
+    # immediately and use those values as the initial slider values.
+    _startup_donut_choices, _ = _list_donut_checkpoints()
+    _startup_donut_path = _startup_donut_choices[0][1] if _startup_donut_choices else ""
+    _startup_preset, _, _startup_bdrc, _startup_rgb = _load_repro_ui_settings(_startup_donut_path)
+
+    bdrc_defaults = _startup_bdrc
+    rgb_defaults = _startup_rgb
     ui_css = """
+/* ── Folder Browser ─────────────────────────────────────────────────── */
+#folder_gallery {
+  min-height: 160px;
+}
+#folder_gallery .thumbnail-item {
+  cursor: pointer;
+  border-radius: 6px;
+  overflow: hidden;
+  transition: box-shadow 0.15s ease;
+}
+#folder_gallery .thumbnail-item:hover {
+  box-shadow: 0 0 0 3px #6366f1;
+}
+#folder_gallery .thumbnail-item.selected {
+  box-shadow: 0 0 0 4px #6366f1;
+}
+#folder_path_input {
+  font-family: monospace;
+}
+/* ── Main image panel ───────────────────────────────────────────────── */
 #ocr_image_panel {
   width: 100% !important;
   border: 1px dashed #cbd5e1;
@@ -1750,36 +1873,79 @@ function() {
 """
 
     with gr.Blocks(title="OCR Workbench (DONUT)", css=ui_css, js=_image_zoom_js) as demo:
-        gr.Markdown("## OCR Workbench (DONUT + Layout)")
-        gr.Markdown(
-            "Automatic mode: layout -> line detection -> OCR. Manual mode: click an existing line or define an ROI with two clicks."
-        )
-        advanced_view = gr.Checkbox(label="Advanced View", value=False)
+        donut_ckpt_choices, donut_msg = _list_donut_checkpoints()
+        layout_model_choices, layout_msg = _list_layout_models()
+        _default_donut = donut_ckpt_choices[0][1] if donut_ckpt_choices else ""
+        _default_layout = layout_model_choices[0][1] if layout_model_choices else ""
+        _donut_label = donut_ckpt_choices[0][0] if donut_ckpt_choices else "—"
+        _layout_label = layout_model_choices[0][0] if layout_model_choices else "—"
 
-        with gr.Row():
+        # ── Top bar: title + model status + advanced toggle ─────────────────
+        with gr.Row(equal_height=True):
+            with gr.Column(scale=6):
+                gr.Markdown("## OCR Workbench (DONUT + Layout)")
+            with gr.Column(scale=4):
+                # ── Compact model info (shown in simple mode) ───────────────
+                with gr.Row() as model_info_row:
+                    gr.Markdown(
+                        f"🤖 `{_donut_label}`  &nbsp;|&nbsp;  📐 `{_layout_label}`",
+                        elem_id="model_info_md",
+                    )
+            with gr.Column(scale=1, min_width=140):
+                advanced_view = gr.Checkbox(label="Advanced View", value=False)
+
+        # ── Folder Browser ──────────────────────────────────────────────────
+        with gr.Accordion("📁 Folder Browser", open=True):
+            gr.Markdown(
+                "Enter a folder path to browse images. "
+                "Click a thumbnail to load it into the workbench below and automatically "
+                "run line segmentation + DONUT OCR."
+            )
+            with gr.Row():
+                folder_path_input = gr.Textbox(
+                    label="Image Folder",
+                    placeholder="/path/to/your/images",
+                    elem_id="folder_path_input",
+                    scale=8,
+                )
+                folder_scan_btn = gr.Button("🔍 Scan", variant="primary", scale=1, min_width=80)
+            folder_status = gr.Textbox(label="Status", interactive=False)
+            # Hidden state: list of full image paths in the scanned folder
+            folder_image_paths = gr.State([])
+            folder_gallery = gr.Gallery(
+                label="Images",
+                elem_id="folder_gallery",
+                columns=6,
+                rows=3,
+                object_fit="contain",
+                height="auto",
+                allow_preview=False,
+            )
+
+        # ── Advanced model selection (hidden in simple mode) ────────────────
+        with gr.Row(visible=False) as advanced_model_row:
             with gr.Column(scale=10):
-                donut_ckpt_choices, donut_msg = _list_donut_checkpoints()
                 # choices = [(label, full_path), ...]; value = full_path string
                 donut_path = gr.Dropdown(
                     label="DONUT Checkpoint",
                     choices=donut_ckpt_choices,
-                    value=donut_ckpt_choices[0][1] if donut_ckpt_choices else "",
+                    value=_default_donut,
                     allow_custom_value=True,
                 )
             with gr.Column(scale=1, min_width=110):
                 donut_refresh_btn = gr.Button("🔄 Refresh", variant="secondary")
                 load_repro_btn = gr.Button("📋 Load repro settings", variant="secondary")
             with gr.Column(scale=10):
-                layout_model_choices, layout_msg = _list_layout_models()
                 # choices = [(label, full_path), ...]; value = full_path string
                 layout_path = gr.Dropdown(
                     label="Layout Analysis Model",
                     choices=layout_model_choices,
-                    value=layout_model_choices[0][1] if layout_model_choices else "",
+                    value=_default_layout,
                     allow_custom_value=True,
                 )
             with gr.Column(scale=1, min_width=110):
                 layout_refresh_btn = gr.Button("🔄 Refresh", variant="secondary")
+
         with gr.Row(visible=False) as advanced_scan_row:
             donut_info = gr.Textbox(label="DONUT Auto-Scan", value=donut_msg, interactive=False)
             layout_info = gr.Textbox(label="Layout Auto-Scan", value=layout_msg, interactive=False)
@@ -1792,7 +1958,7 @@ function() {
         with gr.Row(visible=False) as advanced_preprocess_select_row:
             preprocess_preset = gr.Dropdown(
                 choices=[("bdrc", "bdrc"), ("gray", "gray"), ("RGB", "rgb")],
-                value="bdrc",
+                value=_startup_preset,
                 label="Preprocess Preset",
             )
         with gr.Row(visible=False) as advanced_bdrc_row:
@@ -2760,22 +2926,26 @@ function() {
             show_bdrc = visible and preproc_mode in {"bdrc", "gray"}
             show_rgb = visible and preproc_mode == "rgb"
             return (
-                gr.update(visible=visible),
-                gr.update(visible=visible),
-                gr.update(visible=visible),
-                gr.update(visible=show_bdrc),
-                gr.update(visible=show_rgb),
-                gr.update(visible=visible),
-                gr.update(visible=visible),
-                gr.update(visible=visible),
-                gr.update(visible=visible),
-                gr.update(visible=visible),
+                gr.update(visible=not visible),  # model_info_row  (simple summary)
+                gr.update(visible=visible),       # advanced_model_row
+                gr.update(visible=visible),       # advanced_scan_row
+                gr.update(visible=visible),       # advanced_runtime_row
+                gr.update(visible=visible),       # advanced_preprocess_select_row
+                gr.update(visible=show_bdrc),     # advanced_bdrc_row
+                gr.update(visible=show_rgb),      # advanced_rgb_row
+                gr.update(visible=visible),       # debug_json_accordion
+                gr.update(visible=visible),       # donut_input_before
+                gr.update(visible=visible),       # donut_input_after
+                gr.update(visible=visible),       # save_status
+                gr.update(visible=visible),       # advanced_debug_text_row
             )
 
         advanced_view.change(
             fn=_toggle_advanced,
             inputs=[advanced_view, preprocess_preset],
             outputs=[
+                model_info_row,
+                advanced_model_row,
                 advanced_scan_row,
                 advanced_runtime_row,
                 advanced_preprocess_select_row,
@@ -2811,7 +2981,6 @@ function() {
 
         def _refresh_donut():
             choices, msg = _list_donut_checkpoints()
-            # choices = [(label, full_path), ...]; pass full_path as value
             best = choices[0][1] if choices else ""
             return gr.update(choices=choices, value=best), msg
 
@@ -2830,6 +2999,62 @@ function() {
             fn=_refresh_layout,
             inputs=[],
             outputs=[layout_path, layout_info],
+        )
+
+        # ── Auto-load repro settings whenever the DONUT checkpoint changes ──
+        def _auto_load_repro(ckpt_path: str):
+            """Silently apply repro preprocess settings when checkpoint changes."""
+            preset, _msg, bdrc, rgb = _load_repro_ui_settings(ckpt_path or "")
+            return (
+                gr.update(value=preset),
+                gr.update(value=bdrc["gray_mode"]),
+                gr.update(value=bdrc["normalize_background"]),
+                gr.update(value=bdrc["background_blur_ksize"]),
+                gr.update(value=bdrc["background_strength"]),
+                gr.update(value=bdrc["upscale_factor"]),
+                gr.update(value=bdrc["upscale_interpolation"]),
+                gr.update(value=bdrc["binarize"]),
+                gr.update(value=bdrc["threshold_method"]),
+                gr.update(value=bdrc["threshold_block_size"]),
+                gr.update(value=bdrc["threshold_c"]),
+                gr.update(value=bdrc["fixed_threshold"]),
+                gr.update(value=bdrc["morph_close"]),
+                gr.update(value=bdrc["morph_close_kernel"]),
+                gr.update(value=bdrc["remove_small_components"]),
+                gr.update(value=bdrc["min_component_area"]),
+                gr.update(value=rgb["preserve_color"]),
+                gr.update(value=rgb["normalize_background"]),
+                gr.update(value=rgb["background_method"]),
+                gr.update(value=rgb["background_blur_ksize"]),
+                gr.update(value=rgb["background_strength"]),
+                gr.update(value=rgb["contrast"]),
+                gr.update(value=rgb["denoise"]),
+                gr.update(value=rgb["morph_close"]),
+                gr.update(value=rgb["morph_close_kernel"]),
+                gr.update(value=rgb["remove_small_components"]),
+                gr.update(value=rgb["min_component_area"]),
+                gr.update(value=rgb["upscale_factor"]),
+                gr.update(value=rgb["upscale_interpolation"]),
+                gr.update(value=rgb["ink_normalization"]),
+                gr.update(value=rgb["ink_strength"]),
+            )
+
+        donut_path.change(
+            fn=_auto_load_repro,
+            inputs=[donut_path],
+            outputs=[
+                preprocess_preset,
+                bdrc_gray_mode, bdrc_normalize_bg, bdrc_bg_blur_ksize,
+                bdrc_bg_strength, bdrc_upscale_factor, bdrc_upscale_interp,
+                bdrc_binarize, bdrc_threshold_method, bdrc_threshold_block,
+                bdrc_threshold_c, bdrc_fixed_threshold, bdrc_morph_close,
+                bdrc_morph_close_kernel, bdrc_remove_small_components, bdrc_min_component_area,
+                rgb_preserve_color, rgb_normalize_bg, rgb_background_method,
+                rgb_bg_blur_ksize, rgb_bg_strength, rgb_contrast,
+                rgb_denoise, rgb_morph_close, rgb_morph_close_kernel,
+                rgb_remove_small_components, rgb_min_component_area, rgb_upscale_factor,
+                rgb_upscale_interp, rgb_ink_normalization, rgb_ink_strength,
+            ],
         )
 
         def _on_load_repro(
@@ -2976,6 +3201,180 @@ function() {
                 rgb_ink_normalization,
                 rgb_ink_strength,
             ],
+        )
+
+        # ── Folder Browser events ───────────────────────────────────────────
+        def _on_folder_scan(folder: str):
+            paths, msg = _scan_folder_for_images(folder)
+            thumbs = _make_thumbnails(paths)
+            return thumbs, paths, msg
+
+        folder_scan_btn.click(
+            fn=_on_folder_scan,
+            inputs=[folder_path_input],
+            outputs=[folder_gallery, folder_image_paths, folder_status],
+        )
+        # Also trigger scan when user presses Enter in the text box
+        folder_path_input.submit(
+            fn=_on_folder_scan,
+            inputs=[folder_path_input],
+            outputs=[folder_gallery, folder_image_paths, folder_status],
+        )
+
+        def _on_gallery_select(
+            paths: List[str],
+            donut_s: str,
+            layout_s: str,
+            device_s: str,
+            max_len_s: int,
+            preprocess_preset_s: str,
+            gray_mode_s: str,
+            normalize_background_s: bool,
+            background_blur_ksize_s: int,
+            background_strength_s: float,
+            upscale_factor_s: float,
+            upscale_interpolation_s: str,
+            binarize_s: bool,
+            threshold_method_s: str,
+            threshold_block_size_s: int,
+            threshold_c_s: int,
+            fixed_threshold_s: int,
+            morph_close_s: bool,
+            morph_close_kernel_s: int,
+            remove_small_components_s: bool,
+            min_component_area_s: int,
+            rgb_preserve_color_s: bool,
+            rgb_normalize_bg_s: bool,
+            rgb_background_method_s: str,
+            rgb_bg_blur_ksize_s: int,
+            rgb_bg_strength_s: float,
+            rgb_contrast_s: float,
+            rgb_denoise_s: bool,
+            rgb_morph_close_s: bool,
+            rgb_morph_close_kernel_s: int,
+            rgb_remove_small_components_s: bool,
+            rgb_min_component_area_s: int,
+            rgb_upscale_factor_s: float,
+            rgb_upscale_interp_s: str,
+            rgb_ink_normalization_s: bool,
+            rgb_ink_strength_s: float,
+            evt: gr.SelectData,
+        ):
+            # Resolve selected image path from gallery index
+            idx = getattr(evt, "index", None)
+            if idx is None or not isinstance(paths, list) or idx >= len(paths):
+                return (
+                    None, "", "Could not determine selected image.", _base_state(),
+                    "{}", None, None,
+                )
+            img_path = paths[int(idx)]
+            try:
+                arr = _to_rgb_uint8(img_path)
+            except Exception as exc:
+                return (
+                    None, "", f"Failed to load image: {exc}", _base_state(),
+                    "{}", None, None,
+                )
+
+            new_state = _base_state()
+            new_state["image_path"] = img_path
+            new_state["image_name"] = Path(img_path).name
+            new_state["image"] = arr
+
+            # Build preprocess settings
+            preproc_mode, bdrc_overrides, rgb_overrides = _compose_preprocess_ui_settings(
+                preprocess_preset=preprocess_preset_s,
+                gray_mode=gray_mode_s,
+                normalize_background=normalize_background_s,
+                background_blur_ksize=int(background_blur_ksize_s),
+                background_strength=float(background_strength_s),
+                upscale_factor=float(upscale_factor_s),
+                upscale_interpolation=upscale_interpolation_s,
+                binarize=binarize_s,
+                threshold_method=threshold_method_s,
+                threshold_block_size=int(threshold_block_size_s),
+                threshold_c=int(threshold_c_s),
+                fixed_threshold=int(fixed_threshold_s),
+                morph_close=morph_close_s,
+                morph_close_kernel=int(morph_close_kernel_s),
+                remove_small_components=remove_small_components_s,
+                min_component_area=int(min_component_area_s),
+                rgb_preserve_color=rgb_preserve_color_s,
+                rgb_normalize_background=rgb_normalize_bg_s,
+                rgb_background_method=rgb_background_method_s,
+                rgb_background_blur_ksize=int(rgb_bg_blur_ksize_s),
+                rgb_background_strength=float(rgb_bg_strength_s),
+                rgb_contrast=float(rgb_contrast_s),
+                rgb_denoise=rgb_denoise_s,
+                rgb_morph_close=rgb_morph_close_s,
+                rgb_morph_close_kernel=int(rgb_morph_close_kernel_s),
+                rgb_remove_small_components=rgb_remove_small_components_s,
+                rgb_min_component_area=int(rgb_min_component_area_s),
+                rgb_upscale_factor=float(rgb_upscale_factor_s),
+                rgb_upscale_interpolation=rgb_upscale_interp_s,
+                rgb_ink_normalization=rgb_ink_normalization_s,
+                rgb_ink_strength=float(rgb_ink_strength_s),
+            )
+
+            # Run full-auto OCR (line segmentation + DONUT)
+            overlay, transcript_text, ocr_status, updated_state, debug_j, pre_img, post_img = _run_full_auto(
+                new_state,
+                donut_s,
+                layout_s,
+                device_s,
+                int(max_len_s),
+                preprocess_preset=preproc_mode,
+                bdrc_preprocess_overrides=bdrc_overrides,
+                rgb_preprocess_overrides=rgb_overrides,
+            )
+            return overlay, transcript_text, ocr_status, updated_state, debug_j, pre_img, post_img
+
+        _gallery_select_evt = folder_gallery.select(
+            fn=_on_gallery_select,
+            inputs=[
+                folder_image_paths,
+                donut_path,
+                layout_path,
+                device,
+                max_len,
+                preprocess_preset,
+                bdrc_gray_mode,
+                bdrc_normalize_bg,
+                bdrc_bg_blur_ksize,
+                bdrc_bg_strength,
+                bdrc_upscale_factor,
+                bdrc_upscale_interp,
+                bdrc_binarize,
+                bdrc_threshold_method,
+                bdrc_threshold_block,
+                bdrc_threshold_c,
+                bdrc_fixed_threshold,
+                bdrc_morph_close,
+                bdrc_morph_close_kernel,
+                bdrc_remove_small_components,
+                bdrc_min_component_area,
+                rgb_preserve_color,
+                rgb_normalize_bg,
+                rgb_background_method,
+                rgb_bg_blur_ksize,
+                rgb_bg_strength,
+                rgb_contrast,
+                rgb_denoise,
+                rgb_morph_close,
+                rgb_morph_close_kernel,
+                rgb_remove_small_components,
+                rgb_min_component_area,
+                rgb_upscale_factor,
+                rgb_upscale_interp,
+                rgb_ink_normalization,
+                rgb_ink_strength,
+            ],
+            outputs=[image_view, transcript, status, state, debug_json, donut_input_before, donut_input_after],
+        )
+        _gallery_select_evt.then(
+            fn=lambda st: str((st or {}).get("last_debug_text", "") if isinstance(st, dict) else ""),
+            inputs=[state],
+            outputs=[debug_text],
         )
 
     return demo
