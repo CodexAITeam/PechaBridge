@@ -53,6 +53,7 @@ DEFAULT_BDRC_LINE_THRESHOLD = 0.9
 DEFAULT_BDRC_LAYOUT_THRESHOLD = 0.8
 DEFAULT_BDRC_LINE_K_FACTOR = 2.5
 DEFAULT_BDRC_LINE_BBOX_TOLERANCE = 3.0
+DEFAULT_BDRC_LINE_USE_ROTATION = True
 DEFAULT_BDRC_LINE_TPS_THRESHOLD = 0.25
 DEFAULT_BDRC_LINE_USE_TPS = True
 DEFAULT_BDRC_TPS_ALPHA = 0.5
@@ -762,13 +763,22 @@ def _get_rotation_angle_from_lines(line_mask: np.ndarray, *, max_angle: float = 
     return 0.0
 
 
-def _build_raw_line_data(image: np.ndarray, line_mask: np.ndarray) -> Tuple[np.ndarray, np.ndarray, List[np.ndarray], float]:
+def _build_raw_line_data(
+    image: np.ndarray,
+    line_mask: np.ndarray,
+    *,
+    use_rotation: bool = DEFAULT_BDRC_LINE_USE_ROTATION,
+) -> Tuple[np.ndarray, np.ndarray, List[np.ndarray], float]:
     _require_cv2()
     if line_mask.ndim == 3:
         line_mask = cv2.cvtColor(line_mask, cv2.COLOR_BGR2GRAY)
-    angle = _get_rotation_angle_from_lines(line_mask)
-    rot_mask = _rotate_from_angle(line_mask, angle)
-    rot_img = _rotate_from_angle(image, angle)
+    angle = _get_rotation_angle_from_lines(line_mask) if bool(use_rotation) else 0.0
+    if bool(use_rotation) and abs(float(angle)) > 1e-6:
+        rot_mask = _rotate_from_angle(line_mask, angle)
+        rot_img = _rotate_from_angle(image, angle)
+    else:
+        rot_mask = np.asarray(line_mask).astype(np.uint8, copy=False)
+        rot_img = np.asarray(image).astype(np.uint8, copy=False)
     contours, _ = cv2.findContours(rot_mask, cv2.RETR_LIST, cv2.CHAIN_APPROX_SIMPLE)
     contours = [x for x in contours if cv2.contourArea(x) > 10]
     return rot_img, rot_mask, contours, float(angle)
@@ -947,6 +957,7 @@ def predict_bdrc_line_regions(
     group_lines: bool = True,
     k_factor: float = DEFAULT_BDRC_LINE_K_FACTOR,
     bbox_tolerance: float = DEFAULT_BDRC_LINE_BBOX_TOLERANCE,
+    use_rotation: bool = DEFAULT_BDRC_LINE_USE_ROTATION,
     use_tps: bool = DEFAULT_BDRC_LINE_USE_TPS,
     tps_threshold: float = DEFAULT_BDRC_LINE_TPS_THRESHOLD,
 ) -> Tuple[List[BDRCLinePrediction], Dict[str, Any]]:
@@ -973,7 +984,11 @@ def predict_bdrc_line_regions(
     else:
         line_mask = prediction_mask
 
-    base_rot_img, base_rot_mask, line_contours, page_angle = _build_raw_line_data(src, line_mask)
+    base_rot_img, base_rot_mask, line_contours, page_angle = _build_raw_line_data(
+        src,
+        line_mask,
+        use_rotation=bool(use_rotation),
+    )
     filtered = _filter_line_contours(base_rot_mask, line_contours)
     working_img = base_rot_img
     working_mask = base_rot_mask
@@ -998,6 +1013,7 @@ def predict_bdrc_line_regions(
                 working_img, working_mask, dew_contours, dewarp_angle = _build_raw_line_data(
                     dewarped_img,
                     dewarped_mask_gray,
+                    use_rotation=bool(use_rotation),
                 )
                 working_filtered = _filter_line_contours(working_mask, dew_contours)
                 if working_filtered:
@@ -1080,6 +1096,7 @@ def predict_bdrc_line_regions(
         "group_lines": bool(group_lines),
         "k_factor": float(k_factor),
         "bbox_tolerance": float(bbox_tolerance),
+        "use_rotation": bool(use_rotation),
         "use_tps": bool(use_tps),
         "tps_threshold": float(tps_threshold),
         "tps_ratio": float(tps_ratio),
@@ -1227,6 +1244,7 @@ __all__ = [
     "BDRCLinePrediction",
     "DEFAULT_BDRC_LINE_BBOX_TOLERANCE",
     "DEFAULT_BDRC_LINE_K_FACTOR",
+    "DEFAULT_BDRC_LINE_USE_ROTATION",
     "DEFAULT_BDRC_LINE_TPS_THRESHOLD",
     "DEFAULT_BDRC_LAYOUT_THRESHOLD",
     "DEFAULT_BDRC_LINE_THRESHOLD",

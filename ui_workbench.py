@@ -134,6 +134,8 @@ except Exception:
 
 ROOT = Path(__file__).resolve().parent
 _DEFAULT_BDRC_LINE_MERGE_LINES = True
+_DEFAULT_UI_BDRC_LINE_USE_ROTATION = False
+_DEFAULT_UI_BDRC_LINE_USE_TPS = False
 DEFAULT_TEXTURE_PROMPT = (
     "scanned printed Tibetan pecha page, paper texture, ink bleed, aged grayscale scan, "
     "realistic Tibetan glyph stroke thickness, subtle hand-written-like ink edge variation"
@@ -4105,6 +4107,7 @@ def run_page_line_donut_ocr_preview_ui(
     bdrc_line_merge_lines: bool,
     bdrc_line_k_factor: float,
     bdrc_line_bbox_tolerance: float,
+    bdrc_line_use_rotation: bool,
     bdrc_line_use_tps: bool,
     bdrc_line_tps_threshold: float,
     line_conf: float,
@@ -4321,6 +4324,7 @@ def run_page_line_donut_ocr_preview_ui(
                 group_lines=bool(bdrc_line_merge_lines),
                 k_factor=float(bdrc_line_k_factor),
                 bbox_tolerance=float(bdrc_line_bbox_tolerance),
+                use_rotation=bool(bdrc_line_use_rotation),
                 use_tps=bool(bdrc_line_use_tps),
                 tps_threshold=float(bdrc_line_tps_threshold),
             )
@@ -11162,9 +11166,13 @@ def build_ui() -> gr.Blocks:
                                 label="bdrc_merge_lines",
                                 value=_DEFAULT_BDRC_LINE_MERGE_LINES,
                             )
+                            lineocr_bdrc_use_rotation = gr.Checkbox(
+                                label="bdrc_use_rotation",
+                                value=_DEFAULT_UI_BDRC_LINE_USE_ROTATION,
+                            )
                             lineocr_bdrc_use_tps = gr.Checkbox(
                                 label="bdrc_use_tps",
-                                value=bool(_DEFAULT_BDRC_LINE_USE_TPS),
+                                value=_DEFAULT_UI_BDRC_LINE_USE_TPS,
                             )
                             lineocr_bdrc_tps_threshold = gr.Slider(
                                 0.0,
@@ -11330,6 +11338,7 @@ def build_ui() -> gr.Blocks:
                     lineocr_bdrc_merge_lines,
                     lineocr_bdrc_k_factor,
                     lineocr_bdrc_bbox_tolerance,
+                    lineocr_bdrc_use_rotation,
                     lineocr_bdrc_use_tps,
                     lineocr_bdrc_tps_threshold,
                     lineocr_line_conf,

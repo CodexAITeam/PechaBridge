@@ -155,3 +155,24 @@ def test_run_tps_identity_mapping_preserves_image_geometry() -> None:
     pts = np.asarray([[6.0, 8.0], [3.0, 5.0]], dtype=np.float64)
     mapped = mapping.transform(pts)
     assert np.allclose(mapped, pts, atol=1e-3)
+
+
+def test_build_raw_line_data_can_skip_rotation() -> None:
+    if bdrc_inference.cv2 is None:
+        return
+
+    image = np.zeros((24, 40, 3), dtype=np.uint8)
+    mask = np.zeros((24, 40), dtype=np.uint8)
+    mask[8:14, 5:30] = 255
+
+    rot_img, rot_mask, contours, angle = bdrc_inference._build_raw_line_data(
+        image,
+        mask,
+        use_rotation=False,
+    )
+
+    assert angle == 0.0
+    assert rot_img.shape == image.shape
+    assert rot_mask.shape == mask.shape
+    assert np.array_equal(rot_mask, mask)
+    assert len(contours) == 1
