@@ -30,18 +30,19 @@ def test_expand_line_boxes_vertically_adds_thirty_percent_only_above() -> None:
     assert expanded == [(5, 7, 25, 20)]
 
 
-def test_filter_tall_narrow_boxes_removes_vertical_short_boxes_anywhere() -> None:
+def test_filter_tall_narrow_boxes_removes_any_box_with_width_height_ratio_below_one() -> None:
     filtered = ui_workbench._filter_tall_narrow_boxes(
         [
             (0, 0, 14, 42),
             (90, 5, 104, 41),
             (30, 10, 150, 24),
+            (160, 6, 180, 26),
             (160, 6, 192, 26),
-        ],
-        image_width=200,
+        ]
     )
 
     assert filtered == [
         (30, 10, 150, 24),
+        (160, 6, 180, 26),
         (160, 6, 192, 26),
     ]

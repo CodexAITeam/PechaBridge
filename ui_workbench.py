@@ -9541,25 +9541,15 @@ def _expand_line_boxes_vertically(
 
 def _filter_tall_narrow_boxes(
     line_boxes: List[Tuple[int, int, int, int]],
-    *,
-    image_width: int,
-    max_width_ratio: float = 0.20,
-    min_height_width_ratio: float = 1.15,
 ) -> List[Tuple[int, int, int, int]]:
     if not line_boxes:
         return []
-
-    width_px = max(1, int(image_width))
-    max_box_width = max(12, int(math.ceil(width_px * max(0.0, float(max_width_ratio)))))
-    min_aspect = max(1.0, float(min_height_width_ratio))
 
     kept: List[Tuple[int, int, int, int]] = []
     for x1, y1, x2, y2 in line_boxes:
         box_w = max(1, int(x2) - int(x1))
         box_h = max(1, int(y2) - int(y1))
-        looks_vertical = box_h >= float(box_w) * min_aspect
-        looks_short = box_w <= max_box_width
-        if looks_vertical and looks_short:
+        if (float(box_w) / float(box_h)) < 1.0:
             continue
         kept.append((int(x1), int(y1), int(x2), int(y2)))
     return kept
@@ -9695,7 +9685,7 @@ def _segment_lines_in_text_crop(
     filtered = _filter_line_boxes_by_mean_height(tightened, tolerance_ratio=0.50)
     if not filtered:
         return []
-    filtered = _filter_tall_narrow_boxes(filtered, image_width=w)
+    filtered = _filter_tall_narrow_boxes(filtered)
     if not filtered:
         return []
     return _expand_line_boxes_vertically(
