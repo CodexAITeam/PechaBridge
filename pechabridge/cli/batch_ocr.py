@@ -6,6 +6,7 @@ and writes per-image text files plus a repro.yaml for full reproducibility.
 
 Supported engines:
   - ``donut``      (default) — DONUT VisionEncoderDecoder model
+  - ``bdrc_ocr``   — BDRC-style ONNX OCR model
   - ``tesseract``  — pytesseract, useful for baseline comparison
 
 Usage examples::
@@ -24,10 +25,24 @@ Usage examples::
         --input-dir    /data/pechas/W1234 \\
         --tess-lang    bod
 
+    # BDRC OCR + BDRC line model
+    python cli.py batch-ocr \\
+        --engine          bdrc_ocr \\
+        --layout-engine   bdrc_line \\
+        --bdrc-ocr-model  models/bdrc/ocr/Woodblock \\
+        --bdrc-line-model models/bdrc/Models/Lines \\
+        --input-dir       /data/pechas/W1234
+
 Output is written to a subfolder of the input directory's parent::
 
     # DONUT:
     /data/pechas/W1234__checkpoint-5000/
+        repro.yaml
+        image_001.txt
+        ...
+
+    # BDRC OCR:
+    /data/pechas/W1234__bdrc_ocr_Woodblock/
         repro.yaml
         image_001.txt
         ...
@@ -49,7 +64,10 @@ from datetime import datetime, timezone
 from pathlib import Path
 from typing import Any, Dict, List, Optional, Tuple
 
+import numpy as np
+
 LOGGER = logging.getLogger("pechabridge.cli.batch_ocr")
+REPO_ROOT = Path(__file__).resolve().parents[2]
 
 # ---------------------------------------------------------------------------
 # Image extensions we consider
@@ -300,6 +318,60 @@ def _load_tesseract_runtime(
 
 
 # ---------------------------------------------------------------------------
+# BDRC OCR runtime loader
+# ---------------------------------------------------------------------------
+
+def _load_bdrc_ocr_runtime(
+    model_path: str,
+    device: str,
+    target_encoding: str,
+) -> Dict[str, Any]:
+    from pechabridge.ocr.bdrc_inference import resolve_bdrc_ocr_model_config
+
+    cfg = resolve_bdrc_ocr_model_config(model_path)
+    LOGGER.info(
+        "BDRC OCR backend ready. model=%s input=%dx%d encoder=%s",
+        Path(cfg.model_dir).name,
+        cfg.input_width,
+        cfg.input_height,
+        cfg.encoder,
+    )
+    return {
+        "model_path": str(model_path),
+        "resolved_model_dir": str(cfg.model_dir),
+        "device": str(device),
+        "target_encoding": str(target_encoding or "unicode"),
+    }
+
+
+def _ensure_default_bdrc_line_model_dir() -> Tuple[str, str]:
+    from pechabridge.ocr.bdrc_model_download import ensure_default_bdrc_line_assets
+
+    result = ensure_default_bdrc_line_assets(REPO_ROOT / "models" / "bdrc")
+    chosen = str(result.line_dir)
+    if result.downloaded_items:
+        note = f"Auto-downloaded default BDRC line assets ({', '.join(result.downloaded_items)}) to {result.root}"
+    else:
+        note = f"Using existing default BDRC line assets from {result.root}"
+    return chosen, note
+
+
+def _ensure_default_bdrc_ocr_model_dir() -> Tuple[str, str]:
+    from pechabridge.ocr.bdrc_model_download import (
+        choose_default_bdrc_ocr_model_dir,
+        ensure_default_bdrc_ocr_models,
+    )
+
+    result = ensure_default_bdrc_ocr_models(REPO_ROOT / "models" / "bdrc")
+    chosen = str(choose_default_bdrc_ocr_model_dir(result.root))
+    if result.downloaded:
+        note = f"Auto-downloaded default BDRC OCR models to {result.root}; selected {Path(chosen).name}"
+    else:
+        note = f"Using existing default BDRC OCR model {Path(chosen).name} from {result.root}"
+    return chosen, note
+
+
+# ---------------------------------------------------------------------------
 # Single-crop OCR — DONUT
 # ---------------------------------------------------------------------------
 
@@ -374,11 +446,27 @@ def _ocr_crop_tesseract(
     return str(result.text or "").strip()
 
 
+def _ocr_crop_bdrc(
+    crop_rgb: Any,  # PIL Image
+    runtime: Dict[str, Any],
+) -> str:
+    """Run a BDRC OCR ONNX model on a single prepared line crop."""
+    from pechabridge.ocr.bdrc_inference import run_bdrc_ocr
+
+    text, _debug, _preview = run_bdrc_ocr(
+        crop_rgb,
+        model_path=str(runtime.get("model_path") or ""),
+        device=str(runtime.get("device") or "auto"),
+        target_encoding=str(runtime.get("target_encoding") or "unicode"),
+    )
+    return str(text or "").strip()
+
+
 # ---------------------------------------------------------------------------
 # Layout detection
 # ---------------------------------------------------------------------------
 
-def _detect_lines(
+def _detect_lines_classical(
     image_np: Any,  # np.ndarray HxWx3 uint8
     layout_model_path: str,
     device: str,
@@ -410,6 +498,88 @@ def _detect_lines(
     if isinstance(click_state, dict):
         return list(click_state.get("line_boxes") or [])
     return []
+
+
+def _detect_lines_yolo_model(
+    image_np: Any,  # np.ndarray HxWx3 uint8
+    line_model_path: str,
+    device: str,
+    line_preprocess: str,
+) -> List[Dict[str, Any]]:
+    from pechabridge.ocr.line_segmentation import (
+        DEFAULT_LINE_SEGMENTATION_CONF,
+        DEFAULT_LINE_SEGMENTATION_IMGSZ,
+        normalize_line_segmentation_preprocess_pipeline,
+        predict_line_regions,
+    )
+
+    src = np.asarray(image_np, dtype=np.uint8)
+    h, w = src.shape[:2]
+    preprocess_mode = normalize_line_segmentation_preprocess_pipeline(line_preprocess)
+    predictions = predict_line_regions(
+        src,
+        model_path=line_model_path,
+        conf=DEFAULT_LINE_SEGMENTATION_CONF,
+        imgsz=DEFAULT_LINE_SEGMENTATION_IMGSZ,
+        preprocess_pipeline=preprocess_mode,
+        device=device,
+    )
+    records: List[Dict[str, Any]] = []
+    for idx, pred in enumerate(predictions, start=1):
+        x1, y1, x2, y2 = [int(v) for v in pred.box]
+        x1 = max(0, min(w - 1, x1))
+        y1 = max(0, min(h - 1, y1))
+        x2 = max(0, min(w, x2))
+        y2 = max(0, min(h, y2))
+        if x2 <= x1 or y2 <= y1:
+            continue
+        records.append(
+            {
+                "line_box": [x1, y1, x2, y2],
+                "line_id": idx,
+                "line_polygon": [[int(px), int(py)] for px, py in pred.polygon],
+                "line_confidence": float(pred.confidence),
+                "line_label": str(pred.label),
+                "line_class": int(pred.class_id),
+            }
+        )
+    return records
+
+
+def _detect_lines_bdrc(
+    image_np: Any,  # np.ndarray HxWx3 uint8
+    bdrc_line_model_path: str,
+    device: str,
+    k_factor: float,
+    bbox_tolerance: float,
+    class_threshold: float,
+) -> List[Dict[str, Any]]:
+    from pechabridge.ocr.bdrc_inference import predict_bdrc_line_regions
+
+    predictions, _debug = predict_bdrc_line_regions(
+        image_np,
+        model_path=bdrc_line_model_path,
+        device=device,
+        class_threshold=class_threshold,
+        group_lines=True,
+        k_factor=k_factor,
+        bbox_tolerance=bbox_tolerance,
+    )
+    records: List[Dict[str, Any]] = []
+    for idx, pred in enumerate(predictions, start=1):
+        rec: Dict[str, Any] = {
+            "line_box": [int(v) for v in pred.box],
+            "line_id": idx,
+            "line_polygon": [[int(px), int(py)] for px, py in pred.polygon],
+            "line_confidence": float(pred.confidence),
+            "line_label": str(pred.label),
+            "line_class": int(pred.class_id),
+            "page_angle": float(pred.page_angle),
+        }
+        if pred.crop_image is not None:
+            rec["ocr_crop"] = np.asarray(pred.crop_image, dtype=np.uint8)
+        records.append(rec)
+    return records
 
 
 def _detect_lines_tesseract(
@@ -525,10 +695,16 @@ def _ocr_image(
     engine: str,
     runtime: Dict[str, Any],
     layout_model_path: str,
+    line_model_path: str,
+    bdrc_line_model_path: str,
     pipeline: str,
     max_len: int,
     device: str,
     layout_engine: str = "yolo",
+    line_preprocess: str = "gray",
+    bdrc_line_k_factor: float = 2.5,
+    bdrc_line_bbox_tolerance: float = 3.0,
+    bdrc_line_class_threshold: float = 0.0,
 ) -> Tuple[str, int]:
     """Run full OCR on a single image.
 
@@ -537,12 +713,14 @@ def _ocr_image(
     ``layout_engine`` controls how line bounding boxes are detected:
     - ``"yolo"``      (default) YOLO-based classical segmentation via
                       ``run_tibetan_text_line_split_classical()``.
+    - ``"yolo_line"`` YOLO segmentation/detection line model via
+                      ``predict_line_regions()``.
+    - ``"bdrc_line"`` BDRC ONNX line/layout model plus BDRC contour postprocessing.
     - ``"tesseract"`` Tesseract page segmentation (PSM 3) via
                       ``pytesseract.image_to_data()``.  The ``runtime``
                       dict must contain a ``"tess_layout_runtime"`` key
-                      when the OCR engine is DONUT.
+                      when the OCR engine is DONUT or BDRC OCR.
     """
-    import numpy as np
     from PIL import Image
 
     img_pil = Image.open(image_path).convert("RGB")
@@ -553,8 +731,19 @@ def _ocr_image(
         # Use the dedicated Tesseract layout runtime (may differ from OCR runtime)
         tess_layout_rt = runtime.get("tess_layout_runtime") or runtime
         line_records = _detect_lines_tesseract(img_pil, tess_layout_rt)
+    elif layout_engine == "yolo_line":
+        line_records = _detect_lines_yolo_model(img_np, line_model_path, device, line_preprocess)
+    elif layout_engine == "bdrc_line":
+        line_records = _detect_lines_bdrc(
+            img_np,
+            bdrc_line_model_path,
+            device,
+            k_factor=bdrc_line_k_factor,
+            bbox_tolerance=bdrc_line_bbox_tolerance,
+            class_threshold=bdrc_line_class_threshold,
+        )
     else:
-        line_records = _detect_lines(img_np, layout_model_path, device)
+        line_records = _detect_lines_classical(img_np, layout_model_path, device)
     LOGGER.info(
         "  %s: %d line(s) detected (layout_engine=%s).",
         image_path.name, len(line_records), layout_engine,
@@ -566,11 +755,15 @@ def _ocr_image(
         if box is None:
             continue
         x1, y1, x2, y2 = box
-        crop_np = img_np[y1:y2, x1:x2]
+        crop_np = rec.get("ocr_crop")
+        if not isinstance(crop_np, np.ndarray) or crop_np.size == 0:
+            crop_np = img_np[y1:y2, x1:x2]
         crop_pil = Image.fromarray(crop_np, mode="RGB")
 
         if engine == "tesseract":
             text = _ocr_crop_tesseract(crop_pil, runtime)
+        elif engine == "bdrc_ocr":
+            text = _ocr_crop_bdrc(crop_pil, runtime)
         else:
             text = _ocr_crop_donut(crop_pil, runtime, pipeline, max_len)
 
@@ -679,9 +872,15 @@ def run(args: argparse.Namespace) -> int:
     engine = str(getattr(args, "engine", "donut") or "donut").strip().lower()
     layout_engine = str(getattr(args, "layout_engine", "yolo") or "yolo").strip().lower()
     layout_model = str(getattr(args, "layout_model", "") or "").strip()
+    line_model = str(getattr(args, "line_model", "") or "").strip()
+    bdrc_line_model = str(getattr(args, "bdrc_line_model", "") or "").strip()
     input_dir = Path(args.input_dir).expanduser().resolve()
     device_pref = str(getattr(args, "device", "auto") or "auto").strip().lower()
     max_len = int(getattr(args, "max_len", 0) or 0)
+    line_preprocess = str(getattr(args, "line_preprocess", "gray") or "gray").strip().lower()
+    bdrc_line_k_factor = float(getattr(args, "bdrc_line_k_factor", 2.5) or 2.5)
+    bdrc_line_bbox_tolerance = float(getattr(args, "bdrc_line_bbox_tolerance", 3.0) or 3.0)
+    bdrc_line_class_threshold = float(getattr(args, "bdrc_line_class_threshold", 0.0) or 0.0)
 
     # Tesseract OCR-specific args
     tess_lang = str(getattr(args, "tess_lang", "bod") or "bod").strip()
@@ -696,13 +895,27 @@ def run(args: argparse.Namespace) -> int:
 
     # DONUT-specific args
     ocr_model = str(getattr(args, "ocr_model", "") or "").strip()
+    bdrc_ocr_model = str(getattr(args, "bdrc_ocr_model", "") or "").strip()
+    bdrc_ocr_target_encoding = str(getattr(args, "bdrc_ocr_target_encoding", "unicode") or "unicode").strip().lower()
+
+    if engine == "bdrc-ocr":
+        engine = "bdrc_ocr"
+    if layout_engine in {"classical", "yolo_classical"}:
+        layout_engine = "yolo"
+    if layout_engine in {"yolo-line", "yolo_seg", "yolo-seg", "line_model"}:
+        layout_engine = "yolo_line"
+    if layout_engine in {"bdrc-line", "bdrc"}:
+        layout_engine = "bdrc_line"
 
     # --- Validate engines ---
-    if engine not in {"donut", "tesseract"}:
-        LOGGER.error("Unknown engine '%s'. Choose 'donut' or 'tesseract'.", engine)
+    if engine not in {"donut", "tesseract", "bdrc_ocr"}:
+        LOGGER.error("Unknown engine '%s'. Choose 'donut', 'bdrc_ocr' or 'tesseract'.", engine)
         return 1
-    if layout_engine not in {"yolo", "tesseract"}:
-        LOGGER.error("Unknown layout-engine '%s'. Choose 'yolo' or 'tesseract'.", layout_engine)
+    if layout_engine not in {"yolo", "yolo_line", "bdrc_line", "tesseract"}:
+        LOGGER.error(
+            "Unknown layout-engine '%s'. Choose 'yolo', 'yolo_line', 'bdrc_line' or 'tesseract'.",
+            layout_engine,
+        )
         return 1
 
     # --- Resolve device (only needed for DONUT + YOLO layout model) ---
@@ -715,6 +928,7 @@ def run(args: argparse.Namespace) -> int:
     else:
         device = device_pref
     LOGGER.info("Using device: %s", device)
+    bdrc_auto_notes: List[str] = []
 
     # --- Validate paths ---
     if not input_dir.is_dir():
@@ -727,12 +941,51 @@ def run(args: argparse.Namespace) -> int:
         if not Path(layout_model).exists():
             LOGGER.error("Layout model path does not exist: %s", layout_model)
             return 1
+    if layout_engine == "yolo_line":
+        if not line_model:
+            LOGGER.error("--line-model is required when --layout-engine yolo_line.")
+            return 1
+        if not Path(line_model).exists():
+            LOGGER.error("Line segmentation model path does not exist: %s", line_model)
+            return 1
+    if layout_engine == "bdrc_line":
+        if not bdrc_line_model:
+            try:
+                bdrc_line_model, note = _ensure_default_bdrc_line_model_dir()
+                bdrc_auto_notes.append(note)
+                LOGGER.info("%s", note)
+            except Exception as exc:
+                LOGGER.error(
+                    "No --bdrc-line-model was provided and auto-download failed: %s: %s",
+                    type(exc).__name__,
+                    exc,
+                )
+                return 1
+        if not Path(bdrc_line_model).exists():
+            LOGGER.error("BDRC line model path does not exist: %s", bdrc_line_model)
+            return 1
     if engine == "donut":
         if not ocr_model:
             LOGGER.error("--ocr-model is required for engine 'donut'.")
             return 1
         if not Path(ocr_model).exists():
             LOGGER.error("OCR model path does not exist: %s", ocr_model)
+            return 1
+    if engine == "bdrc_ocr":
+        if not bdrc_ocr_model:
+            try:
+                bdrc_ocr_model, note = _ensure_default_bdrc_ocr_model_dir()
+                bdrc_auto_notes.append(note)
+                LOGGER.info("%s", note)
+            except Exception as exc:
+                LOGGER.error(
+                    "No --bdrc-ocr-model was provided and auto-download failed: %s: %s",
+                    type(exc).__name__,
+                    exc,
+                )
+                return 1
+        if not Path(bdrc_ocr_model).exists():
+            LOGGER.error("BDRC OCR model path does not exist: %s", bdrc_ocr_model)
             return 1
 
     # --- Detect preprocessing pipeline from repro bundle (DONUT only) ---
@@ -757,6 +1010,9 @@ def run(args: argparse.Namespace) -> int:
                 Path(ocr_model).name,
                 pipeline,
             )
+    elif engine == "bdrc_ocr":
+        pipeline = "bdrc_ocr_internal"
+        pipeline_source = "bdrc_ocr_internal"
 
     # --- Collect images ---
     image_files = sorted(
@@ -773,10 +1029,16 @@ def run(args: argparse.Namespace) -> int:
     # Tesseract: <parent>/<input_dir_name>__tesseract_<lang>[__tess_layout]
     if engine == "tesseract":
         model_slug = f"tesseract_{tess_lang}"
+    elif engine == "bdrc_ocr":
+        model_slug = f"bdrc_ocr_{Path(bdrc_ocr_model).name}"
     else:
         model_slug = Path(ocr_model).name
     if layout_engine == "tesseract":
         model_slug = f"{model_slug}__tess_layout"
+    elif layout_engine == "yolo_line":
+        model_slug = f"{model_slug}__yolo_line"
+    elif layout_engine == "bdrc_line":
+        model_slug = f"{model_slug}__bdrc_line"
     out_dir_name = f"{input_dir.name}__{model_slug}"
     out_dir = input_dir.parent / out_dir_name
     out_dir.mkdir(parents=True, exist_ok=True)
@@ -792,7 +1054,7 @@ def run(args: argparse.Namespace) -> int:
         except Exception as exc:
             LOGGER.error("Failed to initialise Tesseract backend: %s", exc)
             return 1
-    else:
+    elif engine == "donut":
         LOGGER.info("Loading DONUT model from %s …", ocr_model)
         try:
             import torch  # noqa: F401 — ensure torch is available for DONUT
@@ -803,6 +1065,17 @@ def run(args: argparse.Namespace) -> int:
             runtime = _load_donut_runtime(ocr_model, device)
         except Exception as exc:
             LOGGER.error("Failed to load DONUT model: %s", exc)
+            return 1
+    else:
+        LOGGER.info("Initialising BDRC OCR backend from %s …", bdrc_ocr_model)
+        try:
+            runtime = _load_bdrc_ocr_runtime(
+                bdrc_ocr_model,
+                device=device,
+                target_encoding=bdrc_ocr_target_encoding,
+            )
+        except Exception as exc:
+            LOGGER.error("Failed to load BDRC OCR backend: %s", exc)
             return 1
 
     # --- Load Tesseract layout runtime (if layout_engine == "tesseract") ---
@@ -832,6 +1105,15 @@ def run(args: argparse.Namespace) -> int:
     ]
     if layout_engine == "yolo":
         cli_argv_repro += ["--layout-model", layout_model]
+    elif layout_engine == "yolo_line":
+        cli_argv_repro += ["--line-model", line_model, "--line-preprocess", line_preprocess]
+    elif layout_engine == "bdrc_line":
+        cli_argv_repro += [
+            "--bdrc-line-model", bdrc_line_model,
+            "--bdrc-line-k-factor", str(bdrc_line_k_factor),
+            "--bdrc-line-bbox-tolerance", str(bdrc_line_bbox_tolerance),
+            "--bdrc-line-class-threshold", str(bdrc_line_class_threshold),
+        ]
     if engine == "tesseract":
         cli_argv_repro += [
             "--tess-lang", tess_lang,
@@ -840,6 +1122,11 @@ def run(args: argparse.Namespace) -> int:
         ]
         if tess_cmd:
             cli_argv_repro += ["--tess-cmd", tess_cmd]
+    elif engine == "bdrc_ocr":
+        cli_argv_repro += [
+            "--bdrc-ocr-model", bdrc_ocr_model,
+            "--bdrc-ocr-target-encoding", bdrc_ocr_target_encoding,
+        ]
     else:
         cli_argv_repro += ["--ocr-model", ocr_model]
         if max_len > 0:
@@ -855,7 +1142,7 @@ def run(args: argparse.Namespace) -> int:
         out_dir,
         engine=engine,
         layout_engine=layout_engine,
-        ocr_model=ocr_model,
+        ocr_model=(bdrc_ocr_model if engine == "bdrc_ocr" else ocr_model),
         layout_model=layout_model,
         input_dir=str(input_dir),
         pipeline=pipeline,
@@ -886,10 +1173,16 @@ def run(args: argparse.Namespace) -> int:
                 engine=engine,
                 runtime=runtime,
                 layout_model_path=layout_model,
+                line_model_path=line_model,
+                bdrc_line_model_path=bdrc_line_model,
                 pipeline=pipeline,
                 max_len=max_len,
                 device=device,
                 layout_engine=layout_engine,
+                line_preprocess=line_preprocess,
+                bdrc_line_k_factor=bdrc_line_k_factor,
+                bdrc_line_bbox_tolerance=bdrc_line_bbox_tolerance,
+                bdrc_line_class_threshold=bdrc_line_class_threshold,
             )
             total_lines += n_lines
         except Exception as exc:
@@ -923,13 +1216,20 @@ def create_parser(add_help: bool = True) -> argparse.ArgumentParser:
             "OCR engines (--engine):\n"
             "  donut      (default) DONUT VisionEncoderDecoder model. Preprocessing pipeline\n"
             "             is auto-detected from the repro bundle (repro/image_preprocess.json).\n"
+            "  bdrc_ocr   BDRC-style ONNX OCR model with BDRC line normalization.\n"
             "  tesseract  pytesseract baseline. No --ocr-model needed.\n\n"
             "Layout engines (--layout-engine):\n"
-            "  yolo       (default) YOLO-based classical line segmentation. Requires --layout-model.\n"
+            "  yolo       (default) Classical CV line segmentation via layout model + projections.\n"
+            "             Requires --layout-model.\n"
+            "  yolo_line  YOLO line segmentation model. Requires --line-model.\n"
+            "  bdrc_line  BDRC ONNX line/layout model with BDRC contour postprocessing.\n"
+            "             Auto-downloads the default BDRC line model when --bdrc-line-model is omitted.\n"
             "  tesseract  Tesseract page segmentation (PSM 3). No --layout-model needed.\n"
-            "             Combine with --engine donut to use Tesseract layout + DONUT OCR.\n\n"
+            "             Combine with --engine donut or --engine bdrc_ocr to use\n"
+            "             Tesseract layout + OCR.\n\n"
             "Output is written to a subfolder of the input directory's parent:\n"
             "  DONUT+YOLO:      <input_dir_name>__<checkpoint_name>/\n"
+            "  BDRC+BDRCLine:   <input_dir_name>__bdrc_ocr_<model_name>__bdrc_line/\n"
             "  DONUT+TessLayout:<input_dir_name>__<checkpoint_name>__tess_layout/\n"
             "  Tesseract:       <input_dir_name>__tesseract_<lang>/\n\n"
             "Each image produces a .txt file (one line per detected text line).\n"
@@ -943,8 +1243,8 @@ def create_parser(add_help: bool = True) -> argparse.ArgumentParser:
         "--engine",
         type=str,
         default="donut",
-        choices=["donut", "tesseract"],
-        help="OCR engine to use. 'donut' (default) or 'tesseract'.",
+        choices=["donut", "bdrc_ocr", "tesseract"],
+        help="OCR engine to use. 'donut' (default), 'bdrc_ocr' or 'tesseract'.",
     )
     parser.add_argument(
         "--layout-engine",
@@ -952,10 +1252,12 @@ def create_parser(add_help: bool = True) -> argparse.ArgumentParser:
         dest="layout_engine",
         type=str,
         default="yolo",
-        choices=["yolo", "tesseract"],
+        choices=["yolo", "yolo_line", "bdrc_line", "tesseract"],
         help=(
             "Layout detection engine used to find line bounding boxes before OCR. "
-            "'yolo' (default) uses the YOLO model specified by --layout-model. "
+            "'yolo' (default) uses the classical CV splitter driven by --layout-model. "
+            "'yolo_line' uses a YOLO line segmentation model specified by --line-model. "
+            "'bdrc_line' uses a BDRC line/layout ONNX model specified by --bdrc-line-model. "
             "'tesseract' uses pytesseract page segmentation (PSM 3) — "
             "no --layout-model needed. "
             "Combining --layout-engine tesseract with --engine donut lets you use "
@@ -972,8 +1274,67 @@ def create_parser(add_help: bool = True) -> argparse.ArgumentParser:
         default="",
         help=(
             "Path to the YOLO layout model file (.pt / .onnx / .torchscript). "
-            "Required when --layout-engine yolo (default). "
-            "Ignored when --layout-engine tesseract."
+            "Required when --layout-engine yolo (default classical splitter). "
+            "Ignored for --layout-engine yolo_line, bdrc_line and tesseract."
+        ),
+    )
+    parser.add_argument(
+        "--line-model",
+        "--line_model",
+        dest="line_model",
+        type=str,
+        default="",
+        help=(
+            "Path to the trained YOLO line segmentation model (.pt / .onnx / .torchscript). "
+            "Required when --layout-engine yolo_line."
+        ),
+    )
+    parser.add_argument(
+        "--line-preprocess",
+        "--line_preprocess",
+        dest="line_preprocess",
+        type=str,
+        default="gray",
+        choices=["none", "bdrc", "gray", "rgb"],
+        help="Preprocessing pipeline for --layout-engine yolo_line. Default: gray.",
+    )
+    parser.add_argument(
+        "--bdrc-line-model",
+        "--bdrc_line_model",
+        dest="bdrc_line_model",
+        type=str,
+        default="",
+        help=(
+            "Path to a BDRC line/layout model directory (or config.json/onnx file). "
+            "Optional when --layout-engine bdrc_line. If omitted, the default BDRC line model "
+            "is downloaded into models/bdrc automatically."
+        ),
+    )
+    parser.add_argument(
+        "--bdrc-line-k-factor",
+        "--bdrc_line_k_factor",
+        dest="bdrc_line_k_factor",
+        type=float,
+        default=2.5,
+        help="Morphological expansion factor for BDRC line crops. Default: 2.5.",
+    )
+    parser.add_argument(
+        "--bdrc-line-bbox-tolerance",
+        "--bdrc_line_bbox_tolerance",
+        dest="bdrc_line_bbox_tolerance",
+        type=float,
+        default=3.0,
+        help="Adaptive crop height tolerance for BDRC line extraction. Default: 3.0.",
+    )
+    parser.add_argument(
+        "--bdrc-line-class-threshold",
+        "--bdrc_line_class_threshold",
+        dest="bdrc_line_class_threshold",
+        type=float,
+        default=0.0,
+        help=(
+            "Optional explicit class threshold for BDRC line/layout ONNX inference. "
+            "0.0 means use backend defaults."
         ),
     )
     parser.add_argument(
@@ -1024,6 +1385,32 @@ def create_parser(add_help: bool = True) -> argparse.ArgumentParser:
             "Override the DONUT generation max_length. "
             "0 means use the value from the repro bundle's generate_config.json, "
             "or fall back to 160 if not present. Default: 0 (use repro config)."
+        ),
+    )
+
+    bdrc_group = parser.add_argument_group("BDRC OCR engine options")
+    bdrc_group.add_argument(
+        "--bdrc-ocr-model",
+        "--bdrc_ocr_model",
+        dest="bdrc_ocr_model",
+        type=str,
+        default="",
+        help=(
+            "Path to a BDRC OCR model directory (or model_config.json/onnx file). "
+            "Optional when --engine bdrc_ocr. If omitted, the default BDRC OCR bundle "
+            "is downloaded into models/bdrc automatically."
+        ),
+    )
+    bdrc_group.add_argument(
+        "--bdrc-ocr-target-encoding",
+        "--bdrc_ocr_target_encoding",
+        dest="bdrc_ocr_target_encoding",
+        type=str,
+        default="unicode",
+        choices=["raw", "unicode", "wylie"],
+        help=(
+            "Optional post-conversion for BDRC OCR output. "
+            "'raw' keeps model output as-is. Default: unicode."
         ),
     )
 

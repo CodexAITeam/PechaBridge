@@ -222,6 +222,17 @@ def _build_root_parser() -> argparse.ArgumentParser:
     )
     train_line_seg_parser.set_defaults(handler=_run_train_line_segmentation)
 
+    from pechabridge.ocr.bdrc_model_download import create_parser as create_download_bdrc_models_parser
+    download_bdrc_parent = create_download_bdrc_models_parser(add_help=False)
+    download_bdrc_parser = subparsers.add_parser(
+        "download-bdrc-models",
+        aliases=["download-bdrc-ocr-models", "download-bdrc-default-models"],
+        parents=[download_bdrc_parent],
+        help="Download the default BDRC line/layout and OCR model assets into models/bdrc",
+        description=download_bdrc_parent.description,
+    )
+    download_bdrc_parser.set_defaults(handler=_run_download_bdrc_models)
+
     bosentencepiece_parent = create_download_bosentencepiece_tokenizer_parser(add_help=False)
     bosentencepiece_parser = subparsers.add_parser(
         "download-bosentencepiece-tokenizer",
@@ -408,6 +419,12 @@ def _run_train_line_segmentation(args: argparse.Namespace) -> int:
 
     run(args)
     return 0
+
+
+def _run_download_bdrc_models(args: argparse.Namespace) -> int:
+    from scripts.download_bdrc_models import run
+
+    return int(run(args))
 
 
 def _run_download_bosentencepiece_tokenizer(args: argparse.Namespace) -> int:

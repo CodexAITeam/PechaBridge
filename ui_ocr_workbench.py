@@ -28,6 +28,18 @@ from pechabridge.ocr.line_segmentation import (
     normalize_line_segmentation_preprocess_pipeline,
     predict_line_regions,
 )
+from pechabridge.ocr.bdrc_inference import (
+    BDRCLinePrediction,
+    find_bdrc_line_model_dirs,
+    find_bdrc_ocr_model_dirs,
+    predict_bdrc_line_regions,
+    run_bdrc_ocr,
+)
+from pechabridge.ocr.bdrc_model_download import (
+    choose_default_bdrc_ocr_model_dir,
+    ensure_default_bdrc_line_assets,
+    ensure_default_bdrc_ocr_models,
+)
 try:
     from pechabridge.ocr.preprocess_bdrc import (
         BDRCPreprocessConfig,
@@ -57,6 +69,9 @@ MODE_AUTO = "Fully Automatic OCR"
 MODE_MANUAL = "Manual Mode"
 LINE_SEG_CLASSICAL = "Classical CV"
 LINE_SEG_YOLO = "Pretrained YOLO Model"
+LINE_SEG_BDRC = "BDRC Line Model"
+OCR_ENGINE_DONUT = "DONUT"
+OCR_ENGINE_BDRC = "BDRC OCR"
 _DONUT_ACTIVE_RUNTIME: Dict[str, Any] = {"checkpoint": "", "runtime": None}
 
 _IMAGE_EXTENSIONS = {".jpg", ".jpeg", ".png", ".tif", ".tiff", ".bmp", ".webp"}
@@ -93,7 +108,16 @@ def _normalize_line_segmentation_mode(mode: str) -> str:
     raw = str(mode or "").strip()
     if raw == LINE_SEG_YOLO:
         return LINE_SEG_YOLO
+    if raw == LINE_SEG_BDRC:
+        return LINE_SEG_BDRC
     return LINE_SEG_CLASSICAL
+
+
+def _normalize_ocr_engine(engine: str) -> str:
+    raw = str(engine or "").strip()
+    if raw == OCR_ENGINE_BDRC:
+        return OCR_ENGINE_BDRC
+    return OCR_ENGINE_DONUT
 
 
 def _load_font() -> ImageFont.ImageFont:
@@ -372,6 +396,59 @@ def _list_line_segmentation_models() -> Tuple[List[Tuple[str, str]], str]:
     return ordered, msg
 
 
+def _list_bdrc_line_models() -> Tuple[List[Tuple[str, str]], str]:
+    preferred = (ROOT / "models" / "bdrc").resolve()
+    fallback_root = (ROOT / "models").resolve()
+    found = find_bdrc_line_model_dirs(preferred)
+    if not found:
+        found = find_bdrc_line_model_dirs(fallback_root)
+    if not found:
+        return [], "No BDRC line model found (expected under models/bdrc/ or models/)."
+    ordered = [(_pretty_model_label(str(p)), str(p)) for p in found]
+    msg = f"Found {len(ordered)} BDRC line model(s). Auto-selected: {ordered[0][1]}"
+    return ordered, msg
+
+
+def _list_bdrc_ocr_models() -> Tuple[List[Tuple[str, str]], str]:
+    preferred = (ROOT / "models" / "bdrc").resolve()
+    fallback_root = (ROOT / "models").resolve()
+    found = find_bdrc_ocr_model_dirs(preferred)
+    if not found:
+        found = find_bdrc_ocr_model_dirs(fallback_root)
+    if not found:
+        return [], "No BDRC OCR model found (expected under models/bdrc/ or models/)."
+    ordered = [(_pretty_model_label(str(p)), str(p)) for p in found]
+    msg = f"Found {len(ordered)} BDRC OCR model(s). Auto-selected: {ordered[0][1]}"
+    return ordered, msg
+
+
+def _ensure_default_bdrc_line_model_path(current_path: str) -> Tuple[str, Optional[str]]:
+    raw = str(current_path or "").strip()
+    if raw and Path(raw).exists():
+        return raw, None
+    result = ensure_default_bdrc_line_assets(ROOT / "models" / "bdrc")
+    note = (
+        f"Auto-downloaded default BDRC line assets ({', '.join(result.downloaded_items)}) to {result.root}"
+        if result.downloaded_items
+        else f"Using existing default BDRC line assets from {result.root}"
+    )
+    return str(result.line_dir), note
+
+
+def _ensure_default_bdrc_ocr_model_path(current_path: str) -> Tuple[str, Optional[str]]:
+    raw = str(current_path or "").strip()
+    if raw and Path(raw).exists():
+        return raw, None
+    result = ensure_default_bdrc_ocr_models(ROOT / "models" / "bdrc")
+    chosen = choose_default_bdrc_ocr_model_dir(result.root)
+    note = (
+        f"Auto-downloaded default BDRC OCR models to {result.root}; selected {chosen.name}"
+        if result.downloaded
+        else f"Using existing default BDRC OCR model {chosen.name} from {result.root}"
+    )
+    return str(chosen), note
+
+
 def _normalize_box(box: List[int], w: int, h: int) -> Optional[List[int]]:
     if not isinstance(box, (list, tuple)) or len(box) != 4:
         return None
@@ -433,6 +510,62 @@ def _rows_from_line_predictions(
     return _sort_lines(rows)
 
 
+def _rows_from_bdrc_line_predictions(
+    predictions: List[BDRCLinePrediction],
+    *,
+    image_w: int,
+    image_h: int,
+    offset_x: int = 0,
+    offset_y: int = 0,
+    source: str,
+) -> List[Dict[str, Any]]:
+    rows: List[Dict[str, Any]] = []
+    for idx, pred in enumerate(predictions, start=1):
+        box = _normalize_box(
+            [
+                int(offset_x) + int(pred.box[0]),
+                int(offset_y) + int(pred.box[1]),
+                int(offset_x) + int(pred.box[2]),
+                int(offset_y) + int(pred.box[3]),
+            ],
+            image_w,
+            image_h,
+        )
+        if box is None:
+            continue
+        polygon = [
+            [int(offset_x) + int(x), int(offset_y) + int(y)]
+            for x, y in list(getattr(pred, "polygon", []) or [])
+        ]
+        row: Dict[str, Any] = {
+            "line_id": idx,
+            "line_box": box,
+            "line_polygon": polygon,
+            "line_confidence": float(getattr(pred, "confidence", 1.0)),
+            "line_label": str(getattr(pred, "label", "line")),
+            "line_class": int(getattr(pred, "class_id", 0)),
+            "page_angle": float(getattr(pred, "page_angle", 0.0)),
+            "source": source,
+        }
+        crop_image = getattr(pred, "crop_image", None)
+        if isinstance(crop_image, np.ndarray) and crop_image.size > 0:
+            row["ocr_crop"] = np.asarray(crop_image).astype(np.uint8, copy=False)
+        rows.append(row)
+    return _sort_lines(rows)
+
+
+def _extract_row_crop(src: np.ndarray, row: Dict[str, Any]) -> np.ndarray:
+    crop = row.get("ocr_crop")
+    if isinstance(crop, np.ndarray) and crop.size > 0:
+        return np.asarray(crop).astype(np.uint8, copy=False)
+    h, w = src.shape[:2]
+    box = _normalize_box(row.get("line_box") or [], w, h)
+    if box is None:
+        return np.zeros((1, 1, 3), dtype=np.uint8)
+    x1, y1, x2, y2 = box
+    return np.asarray(src[y1:y2, x1:x2]).astype(np.uint8, copy=False)
+
+
 def _segment_full_image_lines(
     image: np.ndarray,
     *,
@@ -440,6 +573,7 @@ def _segment_full_image_lines(
     line_segmentation_preprocess: str,
     layout_model: str,
     line_model: str,
+    bdrc_line_model: str,
     device: str,
 ) -> Tuple[List[Dict[str, Any]], str, Dict[str, Any]]:
     src = np.asarray(image).astype(np.uint8, copy=False)
@@ -492,6 +626,39 @@ def _segment_full_image_lines(
                 for rec in rows[:256]
             ],
         }
+        return rows, status, debug
+
+    if mode == LINE_SEG_BDRC:
+        if not (bdrc_line_model or "").strip():
+            return [], "BDRC line model is missing.", {"ok": False, "backend": "bdrc_line_model", "reason": "missing_model"}
+        try:
+            predictions, bdrc_debug = predict_bdrc_line_regions(
+                src,
+                model_path=bdrc_line_model,
+                device=device,
+            )
+        except Exception as exc:
+            return [], f"BDRC line inference failed: {type(exc).__name__}: {exc}", {
+                "ok": False,
+                "backend": "bdrc_line_model",
+                "reason": f"{type(exc).__name__}: {exc}",
+            }
+        rows = _rows_from_bdrc_line_predictions(
+            predictions,
+            image_w=w,
+            image_h=h,
+            source="full_auto_bdrc_line_model",
+        )
+        status = f"Detected {len(rows)} line(s) with the BDRC line model."
+        debug = dict(bdrc_debug)
+        debug.update(
+            {
+                "ok": True,
+                "line_segmentation_mode": mode,
+                "line_segmentation_preprocess": "bdrc_internal",
+                "line_segmentation_model": str(bdrc_line_model or ""),
+            }
+        )
         return rows, status, debug
 
     split_out = run_tibetan_text_line_split_classical(
@@ -851,6 +1018,66 @@ def _run_donut_on_crop(
         }, pre_img, post_img
 
 
+def _run_bdrc_ocr_on_crop(
+    crop: np.ndarray,
+    bdrc_ocr_model: str,
+    device: str,
+    target_encoding: str = "unicode",
+) -> Tuple[str, Dict[str, Any], np.ndarray, np.ndarray]:
+    raw = np.asarray(crop).astype(np.uint8, copy=False)
+    pre_img = raw
+    try:
+        text, dbg, preview_gray = run_bdrc_ocr(
+            raw,
+            model_path=bdrc_ocr_model,
+            device=device,
+            target_encoding=target_encoding,
+        )
+        post_img = np.stack([preview_gray] * 3, axis=-1) if preview_gray.ndim == 2 else np.asarray(preview_gray)
+        dbg = dict(dbg)
+        dbg.setdefault("effective_preprocess_preview", "bdrc_ocr_internal")
+        return text, dbg, pre_img, np.asarray(post_img).astype(np.uint8, copy=False)
+    except Exception as exc:
+        return "", {
+            "ok": False,
+            "backend": "bdrc_ocr",
+            "error": f"{type(exc).__name__}: {exc}",
+            "image_preprocess_pipeline_effective": "bdrc_ocr_internal",
+            "effective_preprocess_preview": "bdrc_ocr_internal",
+        }, pre_img, pre_img
+
+
+def _run_ocr_on_crop(
+    crop: np.ndarray,
+    *,
+    ocr_engine: str,
+    donut_checkpoint: str,
+    bdrc_ocr_model: str,
+    device: str,
+    max_len: int,
+    preprocess_preset: str = "bdrc",
+    bdrc_preprocess_overrides: Optional[Dict[str, Any]] = None,
+    rgb_preprocess_overrides: Optional[Dict[str, Any]] = None,
+) -> Tuple[str, Dict[str, Any], np.ndarray, np.ndarray]:
+    engine = _normalize_ocr_engine(ocr_engine)
+    if engine == OCR_ENGINE_BDRC:
+        return _run_bdrc_ocr_on_crop(
+            crop,
+            bdrc_ocr_model=bdrc_ocr_model,
+            device=device,
+            target_encoding="unicode",
+        )
+    return _run_donut_on_crop(
+        crop,
+        donut_checkpoint,
+        device,
+        max_len,
+        preprocess_preset=preprocess_preset,
+        bdrc_preprocess_overrides=bdrc_preprocess_overrides,
+        rgb_preprocess_overrides=rgb_preprocess_overrides,
+    )
+
+
 @dataclass
 class OCRRuntime:
     donut_path: str
@@ -1118,11 +1345,14 @@ def _compose_preprocess_ui_settings(
 
 def _run_full_auto(
     state: Dict[str, Any],
+    ocr_engine: str,
     donut_checkpoint: str,
+    bdrc_ocr_model: str,
     layout_model: str,
     line_segmentation_mode: str,
     line_segmentation_preprocess: str,
     line_model: str,
+    bdrc_line_model: str,
     device: str,
     max_len: int,
     preprocess_preset: str = "bdrc",
@@ -1132,13 +1362,33 @@ def _run_full_auto(
     image = state.get("image")
     if image is None:
         return None, "", "Please upload an image first.", state, "{}", state.get("last_donut_pre"), state.get("last_donut_post")
-    if not donut_checkpoint.strip():
-        return image, "", "DONUT checkpoint is missing.", state, "{}", state.get("last_donut_pre"), state.get("last_donut_post")
+    engine = _normalize_ocr_engine(ocr_engine)
+    auto_notes: List[str] = []
+    if engine == OCR_ENGINE_BDRC and not bdrc_ocr_model.strip():
+        try:
+            bdrc_ocr_model, note = _ensure_default_bdrc_ocr_model_path(bdrc_ocr_model)
+            if note:
+                auto_notes.append(note)
+        except Exception as exc:
+            return image, "", f"BDRC OCR model is missing and auto-download failed: {type(exc).__name__}: {exc}", state, "{}", state.get("last_donut_pre"), state.get("last_donut_post")
     mode = _normalize_line_segmentation_mode(line_segmentation_mode)
+    if mode == LINE_SEG_BDRC and not (bdrc_line_model or "").strip():
+        try:
+            bdrc_line_model, note = _ensure_default_bdrc_line_model_path(bdrc_line_model)
+            if note:
+                auto_notes.append(note)
+        except Exception as exc:
+            return image, "", f"BDRC line model is missing and auto-download failed: {type(exc).__name__}: {exc}", state, "{}", state.get("last_donut_pre"), state.get("last_donut_post")
+    if engine == OCR_ENGINE_DONUT and not donut_checkpoint.strip():
+        return image, "", "DONUT checkpoint is missing.", state, "{}", state.get("last_donut_pre"), state.get("last_donut_post")
+    if engine == OCR_ENGINE_BDRC and not bdrc_ocr_model.strip():
+        return image, "", "BDRC OCR model is missing.", state, "{}", state.get("last_donut_pre"), state.get("last_donut_post")
     if mode == LINE_SEG_CLASSICAL and not layout_model.strip():
         return image, "", "Layout model is missing.", state, "{}", state.get("last_donut_pre"), state.get("last_donut_post")
     if mode == LINE_SEG_YOLO and not (line_model or "").strip():
         return image, "", "Line segmentation model is missing.", state, "{}", state.get("last_donut_pre"), state.get("last_donut_post")
+    if mode == LINE_SEG_BDRC and not (bdrc_line_model or "").strip():
+        return image, "", "BDRC line model is missing.", state, "{}", state.get("last_donut_pre"), state.get("last_donut_post")
 
     src = np.asarray(image).astype(np.uint8, copy=False)
     h, w = src.shape[:2]
@@ -1148,6 +1398,7 @@ def _run_full_auto(
         line_segmentation_preprocess=line_segmentation_preprocess,
         layout_model=layout_model,
         line_model=line_model,
+        bdrc_line_model=bdrc_line_model,
         device=device if device != "auto" else "",
     )
     rows: List[Dict[str, Any]] = []
@@ -1157,13 +1408,14 @@ def _run_full_auto(
         box = _normalize_box(rec.get("line_box") or [], w, h)
         if box is None:
             continue
-        x1, y1, x2, y2 = box
-        crop = src[y1:y2, x1:x2]
-        text, dbg, pre_img, post_img = _run_donut_on_crop(
+        crop = _extract_row_crop(src, rec)
+        text, dbg, pre_img, post_img = _run_ocr_on_crop(
             crop,
-            donut_checkpoint,
-            device,
-            max_len,
+            ocr_engine=engine,
+            donut_checkpoint=donut_checkpoint,
+            bdrc_ocr_model=bdrc_ocr_model,
+            device=device,
+            max_len=max_len,
             preprocess_preset=preprocess_preset,
             bdrc_preprocess_overrides=bdrc_preprocess_overrides,
             rgb_preprocess_overrides=rgb_preprocess_overrides,
@@ -1179,6 +1431,7 @@ def _run_full_auto(
                 "line_class": int(rec.get("line_class", 0)),
                 "text": text,
                 "ocr_debug": dbg,
+                "ocr_engine": engine,
                 "source": str(rec.get("source") or "full_auto"),
             }
         )
@@ -1196,13 +1449,19 @@ def _run_full_auto(
         "mode": "full_auto",
         "split_status": split_status,
         "line_count": len(rows),
+        "ocr_engine": engine,
+        "ocr_model": (str(donut_checkpoint or "") if engine == OCR_ENGINE_DONUT else str(bdrc_ocr_model or "")),
         "line_segmentation_mode": mode,
         "line_segmentation_preprocess": (
             normalize_line_segmentation_preprocess_pipeline(line_segmentation_preprocess)
             if mode == LINE_SEG_YOLO
-            else "none"
+            else ("bdrc_internal" if mode == LINE_SEG_BDRC else "none")
         ),
-        "line_segmentation_model": (str(line_model or "") if mode == LINE_SEG_YOLO else ""),
+        "line_segmentation_model": (
+            str(line_model or "")
+            if mode == LINE_SEG_YOLO
+            else (str(bdrc_line_model or "") if mode == LINE_SEG_BDRC else "")
+        ),
         "image_preprocess_pipeline": _normalize_preprocess_preset(preprocess_preset),
         "preprocess_overrides": _effective_preprocess_overrides(
             preprocess_preset=preprocess_preset,
@@ -1220,12 +1479,16 @@ def _run_full_auto(
             else None
         ),
         "split_json": split_debug,
+        "auto_download_notes": auto_notes or None,
     }
     strong_overlay = _render_overlay(src, rows)
+    status_msg = f"{split_status} OCR executed on {len(rows)} line(s)."
+    if auto_notes:
+        status_msg += " " + " ".join(auto_notes)
     return (
         strong_overlay,
         transcript,
-        f"{split_status} OCR executed on {len(rows)} line(s).",
+        status_msg,
         state,
         json.dumps(debug, ensure_ascii=False, indent=2),
         state.get("last_donut_pre"),
@@ -1370,10 +1633,12 @@ def _read_repro_preprocess_pipeline(ckpt_path: str) -> Optional[str]:
 
 def _run_comparison(
     state: Dict[str, Any],
+    ocr_engine: str,
     layout_model: str,
     line_segmentation_mode: str,
     line_segmentation_preprocess: str,
     line_model: str,
+    bdrc_line_model: str,
     device: str,
     max_len: int,
     preprocess_preset: str = "bdrc",
@@ -1389,11 +1654,22 @@ def _run_comparison(
     image = state.get("image")
     if image is None:
         return None, "", "Please upload an image first.", state, "{}", None, None
+    if _normalize_ocr_engine(ocr_engine) != OCR_ENGINE_DONUT:
+        src = np.asarray(state.get("image")).astype(np.uint8, copy=False)
+        return src, "", "Comparison mode currently supports DONUT checkpoints only.", state, "{}", None, None
+    auto_notes: List[str] = []
     mode = _normalize_line_segmentation_mode(line_segmentation_mode)
     if mode == LINE_SEG_CLASSICAL and not layout_model.strip():
         return np.asarray(image).astype(np.uint8, copy=False), "", "Layout model is missing.", state, "{}", None, None
     if mode == LINE_SEG_YOLO and not (line_model or "").strip():
         return np.asarray(image).astype(np.uint8, copy=False), "", "Line segmentation model is missing.", state, "{}", None, None
+    if mode == LINE_SEG_BDRC and not (bdrc_line_model or "").strip():
+        try:
+            bdrc_line_model, note = _ensure_default_bdrc_line_model_path(bdrc_line_model)
+            if note:
+                auto_notes.append(note)
+        except Exception as exc:
+            return np.asarray(image).astype(np.uint8, copy=False), "", f"BDRC line model is missing and auto-download failed: {type(exc).__name__}: {exc}", state, "{}", None, None
 
     checkpoints, scan_msg = _list_donut_checkpoints()
     if not checkpoints:
@@ -1406,6 +1682,7 @@ def _run_comparison(
         line_segmentation_preprocess=line_segmentation_preprocess,
         layout_model=layout_model,
         line_model=line_model,
+        bdrc_line_model=bdrc_line_model,
         device=device if device != "auto" else "",
     )
 
@@ -1495,21 +1772,30 @@ def _run_comparison(
         "mode": "comparison",
         "checkpoints_compared": len(checkpoints),
         "split_status": split_status,
+        "ocr_engine": OCR_ENGINE_DONUT,
         "line_segmentation_mode": mode,
         "line_segmentation_preprocess": (
             normalize_line_segmentation_preprocess_pipeline(line_segmentation_preprocess)
             if mode == LINE_SEG_YOLO
-            else "none"
+            else ("bdrc_internal" if mode == LINE_SEG_BDRC else "none")
         ),
-        "line_segmentation_model": (str(line_model or "") if mode == LINE_SEG_YOLO else ""),
+        "line_segmentation_model": (
+            str(line_model or "")
+            if mode == LINE_SEG_YOLO
+            else (str(bdrc_line_model or "") if mode == LINE_SEG_BDRC else "")
+        ),
         "line_count": len(line_records_raw),
         "split_json": split_debug,
         "checkpoints": ckpt_debug,
+        "auto_download_notes": auto_notes or None,
     }
+    status_msg = f"Comparison done: {len(checkpoints)} model(s), {len(line_records_raw)} line(s)."
+    if auto_notes:
+        status_msg += " " + " ".join(auto_notes)
     return (
         last_overlay,
         full_report,
-        f"Comparison done: {len(checkpoints)} model(s), {len(line_records_raw)} line(s).",
+        status_msg,
         state,
         json.dumps(debug, ensure_ascii=False, indent=2),
         None,
@@ -1552,11 +1838,14 @@ def _add_or_update_line(rows: List[Dict[str, Any]], row: Dict[str, Any]) -> List
 
 def _manual_click(
     state: Dict[str, Any],
+    ocr_engine: str,
     donut_checkpoint: str,
+    bdrc_ocr_model: str,
     layout_model: str,
     line_segmentation_mode: str,
     line_segmentation_preprocess: str,
     line_model: str,
+    bdrc_line_model: str,
     device: str,
     max_len: int,
     preprocess_preset: str,
@@ -1567,8 +1856,22 @@ def _manual_click(
     image = state.get("image")
     if image is None:
         return None, "", "Please upload an image first.", state, "{}", state.get("last_donut_pre"), state.get("last_donut_post")
-    if not donut_checkpoint.strip():
+    engine = _normalize_ocr_engine(ocr_engine)
+    if engine == OCR_ENGINE_BDRC and not bdrc_ocr_model.strip():
+        try:
+            bdrc_ocr_model, _ = _ensure_default_bdrc_ocr_model_path(bdrc_ocr_model)
+        except Exception as exc:
+            return image, "", f"BDRC OCR model is missing and auto-download failed: {type(exc).__name__}: {exc}", state, "{}", state.get("last_donut_pre"), state.get("last_donut_post")
+    mode = _normalize_line_segmentation_mode(line_segmentation_mode)
+    if mode == LINE_SEG_BDRC and not (bdrc_line_model or "").strip():
+        try:
+            bdrc_line_model, _ = _ensure_default_bdrc_line_model_path(bdrc_line_model)
+        except Exception as exc:
+            return image, "", f"BDRC line model is missing and auto-download failed: {type(exc).__name__}: {exc}", state, "{}", state.get("last_donut_pre"), state.get("last_donut_post")
+    if engine == OCR_ENGINE_DONUT and not donut_checkpoint.strip():
         return image, "", "DONUT checkpoint is missing.", state, "{}", state.get("last_donut_pre"), state.get("last_donut_post")
+    if engine == OCR_ENGINE_BDRC and not bdrc_ocr_model.strip():
+        return image, "", "BDRC OCR model is missing.", state, "{}", state.get("last_donut_pre"), state.get("last_donut_post")
 
     idx = getattr(evt, "index", None)
     if not isinstance(idx, (tuple, list)) or len(idx) < 2:
@@ -1586,13 +1889,14 @@ def _manual_click(
 
     hit = _find_line_hit(rows, click_x, click_y)
     if hit is not None:
-        x1, y1, x2, y2 = [int(v) for v in hit["line_box"]]
-        crop = src[y1:y2, x1:x2]
-        text, dbg, pre_img, post_img = _run_donut_on_crop(
+        crop = _extract_row_crop(src, hit)
+        text, dbg, pre_img, post_img = _run_ocr_on_crop(
             crop,
-            donut_checkpoint,
-            device,
-            max_len,
+            ocr_engine=engine,
+            donut_checkpoint=donut_checkpoint,
+            bdrc_ocr_model=bdrc_ocr_model,
+            device=device,
+            max_len=max_len,
             preprocess_preset=preprocess_preset,
             bdrc_preprocess_overrides=bdrc_preprocess_overrides,
             rgb_preprocess_overrides=rgb_preprocess_overrides,
@@ -1629,10 +1933,13 @@ def _manual_click(
     roi = _normalize_box([x1, y1, x2, y2], w, h)
     return _manual_process_roi(
         state,
+        ocr_engine,
         donut_checkpoint,
+        bdrc_ocr_model,
         line_segmentation_mode,
         line_segmentation_preprocess,
         line_model,
+        bdrc_line_model,
         device,
         max_len,
         roi,
@@ -1644,10 +1951,13 @@ def _manual_click(
 
 def _manual_process_roi(
     state: Dict[str, Any],
+    ocr_engine: str,
     donut_checkpoint: str,
+    bdrc_ocr_model: str,
     line_segmentation_mode: str,
     line_segmentation_preprocess: str,
     line_model: str,
+    bdrc_line_model: str,
     device: str,
     max_len: int,
     roi: Optional[List[int]],
@@ -1658,6 +1968,23 @@ def _manual_process_roi(
     image = state.get("image")
     if image is None:
         return None, "", "Please upload an image first.", state, "{}", state.get("last_donut_pre"), state.get("last_donut_post")
+    engine = _normalize_ocr_engine(ocr_engine)
+    auto_notes: List[str] = []
+    if engine == OCR_ENGINE_BDRC and not bdrc_ocr_model.strip():
+        try:
+            bdrc_ocr_model, note = _ensure_default_bdrc_ocr_model_path(bdrc_ocr_model)
+            if note:
+                auto_notes.append(note)
+        except Exception as exc:
+            return None, "", f"BDRC OCR model is missing and auto-download failed: {type(exc).__name__}: {exc}", state, "{}", state.get("last_donut_pre"), state.get("last_donut_post")
+    mode = _normalize_line_segmentation_mode(line_segmentation_mode)
+    if mode == LINE_SEG_BDRC and not (bdrc_line_model or "").strip():
+        try:
+            bdrc_line_model, note = _ensure_default_bdrc_line_model_path(bdrc_line_model)
+            if note:
+                auto_notes.append(note)
+        except Exception as exc:
+            return None, "", f"BDRC line model is missing and auto-download failed: {type(exc).__name__}: {exc}", state, "{}", state.get("last_donut_pre"), state.get("last_donut_post")
     src = np.asarray(image).astype(np.uint8, copy=False)
     h, w = src.shape[:2]
     rows = list(state.get("line_rows") or [])
@@ -1674,13 +2001,14 @@ def _manual_process_roi(
     created_rows: List[Dict[str, Any]] = []
     last_pre: Optional[np.ndarray] = None
     last_post: Optional[np.ndarray] = None
-    mode = _normalize_line_segmentation_mode(line_segmentation_mode)
     if _roi_is_single_line(roi_w, roi_h):
-        text, dbg, pre_img, post_img = _run_donut_on_crop(
+        text, dbg, pre_img, post_img = _run_ocr_on_crop(
             roi_crop,
-            donut_checkpoint,
-            device,
-            max_len,
+            ocr_engine=engine,
+            donut_checkpoint=donut_checkpoint,
+            bdrc_ocr_model=bdrc_ocr_model,
+            device=device,
+            max_len=max_len,
             preprocess_preset=preprocess_preset,
             bdrc_preprocess_overrides=bdrc_preprocess_overrides,
             rgb_preprocess_overrides=rgb_preprocess_overrides,
@@ -1714,6 +2042,21 @@ def _manual_process_roi(
                     image_w=roi_w,
                     image_h=roi_h,
                     source="manual_roi_yolo_line_model",
+                )
+            except Exception:
+                line_rows_local = []
+        elif mode == LINE_SEG_BDRC and (bdrc_line_model or "").strip():
+            try:
+                predictions, _dbg = predict_bdrc_line_regions(
+                    roi_crop,
+                    model_path=bdrc_line_model,
+                    device=device,
+                )
+                line_rows_local = _rows_from_bdrc_line_predictions(
+                    predictions,
+                    image_w=roi_w,
+                    image_h=roi_h,
+                    source="manual_roi_bdrc_line_model",
                 )
             except Exception:
                 line_rows_local = []
@@ -1754,13 +2097,16 @@ def _manual_process_roi(
             gbox = _normalize_box([gx1, gy1, gx2, gy2], w, h)
             if gbox is None:
                 continue
-            lx1, ly1, lx2, ly2 = gbox
-            lcrop = src[ly1:ly2, lx1:lx2]
-            text, dbg, pre_img, post_img = _run_donut_on_crop(
+            local_copy = dict(local_rec)
+            local_copy["line_box"] = gbox
+            lcrop = _extract_row_crop(src, local_copy)
+            text, dbg, pre_img, post_img = _run_ocr_on_crop(
                 lcrop,
-                donut_checkpoint,
-                device,
-                max_len,
+                ocr_engine=engine,
+                donut_checkpoint=donut_checkpoint,
+                bdrc_ocr_model=bdrc_ocr_model,
+                device=device,
+                max_len=max_len,
                 preprocess_preset=preprocess_preset,
                 bdrc_preprocess_overrides=bdrc_preprocess_overrides,
                 rgb_preprocess_overrides=rgb_preprocess_overrides,
@@ -1779,15 +2125,19 @@ def _manual_process_roi(
                     "line_class": int(local_rec.get("line_class", 0)),
                     "text": text,
                     "ocr_debug": dbg,
+                    "ocr_engine": engine,
+                    "ocr_crop": local_rec.get("ocr_crop"),
                     "source": str(local_rec.get("source") or "manual_roi_line_split"),
                 }
             )
         if not created_rows:
-            text, dbg, pre_img, post_img = _run_donut_on_crop(
+            text, dbg, pre_img, post_img = _run_ocr_on_crop(
                 roi_crop,
-                donut_checkpoint,
-                device,
-                max_len,
+                ocr_engine=engine,
+                donut_checkpoint=donut_checkpoint,
+                bdrc_ocr_model=bdrc_ocr_model,
+                device=device,
+                max_len=max_len,
                 preprocess_preset=preprocess_preset,
                 bdrc_preprocess_overrides=bdrc_preprocess_overrides,
                 rgb_preprocess_overrides=rgb_preprocess_overrides,
@@ -1802,7 +2152,11 @@ def _manual_process_roi(
                     "source": "manual_roi_fallback_direct",
                 }
             )
-        action = ("roi_line_split_yolo_model" if mode == LINE_SEG_YOLO else "roi_line_split")
+        action = (
+            "roi_line_split_yolo_model"
+            if mode == LINE_SEG_YOLO
+            else ("roi_line_split_bdrc_model" if mode == LINE_SEG_BDRC else "roi_line_split")
+        )
 
     for rec in created_rows:
         rows = _add_or_update_line(rows, rec)
@@ -1820,13 +2174,18 @@ def _manual_process_roi(
         "roi": roi,
         "new_rows": created_rows,
         "total_rows": len(rows),
+        "ocr_engine": engine,
         "line_segmentation_mode": mode,
         "line_segmentation_preprocess": (
             normalize_line_segmentation_preprocess_pipeline(line_segmentation_preprocess)
             if mode == LINE_SEG_YOLO
-            else "none"
+            else ("bdrc_internal" if mode == LINE_SEG_BDRC else "none")
         ),
-        "line_segmentation_model": (str(line_model or "") if mode == LINE_SEG_YOLO else ""),
+        "line_segmentation_model": (
+            str(line_model or "")
+            if mode == LINE_SEG_YOLO
+            else (str(bdrc_line_model or "") if mode == LINE_SEG_BDRC else "")
+        ),
         "image_preprocess_pipeline": _normalize_preprocess_preset(preprocess_preset),
         "preprocess_overrides": _effective_preprocess_overrides(
             preprocess_preset=preprocess_preset,
@@ -1843,11 +2202,15 @@ def _manual_process_roi(
             if isinstance(rgb_preprocess_overrides, dict)
             else None
         ),
+        "auto_download_notes": auto_notes or None,
     }
+    status_msg = f"Manual ROI processed. New/updated lines: {len(created_rows)}."
+    if auto_notes:
+        status_msg += " " + " ".join(auto_notes)
     return (
         overlay,
         _line_text(rows),
-        f"Manual ROI processed. New/updated lines: {len(created_rows)}.",
+        status_msg,
         state,
         json.dumps(debug, ensure_ascii=False, indent=2),
         state.get("last_donut_pre"),
@@ -1858,10 +2221,13 @@ def _manual_process_roi(
 def _manual_full_image_roi(
     mode_s: str,
     state_s: Dict[str, Any],
+    ocr_engine_s: str,
     donut_s: str,
+    bdrc_ocr_model_s: str,
     line_segmentation_mode_s: str,
     line_segmentation_preprocess_s: str,
     line_model_s: str,
+    bdrc_line_model_s: str,
     device_s: str,
     max_len_s: int,
     preprocess_preset: str = "bdrc",
@@ -1879,10 +2245,13 @@ def _manual_full_image_roi(
     h, w = src.shape[:2]
     return _manual_process_roi(
         state_s,
+        ocr_engine_s,
         donut_s,
+        bdrc_ocr_model_s,
         line_segmentation_mode_s,
         line_segmentation_preprocess_s,
         line_model_s,
+        bdrc_line_model_s,
         device_s,
         int(max_len_s),
         [0, 0, w, h],
@@ -1914,11 +2283,14 @@ def _on_upload(img_array: Any, state: Dict[str, Any]) -> Tuple[np.ndarray, str, 
 def _save_results(
     state: Dict[str, Any],
     transcript_text: str,
+    ocr_engine: str,
     donut_checkpoint: str,
+    bdrc_ocr_model: str,
     layout_model: str,
     line_segmentation_mode: str,
     line_segmentation_preprocess: str,
     line_model: str,
+    bdrc_line_model: str,
 ) -> str:
     image = state.get("image")
     if image is None:
@@ -1942,29 +2314,44 @@ def _save_results(
         box = _normalize_box(rec.get("line_box") or [], w, h)
         if box is None:
             continue
-        x1, y1, x2, y2 = box
-        crop = src[y1:y2, x1:x2]
+        crop = _extract_row_crop(src, rec)
         crop_name = f"line_{i:03d}.png"
         Image.fromarray(crop).save(out_dir / crop_name)
         obj = dict(rec)
+        obj.pop("ocr_crop", None)
         obj["line_no"] = i
         obj["line_box"] = box
         obj["line_crop_file"] = crop_name
         saved_rows.append(obj)
 
+    normalized_engine = _normalize_ocr_engine(ocr_engine)
+    normalized_mode = _normalize_line_segmentation_mode(line_segmentation_mode)
     payload = {
         "saved_at": datetime.now().isoformat(),
         "image_name": name,
         "image_path": str(state.get("image_path") or ""),
+        "ocr_engine": normalized_engine,
+        "ocr_model": (
+            str(donut_checkpoint or "")
+            if normalized_engine == OCR_ENGINE_DONUT
+            else str(bdrc_ocr_model or "")
+        ),
         "donut_checkpoint": str(donut_checkpoint or ""),
+        "bdrc_ocr_model": str(bdrc_ocr_model or ""),
         "layout_model": str(layout_model or ""),
-        "line_segmentation_mode": _normalize_line_segmentation_mode(line_segmentation_mode),
+        "line_segmentation_mode": normalized_mode,
         "line_segmentation_preprocess": (
             normalize_line_segmentation_preprocess_pipeline(line_segmentation_preprocess)
-            if _normalize_line_segmentation_mode(line_segmentation_mode) == LINE_SEG_YOLO
-            else "none"
+            if normalized_mode == LINE_SEG_YOLO
+            else ("bdrc_internal" if normalized_mode == LINE_SEG_BDRC else "none")
         ),
-        "line_segmentation_model": str(line_model or ""),
+        "line_segmentation_model": (
+            str(line_model or "")
+            if normalized_mode == LINE_SEG_YOLO
+            else (str(bdrc_line_model or "") if normalized_mode == LINE_SEG_BDRC else "")
+        ),
+        "yolo_line_segmentation_model": str(line_model or ""),
+        "bdrc_line_model": str(bdrc_line_model or ""),
         "line_count": len(saved_rows),
         "lines": saved_rows,
     }
@@ -2158,32 +2545,42 @@ function() {
 }
 """
 
-    with gr.Blocks(title="OCR Workbench (DONUT)", css=ui_css, js=_image_zoom_js) as demo:
+    with gr.Blocks(title="OCR Workbench", css=ui_css, js=_image_zoom_js) as demo:
         donut_ckpt_choices, donut_msg = _list_donut_checkpoints()
         layout_model_choices, layout_msg = _list_layout_models()
         line_model_choices, line_model_msg = _list_line_segmentation_models()
+        bdrc_line_model_choices, bdrc_line_model_msg = _list_bdrc_line_models()
+        bdrc_ocr_model_choices, bdrc_ocr_model_msg = _list_bdrc_ocr_models()
         _default_donut = donut_ckpt_choices[0][1] if donut_ckpt_choices else ""
         _default_layout = layout_model_choices[0][1] if layout_model_choices else ""
+        _default_line_model = line_model_choices[0][1] if line_model_choices else ""
+        _default_bdrc_line_model = bdrc_line_model_choices[0][1] if bdrc_line_model_choices else ""
+        _default_bdrc_ocr_model = bdrc_ocr_model_choices[0][1] if bdrc_ocr_model_choices else ""
         _donut_label = donut_ckpt_choices[0][0] if donut_ckpt_choices else "—"
         _layout_label = layout_model_choices[0][0] if layout_model_choices else "—"
+        _line_label = line_model_choices[0][0] if line_model_choices else "—"
+        _bdrc_line_label = bdrc_line_model_choices[0][0] if bdrc_line_model_choices else "—"
+        _bdrc_ocr_label = bdrc_ocr_model_choices[0][0] if bdrc_ocr_model_choices else "—"
 
         # ── Top bar: title + model status + advanced toggle ─────────────────
         with gr.Row(equal_height=True):
             with gr.Column(scale=6):
-                gr.Markdown("## OCR Workbench (DONUT + Layout)")
+                gr.Markdown("## OCR Workbench")
             with gr.Column(scale=4):
                 # ── Compact model info (shown in simple mode) ───────────────
                 with gr.Row() as model_info_row:
                     gr.Markdown(
-                        f"🤖 `{_donut_label}`  &nbsp;|&nbsp;  📐 `{_layout_label}`",
+                        f"🤖 DONUT `{_donut_label}`  &nbsp;|&nbsp;  🪵 BDRC OCR `{_bdrc_ocr_label}`"
+                        f"  &nbsp;|&nbsp;  📐 Layout `{_layout_label}`  &nbsp;|&nbsp;  "
+                        f"📏 YOLO `{_line_label}` / BDRC `{_bdrc_line_label}`",
                         elem_id="model_info_md",
                     )
             with gr.Column(scale=1, min_width=140):
                 advanced_view = gr.Checkbox(label="Advanced View", value=False)
 
         gr.Markdown(
-            "Automatic mode: choose classical CV line splitting or a pretrained YOLO line model, then run OCR. "
-            "Manual mode: click an existing line or define an ROI with two clicks."
+            "Automatic mode: choose classical CV, a pretrained YOLO line model, or the BDRC line model, "
+            "then run DONUT or BDRC OCR. Manual mode: click an existing line or define an ROI with two clicks."
         )
 
         # ── Folder Browser ──────────────────────────────────────────────────
@@ -2191,7 +2588,7 @@ function() {
             gr.Markdown(
                 "Enter a folder path to browse images. "
                 "Click a thumbnail to load it into the workbench below and automatically "
-                "run line segmentation + DONUT OCR."
+                "run the selected line segmentation backend + OCR engine."
             )
             with gr.Row():
                 folder_path_input = gr.Textbox(
@@ -2237,19 +2634,43 @@ function() {
                 )
             with gr.Column(scale=1, min_width=110):
                 layout_refresh_btn = gr.Button("🔄 Refresh", variant="secondary")
+        with gr.Row(visible=False) as advanced_bdrc_model_row:
+            with gr.Column(scale=10):
+                bdrc_ocr_model_path = gr.Dropdown(
+                    label="BDRC OCR Model",
+                    choices=bdrc_ocr_model_choices,
+                    value=_default_bdrc_ocr_model,
+                    allow_custom_value=True,
+                )
+            with gr.Column(scale=1, min_width=110):
+                bdrc_ocr_refresh_btn = gr.Button("🔄 Refresh", variant="secondary")
+            with gr.Column(scale=10):
+                bdrc_line_model_path = gr.Dropdown(
+                    label="BDRC Line Model",
+                    choices=bdrc_line_model_choices,
+                    value=_default_bdrc_line_model,
+                    allow_custom_value=True,
+                )
+            with gr.Column(scale=1, min_width=110):
+                bdrc_line_model_refresh_btn = gr.Button("🔄 Refresh", variant="secondary")
+        with gr.Row():
+            ocr_engine = gr.Radio(
+                choices=[OCR_ENGINE_DONUT, OCR_ENGINE_BDRC],
+                value=OCR_ENGINE_DONUT,
+                label="OCR Engine",
+            )
         with gr.Row():
             line_segmentation_mode = gr.Radio(
-                choices=[LINE_SEG_CLASSICAL, LINE_SEG_YOLO],
+                choices=[LINE_SEG_CLASSICAL, LINE_SEG_YOLO, LINE_SEG_BDRC],
                 value=LINE_SEG_CLASSICAL,
                 label="Line Segmentation",
             )
         with gr.Row():
             with gr.Column(scale=10):
-                line_model_choices, line_model_msg = _list_line_segmentation_models()
                 line_model_path = gr.Dropdown(
                     label="Line Segmentation Model",
                     choices=line_model_choices,
-                    value=line_model_choices[0][1] if line_model_choices else "",
+                    value=_default_line_model,
                     allow_custom_value=True,
                 )
             with gr.Column(scale=1, min_width=110):
@@ -2258,12 +2679,14 @@ function() {
             donut_info = gr.Textbox(label="DONUT Auto-Scan", value=donut_msg, interactive=False)
             layout_info = gr.Textbox(label="Layout Auto-Scan", value=layout_msg, interactive=False)
             line_model_info = gr.Textbox(label="Line Model Auto-Scan", value=line_model_msg, interactive=False)
+            bdrc_ocr_info = gr.Textbox(label="BDRC OCR Auto-Scan", value=bdrc_ocr_model_msg, interactive=False)
+            bdrc_line_model_info = gr.Textbox(label="BDRC Line Auto-Scan", value=bdrc_line_model_msg, interactive=False)
 
         with gr.Row():
             mode = gr.Radio(choices=[MODE_AUTO, MODE_MANUAL], value=MODE_AUTO, label="Mode")
         with gr.Row(visible=False) as advanced_runtime_row:
             device = gr.Dropdown(choices=["auto", "cuda:0", "cpu"], value="auto", label="Inference Device")
-            max_len = gr.Number(label="DONUT generation_max_length", value=160, precision=0)
+            max_len = gr.Number(label="OCR generation_max_length (DONUT only)", value=160, precision=0)
         with gr.Row(visible=False) as advanced_preprocess_select_row:
             preprocess_preset = gr.Dropdown(
                 choices=[("bdrc", "bdrc"), ("gray", "gray"), ("RGB", "rgb")],
@@ -2273,10 +2696,10 @@ function() {
             line_model_preprocess = gr.Dropdown(
                 choices=[("none", "none"), ("bdrc", "bdrc"), ("gray", "gray"), ("RGB", "rgb")],
                 value=DEFAULT_LINE_SEGMENTATION_PREPROCESS,
-                label="Line Model Preprocess",
+                label="Line Model Preprocess (YOLO only)",
             )
         with gr.Row(visible=False) as advanced_bdrc_row:
-            with gr.Accordion("BDRC / Gray Preprocess (DONUT Input)", open=False):
+            with gr.Accordion("BDRC / Gray Preprocess (OCR Input)", open=False):
                 gr.Markdown(
                     "1) Background normalize  2) Thresholding  3) Morph close + tiny component filter  "
                     "4) Upscale before binarization  5) Gray channel mode\n\n"
@@ -2365,7 +2788,7 @@ function() {
                         label="3) min_component_area",
                     )
         with gr.Row(visible=False) as advanced_rgb_row:
-            with gr.Accordion("RGB Preprocess (DONUT Input)", open=False):
+            with gr.Accordion("RGB Preprocess (OCR Input)", open=False):
                 gr.Markdown(
                     "RGB pipeline keeps color cues and exposes background correction, denoising, "
                     "ink normalization, morphology and upscale options."
@@ -2458,13 +2881,13 @@ function() {
             debug_json = gr.Code(language="json")
         with gr.Column():
             donut_input_before = gr.Image(
-                label="DONUT Input (Before Preprocess)",
+                label="OCR Input (Before Preprocess)",
                 type="numpy",
                 visible=False,
                 elem_id="donut_input_before",
             )
             donut_input_after = gr.Image(
-                label="DONUT Input (After Preprocess)",
+                label="OCR Input (After Preprocess)",
                 type="numpy",
                 visible=False,
                 elem_id="donut_input_after",
@@ -2519,11 +2942,14 @@ function() {
         def _run(
             mode_s: str,
             state_s: Dict[str, Any],
+            ocr_engine_s: str,
             donut_s: str,
+            bdrc_ocr_model_s: str,
             layout_s: str,
             line_segmentation_mode_s: str,
             line_segmentation_preprocess_s: str,
             line_model_s: str,
+            bdrc_line_model_s: str,
             device_s: str,
             max_len_s: int,
             preprocess_preset_s: str,
@@ -2594,11 +3020,14 @@ function() {
             if not _is_manual_mode(mode_s):
                 return _run_full_auto(
                     state_s,
+                    ocr_engine_s,
                     donut_s,
+                    bdrc_ocr_model_s,
                     layout_s,
                     line_segmentation_mode_s,
                     line_segmentation_preprocess_s,
                     line_model_s,
+                    bdrc_line_model_s,
                     device_s,
                     int(max_len_s),
                     preprocess_preset=preproc_mode,
@@ -2610,9 +3039,23 @@ function() {
             debug = {
                 "ok": True,
                 "mode": "manual_waiting",
+                "ocr_engine": _normalize_ocr_engine(ocr_engine_s),
+                "ocr_model": (
+                    str(donut_s or "")
+                    if _normalize_ocr_engine(ocr_engine_s) == OCR_ENGINE_DONUT
+                    else str(bdrc_ocr_model_s or "")
+                ),
                 "line_segmentation_mode": _normalize_line_segmentation_mode(line_segmentation_mode_s),
-                "line_segmentation_preprocess": normalize_line_segmentation_preprocess_pipeline(line_segmentation_preprocess_s),
-                "line_segmentation_model": str(line_model_s or ""),
+                "line_segmentation_preprocess": (
+                    normalize_line_segmentation_preprocess_pipeline(line_segmentation_preprocess_s)
+                    if _normalize_line_segmentation_mode(line_segmentation_mode_s) == LINE_SEG_YOLO
+                    else ("bdrc_internal" if _normalize_line_segmentation_mode(line_segmentation_mode_s) == LINE_SEG_BDRC else "none")
+                ),
+                "line_segmentation_model": (
+                    str(line_model_s or "")
+                    if _normalize_line_segmentation_mode(line_segmentation_mode_s) == LINE_SEG_YOLO
+                    else (str(bdrc_line_model_s or "") if _normalize_line_segmentation_mode(line_segmentation_mode_s) == LINE_SEG_BDRC else "")
+                ),
                 "image_preprocess_pipeline": preproc_mode,
                 "preprocess_overrides": _effective_preprocess_overrides(
                     preprocess_preset=preproc_mode,
@@ -2637,11 +3080,14 @@ function() {
             inputs=[
                 mode,
                 state,
+                ocr_engine,
                 donut_path,
+                bdrc_ocr_model_path,
                 layout_path,
                 line_segmentation_mode,
                 line_model_preprocess,
                 line_model_path,
+                bdrc_line_model_path,
                 device,
                 max_len,
                 preprocess_preset,
@@ -2687,11 +3133,14 @@ function() {
         def _on_select(
             mode_s: str,
             state_s: Dict[str, Any],
+            ocr_engine_s: str,
             donut_s: str,
+            bdrc_ocr_model_s: str,
             layout_s: str,
             line_segmentation_mode_s: str,
             line_segmentation_preprocess_s: str,
             line_model_s: str,
+            bdrc_line_model_s: str,
             device_s: str,
             max_len_s: int,
             preprocess_preset_s: str,
@@ -2816,7 +3265,9 @@ function() {
                         state_s.get("last_donut_post"),
                     )
 
-                if not (donut_s or "").strip():
+                engine = _normalize_ocr_engine(ocr_engine_s)
+                auto_notes: List[str] = []
+                if engine == OCR_ENGINE_DONUT and not (donut_s or "").strip():
                     overlay = _render_overlay(src, rows)
                     return (
                         overlay,
@@ -2827,14 +3278,33 @@ function() {
                         state_s.get("last_donut_pre"),
                         state_s.get("last_donut_post"),
                     )
+                if engine == OCR_ENGINE_BDRC and not (bdrc_ocr_model_s or "").strip():
+                    try:
+                        bdrc_ocr_model_s, note = _ensure_default_bdrc_ocr_model_path(bdrc_ocr_model_s)
+                        if note:
+                            auto_notes.append(note)
+                    except Exception as exc:
+                        overlay = _render_overlay(src, rows)
+                        return (
+                            overlay,
+                            _line_text(rows),
+                            f"BDRC OCR model is missing and auto-download failed: {type(exc).__name__}: {exc}",
+                            state_s,
+                            "{}",
+                            state_s.get("last_donut_pre"),
+                            state_s.get("last_donut_post"),
+                        )
 
-                x1, y1, x2, y2 = [int(v) for v in hit.get("line_box") or [0, 0, 0, 0]]
-                crop = src[y1:y2, x1:x2]
-                text, dbg, pre_img, post_img = _run_donut_on_crop(
+                box = [int(v) for v in hit.get("line_box") or [0, 0, 0, 0]]
+                x1, y1, x2, y2 = box
+                crop = _extract_row_crop(src, hit)
+                text, dbg, pre_img, post_img = _run_ocr_on_crop(
                     crop,
-                    donut_s,
-                    device_s,
-                    int(max_len_s),
+                    ocr_engine=engine,
+                    donut_checkpoint=donut_s,
+                    bdrc_ocr_model=bdrc_ocr_model_s,
+                    device=device_s,
+                    max_len=int(max_len_s),
                     preprocess_preset=preproc_mode,
                     bdrc_preprocess_overrides=bdrc_overrides,
                     rgb_preprocess_overrides=rgb_overrides,
@@ -2853,10 +3323,21 @@ function() {
                     "ok": True,
                     "mode": str(mode_s),
                     "action": "clicked_detected_line_for_debug_preview",
-                    "line_box": [x1, y1, x2, y2],
+                    "ocr_engine": engine,
+                    "ocr_model": (str(donut_s or "") if engine == OCR_ENGINE_DONUT else str(bdrc_ocr_model_s or "")),
+                    "line_box": box,
+                    "auto_download_notes": auto_notes or None,
                     "line_segmentation_mode": _normalize_line_segmentation_mode(line_segmentation_mode_s),
-                    "line_segmentation_preprocess": normalize_line_segmentation_preprocess_pipeline(line_segmentation_preprocess_s),
-                    "line_segmentation_model": str(line_model_s or ""),
+                    "line_segmentation_preprocess": (
+                        normalize_line_segmentation_preprocess_pipeline(line_segmentation_preprocess_s)
+                        if _normalize_line_segmentation_mode(line_segmentation_mode_s) == LINE_SEG_YOLO
+                        else ("bdrc_internal" if _normalize_line_segmentation_mode(line_segmentation_mode_s) == LINE_SEG_BDRC else "none")
+                    ),
+                    "line_segmentation_model": (
+                        str(line_model_s or "")
+                        if _normalize_line_segmentation_mode(line_segmentation_mode_s) == LINE_SEG_YOLO
+                        else (str(bdrc_line_model_s or "") if _normalize_line_segmentation_mode(line_segmentation_mode_s) == LINE_SEG_BDRC else "")
+                    ),
                     "image_preprocess_pipeline": preproc_mode,
                     "preprocess_overrides": _effective_preprocess_overrides(
                         preprocess_preset=preproc_mode,
@@ -2869,7 +3350,10 @@ function() {
                 return (
                     overlay,
                     _line_text(rows),
-                    f"Updated debug preview from clicked line at ({click_x},{click_y}).",
+                    (
+                        f"Updated debug preview from clicked line at ({click_x},{click_y})."
+                        + ((" " + " ".join(auto_notes)) if auto_notes else "")
+                    ),
                     state_s,
                     json.dumps(debug, ensure_ascii=False, indent=2),
                     pre_img,
@@ -2877,11 +3361,14 @@ function() {
                 )
             return _manual_click(
                 state_s,
+                ocr_engine_s,
                 donut_s,
+                bdrc_ocr_model_s,
                 layout_s,
                 line_segmentation_mode_s,
                 line_segmentation_preprocess_s,
                 line_model_s,
+                bdrc_line_model_s,
                 device_s,
                 int(max_len_s),
                 preproc_mode,
@@ -2895,11 +3382,14 @@ function() {
             inputs=[
                 mode,
                 state,
+                ocr_engine,
                 donut_path,
+                bdrc_ocr_model_path,
                 layout_path,
                 line_segmentation_mode,
                 line_model_preprocess,
                 line_model_path,
+                bdrc_line_model_path,
                 device,
                 max_len,
                 preprocess_preset,
@@ -2945,10 +3435,13 @@ function() {
         def _manual_full_roi_with_preprocess(
             mode_s: str,
             state_s: Dict[str, Any],
+            ocr_engine_s: str,
             donut_s: str,
+            bdrc_ocr_model_s: str,
             line_segmentation_mode_s: str,
             line_segmentation_preprocess_s: str,
             line_model_s: str,
+            bdrc_line_model_s: str,
             device_s: str,
             max_len_s: int,
             preprocess_preset_s: str,
@@ -3019,10 +3512,13 @@ function() {
             return _manual_full_image_roi(
                 mode_s,
                 state_s,
+                ocr_engine_s,
                 donut_s,
+                bdrc_ocr_model_s,
                 line_segmentation_mode_s,
                 line_segmentation_preprocess_s,
                 line_model_s,
+                bdrc_line_model_s,
                 device_s,
                 int(max_len_s),
                 preprocess_preset=preproc_mode,
@@ -3035,10 +3531,13 @@ function() {
             inputs=[
                 mode,
                 state,
+                ocr_engine,
                 donut_path,
+                bdrc_ocr_model_path,
                 line_segmentation_mode,
                 line_model_preprocess,
                 line_model_path,
+                bdrc_line_model_path,
                 device,
                 max_len,
                 preprocess_preset,
@@ -3083,10 +3582,12 @@ function() {
 
         def _compare(
             state_s: Dict[str, Any],
+            ocr_engine_s: str,
             layout_s: str,
             line_segmentation_mode_s: str,
             line_segmentation_preprocess_s: str,
             line_model_s: str,
+            bdrc_line_model_s: str,
             device_s: str,
             max_len_s: int,
             preprocess_preset_s: str,
@@ -3156,10 +3657,12 @@ function() {
             )
             return _run_comparison(
                 state_s,
+                ocr_engine_s,
                 layout_s,
                 line_segmentation_mode_s,
                 line_segmentation_preprocess_s,
                 line_model_s,
+                bdrc_line_model_s,
                 device_s,
                 int(max_len_s),
                 preprocess_preset=preproc_mode,
@@ -3171,10 +3674,12 @@ function() {
             fn=_compare,
             inputs=[
                 state,
+                ocr_engine,
                 layout_path,
                 line_segmentation_mode,
                 line_model_preprocess,
                 line_model_path,
+                bdrc_line_model_path,
                 device,
                 max_len,
                 preprocess_preset,
@@ -3214,7 +3719,18 @@ function() {
 
         save_btn.click(
             fn=_save_results,
-            inputs=[state, transcript, donut_path, layout_path, line_segmentation_mode, line_model_preprocess, line_model_path],
+            inputs=[
+                state,
+                transcript,
+                ocr_engine,
+                donut_path,
+                bdrc_ocr_model_path,
+                layout_path,
+                line_segmentation_mode,
+                line_model_preprocess,
+                line_model_path,
+                bdrc_line_model_path,
+            ],
             outputs=[save_status],
         )
 
@@ -3284,6 +3800,7 @@ function() {
             return (
                 gr.update(visible=not visible),  # model_info_row  (simple summary)
                 gr.update(visible=visible),       # advanced_model_row
+                gr.update(visible=visible),       # advanced_bdrc_model_row
                 gr.update(visible=visible),       # advanced_scan_row
                 gr.update(visible=visible),       # advanced_runtime_row
                 gr.update(visible=visible),       # advanced_preprocess_select_row
@@ -3302,6 +3819,7 @@ function() {
             outputs=[
                 model_info_row,
                 advanced_model_row,
+                advanced_bdrc_model_row,
                 advanced_scan_row,
                 advanced_runtime_row,
                 advanced_preprocess_select_row,
@@ -3350,6 +3868,38 @@ function() {
             best = choices[0][1] if choices else ""
             return gr.update(choices=choices, value=best), msg
 
+        def _refresh_bdrc_ocr_model():
+            choices, msg = _list_bdrc_ocr_models()
+            best = choices[0][1] if choices else ""
+            return gr.update(choices=choices, value=best), msg
+
+        def _refresh_bdrc_line_model():
+            choices, msg = _list_bdrc_line_models()
+            best = choices[0][1] if choices else ""
+            return gr.update(choices=choices, value=best), msg
+
+        def _maybe_auto_download_bdrc_ocr_models(engine_s: str, current_path: str):
+            if _normalize_ocr_engine(engine_s) != OCR_ENGINE_BDRC:
+                return gr.update(), gr.update()
+            try:
+                chosen, note = _ensure_default_bdrc_ocr_model_path(current_path)
+                choices, msg = _list_bdrc_ocr_models()
+                status = msg if not note else f"{msg} | {note}"
+                return gr.update(choices=choices, value=chosen), status
+            except Exception as exc:
+                return gr.update(), f"BDRC OCR auto-download failed: {type(exc).__name__}: {exc}"
+
+        def _maybe_auto_download_bdrc_line_models(mode_s: str, current_path: str):
+            if _normalize_line_segmentation_mode(mode_s) != LINE_SEG_BDRC:
+                return gr.update(), gr.update()
+            try:
+                chosen, note = _ensure_default_bdrc_line_model_path(current_path)
+                choices, msg = _list_bdrc_line_models()
+                status = msg if not note else f"{msg} | {note}"
+                return gr.update(choices=choices, value=chosen), status
+            except Exception as exc:
+                return gr.update(), f"BDRC line auto-download failed: {type(exc).__name__}: {exc}"
+
         donut_refresh_btn.click(
             fn=_refresh_donut,
             inputs=[],
@@ -3366,6 +3916,30 @@ function() {
             fn=_refresh_line_model,
             inputs=[],
             outputs=[line_model_path, line_model_info],
+        )
+
+        bdrc_ocr_refresh_btn.click(
+            fn=_refresh_bdrc_ocr_model,
+            inputs=[],
+            outputs=[bdrc_ocr_model_path, bdrc_ocr_info],
+        )
+
+        bdrc_line_model_refresh_btn.click(
+            fn=_refresh_bdrc_line_model,
+            inputs=[],
+            outputs=[bdrc_line_model_path, bdrc_line_model_info],
+        )
+
+        ocr_engine.change(
+            fn=_maybe_auto_download_bdrc_ocr_models,
+            inputs=[ocr_engine, bdrc_ocr_model_path],
+            outputs=[bdrc_ocr_model_path, bdrc_ocr_info],
+        )
+
+        line_segmentation_mode.change(
+            fn=_maybe_auto_download_bdrc_line_models,
+            inputs=[line_segmentation_mode, bdrc_line_model_path],
+            outputs=[bdrc_line_model_path, bdrc_line_model_info],
         )
 
         # ── Auto-load repro settings whenever the DONUT checkpoint changes ──
@@ -3590,8 +4164,14 @@ function() {
 
         def _on_gallery_select(
             paths: List[str],
+            ocr_engine_s: str,
             donut_s: str,
+            bdrc_ocr_model_s: str,
             layout_s: str,
+            line_segmentation_mode_s: str,
+            line_segmentation_preprocess_s: str,
+            line_model_s: str,
+            bdrc_line_model_s: str,
             device_s: str,
             max_len_s: int,
             preprocess_preset_s: str,
@@ -3686,8 +4266,14 @@ function() {
             # Run full-auto OCR (line segmentation + DONUT)
             overlay, transcript_text, ocr_status, updated_state, debug_j, pre_img, post_img = _run_full_auto(
                 new_state,
+                ocr_engine_s,
                 donut_s,
+                bdrc_ocr_model_s,
                 layout_s,
+                line_segmentation_mode_s,
+                line_segmentation_preprocess_s,
+                line_model_s,
+                bdrc_line_model_s,
                 device_s,
                 int(max_len_s),
                 preprocess_preset=preproc_mode,
@@ -3700,8 +4286,14 @@ function() {
             fn=_on_gallery_select,
             inputs=[
                 folder_image_paths,
+                ocr_engine,
                 donut_path,
+                bdrc_ocr_model_path,
                 layout_path,
+                line_segmentation_mode,
+                line_model_preprocess,
+                line_model_path,
+                bdrc_line_model_path,
                 device,
                 max_len,
                 preprocess_preset,
