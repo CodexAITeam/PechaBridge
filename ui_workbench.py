@@ -923,6 +923,148 @@ def _infer_ultralytics_task(dataset: str, model: str) -> str:
     return "detect"
 
 
+def _ultralytics_detect_model_presets() -> List[str]:
+    return [
+        "yolo26n.pt",
+        "yolo26s.pt",
+        "yolo26m.pt",
+        "yolo26l.pt",
+        "yolo26x.pt",
+    ]
+
+
+def _ultralytics_segment_model_presets() -> List[str]:
+    return [
+        "yolo11n-seg.pt",
+        "yolo11s-seg.pt",
+        "yolo11m-seg.pt",
+        "yolo11l-seg.pt",
+        "yolo11x-seg.pt",
+    ]
+
+
+def _default_ultralytics_model_for_task(task: str) -> str:
+    return (
+        _ultralytics_segment_model_presets()[0]
+        if str(task or "").strip().lower() == "segment"
+        else _ultralytics_detect_model_presets()[0]
+    )
+
+
+def _default_ultralytics_project_for_task(task: str) -> str:
+    folder = "segment" if str(task or "").strip().lower() == "segment" else "detect"
+    return str((ROOT / "runs" / folder).resolve())
+
+
+def _model_looks_like_segmentation_checkpoint(model: str) -> bool:
+    txt = str(model or "").strip()
+    if not txt:
+        return False
+    low = txt.lower()
+    name = Path(txt).name.lower()
+    if "-seg" in name or name.startswith("line_seg") or "_seg" in name:
+        return True
+    if "line_segmentation" in low.replace("\\", "/"):
+        return True
+    return False
+
+
+def _model_looks_clearly_wrong_for_segment_task(model: str) -> bool:
+    txt = str(model or "").strip()
+    if not txt:
+        return True
+    if _model_looks_like_segmentation_checkpoint(txt):
+        return False
+
+    low = txt.lower().replace("\\", "/")
+    name = Path(txt).name.lower()
+    path_obj = Path(txt).expanduser()
+    if path_obj.exists():
+        return "layoutmodels" in low or name.startswith("layout_")
+    return True
+
+
+def _suggest_train_model_for_dataset(
+    dataset: str,
+    model_choice: str,
+    model_override: str,
+) -> str:
+    if str(model_override or "").strip():
+        return str(model_choice or "").strip()
+
+    current = str(model_choice or "").strip()
+    task = _infer_ultralytics_task(dataset, current)
+    if task == "segment":
+        if not current or current in _ultralytics_detect_model_presets():
+            return _default_ultralytics_model_for_task("segment")
+    else:
+        if not current or current in _ultralytics_segment_model_presets():
+            return _default_ultralytics_model_for_task("detect")
+    return current
+
+
+def _summarize_ultralytics_training_mode(dataset: str, model: str, project: str) -> str:
+    task = _infer_ultralytics_task(dataset, model)
+    default_project = _default_ultralytics_project_for_task(task)
+    archive_dir = (
+        (ROOT / "models" / "line_segmentation").resolve()
+        if task == "segment"
+        else (ROOT / "models" / "layoutModels").resolve()
+    )
+    lines = [
+        f"Inferred task: {task}",
+        "Entrypoint: train_model.py",
+        f"Effective model: {model or '(empty)'}",
+        f"Project: {project or default_project}",
+        f"Suggested default project: {default_project}",
+        f"Archived model target: {archive_dir}",
+    ]
+    if task == "segment":
+        lines.append(f"Recommended starter model: {_default_ultralytics_model_for_task('segment')}")
+        if _model_looks_clearly_wrong_for_segment_task(model):
+            lines.append("Warning: current model does not look like a segmentation checkpoint.")
+    return "\n".join(lines)
+
+
+def _refresh_ultralytics_training_defaults(
+    dataset: str,
+    model_choice: str,
+    model_override: str,
+    current_project: str,
+) -> Tuple[str, str, str]:
+    suggested_model = _suggest_train_model_for_dataset(dataset, model_choice, model_override)
+    effective_model = resolve_train_model(suggested_model, model_override)
+    task = _infer_ultralytics_task(dataset, effective_model)
+    detect_default = _default_ultralytics_project_for_task("detect")
+    segment_default = _default_ultralytics_project_for_task("segment")
+    project_txt = str(current_project or "").strip()
+    if not project_txt or project_txt in {detect_default, segment_default}:
+        next_project = _default_ultralytics_project_for_task(task)
+    else:
+        next_project = project_txt
+    status = _summarize_ultralytics_training_mode(dataset, effective_model, next_project)
+    return suggested_model, next_project, status
+
+
+def _refresh_ultralytics_training_status_only(
+    dataset: str,
+    model_choice: str,
+    model_override: str,
+    current_project: str,
+) -> Tuple[str, str]:
+    effective_model = resolve_train_model(model_choice, model_override)
+    task = _infer_ultralytics_task(dataset, effective_model)
+    detect_default = _default_ultralytics_project_for_task("detect")
+    segment_default = _default_ultralytics_project_for_task("segment")
+    project_txt = str(current_project or "").strip()
+    if not project_txt or project_txt in {detect_default, segment_default}:
+        next_project = _default_ultralytics_project_for_task(task)
+    else:
+        next_project = project_txt
+    status = _summarize_ultralytics_training_mode(dataset, effective_model, next_project)
+    return next_project, status
+
+
 def run_generate_synthetic(
     background_train: str,
     background_val: str,
@@ -6877,6 +7019,7 @@ def run_ultralytics_train_live(
     wandb_tags: str,
     wandb_name: str,
 ):
+    task = _infer_ultralytics_task(dataset, model)
     cmd = _build_ultralytics_train_cmd(
         dataset=dataset,
         model=model,
@@ -6927,7 +7070,10 @@ def run_ultralytics_train_live(
     stream_failed = False
     stream_fail_msg = ""
 
-    yield f"Running ...\nExpected best model path: {expected_best_model}\n", str(expected_best_model)
+    yield (
+        f"Running ...\nTask: {task}\nModel: {model}\nExpected best model path: {expected_best_model}\n",
+        str(expected_best_model),
+    )
 
     while True:
         got_output = False
@@ -6965,7 +7111,9 @@ def run_ultralytics_train_live(
             tail = _tail_lines_newest_first(log_lines, 800)
             if stream_failed and stream_fail_msg:
                 tail = f"{tail}\n[warning] {stream_fail_msg}" if tail else f"[warning] {stream_fail_msg}"
-            running_msg = f"Running ...\nExpected best model path: {expected_best_model}\n\n{tail}"
+            running_msg = (
+                f"Running ...\nTask: {task}\nModel: {model}\nExpected best model path: {expected_best_model}\n\n{tail}"
+            )
             yield running_msg, str(expected_best_model)
             last_emit_ts = now
             last_emit_count = len(log_lines)
@@ -7025,18 +7173,7 @@ def run_ultralytics_train_live(
 
 
 def _ultralytics_model_presets() -> List[str]:
-    return [
-        "yolo26n.pt",
-        "yolo26s.pt",
-        "yolo26m.pt",
-        "yolo26l.pt",
-        "yolo26x.pt",
-        "yolo11n-seg.pt",
-        "yolo11s-seg.pt",
-        "yolo11m-seg.pt",
-        "yolo11l-seg.pt",
-        "yolo11x-seg.pt",
-    ]
+    return _ultralytics_detect_model_presets() + _ultralytics_segment_model_presets()
 
 
 def scan_ultralytics_models(models_dir: str):
@@ -7077,6 +7214,17 @@ def run_ultralytics_train_from_ui(
     wandb_name: str,
 ):
     model = resolve_train_model(model_choice, model_override)
+    task = _infer_ultralytics_task(dataset, model)
+    if task == "segment" and _model_looks_clearly_wrong_for_segment_task(model):
+        recommended = _default_ultralytics_model_for_task("segment")
+        msg = (
+            "Refusing to start line-segmentation training with a model that does not look like a segmentation checkpoint.\n"
+            f"Dataset: {dataset}\n"
+            f"Selected model: {model or '(empty)'}\n"
+            f"Recommended: {recommended} or a checkpoint from {(ROOT / 'models' / 'line_segmentation').resolve()}"
+        )
+        yield msg, ""
+        return
     yield from run_ultralytics_train_live(
         dataset=dataset,
         model=model,
@@ -11128,10 +11276,21 @@ def build_ui() -> gr.Blocks:
 
         # 5) Training
         with gr.Tab("5. Ultralytics Training"):
-            gr.Markdown("Train a YOLO detection or segmentation model via `train_model.py`.")
+            gr.Markdown(
+                "Train a YOLO detection or segmentation model. "
+                "The tab auto-detects polygon line datasets and suggests matching model/project defaults."
+            )
             train_dataset_choices = _list_dataset_names(default_dataset_base)
             default_train_dataset = train_dataset_choices[0] if train_dataset_choices else "tibetan-yolo"
+            default_train_task = _infer_ultralytics_task(default_train_dataset, "")
             train_model_presets = _ultralytics_model_presets()
+            default_train_model = _default_ultralytics_model_for_task(default_train_task)
+            default_train_project = _default_ultralytics_project_for_task(default_train_task)
+            default_train_status = _summarize_ultralytics_training_mode(
+                default_train_dataset,
+                default_train_model,
+                default_train_project,
+            )
 
             with gr.Row():
                 train_dataset_base = gr.Textbox(label="Datasets Base Directory", value=default_dataset_base)
@@ -11148,7 +11307,7 @@ def build_ui() -> gr.Blocks:
             train_model = gr.Dropdown(
                 label="model",
                 choices=train_model_presets,
-                value=train_model_presets[0],
+                value=default_train_model,
                 allow_custom_value=True,
             )
             train_model_scan_msg = gr.Textbox(label="Model Scan Status", interactive=False)
@@ -11166,10 +11325,11 @@ def build_ui() -> gr.Blocks:
                 with gr.Column():
                     train_workers = gr.Number(label="workers", value=8, precision=0)
                     train_device = gr.Textbox(label="device", value="cuda:0")
-                    train_project = gr.Textbox(label="project", value=str((workspace_root / "runs" / "detect").resolve()))
+                    train_project = gr.Textbox(label="project", value=default_train_project)
                     train_name = gr.Textbox(label="name", value="train-ui")
                     train_patience = gr.Number(label="patience", value=50, precision=0)
                     train_export = gr.Checkbox(label="export", value=True)
+            train_task_hint = gr.Textbox(label="Training Mode", value=default_train_status, lines=6, interactive=False)
 
             with gr.Accordion("Weights & Biases", open=False):
                 train_wandb = gr.Checkbox(label="wandb", value=False)
@@ -11187,6 +11347,21 @@ def build_ui() -> gr.Blocks:
                 fn=scan_ultralytics_models,
                 inputs=[train_models_dir],
                 outputs=[train_model, train_model_scan_msg],
+            )
+            train_dataset.change(
+                fn=_refresh_ultralytics_training_defaults,
+                inputs=[train_dataset, train_model, train_model_override, train_project],
+                outputs=[train_model, train_project, train_task_hint],
+            )
+            train_model.change(
+                fn=_refresh_ultralytics_training_status_only,
+                inputs=[train_dataset, train_model, train_model_override, train_project],
+                outputs=[train_project, train_task_hint],
+            )
+            train_model_override.change(
+                fn=_refresh_ultralytics_training_status_only,
+                inputs=[train_dataset, train_model, train_model_override, train_project],
+                outputs=[train_project, train_task_hint],
             )
             train_run_btn.click(
                 fn=run_ultralytics_train_from_ui,

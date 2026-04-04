@@ -61,3 +61,23 @@ def test_infer_ultralytics_task_detects_segment_dataset_from_polygon_labels(tmp_
     task = ui_workbench._infer_ultralytics_task(str(dataset_root), "best.pt")
 
     assert task == "segment"
+
+
+def test_refresh_ultralytics_training_defaults_prefers_seg_model_and_project_for_segment_dataset(tmp_path: Path) -> None:
+    dataset_root = _make_segment_dataset(tmp_path / "line_dataset_defaults")
+
+    model, project, status = ui_workbench._refresh_ultralytics_training_defaults(
+        str(dataset_root),
+        "yolo26n.pt",
+        "",
+        ui_workbench._default_ultralytics_project_for_task("detect"),
+    )
+
+    assert model == "yolo11n-seg.pt"
+    assert project == ui_workbench._default_ultralytics_project_for_task("segment")
+    assert "Inferred task: segment" in status
+
+
+def test_model_looks_clearly_wrong_for_segment_task_flags_detect_preset() -> None:
+    assert ui_workbench._model_looks_clearly_wrong_for_segment_task("yolo26n.pt") is True
+    assert ui_workbench._model_looks_clearly_wrong_for_segment_task("yolo11n-seg.pt") is False
