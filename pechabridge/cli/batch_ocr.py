@@ -705,7 +705,7 @@ def _ocr_image(
     pipeline: str,
     max_len: int,
     device: str,
-    layout_engine: str = "yolo",
+    layout_engine: str = "cv",
     line_preprocess: str = "gray",
     bdrc_line_k_factor: float = 2.5,
     bdrc_line_bbox_tolerance: float = 3.0,
@@ -719,7 +719,7 @@ def _ocr_image(
     Returns ``(transcript_text, line_count)``.
 
     ``layout_engine`` controls how line bounding boxes are detected:
-    - ``"yolo"``      (default) YOLO-based classical segmentation via
+    - ``"cv"``        (default) Classical CV segmentation via
                       ``run_tibetan_text_line_split_classical()``.
     - ``"yolo_line"`` YOLO segmentation/detection line model via
                       ``predict_line_regions()``.
@@ -881,7 +881,7 @@ def _yaml_str(value: str) -> str:
 
 def run(args: argparse.Namespace) -> int:
     engine = str(getattr(args, "engine", "donut") or "donut").strip().lower()
-    layout_engine = str(getattr(args, "layout_engine", "yolo") or "yolo").strip().lower()
+    layout_engine = str(getattr(args, "layout_engine", "cv") or "cv").strip().lower()
     layout_model = str(getattr(args, "layout_model", "") or "").strip()
     line_model = str(getattr(args, "line_model", "") or "").strip()
     bdrc_line_model = str(getattr(args, "bdrc_line_model", "") or "").strip()
@@ -914,8 +914,8 @@ def run(args: argparse.Namespace) -> int:
 
     if engine == "bdrc-ocr":
         engine = "bdrc_ocr"
-    if layout_engine in {"classical", "yolo_classical"}:
-        layout_engine = "yolo"
+    if layout_engine in {"yolo", "classical", "yolo_classical"}:
+        layout_engine = "cv"
     if layout_engine in {"yolo-line", "yolo_seg", "yolo-seg", "line_model"}:
         layout_engine = "yolo_line"
     if layout_engine in {"bdrc-line", "bdrc"}:
@@ -925,9 +925,9 @@ def run(args: argparse.Namespace) -> int:
     if engine not in {"donut", "tesseract", "bdrc_ocr"}:
         LOGGER.error("Unknown engine '%s'. Choose 'donut', 'bdrc_ocr' or 'tesseract'.", engine)
         return 1
-    if layout_engine not in {"yolo", "yolo_line", "bdrc_line", "tesseract"}:
+    if layout_engine not in {"cv", "yolo_line", "bdrc_line", "tesseract"}:
         LOGGER.error(
-            "Unknown layout-engine '%s'. Choose 'yolo', 'yolo_line', 'bdrc_line' or 'tesseract'.",
+            "Unknown layout-engine '%s'. Choose 'cv', 'yolo_line', 'bdrc_line' or 'tesseract'.",
             layout_engine,
         )
         return 1
@@ -948,7 +948,7 @@ def run(args: argparse.Namespace) -> int:
     if not input_dir.is_dir():
         LOGGER.error("Input directory does not exist: %s", input_dir)
         return 1
-    if layout_engine == "yolo":
+    if layout_engine == "cv":
         if not layout_model:
             LOGGER.error("--layout-model is required when --layout-engine yolo (default).")
             return 1
@@ -1117,7 +1117,7 @@ def run(args: argparse.Namespace) -> int:
         "--input-dir", str(input_dir),
         "--device", device,
     ]
-    if layout_engine == "yolo":
+    if layout_engine == "cv":
         cli_argv_repro += ["--layout-model", layout_model]
     elif layout_engine == "yolo_line":
         cli_argv_repro += ["--line-model", line_model, "--line-preprocess", line_preprocess]
@@ -1271,11 +1271,12 @@ def create_parser(add_help: bool = True) -> argparse.ArgumentParser:
         "--layout_engine",
         dest="layout_engine",
         type=str,
-        default="yolo",
-        choices=["yolo", "yolo_line", "bdrc_line", "tesseract"],
+        default="cv",
+        choices=["cv", "yolo_line", "bdrc_line", "tesseract"],
         help=(
             "Layout detection engine used to find line bounding boxes before OCR. "
-            "'yolo' (default) uses the classical CV splitter driven by --layout-model. "
+            "'cv' (default) uses the classical CV splitter driven by --layout-model. "
+            "Alias: 'yolo'. "
             "'yolo_line' uses a YOLO line segmentation model specified by --line-model. "
             "'bdrc_line' uses a BDRC line/layout ONNX model specified by --bdrc-line-model. "
             "'tesseract' uses pytesseract page segmentation (PSM 3) — "

@@ -2501,6 +2501,43 @@ def build_ui() -> gr.Blocks:
   display: block;
   transform-origin: top left;
 }
+/* ── OCR loading overlay ────────────────────────────────────────────── */
+#ocr_loading_overlay {
+  display: none;
+  position: absolute;
+  inset: 0;
+  z-index: 100;
+  background: rgba(15, 23, 42, 0.55);
+  border-radius: 8px;
+  align-items: center;
+  justify-content: center;
+  flex-direction: column;
+  gap: 14px;
+}
+#ocr_loading_overlay.ocr-running {
+  display: flex;
+}
+#ocr_loading_overlay .ocr-spinner {
+  width: 52px;
+  height: 52px;
+  border: 5px solid rgba(255,255,255,0.2);
+  border-top-color: #6366f1;
+  border-radius: 50%;
+  animation: ocr-spin 0.8s linear infinite;
+}
+#ocr_loading_overlay .ocr-label {
+  color: #fff;
+  font-size: 15px;
+  font-weight: 600;
+  letter-spacing: 0.02em;
+  text-shadow: 0 1px 4px rgba(0,0,0,0.5);
+}
+@keyframes ocr-spin {
+  to { transform: rotate(360deg); }
+}
+#ocr_image_wrap {
+  position: relative;
+}
 #img_zoom_row {
   display: flex;
   align-items: center;
@@ -2637,6 +2674,67 @@ function() {
   const observer = new MutationObserver(initImageZoom);
   observer.observe(document.body, { childList: true, subtree: true });
   initImageZoom();
+
+  // ── OCR loading overlay ──────────────────────────────────────────────
+  function getOverlay() { return document.getElementById('ocr_loading_overlay'); }
+
+  function showOcrOverlay() {
+    const ov = getOverlay();
+    if (ov) ov.classList.add('ocr-running');
+  }
+
+  function hideOcrOverlay() {
+    const ov = getOverlay();
+    if (ov) ov.classList.remove('ocr-running');
+  }
+
+  // Watch the Run OCR button: Gradio disables it while the queue is running,
+  // then re-enables it when done.  We show the overlay on click and hide it
+  // when the button becomes enabled again.
+  function initOcrOverlay() {
+    const runBtn = document.querySelector('#run_ocr_btn button, button#run_ocr_btn');
+    if (runBtn && !runBtn._ocrOverlayInit) {
+      runBtn._ocrOverlayInit = true;
+
+      // Show overlay on click
+      runBtn.addEventListener('click', function() {
+        showOcrOverlay();
+      });
+
+      // Hide overlay when button is re-enabled (OCR done)
+      const btnObserver = new MutationObserver(function(mutations) {
+        for (const m of mutations) {
+          if (m.type === 'attributes' && m.attributeName === 'disabled') {
+            if (!runBtn.disabled) {
+              hideOcrOverlay();
+            }
+          }
+        }
+      });
+      btnObserver.observe(runBtn, { attributes: true, attributeFilter: ['disabled'] });
+    }
+
+    // Also hide when the status textbox text changes (belt-and-suspenders)
+    const statusEl = document.querySelector('#ocr_status_box textarea');
+    if (statusEl && !statusEl._ocrOverlayObserver) {
+      statusEl._ocrOverlayObserver = true;
+      const mo = new MutationObserver(function() { hideOcrOverlay(); });
+      mo.observe(statusEl.parentNode || statusEl, { childList: true, subtree: true, characterData: true });
+    }
+
+    // Also hide when the main image updates (src changes)
+    const imgPanel = document.querySelector('#ocr_image_panel img');
+    if (imgPanel && !imgPanel._ocrOverlayObserver) {
+      imgPanel._ocrOverlayObserver = true;
+      const mo = new MutationObserver(function() { hideOcrOverlay(); });
+      mo.observe(imgPanel, { attributes: true, attributeFilter: ['src'] });
+    }
+  }
+
+  // Re-run init on DOM changes so elements are found after Gradio renders
+  const ocrOverlayObserver = new MutationObserver(initOcrOverlay);
+  ocrOverlayObserver.observe(document.body, { childList: true, subtree: true });
+  initOcrOverlay();
 }
 """
 
@@ -3006,7 +3104,7 @@ function() {
                         label="upscale_interpolation",
                     )
 
-        status = gr.Textbox(label="Status", interactive=False)
+        status = gr.Textbox(label="Status", interactive=False, elem_id="ocr_status_box")
         with gr.Accordion("Debug JSON", open=False, visible=False) as debug_json_accordion:
             debug_json = gr.Code(language="json")
         with gr.Column():
@@ -3030,7 +3128,7 @@ function() {
 
         state = gr.State(_base_state())
         with gr.Row():
-            run_btn = gr.Button("Run OCR", variant="primary")
+            run_btn = gr.Button("Run OCR", variant="primary", elem_id="run_ocr_btn")
             compare_btn = gr.Button("⚖ Compare All Models", variant="secondary")
             full_roi_btn = gr.Button("Process Full Image as ROI", visible=False)
             save_btn = gr.Button("Save", variant="secondary")
@@ -3040,13 +3138,20 @@ function() {
             img_zoom_out_btn = gr.Button("🔍−", elem_id="img_zoom_minus", scale=0, min_width=36)
             img_zoom_reset_btn = gr.Button("⊙", elem_id="img_zoom_reset", scale=0, min_width=36)
             img_zoom_in_btn = gr.Button("🔍+", elem_id="img_zoom_plus", scale=0, min_width=36)
-        with gr.Row():
-            image_view = gr.Image(
-                label="Drop image here or click to upload",
-                type="numpy",
-                interactive=True,
-                elem_id="ocr_image_panel",
+        with gr.Column(elem_id="ocr_image_wrap"):
+            gr.HTML(
+                '<div id="ocr_loading_overlay">'
+                '<div class="ocr-spinner"></div>'
+                '<div class="ocr-label">Running OCR…</div>'
+                '</div>'
             )
+            with gr.Row():
+                image_view = gr.Image(
+                    label="Drop image here or click to upload",
+                    type="numpy",
+                    interactive=True,
+                    elem_id="ocr_image_panel",
+                )
 
         # ── Transcript row (full width) ─────────────────────────────────────
         with gr.Row():
@@ -3267,6 +3372,7 @@ function() {
             rgb_upscale_interp_s: str,
             rgb_ink_normalization_s: bool,
             rgb_ink_strength_s: float,
+            advanced_view_s: bool = False,
         ):
             pending_notes = _pending_bdrc_setup_messages(
                 ocr_engine=ocr_engine_s,
@@ -3275,16 +3381,17 @@ function() {
                 bdrc_line_model=bdrc_line_model_s,
             )
             status_msg = " ".join(pending_notes) if pending_notes else "Running OCR..."
+            # ── Loading state: clear preview images, show spinner overlay ──
             yield (
                 gr.update(),
                 gr.update(),
                 status_msg,
                 state_s,
                 gr.update(),
-                gr.update(),
-                gr.update(),
+                gr.update(value=None, visible=False),
+                gr.update(value=None, visible=False),
             )
-            yield _run(
+            result = _run(
                 mode_s,
                 state_s,
                 ocr_engine_s,
@@ -3334,6 +3441,18 @@ function() {
                 rgb_upscale_interp_s,
                 rgb_ink_normalization_s,
                 rgb_ink_strength_s,
+            )
+            # ── Done: yield result, restore image visibility if data present ──
+            img_out, transcript_out, status_out, state_out, debug_out, pre_img, post_img = result
+            show_imgs = bool(advanced_view_s)
+            yield (
+                img_out,
+                transcript_out,
+                status_out,
+                state_out,
+                debug_out,
+                gr.update(value=pre_img, visible=show_imgs and pre_img is not None),
+                gr.update(value=post_img, visible=show_imgs and post_img is not None),
             )
 
         _run_evt = run_btn.click(
@@ -3388,6 +3507,7 @@ function() {
                 rgb_upscale_interp,
                 rgb_ink_normalization,
                 rgb_ink_strength,
+                advanced_view,
             ],
             outputs=[image_view, transcript, status, state, debug_json, donut_input_before, donut_input_after],
         )
