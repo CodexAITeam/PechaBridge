@@ -8,6 +8,7 @@ from datetime import datetime
 from pathlib import Path
 from typing import Any, Dict, List, Optional, Tuple
 
+
 import gradio as gr
 import numpy as np
 from PIL import Image, ImageDraw, ImageFont
@@ -19,6 +20,29 @@ from ui_workbench import (
     _resolve_donut_runtime_dirs,
     _segment_lines_in_text_crop,
     run_tibetan_text_line_split_classical,
+)
+from pechabridge.ocr.line_segmentation import (
+    DEFAULT_LINE_SEGMENTATION_CONF,
+    DEFAULT_LINE_SEGMENTATION_IMGSZ,
+    DEFAULT_LINE_SEGMENTATION_PREPROCESS,
+    normalize_line_segmentation_preprocess_pipeline,
+    predict_line_regions,
+)
+from pechabridge.ocr.bdrc_inference import (
+    BDRCLinePrediction,
+    DEFAULT_BDRC_LINE_BBOX_TOLERANCE,
+    DEFAULT_BDRC_LINE_K_FACTOR,
+    DEFAULT_BDRC_LINE_TPS_THRESHOLD,
+    DEFAULT_BDRC_LINE_USE_TPS,
+    find_bdrc_line_model_dirs,
+    find_bdrc_ocr_model_dirs,
+    predict_bdrc_line_regions,
+    run_bdrc_ocr,
+)
+from pechabridge.ocr.bdrc_model_download import (
+    choose_default_bdrc_ocr_model_dir,
+    ensure_default_bdrc_line_assets,
+    ensure_default_bdrc_ocr_models,
 )
 try:
     from pechabridge.ocr.preprocess_bdrc import (
@@ -47,11 +71,60 @@ except Exception:
 ROOT = Path(__file__).resolve().parent
 MODE_AUTO = "Fully Automatic OCR"
 MODE_MANUAL = "Manual Mode"
+LINE_SEG_CLASSICAL = "Classical CV"
+LINE_SEG_YOLO = "Pretrained YOLO Model"
+LINE_SEG_BDRC = "BDRC Line Model"
+OCR_ENGINE_DONUT = "DONUT"
+OCR_ENGINE_BDRC = "BDRC OCR"
+DEFAULT_BDRC_LINE_MERGE_LINES = True
+DEFAULT_UI_BDRC_LINE_USE_ROTATION = False
+DEFAULT_UI_BDRC_LINE_USE_TPS = False
 _DONUT_ACTIVE_RUNTIME: Dict[str, Any] = {"checkpoint": "", "runtime": None}
+
+_IMAGE_EXTENSIONS = {".jpg", ".jpeg", ".png", ".tif", ".tiff", ".bmp", ".webp"}
+
+
+def _scan_folder_for_images(folder_path: str) -> Tuple[List[str], str]:
+    """Scan *folder_path* for image files and return (sorted_paths, status_msg)."""
+    p = Path(folder_path).expanduser()
+    if not folder_path.strip():
+        return [], "Please enter a folder path."
+    if not p.exists():
+        return [], f"Folder not found: {folder_path}"
+    if not p.is_dir():
+        return [], f"Not a directory: {folder_path}"
+    found: List[str] = []
+    for child in sorted(p.iterdir()):
+        if child.is_file() and child.suffix.lower() in _IMAGE_EXTENSIONS:
+            found.append(str(child.resolve()))
+    if not found:
+        return [], f"No images found in {folder_path}"
+    return found, f"Found {len(found)} image(s) in {p.name}"
+
+
+def _make_thumbnails(image_paths: List[str]) -> List[Tuple[str, str]]:
+    """Return a list of (path, caption) tuples suitable for gr.Gallery."""
+    return [(p, Path(p).name) for p in image_paths]
 
 
 def _is_manual_mode(mode: str) -> bool:
     return str(mode or "").strip() == MODE_MANUAL
+
+
+def _normalize_line_segmentation_mode(mode: str) -> str:
+    raw = str(mode or "").strip()
+    if raw == LINE_SEG_YOLO:
+        return LINE_SEG_YOLO
+    if raw == LINE_SEG_BDRC:
+        return LINE_SEG_BDRC
+    return LINE_SEG_CLASSICAL
+
+
+def _normalize_ocr_engine(engine: str) -> str:
+    raw = str(engine or "").strip()
+    if raw == OCR_ENGINE_BDRC:
+        return OCR_ENGINE_BDRC
+    return OCR_ENGINE_DONUT
 
 
 def _load_font() -> ImageFont.ImageFont:
@@ -106,55 +179,200 @@ def _is_plain_checkpoint_with_runtime_assets(p: Path) -> bool:
     return bool(has_parent_assets or has_local_gen_cfg)
 
 
-def _find_donut_checkpoint() -> Tuple[str, str]:
+def _pretty_model_label(full_path: str) -> str:
+    """Return a short human-readable label for a model path.
+
+    Shows the path relative to the project root's ``models/`` directory so the
+    dropdown stays compact.  Falls back to the last two path components when the
+    path is outside the models tree.
+    """
+    try:
+        p = Path(full_path)
+        models_root = (ROOT / "models").resolve()
+        rel = p.relative_to(models_root)
+        return str(rel)
+    except ValueError:
+        p = Path(full_path)
+        parts = p.parts
+        return str(Path(*parts[-2:])) if len(parts) >= 2 else p.name
+
+
+def _resolve_best_symlink(candidate: Path) -> Optional[Path]:
+    """Resolve a ``best`` or ``best.pt`` symlink/path to a usable checkpoint path.
+
+    Handles three cases:
+    - ``best/``  — directory (real or symlink) → use as-is after resolving
+    - ``best.pt`` → symlink/file that resolves to a *directory* → use that directory
+    - ``best.pt`` → regular ``.pt`` weight file → use its parent directory
+    """
+    if not candidate.exists():
+        return None
+    try:
+        resolved = candidate.resolve()
+    except Exception:
+        return None
+    if resolved.is_dir():
+        return resolved
+    if resolved.is_file():
+        # Could be a symlink pointing to a .pt file; treat parent as checkpoint dir
+        return resolved.parent
+    return None
+
+
+def _list_donut_checkpoints() -> Tuple[List[Tuple[str, str]], str]:
+    """Return ([(label, full_path), ...] sorted best-first, status_message).
+
+    Priority order:
+    1. ``models/ocr/best`` or ``models/ocr/best.pt`` (symlink or real file/dir)
+    2. All other repro checkpoints under ``models/ocr/`` (highest step first)
+    3. All other plain checkpoints under ``models/ocr/``
+    4. Same scan under ``models/`` as fallback
+    """
     preferred = (ROOT / "models" / "ocr").resolve()
     fallback_root = (ROOT / "models").resolve()
     repro_candidates: List[Path] = []
     plain_candidates: List[Path] = []
 
-    if preferred.exists():
-        for p in sorted(preferred.rglob("checkpoint-*")):
+    # ── Check for explicit best / best.pt shortcut (symlinks supported) ──
+    best_path: Optional[Path] = None
+    for _name in ("best", "best.pt"):
+        candidate = preferred / _name
+        resolved = _resolve_best_symlink(candidate)
+        if resolved is not None:
+            best_path = resolved
+            break
+
+    def _scan_dir(base: Path) -> None:
+        if not base.exists():
+            return
+        for p in sorted(base.rglob("checkpoint-*")):
             if _is_repro_checkpoint(p):
                 repro_candidates.append(p.resolve())
             elif _is_plain_checkpoint_with_runtime_assets(p):
                 plain_candidates.append(p.resolve())
         if not repro_candidates and not plain_candidates:
-            for p in sorted(preferred.rglob("*")):
+            for p in sorted(base.rglob("*")):
                 if p.is_dir() and _is_repro_checkpoint(p):
                     repro_candidates.append(p.resolve())
                 elif p.is_dir() and _is_plain_checkpoint_with_runtime_assets(p):
                     plain_candidates.append(p.resolve())
 
-    if not repro_candidates and not plain_candidates and fallback_root.exists():
-        for p in sorted(fallback_root.rglob("checkpoint-*")):
-            if _is_repro_checkpoint(p):
-                repro_candidates.append(p.resolve())
-            elif _is_plain_checkpoint_with_runtime_assets(p):
-                plain_candidates.append(p.resolve())
-        if not repro_candidates and not plain_candidates:
-            for p in sorted(fallback_root.rglob("*")):
-                if p.is_dir() and _is_repro_checkpoint(p):
-                    repro_candidates.append(p.resolve())
-                elif p.is_dir() and _is_plain_checkpoint_with_runtime_assets(p):
-                    plain_candidates.append(p.resolve())
+    _scan_dir(preferred)
+    if not repro_candidates and not plain_candidates:
+        _scan_dir(fallback_root)
 
-    if repro_candidates:
-        repro_candidates = sorted(repro_candidates, key=_checkpoint_step, reverse=True)
-        return str(repro_candidates[0]), f"Auto-selected DONUT checkpoint (repro): {repro_candidates[0]}"
+    # Deduplicate while preserving order
+    seen: set = set()
+    all_repro: List[Path] = []
+    for p in repro_candidates:
+        if str(p) not in seen:
+            seen.add(str(p))
+            all_repro.append(p)
+    all_plain: List[Path] = []
+    for p in plain_candidates:
+        if str(p) not in seen:
+            seen.add(str(p))
+            all_plain.append(p)
 
-    if plain_candidates:
-        plain_candidates = sorted(plain_candidates, key=_checkpoint_step, reverse=True)
-        return (
-            str(plain_candidates[0]),
-            "Auto-selected DONUT checkpoint (without repro, using parent tokenizer/image_processor): "
-            f"{plain_candidates[0]}",
-        )
+    all_repro = sorted(all_repro, key=_checkpoint_step, reverse=True)
+    all_plain = sorted(all_plain, key=_checkpoint_step, reverse=True)
 
-    return "", "No DONUT checkpoint found (expected under models/ocr/ or models/)."
+    # repro checkpoints first, then plain; label shows short relative path
+    ordered: List[Tuple[str, str]] = [
+        (_pretty_model_label(str(p)) + " ✓", str(p)) for p in all_repro
+    ] + [
+        (_pretty_model_label(str(p)), str(p)) for p in all_plain
+    ]
+
+    # Prepend best entry at the front (remove duplicate if rglob already found it)
+    if best_path is not None:
+        best_str = str(best_path)
+        is_repro = _is_repro_checkpoint(best_path)
+        best_label = "ocr/best ✓" if is_repro else "ocr/best"
+        ordered = [(lbl, pth) for lbl, pth in ordered if pth != best_str]
+        ordered.insert(0, (best_label, best_str))
+
+    if not ordered:
+        return [], "No DONUT checkpoint found (expected under models/ocr/ or models/)."
+
+    tag = "best" if best_path is not None else ("repro" if all_repro else "plain")
+    msg = f"Found {len(ordered)} DONUT checkpoint(s). Auto-selected ({tag}): {ordered[0][1]}"
+    return ordered, msg
+
+
+def _find_donut_checkpoint() -> Tuple[str, str]:
+    """Return (best_checkpoint_path, status_message) — kept for backward compat."""
+    choices, msg = _list_donut_checkpoints()
+    return (choices[0][1] if choices else ""), msg
+
+
+def _list_layout_models() -> Tuple[List[Tuple[str, str]], str]:
+    """Return ([(label, full_path), ...] sorted, status_message).
+
+    ``models/layout/best.pt`` (real file or symlink) is always placed first.
+    """
+    preferred = (ROOT / "models" / "layout").resolve()
+    fallback_root = (ROOT / "models").resolve()
+    model_exts = {".pt", ".onnx", ".torchscript"}
+    candidates: List[Path] = []
+
+    # ── Explicit best.pt shortcut (symlinks supported) ────────────────────
+    best_path: Optional[Path] = None
+    _best_candidate = preferred / "best.pt"
+    if _best_candidate.exists() or _best_candidate.is_symlink():
+        try:
+            _resolved = _best_candidate.resolve()
+            if _resolved.is_file():
+                best_path = _resolved
+        except Exception:
+            pass
+
+    def _scan(base: Path) -> None:
+        if not base.exists():
+            return
+        for p in sorted(base.rglob("*")):
+            if not p.is_file():
+                continue
+            if p.suffix.lower() not in model_exts:
+                continue
+            # Skip macOS resource-fork files (._*)
+            if p.name.startswith("._"):
+                continue
+            candidates.append(p.resolve())
+
+    _scan(preferred)
+    if not candidates:
+        _scan(fallback_root)
+
+    if not candidates and best_path is None:
+        return [], "No layout analysis model found (expected under models/layout/)."
+
+    ordered: List[Tuple[str, str]] = [
+        (_pretty_model_label(str(p)), str(p)) for p in candidates
+    ]
+
+    # Ensure best.pt is at the front (remove duplicate if rglob already found it)
+    if best_path is not None:
+        best_str = str(best_path)
+        ordered = [(lbl, pth) for lbl, pth in ordered if pth != best_str]
+        ordered.insert(0, ("layout/best.pt", best_str))
+
+    if not ordered:
+        return [], "No layout analysis model found (expected under models/layout/)."
+
+    msg = f"Found {len(ordered)} layout model(s). Auto-selected: {ordered[0][1]}"
+    return ordered, msg
 
 
 def _find_layout_model() -> Tuple[str, str]:
-    preferred = (ROOT / "models" / "layoutAnalysis").resolve()
+    """Return (best_model_path, status_message) — kept for backward compat."""
+    choices, msg = _list_layout_models()
+    return (choices[0][1] if choices else ""), msg
+
+
+def _list_line_segmentation_models() -> Tuple[List[Tuple[str, str]], str]:
+    """Return ([(label, full_path), ...] sorted, status_message)."""
+    preferred = (ROOT / "models" / "line_segmentation").resolve()
     fallback_root = (ROOT / "models").resolve()
     model_exts = {".pt", ".onnx", ".torchscript"}
     candidates: List[Path] = []
@@ -167,6 +385,8 @@ def _find_layout_model() -> Tuple[str, str]:
                 continue
             if p.suffix.lower() not in model_exts:
                 continue
+            if p.name.startswith("._"):
+                continue
             candidates.append(p.resolve())
 
     _scan(preferred)
@@ -174,8 +394,80 @@ def _find_layout_model() -> Tuple[str, str]:
         _scan(fallback_root)
 
     if not candidates:
-        return "", "No layout analysis model found (expected under models/layoutAnalysis/)."
-    return str(candidates[0]), f"Auto-selected layout model: {candidates[0]}"
+        return [], "No line segmentation model found (expected under models/line_segmentation/)."
+
+    ordered: List[Tuple[str, str]] = [
+        (_pretty_model_label(str(p)), str(p)) for p in candidates
+    ]
+    msg = f"Found {len(ordered)} line segmentation model(s). Auto-selected: {ordered[0][1]}"
+    return ordered, msg
+
+
+def _list_bdrc_line_models() -> Tuple[List[Tuple[str, str]], str]:
+    preferred = (ROOT / "models" / "bdrc").resolve()
+    fallback_root = (ROOT / "models").resolve()
+    found = find_bdrc_line_model_dirs(preferred)
+    if not found:
+        found = find_bdrc_line_model_dirs(fallback_root)
+    if not found:
+        return [], "No BDRC line model found (expected under models/bdrc/ or models/)."
+    ordered = [(_pretty_model_label(str(p)), str(p)) for p in found]
+    msg = f"Found {len(ordered)} BDRC line model(s). Auto-selected: {ordered[0][1]}"
+    return ordered, msg
+
+
+def _list_bdrc_ocr_models() -> Tuple[List[Tuple[str, str]], str]:
+    preferred = (ROOT / "models" / "bdrc").resolve()
+    fallback_root = (ROOT / "models").resolve()
+    found = find_bdrc_ocr_model_dirs(preferred)
+    if not found:
+        found = find_bdrc_ocr_model_dirs(fallback_root)
+    if not found:
+        return [], "No BDRC OCR model found (expected under models/bdrc/ or models/)."
+    ordered = [(_pretty_model_label(str(p)), str(p)) for p in found]
+    msg = f"Found {len(ordered)} BDRC OCR model(s). Auto-selected: {ordered[0][1]}"
+    return ordered, msg
+
+
+def _ensure_default_bdrc_line_model_path(current_path: str) -> Tuple[str, Optional[str]]:
+    raw = str(current_path or "").strip()
+    if raw and Path(raw).exists():
+        return raw, None
+    result = ensure_default_bdrc_line_assets(ROOT / "models" / "bdrc")
+    note = (
+        f"Auto-downloaded default BDRC line assets ({', '.join(result.downloaded_items)}) to {result.root}"
+        if result.downloaded_items
+        else f"Using existing default BDRC line assets from {result.root}"
+    )
+    return str(result.line_dir), note
+
+
+def _ensure_default_bdrc_ocr_model_path(current_path: str) -> Tuple[str, Optional[str]]:
+    raw = str(current_path or "").strip()
+    if raw and Path(raw).exists():
+        return raw, None
+    result = ensure_default_bdrc_ocr_models(ROOT / "models" / "bdrc")
+    chosen = choose_default_bdrc_ocr_model_dir(result.root)
+    note = (
+        f"Auto-downloaded default BDRC OCR models to {result.root}; selected {chosen.name}"
+        if result.downloaded
+        else f"Using existing default BDRC OCR model {chosen.name} from {result.root}"
+    )
+    return str(chosen), note
+
+
+def _pending_bdrc_setup_messages(
+    ocr_engine: str,
+    bdrc_ocr_model: str,
+    line_segmentation_mode: str,
+    bdrc_line_model: str,
+) -> List[str]:
+    notes: List[str] = []
+    if _normalize_ocr_engine(ocr_engine) == OCR_ENGINE_BDRC and not str(bdrc_ocr_model or "").strip():
+        notes.append("Preparing default BDRC OCR model...")
+    if _normalize_line_segmentation_mode(line_segmentation_mode) == LINE_SEG_BDRC and not str(bdrc_line_model or "").strip():
+        notes.append("Preparing default BDRC line model...")
+    return notes
 
 
 def _normalize_box(box: List[int], w: int, h: int) -> Optional[List[int]]:
@@ -196,6 +488,269 @@ def _normalize_box(box: List[int], w: int, h: int) -> Optional[List[int]]:
 
 def _sort_lines(rows: List[Dict[str, Any]]) -> List[Dict[str, Any]]:
     return sorted(rows, key=lambda r: (int(r["line_box"][1]), int(r["line_box"][0]), int(r["line_id"])))
+
+
+def _rows_from_line_predictions(
+    predictions: List[Any],
+    *,
+    image_w: int,
+    image_h: int,
+    offset_x: int = 0,
+    offset_y: int = 0,
+    source: str,
+) -> List[Dict[str, Any]]:
+    rows: List[Dict[str, Any]] = []
+    for idx, pred in enumerate(predictions, start=1):
+        box = _normalize_box(
+            [
+                int(offset_x) + int(pred.box[0]),
+                int(offset_y) + int(pred.box[1]),
+                int(offset_x) + int(pred.box[2]),
+                int(offset_y) + int(pred.box[3]),
+            ],
+            image_w,
+            image_h,
+        )
+        if box is None:
+            continue
+        polygon = [
+            [int(offset_x) + int(x), int(offset_y) + int(y)]
+            for x, y in list(getattr(pred, "polygon", []) or [])
+        ]
+        rows.append(
+            {
+                "line_id": idx,
+                "line_box": box,
+                "line_polygon": polygon,
+                "line_confidence": float(getattr(pred, "confidence", 0.0)),
+                "line_label": str(getattr(pred, "label", "line")),
+                "line_class": int(getattr(pred, "class_id", 0)),
+                "source": source,
+            }
+        )
+    return _sort_lines(rows)
+
+
+def _rows_from_bdrc_line_predictions(
+    predictions: List[BDRCLinePrediction],
+    *,
+    image_w: int,
+    image_h: int,
+    offset_x: int = 0,
+    offset_y: int = 0,
+    source: str,
+) -> List[Dict[str, Any]]:
+    rows: List[Dict[str, Any]] = []
+    for idx, pred in enumerate(predictions, start=1):
+        box = _normalize_box(
+            [
+                int(offset_x) + int(pred.box[0]),
+                int(offset_y) + int(pred.box[1]),
+                int(offset_x) + int(pred.box[2]),
+                int(offset_y) + int(pred.box[3]),
+            ],
+            image_w,
+            image_h,
+        )
+        if box is None:
+            continue
+        polygon = [
+            [int(offset_x) + int(x), int(offset_y) + int(y)]
+            for x, y in list(getattr(pred, "polygon", []) or [])
+        ]
+        row: Dict[str, Any] = {
+            "line_id": idx,
+            "line_box": box,
+            "line_polygon": polygon,
+            "line_confidence": float(getattr(pred, "confidence", 1.0)),
+            "line_label": str(getattr(pred, "label", "line")),
+            "line_class": int(getattr(pred, "class_id", 0)),
+            "page_angle": float(getattr(pred, "page_angle", 0.0)),
+            "source": source,
+        }
+        crop_image = getattr(pred, "crop_image", None)
+        if isinstance(crop_image, np.ndarray) and crop_image.size > 0:
+            row["ocr_crop"] = np.asarray(crop_image).astype(np.uint8, copy=False)
+        rows.append(row)
+    return _sort_lines(rows)
+
+
+def _extract_row_crop(src: np.ndarray, row: Dict[str, Any]) -> np.ndarray:
+    crop = row.get("ocr_crop")
+    if isinstance(crop, np.ndarray) and crop.size > 0:
+        return np.asarray(crop).astype(np.uint8, copy=False)
+    h, w = src.shape[:2]
+    box = _normalize_box(row.get("line_box") or [], w, h)
+    if box is None:
+        return np.zeros((1, 1, 3), dtype=np.uint8)
+    x1, y1, x2, y2 = box
+    return np.asarray(src[y1:y2, x1:x2]).astype(np.uint8, copy=False)
+
+
+def _segment_full_image_lines(
+    image: np.ndarray,
+    *,
+    line_segmentation_mode: str,
+    line_segmentation_preprocess: str,
+    layout_model: str,
+    line_model: str,
+    bdrc_line_model: str,
+    bdrc_line_merge_lines: bool,
+    bdrc_line_k_factor: float,
+    bdrc_line_bbox_tolerance: float,
+    bdrc_line_use_rotation: bool,
+    bdrc_line_use_tps: bool,
+    bdrc_line_tps_threshold: float,
+    device: str,
+) -> Tuple[List[Dict[str, Any]], str, Dict[str, Any]]:
+    src = np.asarray(image).astype(np.uint8, copy=False)
+    h, w = src.shape[:2]
+    mode = _normalize_line_segmentation_mode(line_segmentation_mode)
+
+    if mode == LINE_SEG_YOLO:
+        if not (line_model or "").strip():
+            return [], "Line segmentation model is missing.", {"ok": False, "backend": "yolo_line_model", "reason": "missing_model"}
+        preprocess_mode = normalize_line_segmentation_preprocess_pipeline(line_segmentation_preprocess)
+        try:
+            predictions = predict_line_regions(
+                src,
+                model_path=line_model,
+                conf=DEFAULT_LINE_SEGMENTATION_CONF,
+                imgsz=DEFAULT_LINE_SEGMENTATION_IMGSZ,
+                preprocess_pipeline=preprocess_mode,
+                device=device,
+            )
+        except Exception as exc:
+            return [], f"Line segmentation inference failed: {type(exc).__name__}: {exc}", {
+                "ok": False,
+                "backend": "yolo_line_model",
+                "reason": f"{type(exc).__name__}: {exc}",
+            }
+        rows = _rows_from_line_predictions(
+            predictions,
+            image_w=w,
+            image_h=h,
+            source="full_auto_yolo_line_model",
+        )
+        status = f"Detected {len(rows)} line(s) with the pretrained line segmentation model."
+        debug = {
+            "ok": True,
+            "backend": "yolo_line_model",
+            "line_segmentation_mode": mode,
+            "line_segmentation_model": str(line_model or ""),
+            "line_segmentation_preprocess": preprocess_mode,
+            "line_count": len(rows),
+            "predict_conf": float(DEFAULT_LINE_SEGMENTATION_CONF),
+            "predict_imgsz": int(DEFAULT_LINE_SEGMENTATION_IMGSZ),
+            "predictions": [
+                {
+                    "line_box": list(rec.get("line_box") or []),
+                    "line_polygon": rec.get("line_polygon") or [],
+                    "confidence": float(rec.get("line_confidence", 0.0)),
+                    "label": str(rec.get("line_label", "line")),
+                    "class": int(rec.get("line_class", 0)),
+                }
+                for rec in rows[:256]
+            ],
+        }
+        return rows, status, debug
+
+    if mode == LINE_SEG_BDRC:
+        if not (bdrc_line_model or "").strip():
+            return [], "BDRC line model is missing.", {"ok": False, "backend": "bdrc_line_model", "reason": "missing_model"}
+        try:
+            predictions, bdrc_debug = predict_bdrc_line_regions(
+                src,
+                model_path=bdrc_line_model,
+                device=device,
+                group_lines=bool(bdrc_line_merge_lines),
+                k_factor=float(bdrc_line_k_factor),
+                bbox_tolerance=float(bdrc_line_bbox_tolerance),
+                use_rotation=bool(bdrc_line_use_rotation),
+                use_tps=bool(bdrc_line_use_tps),
+                tps_threshold=float(bdrc_line_tps_threshold),
+            )
+        except Exception as exc:
+            return [], f"BDRC line inference failed: {type(exc).__name__}: {exc}", {
+                "ok": False,
+                "backend": "bdrc_line_model",
+                "reason": f"{type(exc).__name__}: {exc}",
+            }
+        rows = _rows_from_bdrc_line_predictions(
+            predictions,
+            image_w=w,
+            image_h=h,
+            source="full_auto_bdrc_line_model",
+        )
+        status = f"Detected {len(rows)} line(s) with the BDRC line model."
+        if bool((bdrc_debug or {}).get("tps_applied")):
+            status += " TPS dewarping applied."
+        debug = dict(bdrc_debug)
+        debug.update(
+            {
+                "ok": True,
+                "line_segmentation_mode": mode,
+                "line_segmentation_preprocess": "bdrc_internal",
+                "line_segmentation_model": str(bdrc_line_model or ""),
+            }
+        )
+        return rows, status, debug
+
+    split_out = run_tibetan_text_line_split_classical(
+        image=src,
+        model_path=layout_model,
+        conf=0.25,
+        imgsz=1024,
+        device=device if device != "auto" else "",
+        min_line_height=10,
+        projection_smooth=9,
+        projection_threshold_rel=0.20,
+        merge_gap_px=5,
+        draw_parent_boxes=True,
+        detect_red_text=False,
+        red_min_redness=26,
+        red_min_saturation=35,
+        red_column_fill_rel=0.07,
+        red_merge_gap_px=14,
+        red_min_width_px=18,
+        draw_red_boxes=False,
+    )
+    _, split_status, split_json, _, _, _, _, _, click_state = split_out
+    line_records_raw = []
+    if isinstance(click_state, dict):
+        line_records_raw = list(click_state.get("line_boxes") or [])
+    rows: List[Dict[str, Any]] = []
+    for rec in line_records_raw:
+        box = _normalize_box(rec.get("line_box") or [], w, h)
+        if box is None:
+            continue
+        x1, y1, x2, y2 = box
+        rows.append(
+            {
+                "line_id": int(rec.get("line_id", len(rows) + 1)),
+                "line_box": box,
+                "line_polygon": [[x1, y1], [x2 - 1, y1], [x2 - 1, y2 - 1], [x1, y2 - 1]],
+                "line_confidence": 1.0,
+                "line_label": "classical_line",
+                "line_class": 0,
+                "source": "full_auto_classical",
+            }
+        )
+    debug: Dict[str, Any]
+    try:
+        debug = json.loads(split_json) if (split_json or "").strip().startswith("{") else {"raw": split_json}
+    except Exception:
+        debug = {"raw": split_json}
+    debug = {
+        "ok": True,
+        "backend": "classical_cv",
+        "line_segmentation_mode": mode,
+        "line_segmentation_preprocess": "none",
+        "layout_model": str(layout_model or ""),
+        "split_status": split_status,
+        "split_debug": debug,
+    }
+    return _sort_lines(rows), split_status, debug
 
 
 def _render_overlay(image: np.ndarray, lines: List[Dict[str, Any]], roi: Optional[List[int]] = None) -> np.ndarray:
@@ -498,6 +1053,66 @@ def _run_donut_on_crop(
         }, pre_img, post_img
 
 
+def _run_bdrc_ocr_on_crop(
+    crop: np.ndarray,
+    bdrc_ocr_model: str,
+    device: str,
+    target_encoding: str = "unicode",
+) -> Tuple[str, Dict[str, Any], np.ndarray, np.ndarray]:
+    raw = np.asarray(crop).astype(np.uint8, copy=False)
+    pre_img = raw
+    try:
+        text, dbg, preview_gray = run_bdrc_ocr(
+            raw,
+            model_path=bdrc_ocr_model,
+            device=device,
+            target_encoding=target_encoding,
+        )
+        post_img = np.stack([preview_gray] * 3, axis=-1) if preview_gray.ndim == 2 else np.asarray(preview_gray)
+        dbg = dict(dbg)
+        dbg.setdefault("effective_preprocess_preview", "bdrc_ocr_internal")
+        return text, dbg, pre_img, np.asarray(post_img).astype(np.uint8, copy=False)
+    except Exception as exc:
+        return "", {
+            "ok": False,
+            "backend": "bdrc_ocr",
+            "error": f"{type(exc).__name__}: {exc}",
+            "image_preprocess_pipeline_effective": "bdrc_ocr_internal",
+            "effective_preprocess_preview": "bdrc_ocr_internal",
+        }, pre_img, pre_img
+
+
+def _run_ocr_on_crop(
+    crop: np.ndarray,
+    *,
+    ocr_engine: str,
+    donut_checkpoint: str,
+    bdrc_ocr_model: str,
+    device: str,
+    max_len: int,
+    preprocess_preset: str = "bdrc",
+    bdrc_preprocess_overrides: Optional[Dict[str, Any]] = None,
+    rgb_preprocess_overrides: Optional[Dict[str, Any]] = None,
+) -> Tuple[str, Dict[str, Any], np.ndarray, np.ndarray]:
+    engine = _normalize_ocr_engine(ocr_engine)
+    if engine == OCR_ENGINE_BDRC:
+        return _run_bdrc_ocr_on_crop(
+            crop,
+            bdrc_ocr_model=bdrc_ocr_model,
+            device=device,
+            target_encoding="unicode",
+        )
+    return _run_donut_on_crop(
+        crop,
+        donut_checkpoint,
+        device,
+        max_len,
+        preprocess_preset=preprocess_preset,
+        bdrc_preprocess_overrides=bdrc_preprocess_overrides,
+        rgb_preprocess_overrides=rgb_preprocess_overrides,
+    )
+
+
 @dataclass
 class OCRRuntime:
     donut_path: str
@@ -765,8 +1380,20 @@ def _compose_preprocess_ui_settings(
 
 def _run_full_auto(
     state: Dict[str, Any],
+    ocr_engine: str,
     donut_checkpoint: str,
+    bdrc_ocr_model: str,
     layout_model: str,
+    line_segmentation_mode: str,
+    line_segmentation_preprocess: str,
+    line_model: str,
+    bdrc_line_model: str,
+    bdrc_line_merge_lines: bool,
+    bdrc_line_k_factor: float,
+    bdrc_line_bbox_tolerance: float,
+    bdrc_line_use_rotation: bool,
+    bdrc_line_use_tps: bool,
+    bdrc_line_tps_threshold: float,
     device: str,
     max_len: int,
     preprocess_preset: str = "bdrc",
@@ -776,37 +1403,51 @@ def _run_full_auto(
     image = state.get("image")
     if image is None:
         return None, "", "Please upload an image first.", state, "{}", state.get("last_donut_pre"), state.get("last_donut_post")
-    if not donut_checkpoint.strip():
+    engine = _normalize_ocr_engine(ocr_engine)
+    auto_notes: List[str] = []
+    if engine == OCR_ENGINE_BDRC and not bdrc_ocr_model.strip():
+        try:
+            bdrc_ocr_model, note = _ensure_default_bdrc_ocr_model_path(bdrc_ocr_model)
+            if note:
+                auto_notes.append(note)
+        except Exception as exc:
+            return image, "", f"BDRC OCR model is missing and auto-download failed: {type(exc).__name__}: {exc}", state, "{}", state.get("last_donut_pre"), state.get("last_donut_post")
+    mode = _normalize_line_segmentation_mode(line_segmentation_mode)
+    if mode == LINE_SEG_BDRC and not (bdrc_line_model or "").strip():
+        try:
+            bdrc_line_model, note = _ensure_default_bdrc_line_model_path(bdrc_line_model)
+            if note:
+                auto_notes.append(note)
+        except Exception as exc:
+            return image, "", f"BDRC line model is missing and auto-download failed: {type(exc).__name__}: {exc}", state, "{}", state.get("last_donut_pre"), state.get("last_donut_post")
+    if engine == OCR_ENGINE_DONUT and not donut_checkpoint.strip():
         return image, "", "DONUT checkpoint is missing.", state, "{}", state.get("last_donut_pre"), state.get("last_donut_post")
-    if not layout_model.strip():
+    if engine == OCR_ENGINE_BDRC and not bdrc_ocr_model.strip():
+        return image, "", "BDRC OCR model is missing.", state, "{}", state.get("last_donut_pre"), state.get("last_donut_post")
+    if mode == LINE_SEG_CLASSICAL and not layout_model.strip():
         return image, "", "Layout model is missing.", state, "{}", state.get("last_donut_pre"), state.get("last_donut_post")
-
-    split_out = run_tibetan_text_line_split_classical(
-        image=np.asarray(image).astype(np.uint8, copy=False),
-        model_path=layout_model,
-        conf=0.25,
-        imgsz=1024,
-        device=device if device != "auto" else "",
-        min_line_height=10,
-        projection_smooth=9,
-        projection_threshold_rel=0.20,
-        merge_gap_px=5,
-        draw_parent_boxes=True,
-        detect_red_text=False,
-        red_min_redness=26,
-        red_min_saturation=35,
-        red_column_fill_rel=0.07,
-        red_merge_gap_px=14,
-        red_min_width_px=18,
-        draw_red_boxes=False,
-    )
-    overlay, split_status, split_json, _, _, _, _, _, click_state = split_out
-    line_records_raw = []
-    if isinstance(click_state, dict):
-        line_records_raw = click_state.get("line_boxes") or []
+    if mode == LINE_SEG_YOLO and not (line_model or "").strip():
+        return image, "", "Line segmentation model is missing.", state, "{}", state.get("last_donut_pre"), state.get("last_donut_post")
+    if mode == LINE_SEG_BDRC and not (bdrc_line_model or "").strip():
+        return image, "", "BDRC line model is missing.", state, "{}", state.get("last_donut_pre"), state.get("last_donut_post")
 
     src = np.asarray(image).astype(np.uint8, copy=False)
     h, w = src.shape[:2]
+    line_records_raw, split_status, split_debug = _segment_full_image_lines(
+        src,
+        line_segmentation_mode=mode,
+        line_segmentation_preprocess=line_segmentation_preprocess,
+        layout_model=layout_model,
+        line_model=line_model,
+        bdrc_line_model=bdrc_line_model,
+        bdrc_line_merge_lines=bdrc_line_merge_lines,
+        bdrc_line_k_factor=bdrc_line_k_factor,
+        bdrc_line_bbox_tolerance=bdrc_line_bbox_tolerance,
+        bdrc_line_use_rotation=bdrc_line_use_rotation,
+        bdrc_line_use_tps=bdrc_line_use_tps,
+        bdrc_line_tps_threshold=bdrc_line_tps_threshold,
+        device=device if device != "auto" else "",
+    )
     rows: List[Dict[str, Any]] = []
     last_pre: Optional[np.ndarray] = None
     last_post: Optional[np.ndarray] = None
@@ -814,13 +1455,14 @@ def _run_full_auto(
         box = _normalize_box(rec.get("line_box") or [], w, h)
         if box is None:
             continue
-        x1, y1, x2, y2 = box
-        crop = src[y1:y2, x1:x2]
-        text, dbg, pre_img, post_img = _run_donut_on_crop(
+        crop = _extract_row_crop(src, rec)
+        text, dbg, pre_img, post_img = _run_ocr_on_crop(
             crop,
-            donut_checkpoint,
-            device,
-            max_len,
+            ocr_engine=engine,
+            donut_checkpoint=donut_checkpoint,
+            bdrc_ocr_model=bdrc_ocr_model,
+            device=device,
+            max_len=max_len,
             preprocess_preset=preprocess_preset,
             bdrc_preprocess_overrides=bdrc_preprocess_overrides,
             rgb_preprocess_overrides=rgb_preprocess_overrides,
@@ -830,9 +1472,14 @@ def _run_full_auto(
             {
                 "line_id": int(rec.get("line_id", len(rows) + 1)),
                 "line_box": box,
+                "line_polygon": rec.get("line_polygon") or None,
+                "line_confidence": float(rec.get("line_confidence", 0.0)),
+                "line_label": str(rec.get("line_label", "line")),
+                "line_class": int(rec.get("line_class", 0)),
                 "text": text,
                 "ocr_debug": dbg,
-                "source": "full_auto",
+                "ocr_engine": engine,
+                "source": str(rec.get("source") or "full_auto"),
             }
         )
 
@@ -849,6 +1496,19 @@ def _run_full_auto(
         "mode": "full_auto",
         "split_status": split_status,
         "line_count": len(rows),
+        "ocr_engine": engine,
+        "ocr_model": (str(donut_checkpoint or "") if engine == OCR_ENGINE_DONUT else str(bdrc_ocr_model or "")),
+        "line_segmentation_mode": mode,
+        "line_segmentation_preprocess": (
+            normalize_line_segmentation_preprocess_pipeline(line_segmentation_preprocess)
+            if mode == LINE_SEG_YOLO
+            else ("bdrc_internal" if mode == LINE_SEG_BDRC else "none")
+        ),
+        "line_segmentation_model": (
+            str(line_model or "")
+            if mode == LINE_SEG_YOLO
+            else (str(bdrc_line_model or "") if mode == LINE_SEG_BDRC else "")
+        ),
         "image_preprocess_pipeline": _normalize_preprocess_preset(preprocess_preset),
         "preprocess_overrides": _effective_preprocess_overrides(
             preprocess_preset=preprocess_preset,
@@ -865,17 +1525,340 @@ def _run_full_auto(
             if isinstance(rgb_preprocess_overrides, dict)
             else None
         ),
-        "split_json": json.loads(split_json) if (split_json or "").strip().startswith("{") else split_json,
+        "split_json": split_debug,
+        "auto_download_notes": auto_notes or None,
     }
     strong_overlay = _render_overlay(src, rows)
+    status_msg = f"{split_status} OCR executed on {len(rows)} line(s)."
+    if auto_notes:
+        status_msg += " " + " ".join(auto_notes)
     return (
         strong_overlay,
         transcript,
-        f"{split_status} OCR executed on {len(rows)} line(s).",
+        status_msg,
         state,
         json.dumps(debug, ensure_ascii=False, indent=2),
         state.get("last_donut_pre"),
         state.get("last_donut_post"),
+    )
+
+
+def _load_repro_ui_settings(ckpt_path: str) -> Tuple[str, str, Dict[str, Any], Dict[str, Any]]:
+    """Load preprocessing settings from a repro bundle and return UI-ready values.
+
+    Returns (preset, status_msg, bdrc_dict, rgb_dict).
+    The dicts contain all keys expected by the Advanced View sliders.
+    """
+    repro_pipeline = _read_repro_preprocess_pipeline(ckpt_path)
+    if repro_pipeline is None:
+        # No repro bundle — return current defaults
+        bdrc = _bdrc_ui_defaults()
+        rgb = _rgb_ui_defaults()
+        preset = "bdrc"
+        msg = f"No repro bundle found for {Path(ckpt_path).name}. Defaults loaded."
+        return preset, msg, bdrc, rgb
+
+    preset = _normalize_preprocess_preset(repro_pipeline)
+
+    # Reconstruct vit_defaults for the detected pipeline
+    bdrc = _bdrc_ui_defaults()
+    rgb = _rgb_ui_defaults()
+    if preset in {"bdrc", "gray"} and BDRCPreprocessConfig is not None:
+        try:
+            base = dict(BDRCPreprocessConfig.vit_defaults().to_dict())
+            if preset == "gray":
+                base["binarize"] = False
+                base["gray_mode"] = "min_rgb"
+            # Map to UI keys
+            bdrc = {
+                "gray_mode": str(base.get("gray_mode", "luma")),
+                "normalize_background": bool(base.get("normalize_background", False)),
+                "background_blur_ksize": int(base.get("background_blur_ksize", 0)),
+                "background_strength": float(base.get("background_strength", 1.0)),
+                "upscale_factor": float(base.get("upscale_factor", 1.0)),
+                "upscale_interpolation": str(base.get("upscale_interpolation", "lanczos")),
+                "binarize": bool(base.get("binarize", True)),
+                "threshold_method": str(base.get("threshold_method", "adaptive")),
+                "threshold_block_size": int(base.get("threshold_block_size", 51)),
+                "threshold_c": int(base.get("threshold_c", 13)),
+                "fixed_threshold": int(base.get("fixed_threshold", 120)),
+                "morph_close": bool(base.get("morph_close", False)),
+                "morph_close_kernel": int(base.get("morph_close_kernel", 2)),
+                "remove_small_components": bool(base.get("remove_small_components", False)),
+                "min_component_area": int(base.get("min_component_area", 12)),
+            }
+            cfg_summary = ", ".join(f"{k}={v}" for k, v in sorted(bdrc.items()))
+        except Exception:
+            cfg_summary = "(could not read config)"
+    elif preset == "rgb" and RGBLinePreprocessConfig is not None:
+        try:
+            base = dict(RGBLinePreprocessConfig.vit_defaults().to_dict())
+            rgb = {
+                "preserve_color": bool(base.get("preserve_color", True)),
+                "normalize_background": bool(base.get("normalize_background", True)),
+                "background_method": str(base.get("background_method", "shade_correct")),
+                "background_blur_ksize": int(base.get("background_blur_ksize", 0)),
+                "background_strength": float(base.get("background_strength", 0.35)),
+                "contrast": float(base.get("contrast", 1.0)),
+                "denoise": bool(base.get("denoise", False)),
+                "morph_close": bool(base.get("morph_close", False)),
+                "morph_close_kernel": int(base.get("morph_close_kernel", 3)),
+                "remove_small_components": bool(base.get("remove_small_components", False)),
+                "min_component_area": int(base.get("min_component_area", 12)),
+                "upscale_factor": float(base.get("upscale_factor", 1.0)),
+                "upscale_interpolation": str(base.get("upscale_interpolation", "lanczos")),
+                "ink_normalization": bool(base.get("ink_normalization", True)),
+                "ink_strength": float(base.get("ink_strength", 0.2)),
+            }
+            cfg_summary = ", ".join(f"{k}={v}" for k, v in sorted(rgb.items()))
+        except Exception:
+            cfg_summary = "(could not read config)"
+    else:
+        cfg_summary = "defaults"
+
+    p = Path(ckpt_path)
+    model_label = f"{p.parent.name}/{p.name}"
+    msg = f"Loaded repro settings from {model_label}: pipeline={preset} | {cfg_summary}"
+    return preset, msg, bdrc, rgb
+
+
+def _resolve_effective_preprocess_config_dict(
+    preset: str,
+    pipeline_source: str,
+    bdrc_overrides: Optional[Dict[str, Any]],
+    rgb_overrides: Optional[Dict[str, Any]],
+) -> Dict[str, Any]:
+    """Return the full config dict that will actually be applied during inference.
+
+    For repro-bundle checkpoints the vit_defaults() are used (no UI overrides).
+    For UI-fallback checkpoints the current UI override dict is used.
+    """
+    mode = _normalize_preprocess_preset(preset)
+    if pipeline_source == "repro":
+        # Reconstruct vit_defaults to show exact training-time parameters
+        if mode in {"bdrc", "gray"} and BDRCPreprocessConfig is not None:
+            try:
+                base = dict(BDRCPreprocessConfig.vit_defaults().to_dict())
+                if mode == "gray":
+                    base["binarize"] = False
+                    base["gray_mode"] = "min_rgb"
+                return base
+            except Exception:
+                pass
+        if mode == "rgb" and RGBLinePreprocessConfig is not None:
+            try:
+                return dict(RGBLinePreprocessConfig.vit_defaults().to_dict())
+            except Exception:
+                pass
+        return {}
+    else:
+        # UI-configured overrides
+        effective = _effective_preprocess_overrides(
+            preprocess_preset=preset,
+            bdrc_preprocess_overrides=bdrc_overrides,
+            rgb_preprocess_overrides=rgb_overrides,
+        )
+        return dict(effective) if isinstance(effective, dict) else {}
+
+
+def _read_repro_preprocess_pipeline(ckpt_path: str) -> Optional[str]:
+    """Read the image_preprocess pipeline name saved in a repro checkpoint bundle.
+
+    Returns the pipeline string (e.g. 'bdrc', 'gray', 'rgb') or None if not available.
+    """
+    try:
+        repro = Path(ckpt_path) / "repro" / "image_preprocess.json"
+        if repro.exists():
+            data = json.loads(repro.read_text(encoding="utf-8"))
+            pipeline = str(data.get("pipeline", "") or "").strip().lower()
+            if pipeline and pipeline != "none":
+                return pipeline
+    except Exception:
+        pass
+    return None
+
+
+def _run_comparison(
+    state: Dict[str, Any],
+    ocr_engine: str,
+    layout_model: str,
+    line_segmentation_mode: str,
+    line_segmentation_preprocess: str,
+    line_model: str,
+    bdrc_line_model: str,
+    bdrc_line_merge_lines: bool,
+    bdrc_line_k_factor: float,
+    bdrc_line_bbox_tolerance: float,
+    bdrc_line_use_rotation: bool,
+    bdrc_line_use_tps: bool,
+    bdrc_line_tps_threshold: float,
+    device: str,
+    max_len: int,
+    preprocess_preset: str = "bdrc",
+    bdrc_preprocess_overrides: Optional[Dict[str, Any]] = None,
+    rgb_preprocess_overrides: Optional[Dict[str, Any]] = None,
+) -> Tuple[np.ndarray, str, str, Dict[str, Any], str, Optional[np.ndarray], Optional[np.ndarray]]:
+    """Run all discovered DONUT checkpoints sequentially and write a comparison report.
+
+    For each checkpoint the preprocessing pipeline is auto-detected from the
+    repro bundle (``repro/image_preprocess.json``).  When no repro bundle is
+    present the globally selected UI preset is used as a fallback.
+    """
+    image = state.get("image")
+    if image is None:
+        return None, "", "Please upload an image first.", state, "{}", None, None
+    if _normalize_ocr_engine(ocr_engine) != OCR_ENGINE_DONUT:
+        src = np.asarray(state.get("image")).astype(np.uint8, copy=False)
+        return src, "", "Comparison mode currently supports DONUT checkpoints only.", state, "{}", None, None
+    auto_notes: List[str] = []
+    mode = _normalize_line_segmentation_mode(line_segmentation_mode)
+    if mode == LINE_SEG_CLASSICAL and not layout_model.strip():
+        return np.asarray(image).astype(np.uint8, copy=False), "", "Layout model is missing.", state, "{}", None, None
+    if mode == LINE_SEG_YOLO and not (line_model or "").strip():
+        return np.asarray(image).astype(np.uint8, copy=False), "", "Line segmentation model is missing.", state, "{}", None, None
+    if mode == LINE_SEG_BDRC and not (bdrc_line_model or "").strip():
+        try:
+            bdrc_line_model, note = _ensure_default_bdrc_line_model_path(bdrc_line_model)
+            if note:
+                auto_notes.append(note)
+        except Exception as exc:
+            return np.asarray(image).astype(np.uint8, copy=False), "", f"BDRC line model is missing and auto-download failed: {type(exc).__name__}: {exc}", state, "{}", None, None
+
+    checkpoints, scan_msg = _list_donut_checkpoints()
+    if not checkpoints:
+        return np.asarray(image).astype(np.uint8, copy=False), "", f"No DONUT checkpoints found. {scan_msg}", state, "{}", None, None
+
+    src = np.asarray(image).astype(np.uint8, copy=False)
+    line_records_raw, split_status, split_debug = _segment_full_image_lines(
+        src,
+        line_segmentation_mode=mode,
+        line_segmentation_preprocess=line_segmentation_preprocess,
+        layout_model=layout_model,
+        line_model=line_model,
+        bdrc_line_model=bdrc_line_model,
+        bdrc_line_merge_lines=bdrc_line_merge_lines,
+        bdrc_line_k_factor=bdrc_line_k_factor,
+        bdrc_line_bbox_tolerance=bdrc_line_bbox_tolerance,
+        bdrc_line_use_rotation=bdrc_line_use_rotation,
+        bdrc_line_use_tps=bdrc_line_use_tps,
+        bdrc_line_tps_threshold=bdrc_line_tps_threshold,
+        device=device if device != "auto" else "",
+    )
+
+    h, w = src.shape[:2]
+    image_name = str(state.get("image_name") or "image")
+
+    report_lines: List[str] = [f"Image: {image_name}", ""]
+    last_overlay = _render_overlay(src, line_records_raw)
+    ckpt_debug: List[Dict[str, Any]] = []
+
+    for label, ckpt_path in checkpoints:
+        p = Path(ckpt_path)
+        model_name = f"{p.parent.name}/{p.name}"
+
+        # Auto-detect preprocessing pipeline from repro bundle; fall back to UI preset.
+        repro_pipeline = _read_repro_preprocess_pipeline(ckpt_path)
+        if repro_pipeline is not None:
+            effective_preset = repro_pipeline
+            # Use vit_defaults for the repro pipeline — no UI overrides applied,
+            # matching the exact training-time configuration.
+            effective_bdrc_overrides: Optional[Dict[str, Any]] = None
+            effective_rgb_overrides: Optional[Dict[str, Any]] = None
+            pipeline_source = "repro"
+        else:
+            effective_preset = preprocess_preset
+            effective_bdrc_overrides = bdrc_preprocess_overrides
+            effective_rgb_overrides = rgb_preprocess_overrides
+            pipeline_source = "ui_fallback"
+
+        rows: List[Dict[str, Any]] = []
+        for rec in line_records_raw:
+            box = _normalize_box(rec.get("line_box") or [], w, h)
+            if box is None:
+                continue
+            x1, y1, x2, y2 = box
+            crop = src[y1:y2, x1:x2]
+            try:
+                text, _dbg, _pre, _post = _run_donut_on_crop(
+                    crop,
+                    ckpt_path,
+                    device,
+                    max_len,
+                    preprocess_preset=effective_preset,
+                    bdrc_preprocess_overrides=effective_bdrc_overrides,
+                    rgb_preprocess_overrides=effective_rgb_overrides,
+                )
+            except Exception as exc:
+                text = f"[ERROR: {exc}]"
+            rows.append({
+                "line_id": int(rec.get("line_id", len(rows) + 1)),
+                "line_box": box,
+                "text": text,
+                "source": "comparison",
+            })
+        rows = _sort_lines(rows)
+        transcript = _line_text(rows)
+        report_lines.append(f"Model: {model_name}")
+        pipeline_note = "from repro bundle" if pipeline_source == "repro" else "from UI selection (no repro bundle)"
+        cfg_dict = _resolve_effective_preprocess_config_dict(
+            preset=effective_preset,
+            pipeline_source=pipeline_source,
+            bdrc_overrides=effective_bdrc_overrides,
+            rgb_overrides=effective_rgb_overrides,
+        )
+        cfg_str = ", ".join(f"{k}={v}" for k, v in sorted(cfg_dict.items())) if cfg_dict else "defaults"
+        report_lines.append(f"Preprocessing: {effective_preset} ({pipeline_note})")
+        report_lines.append(f"Preprocessing config: {cfg_str}")
+        report_lines.append(f"Text:\n{transcript}")
+        report_lines.append("")
+        ckpt_debug.append({
+            "checkpoint": ckpt_path,
+            "model_name": model_name,
+            "preprocess_pipeline": effective_preset,
+            "pipeline_source": pipeline_source,
+            "line_count": len(rows),
+        })
+        # Unload model from cache to free memory before loading next
+        _DONUT_ACTIVE_RUNTIME["checkpoint"] = ""
+        _DONUT_ACTIVE_RUNTIME["runtime"] = None
+
+    full_report = "\n".join(report_lines).strip()
+    state["line_rows"] = []
+    state["last_mode"] = "comparison"
+    state["last_debug_text"] = ""
+    debug = {
+        "ok": True,
+        "mode": "comparison",
+        "checkpoints_compared": len(checkpoints),
+        "split_status": split_status,
+        "ocr_engine": OCR_ENGINE_DONUT,
+        "line_segmentation_mode": mode,
+        "line_segmentation_preprocess": (
+            normalize_line_segmentation_preprocess_pipeline(line_segmentation_preprocess)
+            if mode == LINE_SEG_YOLO
+            else ("bdrc_internal" if mode == LINE_SEG_BDRC else "none")
+        ),
+        "line_segmentation_model": (
+            str(line_model or "")
+            if mode == LINE_SEG_YOLO
+            else (str(bdrc_line_model or "") if mode == LINE_SEG_BDRC else "")
+        ),
+        "line_count": len(line_records_raw),
+        "split_json": split_debug,
+        "checkpoints": ckpt_debug,
+        "auto_download_notes": auto_notes or None,
+    }
+    status_msg = f"Comparison done: {len(checkpoints)} model(s), {len(line_records_raw)} line(s)."
+    if auto_notes:
+        status_msg += " " + " ".join(auto_notes)
+    return (
+        last_overlay,
+        full_report,
+        status_msg,
+        state,
+        json.dumps(debug, ensure_ascii=False, indent=2),
+        None,
+        None,
     )
 
 
@@ -914,8 +1897,20 @@ def _add_or_update_line(rows: List[Dict[str, Any]], row: Dict[str, Any]) -> List
 
 def _manual_click(
     state: Dict[str, Any],
+    ocr_engine: str,
     donut_checkpoint: str,
+    bdrc_ocr_model: str,
     layout_model: str,
+    line_segmentation_mode: str,
+    line_segmentation_preprocess: str,
+    line_model: str,
+    bdrc_line_model: str,
+    bdrc_line_merge_lines: bool,
+    bdrc_line_k_factor: float,
+    bdrc_line_bbox_tolerance: float,
+    bdrc_line_use_rotation: bool,
+    bdrc_line_use_tps: bool,
+    bdrc_line_tps_threshold: float,
     device: str,
     max_len: int,
     preprocess_preset: str,
@@ -926,8 +1921,22 @@ def _manual_click(
     image = state.get("image")
     if image is None:
         return None, "", "Please upload an image first.", state, "{}", state.get("last_donut_pre"), state.get("last_donut_post")
-    if not donut_checkpoint.strip():
+    engine = _normalize_ocr_engine(ocr_engine)
+    if engine == OCR_ENGINE_BDRC and not bdrc_ocr_model.strip():
+        try:
+            bdrc_ocr_model, _ = _ensure_default_bdrc_ocr_model_path(bdrc_ocr_model)
+        except Exception as exc:
+            return image, "", f"BDRC OCR model is missing and auto-download failed: {type(exc).__name__}: {exc}", state, "{}", state.get("last_donut_pre"), state.get("last_donut_post")
+    mode = _normalize_line_segmentation_mode(line_segmentation_mode)
+    if mode == LINE_SEG_BDRC and not (bdrc_line_model or "").strip():
+        try:
+            bdrc_line_model, _ = _ensure_default_bdrc_line_model_path(bdrc_line_model)
+        except Exception as exc:
+            return image, "", f"BDRC line model is missing and auto-download failed: {type(exc).__name__}: {exc}", state, "{}", state.get("last_donut_pre"), state.get("last_donut_post")
+    if engine == OCR_ENGINE_DONUT and not donut_checkpoint.strip():
         return image, "", "DONUT checkpoint is missing.", state, "{}", state.get("last_donut_pre"), state.get("last_donut_post")
+    if engine == OCR_ENGINE_BDRC and not bdrc_ocr_model.strip():
+        return image, "", "BDRC OCR model is missing.", state, "{}", state.get("last_donut_pre"), state.get("last_donut_post")
 
     idx = getattr(evt, "index", None)
     if not isinstance(idx, (tuple, list)) or len(idx) < 2:
@@ -945,13 +1954,14 @@ def _manual_click(
 
     hit = _find_line_hit(rows, click_x, click_y)
     if hit is not None:
-        x1, y1, x2, y2 = [int(v) for v in hit["line_box"]]
-        crop = src[y1:y2, x1:x2]
-        text, dbg, pre_img, post_img = _run_donut_on_crop(
+        crop = _extract_row_crop(src, hit)
+        text, dbg, pre_img, post_img = _run_ocr_on_crop(
             crop,
-            donut_checkpoint,
-            device,
-            max_len,
+            ocr_engine=engine,
+            donut_checkpoint=donut_checkpoint,
+            bdrc_ocr_model=bdrc_ocr_model,
+            device=device,
+            max_len=max_len,
             preprocess_preset=preprocess_preset,
             bdrc_preprocess_overrides=bdrc_preprocess_overrides,
             rgb_preprocess_overrides=rgb_preprocess_overrides,
@@ -988,7 +1998,19 @@ def _manual_click(
     roi = _normalize_box([x1, y1, x2, y2], w, h)
     return _manual_process_roi(
         state,
+        ocr_engine,
         donut_checkpoint,
+        bdrc_ocr_model,
+        line_segmentation_mode,
+        line_segmentation_preprocess,
+        line_model,
+        bdrc_line_model,
+        bdrc_line_merge_lines,
+        bdrc_line_k_factor,
+        bdrc_line_bbox_tolerance,
+        bdrc_line_use_rotation,
+        bdrc_line_use_tps,
+        bdrc_line_tps_threshold,
         device,
         max_len,
         roi,
@@ -1000,7 +2022,19 @@ def _manual_click(
 
 def _manual_process_roi(
     state: Dict[str, Any],
+    ocr_engine: str,
     donut_checkpoint: str,
+    bdrc_ocr_model: str,
+    line_segmentation_mode: str,
+    line_segmentation_preprocess: str,
+    line_model: str,
+    bdrc_line_model: str,
+    bdrc_line_merge_lines: bool,
+    bdrc_line_k_factor: float,
+    bdrc_line_bbox_tolerance: float,
+    bdrc_line_use_rotation: bool,
+    bdrc_line_use_tps: bool,
+    bdrc_line_tps_threshold: float,
     device: str,
     max_len: int,
     roi: Optional[List[int]],
@@ -1011,6 +2045,23 @@ def _manual_process_roi(
     image = state.get("image")
     if image is None:
         return None, "", "Please upload an image first.", state, "{}", state.get("last_donut_pre"), state.get("last_donut_post")
+    engine = _normalize_ocr_engine(ocr_engine)
+    auto_notes: List[str] = []
+    if engine == OCR_ENGINE_BDRC and not bdrc_ocr_model.strip():
+        try:
+            bdrc_ocr_model, note = _ensure_default_bdrc_ocr_model_path(bdrc_ocr_model)
+            if note:
+                auto_notes.append(note)
+        except Exception as exc:
+            return None, "", f"BDRC OCR model is missing and auto-download failed: {type(exc).__name__}: {exc}", state, "{}", state.get("last_donut_pre"), state.get("last_donut_post")
+    mode = _normalize_line_segmentation_mode(line_segmentation_mode)
+    if mode == LINE_SEG_BDRC and not (bdrc_line_model or "").strip():
+        try:
+            bdrc_line_model, note = _ensure_default_bdrc_line_model_path(bdrc_line_model)
+            if note:
+                auto_notes.append(note)
+        except Exception as exc:
+            return None, "", f"BDRC line model is missing and auto-download failed: {type(exc).__name__}: {exc}", state, "{}", state.get("last_donut_pre"), state.get("last_donut_post")
     src = np.asarray(image).astype(np.uint8, copy=False)
     h, w = src.shape[:2]
     rows = list(state.get("line_rows") or [])
@@ -1028,11 +2079,13 @@ def _manual_process_roi(
     last_pre: Optional[np.ndarray] = None
     last_post: Optional[np.ndarray] = None
     if _roi_is_single_line(roi_w, roi_h):
-        text, dbg, pre_img, post_img = _run_donut_on_crop(
+        text, dbg, pre_img, post_img = _run_ocr_on_crop(
             roi_crop,
-            donut_checkpoint,
-            device,
-            max_len,
+            ocr_engine=engine,
+            donut_checkpoint=donut_checkpoint,
+            bdrc_ocr_model=bdrc_ocr_model,
+            device=device,
+            max_len=max_len,
             preprocess_preset=preprocess_preset,
             bdrc_preprocess_overrides=bdrc_preprocess_overrides,
             rgb_preprocess_overrides=rgb_preprocess_overrides,
@@ -1049,31 +2102,94 @@ def _manual_process_roi(
         )
         action = "roi_direct_line"
     else:
-        line_state = _compute_line_projection_state(
-            crop_rgb=roi_crop,
-            projection_smooth=9,
-            projection_threshold_rel=0.20,
-        )
-        line_boxes_local = _segment_lines_in_text_crop(
-            crop_rgb=roi_crop,
-            min_line_height=10,
-            projection_smooth=9,
-            projection_threshold_rel=0.20,
-            merge_gap_px=5,
-            projection_state=line_state,
-        )
-        for bx1, by1, bx2, by2 in line_boxes_local:
+        line_rows_local: List[Dict[str, Any]] = []
+        if mode == LINE_SEG_YOLO and (line_model or "").strip():
+            preprocess_mode = normalize_line_segmentation_preprocess_pipeline(line_segmentation_preprocess)
+            try:
+                predictions = predict_line_regions(
+                    roi_crop,
+                    model_path=line_model,
+                    conf=DEFAULT_LINE_SEGMENTATION_CONF,
+                    imgsz=DEFAULT_LINE_SEGMENTATION_IMGSZ,
+                    preprocess_pipeline=preprocess_mode,
+                    device=device,
+                )
+                line_rows_local = _rows_from_line_predictions(
+                    predictions,
+                    image_w=roi_w,
+                    image_h=roi_h,
+                    source="manual_roi_yolo_line_model",
+                )
+            except Exception:
+                line_rows_local = []
+        elif mode == LINE_SEG_BDRC and (bdrc_line_model or "").strip():
+            try:
+                predictions, _dbg = predict_bdrc_line_regions(
+                    roi_crop,
+                    model_path=bdrc_line_model,
+                    device=device,
+                    group_lines=bool(bdrc_line_merge_lines),
+                    k_factor=float(bdrc_line_k_factor),
+                    bbox_tolerance=float(bdrc_line_bbox_tolerance),
+                    use_rotation=bool(bdrc_line_use_rotation),
+                    use_tps=bool(bdrc_line_use_tps),
+                    tps_threshold=float(bdrc_line_tps_threshold),
+                )
+                line_rows_local = _rows_from_bdrc_line_predictions(
+                    predictions,
+                    image_w=roi_w,
+                    image_h=roi_h,
+                    source="manual_roi_bdrc_line_model",
+                )
+            except Exception:
+                line_rows_local = []
+        elif mode == LINE_SEG_CLASSICAL:
+            line_state = _compute_line_projection_state(
+                crop_rgb=roi_crop,
+                projection_smooth=9,
+                projection_threshold_rel=0.20,
+            )
+            line_boxes_local = _segment_lines_in_text_crop(
+                crop_rgb=roi_crop,
+                min_line_height=10,
+                projection_smooth=9,
+                projection_threshold_rel=0.20,
+                merge_gap_px=5,
+                projection_state=line_state,
+            )
+            for bx1, by1, bx2, by2 in line_boxes_local:
+                line_rows_local.append(
+                    {
+                        "line_box": [int(bx1), int(by1), int(bx2), int(by2)],
+                        "line_polygon": [
+                            [int(bx1), int(by1)],
+                            [int(bx2) - 1, int(by1)],
+                            [int(bx2) - 1, int(by2) - 1],
+                            [int(bx1), int(by2) - 1],
+                        ],
+                        "source": "manual_roi_line_split",
+                    }
+                )
+
+        for local_rec in line_rows_local:
+            local_box = local_rec.get("line_box") or []
+            if len(local_box) != 4:
+                continue
+            bx1, by1, bx2, by2 = [int(v) for v in local_box]
             gx1, gy1, gx2, gy2 = rx1 + int(bx1), ry1 + int(by1), rx1 + int(bx2), ry1 + int(by2)
             gbox = _normalize_box([gx1, gy1, gx2, gy2], w, h)
             if gbox is None:
                 continue
-            lx1, ly1, lx2, ly2 = gbox
-            lcrop = src[ly1:ly2, lx1:lx2]
-            text, dbg, pre_img, post_img = _run_donut_on_crop(
+            local_copy = dict(local_rec)
+            local_copy["line_box"] = gbox
+            lcrop = _extract_row_crop(src, local_copy)
+            text, dbg, pre_img, post_img = _run_ocr_on_crop(
                 lcrop,
-                donut_checkpoint,
-                device,
-                max_len,
+                ocr_engine=engine,
+                donut_checkpoint=donut_checkpoint,
+                bdrc_ocr_model=bdrc_ocr_model,
+                device=device,
+                max_len=max_len,
                 preprocess_preset=preprocess_preset,
                 bdrc_preprocess_overrides=bdrc_preprocess_overrides,
                 rgb_preprocess_overrides=rgb_preprocess_overrides,
@@ -1083,17 +2199,28 @@ def _manual_process_roi(
                 {
                     "line_id": len(rows) + len(created_rows) + 1,
                     "line_box": gbox,
+                    "line_polygon": [
+                        [int(rx1) + int(x), int(ry1) + int(y)]
+                        for x, y in list(local_rec.get("line_polygon") or [])
+                    ] or None,
+                    "line_confidence": float(local_rec.get("line_confidence", 0.0)),
+                    "line_label": str(local_rec.get("line_label", "line")),
+                    "line_class": int(local_rec.get("line_class", 0)),
                     "text": text,
                     "ocr_debug": dbg,
-                    "source": "manual_roi_line_split",
+                    "ocr_engine": engine,
+                    "ocr_crop": local_rec.get("ocr_crop"),
+                    "source": str(local_rec.get("source") or "manual_roi_line_split"),
                 }
             )
         if not created_rows:
-            text, dbg, pre_img, post_img = _run_donut_on_crop(
+            text, dbg, pre_img, post_img = _run_ocr_on_crop(
                 roi_crop,
-                donut_checkpoint,
-                device,
-                max_len,
+                ocr_engine=engine,
+                donut_checkpoint=donut_checkpoint,
+                bdrc_ocr_model=bdrc_ocr_model,
+                device=device,
+                max_len=max_len,
                 preprocess_preset=preprocess_preset,
                 bdrc_preprocess_overrides=bdrc_preprocess_overrides,
                 rgb_preprocess_overrides=rgb_preprocess_overrides,
@@ -1108,7 +2235,11 @@ def _manual_process_roi(
                     "source": "manual_roi_fallback_direct",
                 }
             )
-        action = "roi_line_split"
+        action = (
+            "roi_line_split_yolo_model"
+            if mode == LINE_SEG_YOLO
+            else ("roi_line_split_bdrc_model" if mode == LINE_SEG_BDRC else "roi_line_split")
+        )
 
     for rec in created_rows:
         rows = _add_or_update_line(rows, rec)
@@ -1126,6 +2257,18 @@ def _manual_process_roi(
         "roi": roi,
         "new_rows": created_rows,
         "total_rows": len(rows),
+        "ocr_engine": engine,
+        "line_segmentation_mode": mode,
+        "line_segmentation_preprocess": (
+            normalize_line_segmentation_preprocess_pipeline(line_segmentation_preprocess)
+            if mode == LINE_SEG_YOLO
+            else ("bdrc_internal" if mode == LINE_SEG_BDRC else "none")
+        ),
+        "line_segmentation_model": (
+            str(line_model or "")
+            if mode == LINE_SEG_YOLO
+            else (str(bdrc_line_model or "") if mode == LINE_SEG_BDRC else "")
+        ),
         "image_preprocess_pipeline": _normalize_preprocess_preset(preprocess_preset),
         "preprocess_overrides": _effective_preprocess_overrides(
             preprocess_preset=preprocess_preset,
@@ -1142,11 +2285,15 @@ def _manual_process_roi(
             if isinstance(rgb_preprocess_overrides, dict)
             else None
         ),
+        "auto_download_notes": auto_notes or None,
     }
+    status_msg = f"Manual ROI processed. New/updated lines: {len(created_rows)}."
+    if auto_notes:
+        status_msg += " " + " ".join(auto_notes)
     return (
         overlay,
         _line_text(rows),
-        f"Manual ROI processed. New/updated lines: {len(created_rows)}.",
+        status_msg,
         state,
         json.dumps(debug, ensure_ascii=False, indent=2),
         state.get("last_donut_pre"),
@@ -1157,7 +2304,19 @@ def _manual_process_roi(
 def _manual_full_image_roi(
     mode_s: str,
     state_s: Dict[str, Any],
+    ocr_engine_s: str,
     donut_s: str,
+    bdrc_ocr_model_s: str,
+    line_segmentation_mode_s: str,
+    line_segmentation_preprocess_s: str,
+    line_model_s: str,
+    bdrc_line_model_s: str,
+    bdrc_line_merge_lines_s: bool,
+    bdrc_line_k_factor_s: float,
+    bdrc_line_bbox_tolerance_s: float,
+    bdrc_line_use_rotation_s: bool,
+    bdrc_line_use_tps_s: bool,
+    bdrc_line_tps_threshold_s: float,
     device_s: str,
     max_len_s: int,
     preprocess_preset: str = "bdrc",
@@ -1175,7 +2334,19 @@ def _manual_full_image_roi(
     h, w = src.shape[:2]
     return _manual_process_roi(
         state_s,
+        ocr_engine_s,
         donut_s,
+        bdrc_ocr_model_s,
+        line_segmentation_mode_s,
+        line_segmentation_preprocess_s,
+        line_model_s,
+        bdrc_line_model_s,
+        bdrc_line_merge_lines_s,
+        float(bdrc_line_k_factor_s),
+        float(bdrc_line_bbox_tolerance_s),
+        bool(bdrc_line_use_rotation_s),
+        bool(bdrc_line_use_tps_s),
+        float(bdrc_line_tps_threshold_s),
         device_s,
         int(max_len_s),
         [0, 0, w, h],
@@ -1185,26 +2356,36 @@ def _manual_full_image_roi(
     )
 
 
-def _on_upload(file_obj: Any, state: Dict[str, Any]) -> Tuple[np.ndarray, str, Dict[str, Any], str]:
-    if file_obj is None:
+def _on_upload(img_array: Any, state: Dict[str, Any]) -> Tuple[np.ndarray, str, Dict[str, Any], str]:
+    """Accept a numpy array from gr.Image upload."""
+    if img_array is None:
         return None, "", _base_state(), "No image loaded."
-    path = getattr(file_obj, "name", "") or str(file_obj)
-    p = Path(path).expanduser().resolve()
-    if not p.exists():
-        return None, "", _base_state(), f"Datei nicht gefunden: {p}"
-    img = _to_rgb_uint8(str(p))
+    try:
+        img = np.asarray(img_array).astype(np.uint8)
+        if img.ndim == 2:
+            img = np.stack([img] * 3, axis=-1)
+        elif img.shape[2] == 4:
+            img = img[:, :, :3]
+    except Exception as exc:
+        return None, "", _base_state(), f"Failed to load image: {exc}"
     new_state = _base_state()
-    new_state["image_path"] = str(p)
-    new_state["image_name"] = p.name
+    new_state["image_path"] = ""
+    new_state["image_name"] = "uploaded_image.png"
     new_state["image"] = img
-    return img, "", new_state, f"Image loaded: {p.name}"
+    return img, "", new_state, "Image loaded."
 
 
 def _save_results(
     state: Dict[str, Any],
     transcript_text: str,
+    ocr_engine: str,
     donut_checkpoint: str,
+    bdrc_ocr_model: str,
     layout_model: str,
+    line_segmentation_mode: str,
+    line_segmentation_preprocess: str,
+    line_model: str,
+    bdrc_line_model: str,
 ) -> str:
     image = state.get("image")
     if image is None:
@@ -1228,22 +2409,44 @@ def _save_results(
         box = _normalize_box(rec.get("line_box") or [], w, h)
         if box is None:
             continue
-        x1, y1, x2, y2 = box
-        crop = src[y1:y2, x1:x2]
+        crop = _extract_row_crop(src, rec)
         crop_name = f"line_{i:03d}.png"
         Image.fromarray(crop).save(out_dir / crop_name)
         obj = dict(rec)
+        obj.pop("ocr_crop", None)
         obj["line_no"] = i
         obj["line_box"] = box
         obj["line_crop_file"] = crop_name
         saved_rows.append(obj)
 
+    normalized_engine = _normalize_ocr_engine(ocr_engine)
+    normalized_mode = _normalize_line_segmentation_mode(line_segmentation_mode)
     payload = {
         "saved_at": datetime.now().isoformat(),
         "image_name": name,
         "image_path": str(state.get("image_path") or ""),
+        "ocr_engine": normalized_engine,
+        "ocr_model": (
+            str(donut_checkpoint or "")
+            if normalized_engine == OCR_ENGINE_DONUT
+            else str(bdrc_ocr_model or "")
+        ),
         "donut_checkpoint": str(donut_checkpoint or ""),
+        "bdrc_ocr_model": str(bdrc_ocr_model or ""),
         "layout_model": str(layout_model or ""),
+        "line_segmentation_mode": normalized_mode,
+        "line_segmentation_preprocess": (
+            normalize_line_segmentation_preprocess_pipeline(line_segmentation_preprocess)
+            if normalized_mode == LINE_SEG_YOLO
+            else ("bdrc_internal" if normalized_mode == LINE_SEG_BDRC else "none")
+        ),
+        "line_segmentation_model": (
+            str(line_model or "")
+            if normalized_mode == LINE_SEG_YOLO
+            else (str(bdrc_line_model or "") if normalized_mode == LINE_SEG_BDRC else "")
+        ),
+        "yolo_line_segmentation_model": str(line_model or ""),
+        "bdrc_line_model": str(bdrc_line_model or ""),
         "line_count": len(saved_rows),
         "lines": saved_rows,
     }
@@ -1252,27 +2455,103 @@ def _save_results(
 
 
 def build_ui() -> gr.Blocks:
-    donut_ckpt, donut_msg = _find_donut_checkpoint()
-    layout_model, layout_msg = _find_layout_model()
-    bdrc_defaults = _bdrc_ui_defaults()
-    rgb_defaults = _rgb_ui_defaults()
+    # ── Compute startup defaults ─────────────────────────────────────────
+    # Discover the best checkpoint first so we can load its repro pack
+    # immediately and use those values as the initial slider values.
+    _startup_donut_choices, _ = _list_donut_checkpoints()
+    _startup_donut_path = _startup_donut_choices[0][1] if _startup_donut_choices else ""
+    _startup_preset, _, _startup_bdrc, _startup_rgb = _load_repro_ui_settings(_startup_donut_path)
+
+    bdrc_defaults = _startup_bdrc
+    rgb_defaults = _startup_rgb
     ui_css = """
+/* ── Folder Browser ─────────────────────────────────────────────────── */
+#folder_gallery {
+  min-height: 160px;
+}
+#folder_gallery .thumbnail-item {
+  cursor: pointer;
+  border-radius: 6px;
+  overflow: hidden;
+  transition: box-shadow 0.15s ease;
+}
+#folder_gallery .thumbnail-item:hover {
+  box-shadow: 0 0 0 3px #6366f1;
+}
+#folder_gallery .thumbnail-item.selected {
+  box-shadow: 0 0 0 4px #6366f1;
+}
+#folder_path_input {
+  font-family: monospace;
+}
+/* ── Main image panel ───────────────────────────────────────────────── */
 #ocr_image_panel {
-  min-height: 300px;
-  min-width: 320px;
-  resize: both;
-  overflow: auto;
+  width: 100% !important;
   border: 1px dashed #cbd5e1;
   border-radius: 8px;
+  overflow: auto;
 }
-#ocr_image_panel .image-container,
+#ocr_image_panel .image-container {
+  overflow: auto !important;
+  width: 100% !important;
+}
 #ocr_image_panel img {
+  max-width: none !important;
   max-height: none !important;
+  display: block;
+  transform-origin: top left;
+}
+/* ── OCR loading overlay ────────────────────────────────────────────── */
+#ocr_loading_overlay {
+  display: none;
+  position: absolute;
+  inset: 0;
+  z-index: 100;
+  background: rgba(15, 23, 42, 0.55);
+  border-radius: 8px;
+  align-items: center;
+  justify-content: center;
+  flex-direction: column;
+  gap: 14px;
+}
+#ocr_loading_overlay.ocr-running {
+  display: flex;
+}
+#ocr_loading_overlay .ocr-spinner {
+  width: 52px;
+  height: 52px;
+  border: 5px solid rgba(255,255,255,0.2);
+  border-top-color: #6366f1;
+  border-radius: 50%;
+  animation: ocr-spin 0.8s linear infinite;
+}
+#ocr_loading_overlay .ocr-label {
+  color: #fff;
+  font-size: 15px;
+  font-weight: 600;
+  letter-spacing: 0.02em;
+  text-shadow: 0 1px 4px rgba(0,0,0,0.5);
+}
+@keyframes ocr-spin {
+  to { transform: rotate(360deg); }
+}
+#ocr_image_wrap {
+  position: relative;
+}
+#img_zoom_row {
+  display: flex;
+  align-items: center;
+  gap: 6px;
+  margin-bottom: 4px;
+}
+#img_zoom_minus, #img_zoom_plus, #img_zoom_reset {
+  min-width: 36px !important;
+  width: 36px !important;
+  padding: 0 !important;
 }
 #transcript_panel {
-  min-height: 300px;
-  min-width: 320px;
-  resize: both;
+  min-height: 200px;
+  resize: vertical;
   overflow: auto;
   border: 1px dashed #cbd5e1;
   border-radius: 8px;
@@ -1281,7 +2560,7 @@ def build_ui() -> gr.Blocks:
 #transcript_box textarea {
   font-size: 18px !important;
   line-height: 1.45 !important;
-  min-height: 300px !important;
+  min-height: 200px !important;
   resize: both !important;
   overflow: auto !important;
 }
@@ -1304,38 +2583,351 @@ def build_ui() -> gr.Blocks:
 }
 #donut_input_before,
 #donut_input_after {
-  margin-top: 10px !important;
-  margin-bottom: 10px !important;
+  margin-top: 15px !important;
+  margin-bottom: 15px !important;
+  padding-top: 15px !important;
+}
+#donut_input_before .image-container,
+#donut_input_after .image-container {
+  padding-top: 15px !important;
 }
 """
 
-    with gr.Blocks(title="OCR Workbench (DONUT)", css=ui_css) as demo:
-        gr.Markdown("## OCR Workbench (DONUT + Layout)")
-        gr.Markdown(
-            "Automatic mode: layout -> line detection -> OCR. Manual mode: click an existing line or define an ROI with two clicks."
-        )
-        advanced_view = gr.Checkbox(label="Advanced View", value=False)
+    _image_zoom_js = """
+function() {
+  function initImageZoom() {
+    const panel = document.querySelector('#ocr_image_panel');
+    if (!panel || panel._zoomInit) return;
+    panel._zoomInit = true;
 
+    let scale = 1.0;
+    let originX = 0, originY = 0;   // transform-origin in px relative to img
+    let panX = 0, panY = 0;          // translate offset
+    let isPanning = false;
+    let panStartX = 0, panStartY = 0;
+    let panOriginX = 0, panOriginY = 0;
+
+    function getImg() { return panel.querySelector('img'); }
+
+    function applyTransform() {
+      const img = getImg();
+      if (!img) return;
+      img.style.transformOrigin = `${originX}px ${originY}px`;
+      img.style.transform = `translate(${panX}px, ${panY}px) scale(${scale})`;
+      img.style.maxWidth = 'none';
+      img.style.maxHeight = 'none';
+      img.style.display = 'block';
+    }
+
+    // Wheel zoom centered on cursor
+    panel.addEventListener('wheel', function(e) {
+      const img = getImg();
+      if (!img) return;
+      e.preventDefault();
+      const rect = img.getBoundingClientRect();
+      // cursor position relative to the image element (before transform)
+      const mouseX = (e.clientX - rect.left) / scale;
+      const mouseY = (e.clientY - rect.top)  / scale;
+      const delta = e.deltaY < 0 ? 1.15 : 1 / 1.15;
+      const newScale = Math.min(16, Math.max(0.1, scale * delta));
+      // Adjust pan so the point under the cursor stays fixed
+      panX = e.clientX - rect.left - mouseX * newScale + panX - (e.clientX - rect.left - mouseX * scale);
+      panY = e.clientY - rect.top  - mouseY * newScale + panY - (e.clientY - rect.top  - mouseY * scale);
+      originX = mouseX;
+      originY = mouseY;
+      scale = newScale;
+      applyTransform();
+    }, { passive: false });
+
+    // Middle-click or Alt+left-click drag to pan
+    panel.addEventListener('mousedown', function(e) {
+      if (e.button === 1 || (e.button === 0 && e.altKey)) {
+        e.preventDefault();
+        isPanning = true;
+        panStartX = e.clientX;
+        panStartY = e.clientY;
+        panOriginX = panX;
+        panOriginY = panY;
+        panel.style.cursor = 'grabbing';
+      }
+    });
+    window.addEventListener('mousemove', function(e) {
+      if (!isPanning) return;
+      panX = panOriginX + (e.clientX - panStartX);
+      panY = panOriginY + (e.clientY - panStartY);
+      applyTransform();
+    });
+    window.addEventListener('mouseup', function(e) {
+      if (isPanning) {
+        isPanning = false;
+        panel.style.cursor = '';
+      }
+    });
+
+    // Expose reset/zoom for the buttons
+    panel._zoomReset = function() { scale=1; panX=0; panY=0; originX=0; originY=0; applyTransform(); };
+    panel._zoomIn    = function() { scale=Math.min(16, Math.round((scale+0.25)*100)/100); applyTransform(); };
+    panel._zoomOut   = function() { scale=Math.max(0.1, Math.round((scale-0.25)*100)/100); applyTransform(); };
+  }
+
+  // Re-init whenever Gradio re-renders the image
+  const observer = new MutationObserver(initImageZoom);
+  observer.observe(document.body, { childList: true, subtree: true });
+  initImageZoom();
+
+  // ── OCR loading overlay ──────────────────────────────────────────────
+  function getOverlay() { return document.getElementById('ocr_loading_overlay'); }
+
+  function showOcrOverlay() {
+    const ov = getOverlay();
+    if (ov) ov.classList.add('ocr-running');
+  }
+
+  function hideOcrOverlay() {
+    const ov = getOverlay();
+    if (ov) ov.classList.remove('ocr-running');
+  }
+
+  // Watch the Run OCR button: Gradio disables it while the queue is running,
+  // then re-enables it when done.  We show the overlay on click and hide it
+  // when the button becomes enabled again.
+  function initOcrOverlay() {
+    const runBtn = document.querySelector('#run_ocr_btn button, button#run_ocr_btn');
+    if (runBtn && !runBtn._ocrOverlayInit) {
+      runBtn._ocrOverlayInit = true;
+
+      // Show overlay on click
+      runBtn.addEventListener('click', function() {
+        showOcrOverlay();
+      });
+
+      // Hide overlay when button is re-enabled (OCR done)
+      const btnObserver = new MutationObserver(function(mutations) {
+        for (const m of mutations) {
+          if (m.type === 'attributes' && m.attributeName === 'disabled') {
+            if (!runBtn.disabled) {
+              hideOcrOverlay();
+            }
+          }
+        }
+      });
+      btnObserver.observe(runBtn, { attributes: true, attributeFilter: ['disabled'] });
+    }
+
+    // Also hide when the status textbox text changes (belt-and-suspenders)
+    const statusEl = document.querySelector('#ocr_status_box textarea');
+    if (statusEl && !statusEl._ocrOverlayObserver) {
+      statusEl._ocrOverlayObserver = true;
+      const mo = new MutationObserver(function() { hideOcrOverlay(); });
+      mo.observe(statusEl.parentNode || statusEl, { childList: true, subtree: true, characterData: true });
+    }
+
+    // Also hide when the main image updates (src changes)
+    const imgPanel = document.querySelector('#ocr_image_panel img');
+    if (imgPanel && !imgPanel._ocrOverlayObserver) {
+      imgPanel._ocrOverlayObserver = true;
+      const mo = new MutationObserver(function() { hideOcrOverlay(); });
+      mo.observe(imgPanel, { attributes: true, attributeFilter: ['src'] });
+    }
+  }
+
+  // Re-run init on DOM changes so elements are found after Gradio renders
+  const ocrOverlayObserver = new MutationObserver(initOcrOverlay);
+  ocrOverlayObserver.observe(document.body, { childList: true, subtree: true });
+  initOcrOverlay();
+}
+"""
+
+    with gr.Blocks(title="OCR Workbench", css=ui_css, js=_image_zoom_js) as demo:
+        donut_ckpt_choices, donut_msg = _list_donut_checkpoints()
+        layout_model_choices, layout_msg = _list_layout_models()
+        line_model_choices, line_model_msg = _list_line_segmentation_models()
+        bdrc_line_model_choices, bdrc_line_model_msg = _list_bdrc_line_models()
+        bdrc_ocr_model_choices, bdrc_ocr_model_msg = _list_bdrc_ocr_models()
+        _default_donut = donut_ckpt_choices[0][1] if donut_ckpt_choices else ""
+        _default_layout = layout_model_choices[0][1] if layout_model_choices else ""
+        _default_line_model = line_model_choices[0][1] if line_model_choices else ""
+        _default_bdrc_line_model = bdrc_line_model_choices[0][1] if bdrc_line_model_choices else ""
+        _default_bdrc_ocr_model = bdrc_ocr_model_choices[0][1] if bdrc_ocr_model_choices else ""
+        _donut_label = donut_ckpt_choices[0][0] if donut_ckpt_choices else "—"
+        _layout_label = layout_model_choices[0][0] if layout_model_choices else "—"
+        _line_label = line_model_choices[0][0] if line_model_choices else "—"
+        _bdrc_line_label = bdrc_line_model_choices[0][0] if bdrc_line_model_choices else "—"
+        _bdrc_ocr_label = bdrc_ocr_model_choices[0][0] if bdrc_ocr_model_choices else "—"
+
+        # ── Top bar: title + model status + advanced toggle ─────────────────
+        with gr.Row(equal_height=True):
+            with gr.Column(scale=6):
+                gr.Markdown("## OCR Workbench")
+            with gr.Column(scale=4):
+                # ── Compact model info (shown in simple mode) ───────────────
+                with gr.Row() as model_info_row:
+                    gr.Markdown(
+                        f"🤖 DONUT `{_donut_label}`  &nbsp;|&nbsp;  🪵 BDRC OCR `{_bdrc_ocr_label}`"
+                        f"  &nbsp;|&nbsp;  📐 Layout `{_layout_label}`  &nbsp;|&nbsp;  "
+                        f"📏 YOLO `{_line_label}` / BDRC `{_bdrc_line_label}`",
+                        elem_id="model_info_md",
+                    )
+            with gr.Column(scale=1, min_width=140):
+                advanced_view = gr.Checkbox(label="Advanced View", value=False)
+
+        gr.Markdown(
+            "Automatic mode: choose classical CV, a pretrained YOLO line model, or the BDRC line model, "
+            "then run DONUT or BDRC OCR. Manual mode: click an existing line or define an ROI with two clicks."
+        )
+
+        # ── Folder Browser ──────────────────────────────────────────────────
+        with gr.Accordion("📁 Folder Browser", open=True):
+            gr.Markdown(
+                "Enter a folder path to browse images. "
+                "Click a thumbnail to load it into the workbench below and automatically "
+                "run the selected line segmentation backend + OCR engine."
+            )
+            with gr.Row():
+                folder_path_input = gr.Textbox(
+                    label="Image Folder",
+                    placeholder="/path/to/your/images",
+                    elem_id="folder_path_input",
+                    scale=8,
+                )
+                folder_scan_btn = gr.Button("🔍 Scan", variant="primary", scale=1, min_width=80)
+            folder_status = gr.Textbox(label="Status", interactive=False)
+            # Hidden state: list of full image paths in the scanned folder
+            folder_image_paths = gr.State([])
+            folder_gallery = gr.Gallery(
+                label="Images",
+                elem_id="folder_gallery",
+                columns=6,
+                rows=3,
+                object_fit="contain",
+                height="auto",
+                allow_preview=False,
+            )
+
+        # ── Advanced model selection (hidden in simple mode) ────────────────
+        with gr.Row(visible=False) as advanced_model_row:
+            with gr.Column(scale=10):
+                # choices = [(label, full_path), ...]; value = full_path string
+                donut_path = gr.Dropdown(
+                    label="DONUT Checkpoint",
+                    choices=donut_ckpt_choices,
+                    value=_default_donut,
+                    allow_custom_value=True,
+                )
+            with gr.Column(scale=1, min_width=110):
+                donut_refresh_btn = gr.Button("🔄 Refresh", variant="secondary")
+                load_repro_btn = gr.Button("📋 Load repro settings", variant="secondary")
+            with gr.Column(scale=10):
+                # choices = [(label, full_path), ...]; value = full_path string
+                layout_path = gr.Dropdown(
+                    label="Layout Analysis Model",
+                    choices=layout_model_choices,
+                    value=_default_layout,
+                    allow_custom_value=True,
+                )
+            with gr.Column(scale=1, min_width=110):
+                layout_refresh_btn = gr.Button("🔄 Refresh", variant="secondary")
+        with gr.Row(visible=False) as advanced_bdrc_model_row:
+            with gr.Column(scale=10):
+                bdrc_ocr_model_path = gr.Dropdown(
+                    label="BDRC OCR Model",
+                    choices=bdrc_ocr_model_choices,
+                    value=_default_bdrc_ocr_model,
+                    allow_custom_value=True,
+                )
+            with gr.Column(scale=1, min_width=110):
+                bdrc_ocr_refresh_btn = gr.Button("🔄 Refresh", variant="secondary")
+            with gr.Column(scale=10):
+                bdrc_line_model_path = gr.Dropdown(
+                    label="BDRC Line Model",
+                    choices=bdrc_line_model_choices,
+                    value=_default_bdrc_line_model,
+                    allow_custom_value=True,
+                )
+            with gr.Column(scale=1, min_width=110):
+                bdrc_line_model_refresh_btn = gr.Button("🔄 Refresh", variant="secondary")
         with gr.Row():
-            donut_path = gr.Textbox(label="DONUT Checkpoint", value=donut_ckpt)
-            layout_path = gr.Textbox(label="Layout Analysis Model", value=layout_model)
+            ocr_engine = gr.Radio(
+                choices=[OCR_ENGINE_DONUT, OCR_ENGINE_BDRC],
+                value=OCR_ENGINE_DONUT,
+                label="OCR Engine",
+            )
+        with gr.Row():
+            line_segmentation_mode = gr.Radio(
+                choices=[LINE_SEG_CLASSICAL, LINE_SEG_YOLO, LINE_SEG_BDRC],
+                value=LINE_SEG_CLASSICAL,
+                label="Line Segmentation",
+            )
+        with gr.Row():
+            with gr.Column(scale=10):
+                line_model_path = gr.Dropdown(
+                    label="Line Segmentation Model",
+                    choices=line_model_choices,
+                    value=_default_line_model,
+                    allow_custom_value=True,
+                )
+            with gr.Column(scale=1, min_width=110):
+                line_model_refresh_btn = gr.Button("🔄 Refresh", variant="secondary")
         with gr.Row(visible=False) as advanced_scan_row:
             donut_info = gr.Textbox(label="DONUT Auto-Scan", value=donut_msg, interactive=False)
             layout_info = gr.Textbox(label="Layout Auto-Scan", value=layout_msg, interactive=False)
+            line_model_info = gr.Textbox(label="Line Model Auto-Scan", value=line_model_msg, interactive=False)
+            bdrc_ocr_info = gr.Textbox(label="BDRC OCR Auto-Scan", value=bdrc_ocr_model_msg, interactive=False)
+            bdrc_line_model_info = gr.Textbox(label="BDRC Line Auto-Scan", value=bdrc_line_model_msg, interactive=False)
 
         with gr.Row():
             mode = gr.Radio(choices=[MODE_AUTO, MODE_MANUAL], value=MODE_AUTO, label="Mode")
         with gr.Row(visible=False) as advanced_runtime_row:
             device = gr.Dropdown(choices=["auto", "cuda:0", "cpu"], value="auto", label="Inference Device")
-            max_len = gr.Number(label="DONUT generation_max_length", value=160, precision=0)
+            max_len = gr.Number(label="OCR generation_max_length (DONUT only)", value=160, precision=0)
+        with gr.Row(visible=False) as advanced_bdrc_line_row:
+            bdrc_line_merge_lines = gr.Checkbox(
+                value=DEFAULT_BDRC_LINE_MERGE_LINES,
+                label="BDRC merge_lines",
+            )
+            bdrc_line_use_rotation = gr.Checkbox(
+                value=DEFAULT_UI_BDRC_LINE_USE_ROTATION,
+                label="BDRC auto-rotate",
+            )
+            bdrc_line_use_tps = gr.Checkbox(
+                value=DEFAULT_UI_BDRC_LINE_USE_TPS,
+                label="BDRC dewarp (TPS)",
+            )
+            bdrc_line_tps_threshold = gr.Slider(
+                minimum=0.0,
+                maximum=1.0,
+                step=0.01,
+                value=float(DEFAULT_BDRC_LINE_TPS_THRESHOLD),
+                label="BDRC tps_threshold",
+            )
+        with gr.Row(visible=False) as advanced_bdrc_line_crop_row:
+            bdrc_line_k_factor = gr.Slider(
+                minimum=0.5,
+                maximum=5.0,
+                step=0.1,
+                value=float(DEFAULT_BDRC_LINE_K_FACTOR),
+                label="BDRC k_factor",
+            )
+            bdrc_line_bbox_tolerance = gr.Slider(
+                minimum=1.0,
+                maximum=6.0,
+                step=0.1,
+                value=float(DEFAULT_BDRC_LINE_BBOX_TOLERANCE),
+                label="BDRC bbox_tolerance",
+            )
         with gr.Row(visible=False) as advanced_preprocess_select_row:
             preprocess_preset = gr.Dropdown(
                 choices=[("bdrc", "bdrc"), ("gray", "gray"), ("RGB", "rgb")],
-                value="bdrc",
+                value=_startup_preset,
                 label="Preprocess Preset",
             )
+            line_model_preprocess = gr.Dropdown(
+                choices=[("none", "none"), ("bdrc", "bdrc"), ("gray", "gray"), ("RGB", "rgb")],
+                value=DEFAULT_LINE_SEGMENTATION_PREPROCESS,
+                label="Line Model Preprocess (YOLO only)",
+            )
         with gr.Row(visible=False) as advanced_bdrc_row:
-            with gr.Accordion("BDRC / Gray Preprocess (DONUT Input)", open=False):
+            with gr.Accordion("BDRC / Gray Preprocess (OCR Input)", open=False):
                 gr.Markdown(
                     "1) Background normalize  2) Thresholding  3) Morph close + tiny component filter  "
                     "4) Upscale before binarization  5) Gray channel mode\n\n"
@@ -1424,7 +3016,7 @@ def build_ui() -> gr.Blocks:
                         label="3) min_component_area",
                     )
         with gr.Row(visible=False) as advanced_rgb_row:
-            with gr.Accordion("RGB Preprocess (DONUT Input)", open=False):
+            with gr.Accordion("RGB Preprocess (OCR Input)", open=False):
                 gr.Markdown(
                     "RGB pipeline keeps color cues and exposes background correction, denoising, "
                     "ink normalization, morphology and upscale options."
@@ -1512,55 +3104,68 @@ def build_ui() -> gr.Blocks:
                         label="upscale_interpolation",
                     )
 
-        status = gr.Textbox(label="Status", interactive=False)
-        debug_json = gr.Code(label="Debug JSON", language="json", visible=False)
+        status = gr.Textbox(label="Status", interactive=False, elem_id="ocr_status_box")
+        with gr.Accordion("Debug JSON", open=False, visible=False) as debug_json_accordion:
+            debug_json = gr.Code(language="json")
         with gr.Column():
             donut_input_before = gr.Image(
-                label="DONUT Input (Before Preprocess)",
+                label="OCR Input (Before Preprocess)",
                 type="numpy",
                 visible=False,
                 elem_id="donut_input_before",
             )
             donut_input_after = gr.Image(
-                label="DONUT Input (After Preprocess)",
+                label="OCR Input (After Preprocess)",
                 type="numpy",
                 visible=False,
                 elem_id="donut_input_after",
             )
         with gr.Row(visible=False) as advanced_debug_text_row:
-            debug_text = gr.Textbox(label="Debug Transcription", lines=4, elem_id="debug_text_box")
+            debug_text = gr.Textbox(label="Debug Transcription", lines=4, elem_id="debug_text_box", interactive=True)
             with gr.Column(elem_id="debug_font_ctrl_col", scale=1, min_width=24):
                 debug_font_plus_btn = gr.Button("+")
                 debug_font_minus_btn = gr.Button("−")
 
         state = gr.State(_base_state())
         with gr.Row():
-            image_file = gr.File(label="Upload Image", file_types=["image"])
-            run_btn = gr.Button("Run OCR", variant="primary")
+            run_btn = gr.Button("Run OCR", variant="primary", elem_id="run_ocr_btn")
+            compare_btn = gr.Button("⚖ Compare All Models", variant="secondary")
             full_roi_btn = gr.Button("Process Full Image as ROI", visible=False)
             save_btn = gr.Button("Save", variant="secondary")
 
-        with gr.Row():
-            image_view = gr.Image(
-                label="Image / Overlay",
-                type="numpy",
-                interactive=True,
-                height=300,
-                elem_id="ocr_image_panel",
-                show_label=False,
-                scale=3,
+        # ── Image row (full width) ──────────────────────────────────────────
+        with gr.Row(elem_id="img_zoom_row"):
+            img_zoom_out_btn = gr.Button("🔍−", elem_id="img_zoom_minus", scale=0, min_width=36)
+            img_zoom_reset_btn = gr.Button("⊙", elem_id="img_zoom_reset", scale=0, min_width=36)
+            img_zoom_in_btn = gr.Button("🔍+", elem_id="img_zoom_plus", scale=0, min_width=36)
+        with gr.Column(elem_id="ocr_image_wrap"):
+            gr.HTML(
+                '<div id="ocr_loading_overlay">'
+                '<div class="ocr-spinner"></div>'
+                '<div class="ocr-label">Running OCR…</div>'
+                '</div>'
             )
-            with gr.Column(elem_id="transcript_panel", scale=7):
+            with gr.Row():
+                image_view = gr.Image(
+                    label="Drop image here or click to upload",
+                    type="numpy",
+                    interactive=True,
+                    elem_id="ocr_image_panel",
+                )
+
+        # ── Transcript row (full width) ─────────────────────────────────────
+        with gr.Row():
+            with gr.Column(elem_id="transcript_panel"):
                 with gr.Row():
-                    transcript = gr.Textbox(label="", lines=28, elem_id="transcript_box", show_label=False, scale=36)
+                    transcript = gr.Textbox(label="", lines=14, elem_id="transcript_box", show_label=False, scale=36)
                     with gr.Column(elem_id="font_ctrl_col", scale=1, min_width=24):
                         font_plus_btn = gr.Button("+", elem_id="font_btn_plus")
                         font_minus_btn = gr.Button("−", elem_id="font_btn_minus")
         save_status = gr.Textbox(label="Save Status", interactive=False, visible=False)
 
-        _upload_evt = image_file.change(
+        _upload_evt = image_view.upload(
             fn=_on_upload,
-            inputs=[image_file, state],
+            inputs=[image_view, state],
             outputs=[image_view, transcript, state, status],
         )
         _upload_evt.then(
@@ -1572,8 +3177,20 @@ def build_ui() -> gr.Blocks:
         def _run(
             mode_s: str,
             state_s: Dict[str, Any],
+            ocr_engine_s: str,
             donut_s: str,
+            bdrc_ocr_model_s: str,
             layout_s: str,
+            line_segmentation_mode_s: str,
+            line_segmentation_preprocess_s: str,
+            line_model_s: str,
+            bdrc_line_model_s: str,
+            bdrc_line_merge_lines_s: bool,
+            bdrc_line_k_factor_s: float,
+            bdrc_line_bbox_tolerance_s: float,
+            bdrc_line_use_rotation_s: bool,
+            bdrc_line_use_tps_s: bool,
+            bdrc_line_tps_threshold_s: float,
             device_s: str,
             max_len_s: int,
             preprocess_preset_s: str,
@@ -1644,8 +3261,20 @@ def build_ui() -> gr.Blocks:
             if not _is_manual_mode(mode_s):
                 return _run_full_auto(
                     state_s,
+                    ocr_engine_s,
                     donut_s,
+                    bdrc_ocr_model_s,
                     layout_s,
+                    line_segmentation_mode_s,
+                    line_segmentation_preprocess_s,
+                    line_model_s,
+                    bdrc_line_model_s,
+                    bool(bdrc_line_merge_lines_s),
+                    float(bdrc_line_k_factor_s),
+                    float(bdrc_line_bbox_tolerance_s),
+                    bool(bdrc_line_use_rotation_s),
+                    bool(bdrc_line_use_tps_s),
+                    float(bdrc_line_tps_threshold_s),
                     device_s,
                     int(max_len_s),
                     preprocess_preset=preproc_mode,
@@ -1657,6 +3286,23 @@ def build_ui() -> gr.Blocks:
             debug = {
                 "ok": True,
                 "mode": "manual_waiting",
+                "ocr_engine": _normalize_ocr_engine(ocr_engine_s),
+                "ocr_model": (
+                    str(donut_s or "")
+                    if _normalize_ocr_engine(ocr_engine_s) == OCR_ENGINE_DONUT
+                    else str(bdrc_ocr_model_s or "")
+                ),
+                "line_segmentation_mode": _normalize_line_segmentation_mode(line_segmentation_mode_s),
+                "line_segmentation_preprocess": (
+                    normalize_line_segmentation_preprocess_pipeline(line_segmentation_preprocess_s)
+                    if _normalize_line_segmentation_mode(line_segmentation_mode_s) == LINE_SEG_YOLO
+                    else ("bdrc_internal" if _normalize_line_segmentation_mode(line_segmentation_mode_s) == LINE_SEG_BDRC else "none")
+                ),
+                "line_segmentation_model": (
+                    str(line_model_s or "")
+                    if _normalize_line_segmentation_mode(line_segmentation_mode_s) == LINE_SEG_YOLO
+                    else (str(bdrc_line_model_s or "") if _normalize_line_segmentation_mode(line_segmentation_mode_s) == LINE_SEG_BDRC else "")
+                ),
                 "image_preprocess_pipeline": preproc_mode,
                 "preprocess_overrides": _effective_preprocess_overrides(
                     preprocess_preset=preproc_mode,
@@ -1676,13 +3322,158 @@ def build_ui() -> gr.Blocks:
                 state_s.get("last_donut_post"),
             )
 
+        def _run_with_status(
+            mode_s: str,
+            state_s: Dict[str, Any],
+            ocr_engine_s: str,
+            donut_s: str,
+            bdrc_ocr_model_s: str,
+            layout_s: str,
+            line_segmentation_mode_s: str,
+            line_segmentation_preprocess_s: str,
+            line_model_s: str,
+            bdrc_line_model_s: str,
+            bdrc_line_merge_lines_s: bool,
+            bdrc_line_k_factor_s: float,
+            bdrc_line_bbox_tolerance_s: float,
+            bdrc_line_use_rotation_s: bool,
+            bdrc_line_use_tps_s: bool,
+            bdrc_line_tps_threshold_s: float,
+            device_s: str,
+            max_len_s: int,
+            preprocess_preset_s: str,
+            gray_mode_s: str,
+            normalize_background_s: bool,
+            background_blur_ksize_s: int,
+            background_strength_s: float,
+            upscale_factor_s: float,
+            upscale_interpolation_s: str,
+            binarize_s: bool,
+            threshold_method_s: str,
+            threshold_block_size_s: int,
+            threshold_c_s: int,
+            fixed_threshold_s: int,
+            morph_close_s: bool,
+            morph_close_kernel_s: int,
+            remove_small_components_s: bool,
+            min_component_area_s: int,
+            rgb_preserve_color_s: bool,
+            rgb_normalize_bg_s: bool,
+            rgb_background_method_s: str,
+            rgb_bg_blur_ksize_s: int,
+            rgb_bg_strength_s: float,
+            rgb_contrast_s: float,
+            rgb_denoise_s: bool,
+            rgb_morph_close_s: bool,
+            rgb_morph_close_kernel_s: int,
+            rgb_remove_small_components_s: bool,
+            rgb_min_component_area_s: int,
+            rgb_upscale_factor_s: float,
+            rgb_upscale_interp_s: str,
+            rgb_ink_normalization_s: bool,
+            rgb_ink_strength_s: float,
+            advanced_view_s: bool = False,
+        ):
+            pending_notes = _pending_bdrc_setup_messages(
+                ocr_engine=ocr_engine_s,
+                bdrc_ocr_model=bdrc_ocr_model_s,
+                line_segmentation_mode=line_segmentation_mode_s,
+                bdrc_line_model=bdrc_line_model_s,
+            )
+            status_msg = " ".join(pending_notes) if pending_notes else "Running OCR..."
+            # ── Loading state: clear preview images, show spinner overlay ──
+            yield (
+                gr.update(),
+                gr.update(),
+                status_msg,
+                state_s,
+                gr.update(),
+                gr.update(value=None, visible=False),
+                gr.update(value=None, visible=False),
+            )
+            result = _run(
+                mode_s,
+                state_s,
+                ocr_engine_s,
+                donut_s,
+                bdrc_ocr_model_s,
+                layout_s,
+                line_segmentation_mode_s,
+                line_segmentation_preprocess_s,
+                line_model_s,
+                bdrc_line_model_s,
+                bdrc_line_merge_lines_s,
+                bdrc_line_k_factor_s,
+                bdrc_line_bbox_tolerance_s,
+                bdrc_line_use_rotation_s,
+                bdrc_line_use_tps_s,
+                bdrc_line_tps_threshold_s,
+                device_s,
+                max_len_s,
+                preprocess_preset_s,
+                gray_mode_s,
+                normalize_background_s,
+                background_blur_ksize_s,
+                background_strength_s,
+                upscale_factor_s,
+                upscale_interpolation_s,
+                binarize_s,
+                threshold_method_s,
+                threshold_block_size_s,
+                threshold_c_s,
+                fixed_threshold_s,
+                morph_close_s,
+                morph_close_kernel_s,
+                remove_small_components_s,
+                min_component_area_s,
+                rgb_preserve_color_s,
+                rgb_normalize_bg_s,
+                rgb_background_method_s,
+                rgb_bg_blur_ksize_s,
+                rgb_bg_strength_s,
+                rgb_contrast_s,
+                rgb_denoise_s,
+                rgb_morph_close_s,
+                rgb_morph_close_kernel_s,
+                rgb_remove_small_components_s,
+                rgb_min_component_area_s,
+                rgb_upscale_factor_s,
+                rgb_upscale_interp_s,
+                rgb_ink_normalization_s,
+                rgb_ink_strength_s,
+            )
+            # ── Done: yield result, restore image visibility if data present ──
+            img_out, transcript_out, status_out, state_out, debug_out, pre_img, post_img = result
+            show_imgs = bool(advanced_view_s)
+            yield (
+                img_out,
+                transcript_out,
+                status_out,
+                state_out,
+                debug_out,
+                gr.update(value=pre_img, visible=show_imgs and pre_img is not None),
+                gr.update(value=post_img, visible=show_imgs and post_img is not None),
+            )
+
         _run_evt = run_btn.click(
-            fn=_run,
+            fn=_run_with_status,
             inputs=[
                 mode,
                 state,
+                ocr_engine,
                 donut_path,
+                bdrc_ocr_model_path,
                 layout_path,
+                line_segmentation_mode,
+                line_model_preprocess,
+                line_model_path,
+                bdrc_line_model_path,
+                bdrc_line_merge_lines,
+                bdrc_line_k_factor,
+                bdrc_line_bbox_tolerance,
+                bdrc_line_use_rotation,
+                bdrc_line_use_tps,
+                bdrc_line_tps_threshold,
                 device,
                 max_len,
                 preprocess_preset,
@@ -1716,6 +3507,7 @@ def build_ui() -> gr.Blocks:
                 rgb_upscale_interp,
                 rgb_ink_normalization,
                 rgb_ink_strength,
+                advanced_view,
             ],
             outputs=[image_view, transcript, status, state, debug_json, donut_input_before, donut_input_after],
         )
@@ -1728,8 +3520,20 @@ def build_ui() -> gr.Blocks:
         def _on_select(
             mode_s: str,
             state_s: Dict[str, Any],
+            ocr_engine_s: str,
             donut_s: str,
+            bdrc_ocr_model_s: str,
             layout_s: str,
+            line_segmentation_mode_s: str,
+            line_segmentation_preprocess_s: str,
+            line_model_s: str,
+            bdrc_line_model_s: str,
+            bdrc_line_merge_lines_s: bool,
+            bdrc_line_k_factor_s: float,
+            bdrc_line_bbox_tolerance_s: float,
+            bdrc_line_use_rotation_s: bool,
+            bdrc_line_use_tps_s: bool,
+            bdrc_line_tps_threshold_s: float,
             device_s: str,
             max_len_s: int,
             preprocess_preset_s: str,
@@ -1854,7 +3658,9 @@ def build_ui() -> gr.Blocks:
                         state_s.get("last_donut_post"),
                     )
 
-                if not (donut_s or "").strip():
+                engine = _normalize_ocr_engine(ocr_engine_s)
+                auto_notes: List[str] = []
+                if engine == OCR_ENGINE_DONUT and not (donut_s or "").strip():
                     overlay = _render_overlay(src, rows)
                     return (
                         overlay,
@@ -1865,14 +3671,33 @@ def build_ui() -> gr.Blocks:
                         state_s.get("last_donut_pre"),
                         state_s.get("last_donut_post"),
                     )
+                if engine == OCR_ENGINE_BDRC and not (bdrc_ocr_model_s or "").strip():
+                    try:
+                        bdrc_ocr_model_s, note = _ensure_default_bdrc_ocr_model_path(bdrc_ocr_model_s)
+                        if note:
+                            auto_notes.append(note)
+                    except Exception as exc:
+                        overlay = _render_overlay(src, rows)
+                        return (
+                            overlay,
+                            _line_text(rows),
+                            f"BDRC OCR model is missing and auto-download failed: {type(exc).__name__}: {exc}",
+                            state_s,
+                            "{}",
+                            state_s.get("last_donut_pre"),
+                            state_s.get("last_donut_post"),
+                        )
 
-                x1, y1, x2, y2 = [int(v) for v in hit.get("line_box") or [0, 0, 0, 0]]
-                crop = src[y1:y2, x1:x2]
-                text, dbg, pre_img, post_img = _run_donut_on_crop(
+                box = [int(v) for v in hit.get("line_box") or [0, 0, 0, 0]]
+                x1, y1, x2, y2 = box
+                crop = _extract_row_crop(src, hit)
+                text, dbg, pre_img, post_img = _run_ocr_on_crop(
                     crop,
-                    donut_s,
-                    device_s,
-                    int(max_len_s),
+                    ocr_engine=engine,
+                    donut_checkpoint=donut_s,
+                    bdrc_ocr_model=bdrc_ocr_model_s,
+                    device=device_s,
+                    max_len=int(max_len_s),
                     preprocess_preset=preproc_mode,
                     bdrc_preprocess_overrides=bdrc_overrides,
                     rgb_preprocess_overrides=rgb_overrides,
@@ -1891,7 +3716,21 @@ def build_ui() -> gr.Blocks:
                     "ok": True,
                     "mode": str(mode_s),
                     "action": "clicked_detected_line_for_debug_preview",
-                    "line_box": [x1, y1, x2, y2],
+                    "ocr_engine": engine,
+                    "ocr_model": (str(donut_s or "") if engine == OCR_ENGINE_DONUT else str(bdrc_ocr_model_s or "")),
+                    "line_box": box,
+                    "auto_download_notes": auto_notes or None,
+                    "line_segmentation_mode": _normalize_line_segmentation_mode(line_segmentation_mode_s),
+                    "line_segmentation_preprocess": (
+                        normalize_line_segmentation_preprocess_pipeline(line_segmentation_preprocess_s)
+                        if _normalize_line_segmentation_mode(line_segmentation_mode_s) == LINE_SEG_YOLO
+                        else ("bdrc_internal" if _normalize_line_segmentation_mode(line_segmentation_mode_s) == LINE_SEG_BDRC else "none")
+                    ),
+                    "line_segmentation_model": (
+                        str(line_model_s or "")
+                        if _normalize_line_segmentation_mode(line_segmentation_mode_s) == LINE_SEG_YOLO
+                        else (str(bdrc_line_model_s or "") if _normalize_line_segmentation_mode(line_segmentation_mode_s) == LINE_SEG_BDRC else "")
+                    ),
                     "image_preprocess_pipeline": preproc_mode,
                     "preprocess_overrides": _effective_preprocess_overrides(
                         preprocess_preset=preproc_mode,
@@ -1904,7 +3743,10 @@ def build_ui() -> gr.Blocks:
                 return (
                     overlay,
                     _line_text(rows),
-                    f"Updated debug preview from clicked line at ({click_x},{click_y}).",
+                    (
+                        f"Updated debug preview from clicked line at ({click_x},{click_y})."
+                        + ((" " + " ".join(auto_notes)) if auto_notes else "")
+                    ),
                     state_s,
                     json.dumps(debug, ensure_ascii=False, indent=2),
                     pre_img,
@@ -1912,8 +3754,20 @@ def build_ui() -> gr.Blocks:
                 )
             return _manual_click(
                 state_s,
+                ocr_engine_s,
                 donut_s,
+                bdrc_ocr_model_s,
                 layout_s,
+                line_segmentation_mode_s,
+                line_segmentation_preprocess_s,
+                line_model_s,
+                bdrc_line_model_s,
+                bool(bdrc_line_merge_lines_s),
+                float(bdrc_line_k_factor_s),
+                float(bdrc_line_bbox_tolerance_s),
+                bool(bdrc_line_use_rotation_s),
+                bool(bdrc_line_use_tps_s),
+                float(bdrc_line_tps_threshold_s),
                 device_s,
                 int(max_len_s),
                 preproc_mode,
@@ -1927,8 +3781,20 @@ def build_ui() -> gr.Blocks:
             inputs=[
                 mode,
                 state,
+                ocr_engine,
                 donut_path,
+                bdrc_ocr_model_path,
                 layout_path,
+                line_segmentation_mode,
+                line_model_preprocess,
+                line_model_path,
+                bdrc_line_model_path,
+                bdrc_line_merge_lines,
+                bdrc_line_k_factor,
+                bdrc_line_bbox_tolerance,
+                bdrc_line_use_rotation,
+                bdrc_line_use_tps,
+                bdrc_line_tps_threshold,
                 device,
                 max_len,
                 preprocess_preset,
@@ -1974,7 +3840,19 @@ def build_ui() -> gr.Blocks:
         def _manual_full_roi_with_preprocess(
             mode_s: str,
             state_s: Dict[str, Any],
+            ocr_engine_s: str,
             donut_s: str,
+            bdrc_ocr_model_s: str,
+            line_segmentation_mode_s: str,
+            line_segmentation_preprocess_s: str,
+            line_model_s: str,
+            bdrc_line_model_s: str,
+            bdrc_line_merge_lines_s: bool,
+            bdrc_line_k_factor_s: float,
+            bdrc_line_bbox_tolerance_s: float,
+            bdrc_line_use_rotation_s: bool,
+            bdrc_line_use_tps_s: bool,
+            bdrc_line_tps_threshold_s: float,
             device_s: str,
             max_len_s: int,
             preprocess_preset_s: str,
@@ -2045,7 +3923,19 @@ def build_ui() -> gr.Blocks:
             return _manual_full_image_roi(
                 mode_s,
                 state_s,
+                ocr_engine_s,
                 donut_s,
+                bdrc_ocr_model_s,
+                line_segmentation_mode_s,
+                line_segmentation_preprocess_s,
+                line_model_s,
+                bdrc_line_model_s,
+                bool(bdrc_line_merge_lines_s),
+                float(bdrc_line_k_factor_s),
+                float(bdrc_line_bbox_tolerance_s),
+                bool(bdrc_line_use_rotation_s),
+                bool(bdrc_line_use_tps_s),
+                float(bdrc_line_tps_threshold_s),
                 device_s,
                 int(max_len_s),
                 preprocess_preset=preproc_mode,
@@ -2058,7 +3948,19 @@ def build_ui() -> gr.Blocks:
             inputs=[
                 mode,
                 state,
+                ocr_engine,
                 donut_path,
+                bdrc_ocr_model_path,
+                line_segmentation_mode,
+                line_model_preprocess,
+                line_model_path,
+                bdrc_line_model_path,
+                bdrc_line_merge_lines,
+                bdrc_line_k_factor,
+                bdrc_line_bbox_tolerance,
+                bdrc_line_use_rotation,
+                bdrc_line_use_tps,
+                bdrc_line_tps_threshold,
                 device,
                 max_len,
                 preprocess_preset,
@@ -2101,9 +4003,175 @@ def build_ui() -> gr.Blocks:
             outputs=[debug_text],
         )
 
+        def _compare(
+            state_s: Dict[str, Any],
+            ocr_engine_s: str,
+            layout_s: str,
+            line_segmentation_mode_s: str,
+            line_segmentation_preprocess_s: str,
+            line_model_s: str,
+            bdrc_line_model_s: str,
+            bdrc_line_merge_lines_s: bool,
+            bdrc_line_k_factor_s: float,
+            bdrc_line_bbox_tolerance_s: float,
+            bdrc_line_use_rotation_s: bool,
+            bdrc_line_use_tps_s: bool,
+            bdrc_line_tps_threshold_s: float,
+            device_s: str,
+            max_len_s: int,
+            preprocess_preset_s: str,
+            gray_mode_s: str,
+            normalize_background_s: bool,
+            background_blur_ksize_s: int,
+            background_strength_s: float,
+            upscale_factor_s: float,
+            upscale_interpolation_s: str,
+            binarize_s: bool,
+            threshold_method_s: str,
+            threshold_block_size_s: int,
+            threshold_c_s: int,
+            fixed_threshold_s: int,
+            morph_close_s: bool,
+            morph_close_kernel_s: int,
+            remove_small_components_s: bool,
+            min_component_area_s: int,
+            rgb_preserve_color_s: bool,
+            rgb_normalize_bg_s: bool,
+            rgb_background_method_s: str,
+            rgb_bg_blur_ksize_s: int,
+            rgb_bg_strength_s: float,
+            rgb_contrast_s: float,
+            rgb_denoise_s: bool,
+            rgb_morph_close_s: bool,
+            rgb_morph_close_kernel_s: int,
+            rgb_remove_small_components_s: bool,
+            rgb_min_component_area_s: int,
+            rgb_upscale_factor_s: float,
+            rgb_upscale_interp_s: str,
+            rgb_ink_normalization_s: bool,
+            rgb_ink_strength_s: float,
+        ):
+            preproc_mode, bdrc_overrides, rgb_overrides = _compose_preprocess_ui_settings(
+                preprocess_preset=preprocess_preset_s,
+                gray_mode=gray_mode_s,
+                normalize_background=normalize_background_s,
+                background_blur_ksize=int(background_blur_ksize_s),
+                background_strength=float(background_strength_s),
+                upscale_factor=float(upscale_factor_s),
+                upscale_interpolation=upscale_interpolation_s,
+                binarize=binarize_s,
+                threshold_method=threshold_method_s,
+                threshold_block_size=int(threshold_block_size_s),
+                threshold_c=int(threshold_c_s),
+                fixed_threshold=int(fixed_threshold_s),
+                morph_close=morph_close_s,
+                morph_close_kernel=int(morph_close_kernel_s),
+                remove_small_components=remove_small_components_s,
+                min_component_area=int(min_component_area_s),
+                rgb_preserve_color=rgb_preserve_color_s,
+                rgb_normalize_background=rgb_normalize_bg_s,
+                rgb_background_method=rgb_background_method_s,
+                rgb_background_blur_ksize=int(rgb_bg_blur_ksize_s),
+                rgb_background_strength=float(rgb_bg_strength_s),
+                rgb_contrast=float(rgb_contrast_s),
+                rgb_denoise=rgb_denoise_s,
+                rgb_morph_close=rgb_morph_close_s,
+                rgb_morph_close_kernel=int(rgb_morph_close_kernel_s),
+                rgb_remove_small_components=rgb_remove_small_components_s,
+                rgb_min_component_area=int(rgb_min_component_area_s),
+                rgb_upscale_factor=float(rgb_upscale_factor_s),
+                rgb_upscale_interpolation=rgb_upscale_interp_s,
+                rgb_ink_normalization=rgb_ink_normalization_s,
+                rgb_ink_strength=float(rgb_ink_strength_s),
+            )
+            return _run_comparison(
+                state_s,
+                ocr_engine_s,
+                layout_s,
+                line_segmentation_mode_s,
+                line_segmentation_preprocess_s,
+                line_model_s,
+                bdrc_line_model_s,
+                bool(bdrc_line_merge_lines_s),
+                float(bdrc_line_k_factor_s),
+                float(bdrc_line_bbox_tolerance_s),
+                bool(bdrc_line_use_rotation_s),
+                bool(bdrc_line_use_tps_s),
+                float(bdrc_line_tps_threshold_s),
+                device_s,
+                int(max_len_s),
+                preprocess_preset=preproc_mode,
+                bdrc_preprocess_overrides=bdrc_overrides,
+                rgb_preprocess_overrides=rgb_overrides,
+            )
+
+        compare_btn.click(
+            fn=_compare,
+            inputs=[
+                state,
+                ocr_engine,
+                layout_path,
+                line_segmentation_mode,
+                line_model_preprocess,
+                line_model_path,
+                bdrc_line_model_path,
+                bdrc_line_merge_lines,
+                bdrc_line_k_factor,
+                bdrc_line_bbox_tolerance,
+                bdrc_line_use_rotation,
+                bdrc_line_use_tps,
+                bdrc_line_tps_threshold,
+                device,
+                max_len,
+                preprocess_preset,
+                bdrc_gray_mode,
+                bdrc_normalize_bg,
+                bdrc_bg_blur_ksize,
+                bdrc_bg_strength,
+                bdrc_upscale_factor,
+                bdrc_upscale_interp,
+                bdrc_binarize,
+                bdrc_threshold_method,
+                bdrc_threshold_block,
+                bdrc_threshold_c,
+                bdrc_fixed_threshold,
+                bdrc_morph_close,
+                bdrc_morph_close_kernel,
+                bdrc_remove_small_components,
+                bdrc_min_component_area,
+                rgb_preserve_color,
+                rgb_normalize_bg,
+                rgb_background_method,
+                rgb_bg_blur_ksize,
+                rgb_bg_strength,
+                rgb_contrast,
+                rgb_denoise,
+                rgb_morph_close,
+                rgb_morph_close_kernel,
+                rgb_remove_small_components,
+                rgb_min_component_area,
+                rgb_upscale_factor,
+                rgb_upscale_interp,
+                rgb_ink_normalization,
+                rgb_ink_strength,
+            ],
+            outputs=[image_view, transcript, status, state, debug_json, donut_input_before, donut_input_after],
+        )
+
         save_btn.click(
             fn=_save_results,
-            inputs=[state, transcript, donut_path, layout_path],
+            inputs=[
+                state,
+                transcript,
+                ocr_engine,
+                donut_path,
+                bdrc_ocr_model_path,
+                layout_path,
+                line_segmentation_mode,
+                line_model_preprocess,
+                line_model_path,
+                bdrc_line_model_path,
+            ],
             outputs=[save_status],
         )
 
@@ -2133,6 +4201,10 @@ def build_ui() -> gr.Blocks:
 }
 """,
         )
+
+        img_zoom_in_btn.click(fn=None, js="() => { const p = document.querySelector('#ocr_image_panel'); if (p && p._zoomIn) p._zoomIn(); }")
+        img_zoom_out_btn.click(fn=None, js="() => { const p = document.querySelector('#ocr_image_panel'); if (p && p._zoomOut) p._zoomOut(); }")
+        img_zoom_reset_btn.click(fn=None, js="() => { const p = document.querySelector('#ocr_image_panel'); if (p && p._zoomReset) p._zoomReset(); }")
 
         debug_font_plus_btn.click(
             fn=None,
@@ -2167,28 +4239,38 @@ def build_ui() -> gr.Blocks:
             show_bdrc = visible and preproc_mode in {"bdrc", "gray"}
             show_rgb = visible and preproc_mode == "rgb"
             return (
-                gr.update(visible=visible),
-                gr.update(visible=visible),
-                gr.update(visible=visible),
-                gr.update(visible=show_bdrc),
-                gr.update(visible=show_rgb),
-                gr.update(visible=visible),
-                gr.update(visible=visible),
-                gr.update(visible=visible),
-                gr.update(visible=visible),
-                gr.update(visible=visible),
+                gr.update(visible=not visible),  # model_info_row  (simple summary)
+                gr.update(visible=visible),       # advanced_model_row
+                gr.update(visible=visible),       # advanced_bdrc_model_row
+                gr.update(visible=visible),       # advanced_scan_row
+                gr.update(visible=visible),       # advanced_runtime_row
+                gr.update(visible=visible),       # advanced_bdrc_line_row
+                gr.update(visible=visible),       # advanced_bdrc_line_crop_row
+                gr.update(visible=visible),       # advanced_preprocess_select_row
+                gr.update(visible=show_bdrc),     # advanced_bdrc_row
+                gr.update(visible=show_rgb),      # advanced_rgb_row
+                gr.update(visible=visible),       # debug_json_accordion
+                gr.update(visible=visible),       # donut_input_before
+                gr.update(visible=visible),       # donut_input_after
+                gr.update(visible=visible),       # save_status
+                gr.update(visible=visible),       # advanced_debug_text_row
             )
 
         advanced_view.change(
             fn=_toggle_advanced,
             inputs=[advanced_view, preprocess_preset],
             outputs=[
+                model_info_row,
+                advanced_model_row,
+                advanced_bdrc_model_row,
                 advanced_scan_row,
                 advanced_runtime_row,
+                advanced_bdrc_line_row,
+                advanced_bdrc_line_crop_row,
                 advanced_preprocess_select_row,
                 advanced_bdrc_row,
                 advanced_rgb_row,
-                debug_json,
+                debug_json_accordion,
                 donut_input_before,
                 donut_input_after,
                 save_status,
@@ -2216,29 +4298,519 @@ def build_ui() -> gr.Blocks:
             outputs=[full_roi_btn],
         )
 
-        def _on_device_change(device_s: str, donut_s: str):
-            _rt, msg = _ensure_donut_runtime_loaded(donut_s, device_s)
-            return msg
+        def _refresh_donut():
+            choices, msg = _list_donut_checkpoints()
+            best = choices[0][1] if choices else ""
+            return gr.update(choices=choices, value=best), msg
 
-        device.change(
-            fn=_on_device_change,
-            inputs=[device, donut_path],
-            outputs=[status],
+        def _refresh_layout():
+            choices, msg = _list_layout_models()
+            best = choices[0][1] if choices else ""
+            return gr.update(choices=choices, value=best), msg
+
+        def _refresh_line_model():
+            choices, msg = _list_line_segmentation_models()
+            best = choices[0][1] if choices else ""
+            return gr.update(choices=choices, value=best), msg
+
+        def _refresh_bdrc_ocr_model():
+            choices, msg = _list_bdrc_ocr_models()
+            best = choices[0][1] if choices else ""
+            return gr.update(choices=choices, value=best), msg, msg
+
+        def _refresh_bdrc_line_model():
+            choices, msg = _list_bdrc_line_models()
+            best = choices[0][1] if choices else ""
+            return gr.update(choices=choices, value=best), msg, msg
+
+        def _maybe_auto_download_bdrc_ocr_models(engine_s: str, current_path: str):
+            if _normalize_ocr_engine(engine_s) != OCR_ENGINE_BDRC:
+                yield gr.update(), gr.update(), gr.update()
+                return
+            yield gr.update(), gr.update(), "Preparing default BDRC OCR model..."
+            try:
+                chosen, note = _ensure_default_bdrc_ocr_model_path(current_path)
+                choices, msg = _list_bdrc_ocr_models()
+                status_msg = msg if not note else f"{msg} | {note}"
+                yield gr.update(choices=choices, value=chosen), status_msg, status_msg
+            except Exception as exc:
+                error_msg = f"BDRC OCR auto-download failed: {type(exc).__name__}: {exc}"
+                yield gr.update(), error_msg, error_msg
+
+        def _maybe_auto_download_bdrc_line_models(mode_s: str, current_path: str):
+            if _normalize_line_segmentation_mode(mode_s) != LINE_SEG_BDRC:
+                yield gr.update(), gr.update(), gr.update()
+                return
+            yield gr.update(), gr.update(), "Preparing default BDRC line model..."
+            try:
+                chosen, note = _ensure_default_bdrc_line_model_path(current_path)
+                choices, msg = _list_bdrc_line_models()
+                status_msg = msg if not note else f"{msg} | {note}"
+                yield gr.update(choices=choices, value=chosen), status_msg, status_msg
+            except Exception as exc:
+                error_msg = f"BDRC line auto-download failed: {type(exc).__name__}: {exc}"
+                yield gr.update(), error_msg, error_msg
+
+        donut_refresh_btn.click(
+            fn=_refresh_donut,
+            inputs=[],
+            outputs=[donut_path, donut_info],
+        )
+
+        layout_refresh_btn.click(
+            fn=_refresh_layout,
+            inputs=[],
+            outputs=[layout_path, layout_info],
+        )
+
+        line_model_refresh_btn.click(
+            fn=_refresh_line_model,
+            inputs=[],
+            outputs=[line_model_path, line_model_info],
+        )
+
+        bdrc_ocr_refresh_btn.click(
+            fn=_refresh_bdrc_ocr_model,
+            inputs=[],
+            outputs=[bdrc_ocr_model_path, bdrc_ocr_info, status],
+        )
+
+        bdrc_line_model_refresh_btn.click(
+            fn=_refresh_bdrc_line_model,
+            inputs=[],
+            outputs=[bdrc_line_model_path, bdrc_line_model_info, status],
+        )
+
+        ocr_engine.change(
+            fn=_maybe_auto_download_bdrc_ocr_models,
+            inputs=[ocr_engine, bdrc_ocr_model_path],
+            outputs=[bdrc_ocr_model_path, bdrc_ocr_info, status],
+        )
+
+        line_segmentation_mode.change(
+            fn=_maybe_auto_download_bdrc_line_models,
+            inputs=[line_segmentation_mode, bdrc_line_model_path],
+            outputs=[bdrc_line_model_path, bdrc_line_model_info, status],
+        )
+
+        # ── Auto-load repro settings whenever the DONUT checkpoint changes ──
+        def _auto_load_repro(ckpt_path: str):
+            """Silently apply repro preprocess settings when checkpoint changes."""
+            preset, _msg, bdrc, rgb = _load_repro_ui_settings(ckpt_path or "")
+            return (
+                gr.update(value=preset),
+                gr.update(value=bdrc["gray_mode"]),
+                gr.update(value=bdrc["normalize_background"]),
+                gr.update(value=bdrc["background_blur_ksize"]),
+                gr.update(value=bdrc["background_strength"]),
+                gr.update(value=bdrc["upscale_factor"]),
+                gr.update(value=bdrc["upscale_interpolation"]),
+                gr.update(value=bdrc["binarize"]),
+                gr.update(value=bdrc["threshold_method"]),
+                gr.update(value=bdrc["threshold_block_size"]),
+                gr.update(value=bdrc["threshold_c"]),
+                gr.update(value=bdrc["fixed_threshold"]),
+                gr.update(value=bdrc["morph_close"]),
+                gr.update(value=bdrc["morph_close_kernel"]),
+                gr.update(value=bdrc["remove_small_components"]),
+                gr.update(value=bdrc["min_component_area"]),
+                gr.update(value=rgb["preserve_color"]),
+                gr.update(value=rgb["normalize_background"]),
+                gr.update(value=rgb["background_method"]),
+                gr.update(value=rgb["background_blur_ksize"]),
+                gr.update(value=rgb["background_strength"]),
+                gr.update(value=rgb["contrast"]),
+                gr.update(value=rgb["denoise"]),
+                gr.update(value=rgb["morph_close"]),
+                gr.update(value=rgb["morph_close_kernel"]),
+                gr.update(value=rgb["remove_small_components"]),
+                gr.update(value=rgb["min_component_area"]),
+                gr.update(value=rgb["upscale_factor"]),
+                gr.update(value=rgb["upscale_interpolation"]),
+                gr.update(value=rgb["ink_normalization"]),
+                gr.update(value=rgb["ink_strength"]),
+            )
+
+        donut_path.change(
+            fn=_auto_load_repro,
+            inputs=[donut_path],
+            outputs=[
+                preprocess_preset,
+                bdrc_gray_mode, bdrc_normalize_bg, bdrc_bg_blur_ksize,
+                bdrc_bg_strength, bdrc_upscale_factor, bdrc_upscale_interp,
+                bdrc_binarize, bdrc_threshold_method, bdrc_threshold_block,
+                bdrc_threshold_c, bdrc_fixed_threshold, bdrc_morph_close,
+                bdrc_morph_close_kernel, bdrc_remove_small_components, bdrc_min_component_area,
+                rgb_preserve_color, rgb_normalize_bg, rgb_background_method,
+                rgb_bg_blur_ksize, rgb_bg_strength, rgb_contrast,
+                rgb_denoise, rgb_morph_close, rgb_morph_close_kernel,
+                rgb_remove_small_components, rgb_min_component_area, rgb_upscale_factor,
+                rgb_upscale_interp, rgb_ink_normalization, rgb_ink_strength,
+            ],
+        )
+
+        def _on_load_repro(
+            ckpt_path: str,
+            cur_preset: str,
+            cur_gray_mode: str, cur_normalize_bg: bool, cur_bg_blur: int,
+            cur_bg_strength: float, cur_upscale: float, cur_upscale_interp: str,
+            cur_binarize: bool, cur_threshold_method: str, cur_threshold_block: int,
+            cur_threshold_c: int, cur_fixed_threshold: int, cur_morph_close: bool,
+            cur_morph_kernel: int, cur_remove_small: bool, cur_min_area: int,
+            cur_rgb_preserve: bool, cur_rgb_norm_bg: bool, cur_rgb_bg_method: str,
+            cur_rgb_bg_blur: int, cur_rgb_bg_strength: float, cur_rgb_contrast: float,
+            cur_rgb_denoise: bool, cur_rgb_morph: bool, cur_rgb_morph_kernel: int,
+            cur_rgb_remove_small: bool, cur_rgb_min_area: int, cur_rgb_upscale: float,
+            cur_rgb_upscale_interp: str, cur_rgb_ink_norm: bool, cur_rgb_ink_strength: float,
+        ):
+            preset, msg, bdrc, rgb = _load_repro_ui_settings(ckpt_path or "")
+
+            # Build current state dicts for diffing
+            cur_bdrc = {
+                "gray_mode": cur_gray_mode, "normalize_background": cur_normalize_bg,
+                "background_blur_ksize": cur_bg_blur, "background_strength": cur_bg_strength,
+                "upscale_factor": cur_upscale, "upscale_interpolation": cur_upscale_interp,
+                "binarize": cur_binarize, "threshold_method": cur_threshold_method,
+                "threshold_block_size": cur_threshold_block, "threshold_c": cur_threshold_c,
+                "fixed_threshold": cur_fixed_threshold, "morph_close": cur_morph_close,
+                "morph_close_kernel": cur_morph_kernel, "remove_small_components": cur_remove_small,
+                "min_component_area": cur_min_area,
+            }
+            cur_rgb = {
+                "preserve_color": cur_rgb_preserve, "normalize_background": cur_rgb_norm_bg,
+                "background_method": cur_rgb_bg_method, "background_blur_ksize": cur_rgb_bg_blur,
+                "background_strength": cur_rgb_bg_strength, "contrast": cur_rgb_contrast,
+                "denoise": cur_rgb_denoise, "morph_close": cur_rgb_morph,
+                "morph_close_kernel": cur_rgb_morph_kernel, "remove_small_components": cur_rgb_remove_small,
+                "min_component_area": cur_rgb_min_area, "upscale_factor": cur_rgb_upscale,
+                "upscale_interpolation": cur_rgb_upscale_interp, "ink_normalization": cur_rgb_ink_norm,
+                "ink_strength": cur_rgb_ink_strength,
+            }
+
+            # Compute diff
+            changes = []
+            if str(cur_preset) != str(preset):
+                changes.append(f"preset: {cur_preset} → {preset}")
+            for k, new_v in bdrc.items():
+                old_v = cur_bdrc.get(k)
+                if str(old_v) != str(new_v):
+                    changes.append(f"{k}: {old_v} → {new_v}")
+            for k, new_v in rgb.items():
+                old_v = cur_rgb.get(k)
+                if str(old_v) != str(new_v):
+                    changes.append(f"{k}: {old_v} → {new_v}")
+
+            if changes:
+                diff_str = " | ".join(changes)
+                status_msg = f"{msg} | Changed: {diff_str}"
+            else:
+                status_msg = f"{msg} | No changes (already matching)."
+
+            return (
+                gr.update(value=preset),
+                status_msg,
+                # BDRC sliders
+                gr.update(value=bdrc["gray_mode"]),
+                gr.update(value=bdrc["normalize_background"]),
+                gr.update(value=bdrc["background_blur_ksize"]),
+                gr.update(value=bdrc["background_strength"]),
+                gr.update(value=bdrc["upscale_factor"]),
+                gr.update(value=bdrc["upscale_interpolation"]),
+                gr.update(value=bdrc["binarize"]),
+                gr.update(value=bdrc["threshold_method"]),
+                gr.update(value=bdrc["threshold_block_size"]),
+                gr.update(value=bdrc["threshold_c"]),
+                gr.update(value=bdrc["fixed_threshold"]),
+                gr.update(value=bdrc["morph_close"]),
+                gr.update(value=bdrc["morph_close_kernel"]),
+                gr.update(value=bdrc["remove_small_components"]),
+                gr.update(value=bdrc["min_component_area"]),
+                # RGB sliders
+                gr.update(value=rgb["preserve_color"]),
+                gr.update(value=rgb["normalize_background"]),
+                gr.update(value=rgb["background_method"]),
+                gr.update(value=rgb["background_blur_ksize"]),
+                gr.update(value=rgb["background_strength"]),
+                gr.update(value=rgb["contrast"]),
+                gr.update(value=rgb["denoise"]),
+                gr.update(value=rgb["morph_close"]),
+                gr.update(value=rgb["morph_close_kernel"]),
+                gr.update(value=rgb["remove_small_components"]),
+                gr.update(value=rgb["min_component_area"]),
+                gr.update(value=rgb["upscale_factor"]),
+                gr.update(value=rgb["upscale_interpolation"]),
+                gr.update(value=rgb["ink_normalization"]),
+                gr.update(value=rgb["ink_strength"]),
+            )
+
+        load_repro_btn.click(
+            fn=_on_load_repro,
+            inputs=[
+                donut_path,
+                preprocess_preset,
+                bdrc_gray_mode, bdrc_normalize_bg, bdrc_bg_blur_ksize,
+                bdrc_bg_strength, bdrc_upscale_factor, bdrc_upscale_interp,
+                bdrc_binarize, bdrc_threshold_method, bdrc_threshold_block,
+                bdrc_threshold_c, bdrc_fixed_threshold, bdrc_morph_close,
+                bdrc_morph_close_kernel, bdrc_remove_small_components, bdrc_min_component_area,
+                rgb_preserve_color, rgb_normalize_bg, rgb_background_method,
+                rgb_bg_blur_ksize, rgb_bg_strength, rgb_contrast,
+                rgb_denoise, rgb_morph_close, rgb_morph_close_kernel,
+                rgb_remove_small_components, rgb_min_component_area, rgb_upscale_factor,
+                rgb_upscale_interp, rgb_ink_normalization, rgb_ink_strength,
+            ],
+            outputs=[
+                preprocess_preset,
+                status,
+                bdrc_gray_mode,
+                bdrc_normalize_bg,
+                bdrc_bg_blur_ksize,
+                bdrc_bg_strength,
+                bdrc_upscale_factor,
+                bdrc_upscale_interp,
+                bdrc_binarize,
+                bdrc_threshold_method,
+                bdrc_threshold_block,
+                bdrc_threshold_c,
+                bdrc_fixed_threshold,
+                bdrc_morph_close,
+                bdrc_morph_close_kernel,
+                bdrc_remove_small_components,
+                bdrc_min_component_area,
+                rgb_preserve_color,
+                rgb_normalize_bg,
+                rgb_background_method,
+                rgb_bg_blur_ksize,
+                rgb_bg_strength,
+                rgb_contrast,
+                rgb_denoise,
+                rgb_morph_close,
+                rgb_morph_close_kernel,
+                rgb_remove_small_components,
+                rgb_min_component_area,
+                rgb_upscale_factor,
+                rgb_upscale_interp,
+                rgb_ink_normalization,
+                rgb_ink_strength,
+            ],
+        )
+
+        # ── Folder Browser events ───────────────────────────────────────────
+        def _on_folder_scan(folder: str):
+            paths, msg = _scan_folder_for_images(folder)
+            thumbs = _make_thumbnails(paths)
+            return thumbs, paths, msg
+
+        folder_scan_btn.click(
+            fn=_on_folder_scan,
+            inputs=[folder_path_input],
+            outputs=[folder_gallery, folder_image_paths, folder_status],
+        )
+        # Also trigger scan when user presses Enter in the text box
+        folder_path_input.submit(
+            fn=_on_folder_scan,
+            inputs=[folder_path_input],
+            outputs=[folder_gallery, folder_image_paths, folder_status],
+        )
+
+        def _on_gallery_select(
+            paths: List[str],
+            ocr_engine_s: str,
+            donut_s: str,
+            bdrc_ocr_model_s: str,
+            layout_s: str,
+            line_segmentation_mode_s: str,
+            line_segmentation_preprocess_s: str,
+            line_model_s: str,
+            bdrc_line_model_s: str,
+            bdrc_line_merge_lines_s: bool,
+            bdrc_line_k_factor_s: float,
+            bdrc_line_bbox_tolerance_s: float,
+            bdrc_line_use_rotation_s: bool,
+            bdrc_line_use_tps_s: bool,
+            bdrc_line_tps_threshold_s: float,
+            device_s: str,
+            max_len_s: int,
+            preprocess_preset_s: str,
+            gray_mode_s: str,
+            normalize_background_s: bool,
+            background_blur_ksize_s: int,
+            background_strength_s: float,
+            upscale_factor_s: float,
+            upscale_interpolation_s: str,
+            binarize_s: bool,
+            threshold_method_s: str,
+            threshold_block_size_s: int,
+            threshold_c_s: int,
+            fixed_threshold_s: int,
+            morph_close_s: bool,
+            morph_close_kernel_s: int,
+            remove_small_components_s: bool,
+            min_component_area_s: int,
+            rgb_preserve_color_s: bool,
+            rgb_normalize_bg_s: bool,
+            rgb_background_method_s: str,
+            rgb_bg_blur_ksize_s: int,
+            rgb_bg_strength_s: float,
+            rgb_contrast_s: float,
+            rgb_denoise_s: bool,
+            rgb_morph_close_s: bool,
+            rgb_morph_close_kernel_s: int,
+            rgb_remove_small_components_s: bool,
+            rgb_min_component_area_s: int,
+            rgb_upscale_factor_s: float,
+            rgb_upscale_interp_s: str,
+            rgb_ink_normalization_s: bool,
+            rgb_ink_strength_s: float,
+            evt: gr.SelectData,
+        ):
+            # Resolve selected image path from gallery index
+            idx = getattr(evt, "index", None)
+            if idx is None or not isinstance(paths, list) or idx >= len(paths):
+                return (
+                    None, "", "Could not determine selected image.", _base_state(),
+                    "{}", None, None,
+                )
+            img_path = paths[int(idx)]
+            try:
+                arr = _to_rgb_uint8(img_path)
+            except Exception as exc:
+                return (
+                    None, "", f"Failed to load image: {exc}", _base_state(),
+                    "{}", None, None,
+                )
+
+            new_state = _base_state()
+            new_state["image_path"] = img_path
+            new_state["image_name"] = Path(img_path).name
+            new_state["image"] = arr
+
+            # Build preprocess settings
+            preproc_mode, bdrc_overrides, rgb_overrides = _compose_preprocess_ui_settings(
+                preprocess_preset=preprocess_preset_s,
+                gray_mode=gray_mode_s,
+                normalize_background=normalize_background_s,
+                background_blur_ksize=int(background_blur_ksize_s),
+                background_strength=float(background_strength_s),
+                upscale_factor=float(upscale_factor_s),
+                upscale_interpolation=upscale_interpolation_s,
+                binarize=binarize_s,
+                threshold_method=threshold_method_s,
+                threshold_block_size=int(threshold_block_size_s),
+                threshold_c=int(threshold_c_s),
+                fixed_threshold=int(fixed_threshold_s),
+                morph_close=morph_close_s,
+                morph_close_kernel=int(morph_close_kernel_s),
+                remove_small_components=remove_small_components_s,
+                min_component_area=int(min_component_area_s),
+                rgb_preserve_color=rgb_preserve_color_s,
+                rgb_normalize_background=rgb_normalize_bg_s,
+                rgb_background_method=rgb_background_method_s,
+                rgb_background_blur_ksize=int(rgb_bg_blur_ksize_s),
+                rgb_background_strength=float(rgb_bg_strength_s),
+                rgb_contrast=float(rgb_contrast_s),
+                rgb_denoise=rgb_denoise_s,
+                rgb_morph_close=rgb_morph_close_s,
+                rgb_morph_close_kernel=int(rgb_morph_close_kernel_s),
+                rgb_remove_small_components=rgb_remove_small_components_s,
+                rgb_min_component_area=int(rgb_min_component_area_s),
+                rgb_upscale_factor=float(rgb_upscale_factor_s),
+                rgb_upscale_interpolation=rgb_upscale_interp_s,
+                rgb_ink_normalization=rgb_ink_normalization_s,
+                rgb_ink_strength=float(rgb_ink_strength_s),
+            )
+
+            # Run full-auto OCR (line segmentation + DONUT)
+            overlay, transcript_text, ocr_status, updated_state, debug_j, pre_img, post_img = _run_full_auto(
+                new_state,
+                ocr_engine_s,
+                donut_s,
+                bdrc_ocr_model_s,
+                layout_s,
+                line_segmentation_mode_s,
+                line_segmentation_preprocess_s,
+                line_model_s,
+                bdrc_line_model_s,
+                bool(bdrc_line_merge_lines_s),
+                float(bdrc_line_k_factor_s),
+                float(bdrc_line_bbox_tolerance_s),
+                bool(bdrc_line_use_rotation_s),
+                bool(bdrc_line_use_tps_s),
+                float(bdrc_line_tps_threshold_s),
+                device_s,
+                int(max_len_s),
+                preprocess_preset=preproc_mode,
+                bdrc_preprocess_overrides=bdrc_overrides,
+                rgb_preprocess_overrides=rgb_overrides,
+            )
+            return overlay, transcript_text, ocr_status, updated_state, debug_j, pre_img, post_img
+
+        _gallery_select_evt = folder_gallery.select(
+            fn=_on_gallery_select,
+            inputs=[
+                folder_image_paths,
+                ocr_engine,
+                donut_path,
+                bdrc_ocr_model_path,
+                layout_path,
+                line_segmentation_mode,
+                line_model_preprocess,
+                line_model_path,
+                bdrc_line_model_path,
+                bdrc_line_merge_lines,
+                bdrc_line_k_factor,
+                bdrc_line_bbox_tolerance,
+                bdrc_line_use_rotation,
+                bdrc_line_use_tps,
+                bdrc_line_tps_threshold,
+                device,
+                max_len,
+                preprocess_preset,
+                bdrc_gray_mode,
+                bdrc_normalize_bg,
+                bdrc_bg_blur_ksize,
+                bdrc_bg_strength,
+                bdrc_upscale_factor,
+                bdrc_upscale_interp,
+                bdrc_binarize,
+                bdrc_threshold_method,
+                bdrc_threshold_block,
+                bdrc_threshold_c,
+                bdrc_fixed_threshold,
+                bdrc_morph_close,
+                bdrc_morph_close_kernel,
+                bdrc_remove_small_components,
+                bdrc_min_component_area,
+                rgb_preserve_color,
+                rgb_normalize_bg,
+                rgb_background_method,
+                rgb_bg_blur_ksize,
+                rgb_bg_strength,
+                rgb_contrast,
+                rgb_denoise,
+                rgb_morph_close,
+                rgb_morph_close_kernel,
+                rgb_remove_small_components,
+                rgb_min_component_area,
+                rgb_upscale_factor,
+                rgb_upscale_interp,
+                rgb_ink_normalization,
+                rgb_ink_strength,
+            ],
+            outputs=[image_view, transcript, status, state, debug_json, donut_input_before, donut_input_after],
+        )
+        _gallery_select_evt.then(
+            fn=lambda st: str((st or {}).get("last_debug_text", "") if isinstance(st, dict) else ""),
+            inputs=[state],
+            outputs=[debug_text],
         )
 
     return demo
 
 
 if __name__ == "__main__":
-    # Warm-load DONUT runtime on startup (prefer GPU).
-    try:
-        _ckpt, _ = _find_donut_checkpoint()
-        if _ckpt:
-            _ensure_donut_runtime_loaded(_ckpt, "cuda:0")
-    except Exception:
-        pass
     app = build_ui()
-    host = os.environ.get("UI_HOST", "127.0.0.1")
+    host = os.environ.get("UI_HOST", "0.0.0.0")
     try:
         port = int(os.environ.get("UI_PORT", "7865"))
     except ValueError:

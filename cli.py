@@ -19,6 +19,7 @@ from tibetan_utils.arg_utils import (
     create_texture_augment_parser,
     create_train_texture_lora_parser,
 )
+from pechabridge.cli.batch_ocr import create_parser as create_batch_ocr_parser, run as run_batch_ocr
 from pechabridge.cli.gen_patches import create_parser as create_gen_patches_parser, run as run_gen_patches
 from pechabridge.cli.mine_mnn_pairs import create_parser as create_mnn_pairs_parser, run as run_mnn_pairs
 from pechabridge.cli.weak_ocr_label import create_parser as create_weak_ocr_label_parser, run as run_weak_ocr_label
@@ -27,10 +28,24 @@ from pechabridge.eval.eval_faiss_crosspage import run as run_eval_faiss_crosspag
 from scripts.download_merge_openpecha_ocr_lines import (
     create_parser as create_download_openpecha_ocr_lines_parser,
 )
+from scripts.download_openpecha_line_segmentation import (
+    create_parser as create_download_openpecha_line_segmentation_parser,
+)
+from scripts.expand_line_segmentation_dataset import (
+    create_parser as create_expand_line_segmentation_dataset_parser,
+)
+from scripts.filter_line_segmentation_dataset import (
+    create_parser as create_filter_line_segmentation_dataset_parser,
+)
 from scripts.download_bosentencepiece_tokenizer import (
     create_parser as create_download_bosentencepiece_tokenizer_parser,
 )
+from scripts.download_pechabridge_models import (
+    create_parser as create_download_pechabridge_models_parser,
+    main as _download_pechabridge_models_main,
+)
 from scripts.eval_ocr_tokenizer import create_parser as create_eval_ocr_tokenizer_parser
+from scripts.train_line_segmentation import create_parser as create_train_line_segmentation_parser
 from scripts.warm_line_clip_workbench_cache import (
     create_parser as create_warm_line_clip_workbench_cache_parser,
 )
@@ -198,6 +213,66 @@ def _build_root_parser() -> argparse.ArgumentParser:
     )
     openpecha_ocr_parser.set_defaults(handler=_run_download_openpecha_ocr_lines)
 
+    openpecha_line_seg_parent = create_download_openpecha_line_segmentation_parser(add_help=False)
+    openpecha_line_seg_parser = subparsers.add_parser(
+        "download-openpecha-line-segmentation",
+        aliases=["download-openpecha-tibetan-line-segmentation"],
+        parents=[openpecha_line_seg_parent],
+        help="Download the OpenPecha Tibetan line segmentation dataset as Ultralytics segment data",
+        description=openpecha_line_seg_parent.description,
+    )
+    openpecha_line_seg_parser.set_defaults(handler=_run_download_openpecha_line_segmentation)
+
+    expand_line_seg_parent = create_expand_line_segmentation_dataset_parser(add_help=False)
+    expand_line_seg_parser = subparsers.add_parser(
+        "expand-line-segmentation-dataset",
+        aliases=["expand-line-seg-dataset", "inflate-line-segmentation-dataset"],
+        parents=[expand_line_seg_parent],
+        help="Write a new Ultralytics line-segmentation dataset with vertically expanded polygons",
+        description=expand_line_seg_parent.description,
+    )
+    expand_line_seg_parser.set_defaults(handler=_run_expand_line_segmentation_dataset)
+
+    filter_line_seg_parent = create_filter_line_segmentation_dataset_parser(add_help=False)
+    filter_line_seg_parser = subparsers.add_parser(
+        "filter-line-segmentation-dataset",
+        aliases=["filter-line-seg-dataset", "prune-line-segmentation-dataset"],
+        parents=[filter_line_seg_parent],
+        help="Write a new Ultralytics line-segmentation dataset with tall/narrow polygons removed",
+        description=filter_line_seg_parent.description,
+    )
+    filter_line_seg_parser.set_defaults(handler=_run_filter_line_segmentation_dataset)
+
+    train_line_seg_parent = create_train_line_segmentation_parser(add_help=False)
+    train_line_seg_parser = subparsers.add_parser(
+        "train-line-segmentation",
+        parents=[train_line_seg_parent],
+        help="Train a YOLO line segmentation model on an Ultralytics segment dataset",
+        description=train_line_seg_parent.description,
+    )
+    train_line_seg_parser.set_defaults(handler=_run_train_line_segmentation)
+
+    from pechabridge.ocr.bdrc_model_download import create_parser as create_download_bdrc_models_parser
+    download_bdrc_parent = create_download_bdrc_models_parser(add_help=False)
+    download_bdrc_parser = subparsers.add_parser(
+        "download-bdrc-models",
+        aliases=["download-bdrc-ocr-models", "download-bdrc-default-models"],
+        parents=[download_bdrc_parent],
+        help="Download the default BDRC line/layout and OCR model assets into models/bdrc",
+        description=download_bdrc_parent.description,
+    )
+    download_bdrc_parser.set_defaults(handler=_run_download_bdrc_models)
+
+    download_pb_parent = create_download_pechabridge_models_parser(add_help=False)
+    download_pb_parser = subparsers.add_parser(
+        "download-models",
+        aliases=["download-pechabridge-models"],
+        parents=[download_pb_parent],
+        help="Download PechaBridge OCR + Line Segmentation models from HuggingFace into models/",
+        description=download_pb_parent.description,
+    )
+    download_pb_parser.set_defaults(handler=_run_download_pechabridge_models)
+
     bosentencepiece_parent = create_download_bosentencepiece_tokenizer_parser(add_help=False)
     bosentencepiece_parser = subparsers.add_parser(
         "download-bosentencepiece-tokenizer",
@@ -207,6 +282,15 @@ def _build_root_parser() -> argparse.ArgumentParser:
         description=bosentencepiece_parent.description,
     )
     bosentencepiece_parser.set_defaults(handler=_run_download_bosentencepiece_tokenizer)
+
+    batch_ocr_parent = create_batch_ocr_parser(add_help=False)
+    batch_ocr_parser = subparsers.add_parser(
+        "batch-ocr",
+        parents=[batch_ocr_parent],
+        help="Batch OCR a folder of Pecha images using a DONUT OCR model and a YOLO layout model",
+        description=batch_ocr_parent.description,
+    )
+    batch_ocr_parser.set_defaults(handler=_run_batch_ocr)
 
     gen_patches_parent = create_gen_patches_parser(add_help=False)
     gen_patches_parser = subparsers.add_parser(
@@ -363,10 +447,57 @@ def _run_download_openpecha_ocr_lines(args: argparse.Namespace) -> int:
     return 0
 
 
+def _run_download_openpecha_line_segmentation(args: argparse.Namespace) -> int:
+    from scripts.download_openpecha_line_segmentation import run
+
+    run(args)
+    return 0
+
+
+def _run_expand_line_segmentation_dataset(args: argparse.Namespace) -> int:
+    from scripts.expand_line_segmentation_dataset import run
+
+    run(args)
+    return 0
+
+
+def _run_filter_line_segmentation_dataset(args: argparse.Namespace) -> int:
+    from scripts.filter_line_segmentation_dataset import run
+
+    run(args)
+    return 0
+
+
+def _run_train_line_segmentation(args: argparse.Namespace) -> int:
+    from scripts.train_line_segmentation import run
+
+    run(args)
+    return 0
+
+
+def _run_download_bdrc_models(args: argparse.Namespace) -> int:
+    from scripts.download_bdrc_models import run
+
+    return int(run(args))
+
+
+def _run_download_pechabridge_models(args: argparse.Namespace) -> int:
+    return int(_download_pechabridge_models_main([
+        "--models", str(getattr(args, "models", "all") or "all"),
+        "--dest",   str(getattr(args, "dest", "") or ""),
+        *(["--token", str(args.token)] if getattr(args, "token", "") else []),
+        *(["--force"] if getattr(args, "force", False) else []),
+    ]))
+
+
 def _run_download_bosentencepiece_tokenizer(args: argparse.Namespace) -> int:
     from scripts.download_bosentencepiece_tokenizer import run
 
     return int(run(args))
+
+
+def _run_batch_ocr(args: argparse.Namespace) -> int:
+    return int(run_batch_ocr(args))
 
 
 def _run_gen_patches(args: argparse.Namespace) -> int:
