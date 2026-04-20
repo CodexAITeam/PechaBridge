@@ -40,6 +40,10 @@ from scripts.filter_line_segmentation_dataset import (
 from scripts.download_bosentencepiece_tokenizer import (
     create_parser as create_download_bosentencepiece_tokenizer_parser,
 )
+from scripts.download_pechabridge_models import (
+    create_parser as create_download_pechabridge_models_parser,
+    main as _download_pechabridge_models_main,
+)
 from scripts.eval_ocr_tokenizer import create_parser as create_eval_ocr_tokenizer_parser
 from scripts.train_line_segmentation import create_parser as create_train_line_segmentation_parser
 from scripts.warm_line_clip_workbench_cache import (
@@ -259,6 +263,16 @@ def _build_root_parser() -> argparse.ArgumentParser:
     )
     download_bdrc_parser.set_defaults(handler=_run_download_bdrc_models)
 
+    download_pb_parent = create_download_pechabridge_models_parser(add_help=False)
+    download_pb_parser = subparsers.add_parser(
+        "download-models",
+        aliases=["download-pechabridge-models"],
+        parents=[download_pb_parent],
+        help="Download PechaBridge OCR + Line Segmentation models from HuggingFace into models/",
+        description=download_pb_parent.description,
+    )
+    download_pb_parser.set_defaults(handler=_run_download_pechabridge_models)
+
     bosentencepiece_parent = create_download_bosentencepiece_tokenizer_parser(add_help=False)
     bosentencepiece_parser = subparsers.add_parser(
         "download-bosentencepiece-tokenizer",
@@ -465,6 +479,15 @@ def _run_download_bdrc_models(args: argparse.Namespace) -> int:
     from scripts.download_bdrc_models import run
 
     return int(run(args))
+
+
+def _run_download_pechabridge_models(args: argparse.Namespace) -> int:
+    return int(_download_pechabridge_models_main([
+        "--models", str(getattr(args, "models", "all") or "all"),
+        "--dest",   str(getattr(args, "dest", "") or ""),
+        *(["--token", str(args.token)] if getattr(args, "token", "") else []),
+        *(["--force"] if getattr(args, "force", False) else []),
+    ]))
 
 
 def _run_download_bosentencepiece_tokenizer(args: argparse.Namespace) -> int:

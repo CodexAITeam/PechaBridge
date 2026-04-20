@@ -4,65 +4,40 @@
 
 ## Project Description
 
-PechaBridge is a workflow for **Tibetan pecha document understanding** with a focus on layout detection, synthetic data generation, SBB data ingestion, OCR/VLM-assisted parsing, diffusion-based texture augmentation, and retrieval-ready patch pipelines.
+PechaBridge is a workflow for **Tibetan document understanding** with a focus on training OCR and Line Segmentation models for text retrieval in Tibetan script.
 
-The project combines:
+The primary entrypoint for end-to-end usage is the **OCR Workbencg** (`ui_ocr_workbench.py`).
 
-- synthetic YOLO dataset generation for Tibetan/number classes,
-- training and evaluation of detection models,
-- large-scale processing of SBB page images,
-- optional VLM backends for layout extraction,
-- SDXL/SD2.1 + ControlNet + LoRA texture adaptation,
-- line sub-patch dataset generation with Option-A neighborhood metadata,
-- weak OCR labeling + robust MNN mining for cross-page positives,
-- ViT/DINOv2 retrieval training (mp-InfoNCE) and FAISS-based evaluation/search,
-- line-level dual vision-text encoder training (CLIP-style) on OCR manifests,
-- Donut/TroCR OCR training on OpenPecha/BDRC-style line manifests with optional BDRC preprocessing.
+## Example: SBB Pecha OCR
 
-The primary entrypoint for end-to-end usage is the **Workbench UI** (`ui_workbench.py`).
+The figure below shows an example line segmentation result for a Tibetan pecha
+page from the Staatsbibliothek zu Berlin (SBB). Each detected line is passed
+through the OCR model to extract the Tibetan text.
+
+![Line segmentation on an SBB pecha page](assets/sbb_pecha_line_segmentation.png)
+
+Sample OCR output for the page shown above:
+
+``` 
+༄༅། །བྱས་ལ། །སྔགས་དྲུག་ཕྱག་རྒྱ་དྲུག་གིས་སྦྱངས། སྤེལ་རྒྱུན་ཤཚམ།
+སྐྱིད་དམིགས་དང་ཉིད་ཨོ་རྒྱན་རིགས་འཛིན་བསམ་དགྱེས་པའི་དབྱངས་ནི་འདི་སྐད་
+དོ། །སྟོང་གསུམ་ཀུན་ནི་མཆོག་འབུན་འགྱར་བའི། །སྤོས་དང་
+སྨན་སྦུར་ཆུ་གཙང་དག་བཞི་ཁྲུས། །ཡ དི་བཞིན་སྲིན་ཕུད་མཁན་
+``` 
+
+```markdown
+> ⚠ The transcript above is an early-stage model output and may contain
+> recognition errors. Accuracy improves with more training data.
+``` 
 
 ## Core Features
 
 - **Synthetic multi-class dataset generation**: Creates YOLO-ready pages for Tibetan number words, Tibetan text blocks, and Chinese number words.
 - **OCR-ready target export**: Optionally saves rendered OCR targets with deterministic line linearization and optional OCR crop export by label.
-- **Detection training and inference**: Provides Ultralytics YOLO training, validation, and inference workflows for local data and SBB pages.
-- **Pseudo-labeling and rule-based filtering**: Supports VLM-assisted layout extraction plus post-filtering before annotation review.
-- **Donut-style OCR workflow (Label 1)**: Runs generation, manifest preparation, tokenizer handling, and Vision Transformer encoder + autoregressive decoder training.
 - **Standalone DONUT/TroCR OCR training**: Trains OCR directly on OpenPecha/BDRC line manifests (`train-donut-ocr`) with `none|pb|gray|bdrc|rgb` image preprocessing and CER evaluation.
-- **Diffusion texture adaptation**: Includes SDXL/SD2.1 + ControlNet augmentation and optional LoRA integration for more realistic page textures.
-- **Patch retrieval dataset generation**: Generates line sub-patches (`datasets/text_patches`) with parquet metadata for retrieval training.
-- **Weak supervision for retrieval**: Supports weak OCR labels and robust MNN mining for cross-page positives.
 - **Retrieval encoder training + eval**: Trains ViT/DINOv2 patch encoders with mp-InfoNCE and exports FAISS-ready embeddings plus cross-page evaluation.
 - **Dual vision-text encoder (CLIP-style) training**: Trains DINOv2 + text encoder (e.g. ByT5) on line image/text manifests (`line_clip`) for text-to-line and line-to-text retrieval.
-- **Retrieval encoder preparation (legacy/base)**: Includes unpaired image/text encoder training as a base for broader Tibetan retrieval experiments.
 
-## Example: SBB Layout Analysis
-
-The figure below shows an example layout analysis result for a Tibetan pecha page from the Staatsbibliothek zu Berlin (SBB).
-Detected layout regions are overlaid on the original page image and illustrate the intended detection quality for real-world scans.
-
-![Example layout analysis on an SBB pecha page](assets/pecha_layout%20analysis.jpeg)
-
-## Project Goals
-
-1. Build a robust pipeline for Tibetan page layout analysis that works with limited labeled data.
-2. Improve model quality through synthetic data and realistic texture transfer from real scans.
-3. Support scalable ingestion and weak supervision on large historical collections (for example SBB PPNs).
-4. Prepare retrieval-ready representations (image and text encoders) for future Tibetan n-gram search.
-5. Keep all major workflows reproducible in both UI and CLI.
-
-## Roadmap
-
-1. Data Foundation:
-Synthetic generation, SBB download pipeline, and dataset QA/export workflows.
-2. Detection and Parsing:
-YOLO training/inference plus optional VLM-assisted layout parsing and pseudo-labeling.
-3. Realism and Domain Adaptation:
-Diffusion + LoRA texture workflows to bridge synthetic-to-real domain gaps.
-4. Retrieval Readiness:
-Train unpaired image/text encoders and establish schemas/pipelines for retrieval indexing.
-5. Retrieval System:
-Dual-encoder alignment, ANN indexing, provenance-aware search results, and iterative evaluation.
 
 ## Install
 
@@ -70,75 +45,141 @@ Dual-encoder alignment, ANN indexing, provenance-aware search results, and itera
 pip install -r requirements.txt
 ```
 
-`requirements.txt` is now the **unified** dependency file for:
-
-- Workbench UI
-- VLM backends
-- Diffusion + LoRA workflows
-- Retrieval encoder training
+`requirements.txt` is now the **unified** dependency file for the repository.
 
 Legacy files `requirements-ui.txt`, `requirements-vlm.txt`, and `requirements-lora.txt` remain as compatibility wrappers.
 
-## Start Here: DONUT OCR Training
+## Pretrained Models
 
-If your focus is DONUT/TroCR OCR training, start with this detailed guide:
+Pretrained PechaBridge models are hosted on HuggingFace:
 
-- [docs/donut_training_guide.md](docs/donut_training_guide.md) (tiny pretraining workflow, anti-collapse diagnostics, full-run recipes for `gray` and `rgb`)
+| Model | HuggingFace Repo | Description |
+|-------|-----------------|-------------|
+| DONUT OCR | [`TibetanCodexAITeam/PechaBridgeOCR`](https://huggingface.co/TibetanCodexAITeam/PechaBridgeOCR) | VisionEncoderDecoder OCR for Tibetan line images |
+| Line Segmentation | [`TibetanCodexAITeam/PechaBridgeLineSegmentation`](https://huggingface.co/TibetanCodexAITeam/PechaBridgeLineSegmentation) | YOLO segmentation model for Tibetan text lines |
 
-## Documentation Guide
-
-- NEW: Full DONUT OCR training playbook (Tiny-Pretraining, Anti-Collapse, Full-Run recipes): [docs/donut_training_guide.md](docs/donut_training_guide.md)
-- CLI command reference and end-to-end examples: [README_CLI.md](README_CLI.md)
-- Pseudo-labeling and Label Studio workflow: [README_PSEUDO_LABELING_LABEL_STUDIO.md](README_PSEUDO_LABELING_LABEL_STUDIO.md)
-- Patch dataset generation (YOLO textbox -> lines -> sub-patches): [docs/dataset_generation.md](docs/dataset_generation.md)
-- Robust MNN mining for cross-page positives: [docs/mnn_mining.md](docs/mnn_mining.md)
-- Retrieval training with mp-InfoNCE (MNN/OCR weak positives): [docs/retrieval_mpnce_training.md](docs/retrieval_mpnce_training.md)
-- DONUT/TroCR OCR training (OpenPecha/BDRC manifests, CER, checkpoints): [README_DONUT_OCR.md](README_DONUT_OCR.md)
-- Line-CLIP dual vision-text encoder training (DINOv2 + text encoder): [README_LINE_CLIP_DUAL_ENCODER.md](README_LINE_CLIP_DUAL_ENCODER.md)
-- line_clip cache warmup + in-split/cross-split probing & evaluation guide: [docs/line_clip_dual_encoder_probe_guide.md](docs/line_clip_dual_encoder_probe_guide.md)
-- Weak OCR labeling for patch datasets: [docs/weak_ocr.md](docs/weak_ocr.md)
-- Diffusion + LoRA details: [docs/texture_augmentation.md](docs/texture_augmentation.md)
-- Retrieval roadmap: [docs/tibetan_ngram_retrieval_plan.md](docs/tibetan_ngram_retrieval_plan.md)
-- Chinese number corpus note: [data/corpora/Chinese Number Words/README.md](data/corpora/Chinese%20Number%20Words/README.md)
-
-## Start the Workbench
+### Download (one command)
 
 ```bash
-python ui_workbench.py
+# Download both models into models/ (auto-detected by UI and CLI):
+python cli.py download-models
+
+# Download only the OCR model:
+python cli.py download-models --models ocr
+
+# Download only the line segmentation model:
+python cli.py download-models --models line
+
+# Force re-download:
+python cli.py download-models --force
 ```
 
-Optional runtime flags via environment variables:
+After download the directory layout is:
+
+```
+models/
+  ocr/
+    PechaBridgeOCR/          ← DONUT checkpoint (auto-detected by ui_ocr_workbench.py)
+      config.json
+      model.safetensors
+      tokenizer_config.json
+      preprocessor_config.json
+      repro/
+        image_preprocess.json
+        generate_config.json
+  line_segmentation/
+    PechaBridgeLineSegmentation.pt   ← YOLO .pt (auto-detected by ui_workbench.py)
+```
+
+Both UI workbenches (`ui_ocr_workbench.py`, `ui_workbench.py`) scan these directories on startup and populate their model dropdowns automatically — no manual path configuration needed.
+
+### Batch OCR with downloaded models
+
+```bash
+python cli.py batch-ocr \
+    --ocr-model    models/ocr/PechaBridgeOCR \
+    --line-model   models/line_segmentation/PechaBridgeLineSegmentation.pt \
+    --layout-engine yolo_line \
+    --engine donut \
+    --input-dir /path/to/pecha/images
+```
+
+## OCR Workbench
+
+The **OCR Workbench** (`ui_ocr_workbench.py`) is a dedicated Gradio UI for interactive Tibetan OCR on pecha page images.
+
+```bash
+python ui_ocr_workbench.py
+```
+
+### Quick Start
+
+1. **Download the pretrained models** (once):
+   ```bash
+   python cli.py download-models
+   ```
+
+2. **Start the workbench** — models are auto-detected from `models/ocr/` and `models/line_segmentation/`.
+
+3. **Upload a pecha page image** and click **Run OCR**.
+
+### Modes
+
+| Mode | Description |
+|------|-------------|
+| **Fully Automatic OCR** | Segments all lines on the page, runs OCR on each, and returns the full transcript. |
+| **Manual Mode** | Click a line on the page or draw a bounding box with two clicks to OCR a single region. |
+
+### Line Segmentation Backends
+
+| Backend | When to use |
+|---------|-------------|
+| **Classical CV** | Fast, no GPU needed. Works well on clean woodblock prints. Requires a YOLO layout model (`models/layout/`). |
+| **Pretrained YOLO Model** | Best accuracy for complex or degraded pages. Uses `models/line_segmentation/PechaBridgeLineSegmentation.pt`. |
+| **BDRC Line Model** | Alternative ONNX-based segmentation from the BDRC Tibetan OCR app. Auto-downloaded on first use. |
+
+### OCR Engines
+
+| Engine | Description |
+|--------|-------------|
+| **DONUT** | Default. VisionEncoderDecoder model from `models/ocr/PechaBridgeOCR/`. Preprocessing pipeline is auto-detected from the checkpoint's repro bundle. |
+| **BDRC OCR** | ONNX-based CTC OCR from the BDRC Tibetan OCR app. Auto-downloaded on first use. |
+
+### Typical Workflow (Automatic Mode)
+
+```
+Upload page image
+  → Select line segmentation backend (YOLO recommended)
+  → Select OCR engine (DONUT)
+  → Click "Run OCR"
+  → Inspect annotated page + transcript
+  → Save results
+```
+
+### Notes
+
+- The DONUT model and YOLO line segmentation model are loaded once and cached in memory for the session.
+- The preprocessing pipeline (`bdrc`, `gray`, `rgb`) is read automatically from `repro/image_preprocess.json` inside the checkpoint — no manual selection needed when using downloaded models.
+- For remote server usage, use SSH port forwarding and keep `UI_SHARE=false`.
+
+## Running the Workbench
+
+Both `ui_ocr_workbench.py` and `ui_workbench.py` accept optional runtime flags via environment variables:
 
 ```bash
 export UI_HOST=127.0.0.1   # use 0.0.0.0 for remote server binding
 export UI_PORT=7860
 export UI_SHARE=false      # set true only if you explicitly want a public Gradio link
-python ui_workbench.py
+python ui_ocr_workbench.py  # or ui_workbench.py
 ```
 
-### SSH Port Forwarding (server -> laptop)
-
-If the Workbench runs on a remote host, keep `UI_SHARE=false` and use SSH forwarding:
+For remote server usage, keep `UI_SHARE=false` and use SSH port forwarding:
 
 ```bash
 ssh -L 7860:127.0.0.1:7860 <user>@<server>
 ```
 
 Then open `http://127.0.0.1:7860` on your laptop.
-
-## Recommended Workflow (UI + CLI)
-
-1. `Synthetic Data` / `PPN Downloader`: build or ingest page images.
-2. `Ultralytics Training` + `Model Inference`: train and validate layout detection (YOLO).
-3. `Workbench Preview Tabs`: inspect detected text blocks, classical line segmentation, model-based line segmentation, and hierarchy overlays on real pecha pages.
-4. `Label Studio Export` / pseudo-label workflow: generate reviewable labels when needed.
-5. `gen-patches` (CLI): build `datasets/text_patches` from page images using YOLO textbox detection + classical or model-based line segmentation.
-6. `weak-ocr-label` (CLI, optional): create weak OCR labels on patch crops.
-7. `mine-mnn-pairs` (CLI): mine robust cross-page positives for retrieval training.
-8. `train-text-hierarchy-vit` (CLI): train patch retrieval encoder with mp-InfoNCE using `MNN`, `OCR`, or `both`.
-9. `train-text-hierarchy-vit --train-mode line_clip` (CLI): train line-level dual vision-text encoder on OCR manifests.
-10. `train-donut-ocr` (CLI): train generative OCR model (TroCR/Donut-style VisionEncoderDecoder) on line manifests.
-11. `eval-faiss-crosspage` and `faiss-text-hierarchy-search` (CLI): evaluate and inspect retrieval behavior.
 
 ## Unified CLI
 
@@ -249,15 +290,6 @@ python cli.py run-donut-ocr-workflow \
   --model_output_dir ./models/donut-ocr-label1
 ```
 
-Weak OCR label generation for patch datasets is available as a root CLI subcommand:
-
-```bash
-python cli.py weak-ocr-label \
-  --dataset ./datasets/text_patches \
-  --meta ./datasets/text_patches/meta/patches.parquet \
-  --out ./datasets/text_patches/meta/weak_ocr.parquet
-```
-
 ## Model Outputs And Workbench Compatibility
 
 ### DONUT/TroCR OCR (`train-donut-ocr`)
@@ -271,10 +303,15 @@ Typical outputs in `--output_dir`:
 - `image_processor/`
 - `train_summary.json`
 
+Each checkpoint also contains a `repro/` bundle with:
+- `repro/image_preprocess.json` — preprocessing pipeline name (`bdrc`, `gray`, `rgb`)
+- `repro/generate_config.json` — generation parameters (max_length, decoder_start_token_id, …)
+- `repro/tokenizer/` + `repro/image_processor/` — self-contained copies for reproducibility
+
 Current Workbench support:
 
 - The Workbench supports the **DONUT OCR workflow runner** (`run-donut-ocr-workflow`) and monitors training logs/output dirs.
-- There is currently **no dedicated standalone DONUT inference tab** that loads a trained `model/ + tokenizer/ + image_processor/` triplet for ad-hoc OCR inference in the UI.
+- `ui_ocr_workbench.py` auto-scans `models/ocr/` for checkpoints and exposes them in the DONUT dropdown.
 - Training and evaluation are fully supported via CLI (`cli.py train-donut-ocr`).
 
 ### Dual Vision-Text Encoder (`train-text-hierarchy-vit --train-mode line_clip`)
@@ -306,18 +343,21 @@ export LABEL_STUDIO_LOCAL_FILES_DOCUMENT_ROOT=/absolute/path/to/your/dataset/roo
 
 Then use the Workbench export actions.
 
-## CLI Documentation
+## Documentation Guide
 
-CLI usage is documented separately in:
-
-- [README_CLI.md](README_CLI.md)
-- [README_PSEUDO_LABELING_LABEL_STUDIO.md](README_PSEUDO_LABELING_LABEL_STUDIO.md)
-- [docs/dataset_generation.md](docs/dataset_generation.md)
-- [docs/mnn_mining.md](docs/mnn_mining.md)
-- [docs/retrieval_mpnce_training.md](docs/retrieval_mpnce_training.md)
-- [docs/weak_ocr.md](docs/weak_ocr.md)
-- [docs/texture_augmentation.md](docs/texture_augmentation.md)
-- [docs/tibetan_ngram_retrieval_plan.md](docs/tibetan_ngram_retrieval_plan.md)
+- **NEW:** Full DONUT OCR training playbook (Tiny-Pretraining, Anti-Collapse, Full-Run recipes): [docs/donut_training_guide.md](docs/donut_training_guide.md)
+- CLI command reference and end-to-end examples: [README_CLI.md](README_CLI.md)
+- Pseudo-labeling and Label Studio workflow: [README_PSEUDO_LABELING_LABEL_STUDIO.md](README_PSEUDO_LABELING_LABEL_STUDIO.md)
+- Patch dataset generation (YOLO textbox -> lines -> sub-patches): [docs/dataset_generation.md](docs/dataset_generation.md)
+- Robust MNN mining for cross-page positives: [docs/mnn_mining.md](docs/mnn_mining.md)
+- Retrieval training with mp-InfoNCE (MNN/OCR weak positives): [docs/retrieval_mpnce_training.md](docs/retrieval_mpnce_training.md)
+- DONUT/TroCR OCR training (OpenPecha/BDRC manifests, CER, checkpoints): [README_DONUT_OCR.md](README_DONUT_OCR.md)
+- Line-CLIP dual vision-text encoder training (DINOv2 + text encoder): [README_LINE_CLIP_DUAL_ENCODER.md](README_LINE_CLIP_DUAL_ENCODER.md)
+- line_clip cache warmup + in-split/cross-split probing & evaluation guide: [docs/line_clip_dual_encoder_probe_guide.md](docs/line_clip_dual_encoder_probe_guide.md)
+- Weak OCR labeling for patch datasets: [docs/weak_ocr.md](docs/weak_ocr.md)
+- Diffusion + LoRA details: [docs/texture_augmentation.md](docs/texture_augmentation.md)
+- Retrieval roadmap: [docs/tibetan_ngram_retrieval_plan.md](docs/tibetan_ngram_retrieval_plan.md)
+- Chinese number corpus note: [data/corpora/Chinese Number Words/README.md](data/corpora/Chinese%20Number%20Words/README.md)
 
 ## License
 
