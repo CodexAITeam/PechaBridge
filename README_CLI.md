@@ -12,6 +12,8 @@ If you are a regular user, prefer the UI in `README.md`.
 - `pseudo_label_from_vlm.py`
 - `layout_rule_filter.py`
 - `run_pseudo_label_workflow.py`
+- `scripts/download_openpecha_line_segmentation.py`
+- `scripts/train_line_segmentation.py`
 - `cli.py` (unified diffusion + retrieval-encoder commands)
 
 ## Install
@@ -51,6 +53,8 @@ Available subcommands:
 - `train-donut-ocr`
 - `run-donut-ocr-workflow`
 - `download-openpecha-ocr-lines`
+- `download-openpecha-line-segmentation`
+- `train-line-segmentation`
 
 ## Example CLI Workflow
 
@@ -215,7 +219,51 @@ python cli.py train-donut-ocr \
 
 Note: The Donut OCR training flow now always reuses the configured tokenizer path directly (no tokenizer retraining flag).
 
-### 6) Patch Retrieval Dataset + mp-InfoNCE ViT Training (current)
+### 6) OpenPecha line segmentation dataset + YOLO training
+
+Download the Hugging Face line-coordinate dataset and convert it into an Ultralytics segment dataset:
+
+```bash
+python cli.py download-openpecha-line-segmentation \
+  --output-dir ./datasets/openpecha_line_segmentation
+```
+
+If you want to create a second dataset with vertically expanded line polygons, you can derive it from the raw base dataset:
+
+```bash
+python cli.py expand-line-segmentation-dataset \
+  --dataset ./datasets/openpecha_line_segmentation/data.yaml \
+  --output-dir ./datasets/openpecha_line_segmentation_padded \
+  --top-ratio 0.20 \
+  --bottom-ratio 0.20
+```
+
+If you want to remove tall/narrow line polygons into a separate dataset root, use the dedicated filter CLI:
+
+```bash
+python cli.py filter-line-segmentation-dataset \
+  --dataset ./datasets/openpecha_line_segmentation_padded/data.yaml \
+  --output-dir ./datasets/openpecha_line_segmentation_padded_filtered \
+  --min-width-height-ratio 1.0
+```
+
+Train a YOLO segmentation model on the converted dataset. The line-image preprocessing now belongs to the
+training run, not to the downloader:
+
+```bash
+python cli.py train-line-segmentation \
+  --dataset ./datasets/openpecha_line_segmentation/data.yaml \
+  --model yolo11n-seg.pt \
+  --image-preprocess-pipeline gray \
+  --epochs 100 \
+  --project ./runs/segment \
+  --name tibetan-line-seg
+```
+
+The OCR Workbench can then switch between `Classical CV` line splitting and `Pretrained YOLO Model`.
+The training command defaults to `gray`, matching the DONUT OCR `gray` preprocessing semantics (`min_rgb`, `binarize=false`), while the downloaded dataset stays raw.
+
+### 7) Patch Retrieval Dataset + mp-InfoNCE ViT Training (current)
 
 Generate the patch dataset (`patches/` + `meta/patches.parquet`) from page images:
 

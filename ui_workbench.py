@@ -86,8 +86,56 @@ except Exception:
     _BDRCPreprocessConfig = None
     _preprocess_image_bdrc = None
 
+try:
+    from pechabridge.ocr.line_segmentation import (
+        DEFAULT_LINE_SEGMENTATION_CONF as _DEFAULT_LINE_SEGMENTATION_CONF,
+        DEFAULT_LINE_SEGMENTATION_IMGSZ as _DEFAULT_LINE_SEGMENTATION_IMGSZ,
+        normalize_line_segmentation_preprocess_pipeline as _normalize_line_segmentation_preprocess_pipeline,
+        predict_line_regions as _predict_line_regions,
+    )
+except Exception:
+    _DEFAULT_LINE_SEGMENTATION_CONF = 0.25
+    _DEFAULT_LINE_SEGMENTATION_IMGSZ = 1280
+    _normalize_line_segmentation_preprocess_pipeline = None
+    _predict_line_regions = None
+
+try:
+    from pechabridge.ocr.bdrc_inference import (
+        DEFAULT_BDRC_LINE_BBOX_TOLERANCE as _DEFAULT_BDRC_LINE_BBOX_TOLERANCE,
+        DEFAULT_BDRC_LINE_K_FACTOR as _DEFAULT_BDRC_LINE_K_FACTOR,
+        DEFAULT_BDRC_LINE_TPS_THRESHOLD as _DEFAULT_BDRC_LINE_TPS_THRESHOLD,
+        DEFAULT_BDRC_LINE_USE_TPS as _DEFAULT_BDRC_LINE_USE_TPS,
+        find_bdrc_line_model_dirs as _find_bdrc_line_model_dirs,
+        find_bdrc_ocr_model_dirs as _find_bdrc_ocr_model_dirs,
+        predict_bdrc_line_regions as _predict_bdrc_line_regions,
+        run_bdrc_ocr as _run_bdrc_ocr,
+    )
+except Exception:
+    _DEFAULT_BDRC_LINE_BBOX_TOLERANCE = 3.0
+    _DEFAULT_BDRC_LINE_K_FACTOR = 2.5
+    _DEFAULT_BDRC_LINE_TPS_THRESHOLD = 0.25
+    _DEFAULT_BDRC_LINE_USE_TPS = True
+    _find_bdrc_line_model_dirs = None
+    _find_bdrc_ocr_model_dirs = None
+    _predict_bdrc_line_regions = None
+    _run_bdrc_ocr = None
+
+try:
+    from pechabridge.ocr.bdrc_model_download import (
+        choose_default_bdrc_ocr_model_dir as _choose_default_bdrc_ocr_model_dir,
+        ensure_default_bdrc_line_assets as _ensure_default_bdrc_line_assets,
+        ensure_default_bdrc_ocr_models as _ensure_default_bdrc_ocr_models,
+    )
+except Exception:
+    _choose_default_bdrc_ocr_model_dir = None
+    _ensure_default_bdrc_line_assets = None
+    _ensure_default_bdrc_ocr_models = None
+
 
 ROOT = Path(__file__).resolve().parent
+_DEFAULT_BDRC_LINE_MERGE_LINES = True
+_DEFAULT_UI_BDRC_LINE_USE_ROTATION = False
+_DEFAULT_UI_BDRC_LINE_USE_TPS = False
 DEFAULT_TEXTURE_PROMPT = (
     "scanned printed Tibetan pecha page, paper texture, ink bleed, aged grayscale scan, "
     "realistic Tibetan glyph stroke thickness, subtle hand-written-like ink edge variation"
@@ -208,7 +256,7 @@ def _list_datasets(base_dir: str) -> List[str]:
         return []
     out = []
     for child in sorted([c for c in p.iterdir() if c.is_dir()]):
-        if (child / "train").exists() or (child / "val").exists():
+        if _is_supported_yolo_dataset_root(child):
             out.append(str(child))
     return out
 
@@ -219,12 +267,129 @@ def _list_dataset_names(base_dir: str) -> List[str]:
         return []
     out = []
     for child in sorted([c for c in p.iterdir() if c.is_dir()]):
-        if (child / "train").exists() or (child / "val").exists():
+        if _is_supported_yolo_dataset_root(child):
             out.append(child.name)
     # Also include YAML dataset configs created at base level
     for yml in sorted([c for c in p.iterdir() if c.is_file() and c.suffix.lower() in {".yaml", ".yml"}]):
-        out.append(yml.name)
+        if _resolve_yolo_split_io_dirs(yml, "train")[0] is not None or _resolve_yolo_split_io_dirs(yml, "val")[0] is not None:
+            out.append(yml.name)
     return out
+
+
+def _read_yaml_mapping(path: Path) -> Dict[str, Any]:
+    try:
+        payload = yaml.safe_load(path.read_text(encoding="utf-8")) or {}
+    except Exception:
+        return {}
+    return payload if isinstance(payload, dict) else {}
+
+
+def _resolve_dataset_root_from_yaml(yaml_path: Path) -> Path:
+    cfg = _read_yaml_mapping(yaml_path)
+    raw_root = cfg.get("path", "")
+    if raw_root:
+        root = Path(str(raw_root)).expanduser()
+        if not root.is_absolute():
+            root = (yaml_path.parent / root).resolve()
+        return root.resolve()
+    return yaml_path.parent.resolve()
+
+
+def _dataset_yaml_candidates(dataset_ref: Path) -> List[Path]:
+    candidates: List[Path] = []
+    if dataset_ref.is_file() and dataset_ref.suffix.lower() in {".yaml", ".yml"}:
+        candidates.append(dataset_ref.resolve())
+        return candidates
+    if dataset_ref.is_dir():
+        for name in ("data.yml", "data.yaml"):
+            cand = (dataset_ref / name).resolve()
+            if cand.exists():
+                candidates.append(cand)
+    return candidates
+
+
+def _resolve_dataset_yaml_path(dataset: str) -> Optional[Path]:
+    raw_txt = (dataset or "").strip()
+    if not raw_txt:
+        return None
+
+    raw = Path(raw_txt).expanduser()
+    candidates: List[Path] = []
+    if raw.is_absolute():
+        candidates.append(raw)
+    else:
+        candidates.append((Path.cwd() / raw).resolve())
+        candidates.append((ROOT / raw).resolve())
+        candidates.append((ROOT / "datasets" / raw).resolve())
+        if raw.suffix.lower() not in {".yaml", ".yml"}:
+            candidates.append((ROOT / "datasets" / f"{raw_txt}.yml").resolve())
+            candidates.append((ROOT / "datasets" / f"{raw_txt}.yaml").resolve())
+
+    seen: Dict[str, Path] = {}
+    for cand in candidates:
+        for yaml_path in _dataset_yaml_candidates(cand):
+            seen[str(yaml_path)] = yaml_path
+    ordered = list(seen.values())
+    return ordered[0] if ordered else None
+
+
+def _derive_labels_dir_from_images_dir(images_dir: Path) -> Path:
+    if images_dir.name == "images":
+        return (images_dir.parent / "labels").resolve()
+    if images_dir.parent.name == "images":
+        return (images_dir.parent.parent / "labels" / images_dir.name).resolve()
+    return (images_dir.parent / "labels").resolve()
+
+
+def _resolve_yolo_split_io_dirs(dataset_ref: Any, split: str) -> Tuple[Optional[Path], Optional[Path], Optional[Path]]:
+    split_name = (split or "").strip()
+    if not split_name:
+        return None, None, None
+
+    base = Path(str(dataset_ref)).expanduser().resolve()
+    dataset_root = base
+    yaml_path: Optional[Path] = None
+    if base.is_file() and base.suffix.lower() in {".yaml", ".yml"}:
+        yaml_path = base
+        dataset_root = _resolve_dataset_root_from_yaml(base)
+    elif base.is_dir():
+        yaml_path = _resolve_dataset_yaml_path(str(base))
+
+    image_candidates: List[Path] = []
+    if dataset_root.exists():
+        image_candidates.append((dataset_root / split_name / "images").resolve())
+        image_candidates.append((dataset_root / "images" / split_name).resolve())
+
+    if yaml_path is not None and yaml_path.exists():
+        cfg = _read_yaml_mapping(yaml_path)
+        split_value = str(cfg.get(split_name, "") or "").strip()
+        if split_value:
+            img_dir = Path(split_value).expanduser()
+            if not img_dir.is_absolute():
+                img_dir = (_resolve_dataset_root_from_yaml(yaml_path) / img_dir).resolve()
+            image_candidates.insert(0, img_dir.resolve())
+
+    seen: Dict[str, Path] = {}
+    for cand in image_candidates:
+        seen[str(cand)] = cand
+    unique_candidates = list(seen.values())
+    for image_dir in unique_candidates:
+        if image_dir.exists():
+            return image_dir, _derive_labels_dir_from_images_dir(image_dir), dataset_root
+
+    if unique_candidates:
+        guessed = unique_candidates[0]
+        return guessed, _derive_labels_dir_from_images_dir(guessed), dataset_root
+    return None, None, dataset_root if dataset_root else None
+
+
+def _is_supported_yolo_dataset_root(dataset_root: Path) -> bool:
+    for split in ("train", "val", "test"):
+        images_dir, labels_dir, _ = _resolve_yolo_split_io_dirs(dataset_root, split)
+        if images_dir is not None and images_dir.exists():
+            if labels_dir is None or labels_dir.exists():
+                return True
+    return False
 
 
 def _list_images(split_images_dir: Path) -> List[str]:
@@ -374,7 +539,7 @@ def _draw_yolo_boxes(image_path: Path, label_path: Path) -> Tuple[np.ndarray, st
     }
     class_names = dict(DEFAULT_LAYOUT_CLASS_NAMES)
     try:
-        # label path pattern: <dataset>/<split>/labels/<file>.txt
+        # Supports both <dataset>/<split>/labels/<file>.txt and <dataset>/labels/<split>/<file>.txt.
         split_dir = label_path.parent.parent
         dataset_root = split_dir.parent
         classes_file = dataset_root / "classes.txt"
@@ -382,6 +547,20 @@ def _draw_yolo_boxes(image_path: Path, label_path: Path) -> Tuple[np.ndarray, st
             lines = [ln.strip() for ln in classes_file.read_text(encoding="utf-8", errors="replace").splitlines() if ln.strip()]
             for i, name in enumerate(lines):
                 class_names[i] = name
+        else:
+            yaml_path = _resolve_dataset_yaml_path(str(dataset_root))
+            if yaml_path is not None and yaml_path.exists():
+                cfg = _read_yaml_mapping(yaml_path)
+                names = cfg.get("names")
+                if isinstance(names, dict):
+                    for k, v in names.items():
+                        try:
+                            class_names[int(k)] = str(v)
+                        except Exception:
+                            continue
+                elif isinstance(names, list):
+                    for i, name in enumerate(names):
+                        class_names[i] = str(name)
     except Exception:
         pass
 
@@ -720,8 +899,7 @@ def _resolve_ls_export_split_from_path_or_zip(ls_export_dir: str, ls_export_zip:
     return _resolve_ls_export_split(ls_export_dir)
 
 
-def _inspect_label_format(split_dir: Path) -> Dict[str, int]:
-    labels_dir = split_dir / "labels"
+def _inspect_label_dir_format(labels_dir: Path) -> Dict[str, int]:
     stats = {"files": 0, "rows": 0, "bbox_rows": 0, "polygon_rows": 0, "invalid_rows": 0}
     if not labels_dir.exists():
         return stats
@@ -742,6 +920,10 @@ def _inspect_label_format(split_dir: Path) -> Dict[str, int]:
             else:
                 stats["invalid_rows"] += 1
     return stats
+
+
+def _inspect_label_format(split_dir: Path) -> Dict[str, int]:
+    return _inspect_label_dir_format(split_dir / "labels")
 
 
 def _label_format_summary(stats: Dict[str, int]) -> str:
@@ -766,6 +948,169 @@ def _label_format_summary(stats: Dict[str, int]) -> str:
         f"Label format check: {fmt} "
         f"(files={files}, rows={rows}, bbox={bbox_rows}, polygon={poly_rows}, invalid={invalid_rows})"
     )
+
+
+def _infer_ultralytics_task(dataset: str, model: str) -> str:
+    model_name = Path(str(model or "")).name.lower()
+    if "-seg" in model_name:
+        return "segment"
+
+    yaml_path = _resolve_dataset_yaml_path(str(dataset or ""))
+    if yaml_path is None:
+        return "detect"
+
+    for split_name in ("train", "val", "test"):
+        _, labels_dir, _ = _resolve_yolo_split_io_dirs(yaml_path, split_name)
+        if labels_dir is None:
+            continue
+        stats = _inspect_label_dir_format(labels_dir)
+        if int(stats.get("polygon_rows", 0)) > 0 and int(stats.get("bbox_rows", 0)) == 0 and int(stats.get("invalid_rows", 0)) == 0:
+            return "segment"
+        if int(stats.get("bbox_rows", 0)) > 0:
+            return "detect"
+    return "detect"
+
+
+def _ultralytics_detect_model_presets() -> List[str]:
+    return [
+        "yolo26n.pt",
+        "yolo26s.pt",
+        "yolo26m.pt",
+        "yolo26l.pt",
+        "yolo26x.pt",
+    ]
+
+
+def _ultralytics_segment_model_presets() -> List[str]:
+    return [
+        "yolo11n-seg.pt",
+        "yolo11s-seg.pt",
+        "yolo11m-seg.pt",
+        "yolo11l-seg.pt",
+        "yolo11x-seg.pt",
+    ]
+
+
+def _default_ultralytics_model_for_task(task: str) -> str:
+    return (
+        _ultralytics_segment_model_presets()[0]
+        if str(task or "").strip().lower() == "segment"
+        else _ultralytics_detect_model_presets()[0]
+    )
+
+
+def _default_ultralytics_project_for_task(task: str) -> str:
+    folder = "segment" if str(task or "").strip().lower() == "segment" else "detect"
+    return str((ROOT / "runs" / folder).resolve())
+
+
+def _model_looks_like_segmentation_checkpoint(model: str) -> bool:
+    txt = str(model or "").strip()
+    if not txt:
+        return False
+    low = txt.lower()
+    name = Path(txt).name.lower()
+    if "-seg" in name or name.startswith("line_seg") or "_seg" in name:
+        return True
+    if "line_segmentation" in low.replace("\\", "/"):
+        return True
+    return False
+
+
+def _model_looks_clearly_wrong_for_segment_task(model: str) -> bool:
+    txt = str(model or "").strip()
+    if not txt:
+        return True
+    if _model_looks_like_segmentation_checkpoint(txt):
+        return False
+
+    low = txt.lower().replace("\\", "/")
+    name = Path(txt).name.lower()
+    path_obj = Path(txt).expanduser()
+    if path_obj.exists():
+        return "layoutmodels" in low or name.startswith("layout_")
+    return True
+
+
+def _suggest_train_model_for_dataset(
+    dataset: str,
+    model_choice: str,
+    model_override: str,
+) -> str:
+    if str(model_override or "").strip():
+        return str(model_choice or "").strip()
+
+    current = str(model_choice or "").strip()
+    task = _infer_ultralytics_task(dataset, current)
+    if task == "segment":
+        if not current or current in _ultralytics_detect_model_presets():
+            return _default_ultralytics_model_for_task("segment")
+    else:
+        if not current or current in _ultralytics_segment_model_presets():
+            return _default_ultralytics_model_for_task("detect")
+    return current
+
+
+def _summarize_ultralytics_training_mode(dataset: str, model: str, project: str) -> str:
+    task = _infer_ultralytics_task(dataset, model)
+    default_project = _default_ultralytics_project_for_task(task)
+    archive_dir = (
+        (ROOT / "models" / "line_segmentation").resolve()
+        if task == "segment"
+        else (ROOT / "models" / "layoutModels").resolve()
+    )
+    lines = [
+        f"Inferred task: {task}",
+        "Entrypoint: train_model.py",
+        f"Effective model: {model or '(empty)'}",
+        f"Project: {project or default_project}",
+        f"Suggested default project: {default_project}",
+        f"Archived model target: {archive_dir}",
+    ]
+    if task == "segment":
+        lines.append(f"Recommended starter model: {_default_ultralytics_model_for_task('segment')}")
+        if _model_looks_clearly_wrong_for_segment_task(model):
+            lines.append("Warning: current model does not look like a segmentation checkpoint.")
+    return "\n".join(lines)
+
+
+def _refresh_ultralytics_training_defaults(
+    dataset: str,
+    model_choice: str,
+    model_override: str,
+    current_project: str,
+) -> Tuple[str, str, str]:
+    suggested_model = _suggest_train_model_for_dataset(dataset, model_choice, model_override)
+    effective_model = resolve_train_model(suggested_model, model_override)
+    task = _infer_ultralytics_task(dataset, effective_model)
+    detect_default = _default_ultralytics_project_for_task("detect")
+    segment_default = _default_ultralytics_project_for_task("segment")
+    project_txt = str(current_project or "").strip()
+    if not project_txt or project_txt in {detect_default, segment_default}:
+        next_project = _default_ultralytics_project_for_task(task)
+    else:
+        next_project = project_txt
+    status = _summarize_ultralytics_training_mode(dataset, effective_model, next_project)
+    return suggested_model, next_project, status
+
+
+def _refresh_ultralytics_training_status_only(
+    dataset: str,
+    model_choice: str,
+    model_override: str,
+    current_project: str,
+) -> Tuple[str, str]:
+    effective_model = resolve_train_model(model_choice, model_override)
+    task = _infer_ultralytics_task(dataset, effective_model)
+    detect_default = _default_ultralytics_project_for_task("detect")
+    segment_default = _default_ultralytics_project_for_task("segment")
+    project_txt = str(current_project or "").strip()
+    if not project_txt or project_txt in {detect_default, segment_default}:
+        next_project = _default_ultralytics_project_for_task(task)
+    else:
+        next_project = project_txt
+    status = _summarize_ultralytics_training_mode(dataset, effective_model, next_project)
+    return next_project, status
 
 
 def run_generate_synthetic(
@@ -3718,11 +4063,53 @@ def _render_line_ocr_cards_html_ui(rows: List[Dict[str, Any]], note: str = "") -
     )
 
 
+def _ensure_default_bdrc_line_model_ui(current_path: str) -> Tuple[str, Optional[str]]:
+    raw = str(current_path or "").strip()
+    if raw and Path(raw).exists():
+        return raw, None
+    if _ensure_default_bdrc_line_assets is None:
+        raise RuntimeError("BDRC line downloader is unavailable.")
+    result = _ensure_default_bdrc_line_assets(ROOT / "models" / "bdrc")
+    note = (
+        f"Auto-downloaded default BDRC line assets ({', '.join(result.downloaded_items)}) to {result.root}"
+        if result.downloaded_items
+        else f"Using existing default BDRC line assets from {result.root}"
+    )
+    return str(result.line_dir), note
+
+
+def _ensure_default_bdrc_ocr_model_ui(current_path: str) -> Tuple[str, Optional[str]]:
+    raw = str(current_path or "").strip()
+    if raw and Path(raw).exists():
+        return raw, None
+    if _ensure_default_bdrc_ocr_models is None or _choose_default_bdrc_ocr_model_dir is None:
+        raise RuntimeError("BDRC OCR downloader is unavailable.")
+    result = _ensure_default_bdrc_ocr_models(ROOT / "models" / "bdrc")
+    chosen = _choose_default_bdrc_ocr_model_dir(result.root)
+    note = (
+        f"Auto-downloaded default BDRC OCR models to {result.root}; selected {chosen.name}"
+        if result.downloaded
+        else f"Using existing default BDRC OCR model {chosen.name} from {result.root}"
+    )
+    return str(chosen), note
+
+
 def run_page_line_donut_ocr_preview_ui(
     input_mode: str,
     image: Optional[np.ndarray],
     direct_line_image: Optional[np.ndarray],
-    line_model_path: str,
+    ocr_engine: str,
+    line_backend: str,
+    classical_layout_model_path: str,
+    yolo_line_model_path: str,
+    yolo_line_preproc: str,
+    bdrc_line_model_path: str,
+    bdrc_line_merge_lines: bool,
+    bdrc_line_k_factor: float,
+    bdrc_line_bbox_tolerance: float,
+    bdrc_line_use_rotation: bool,
+    bdrc_line_use_tps: bool,
+    bdrc_line_tps_threshold: float,
     line_conf: float,
     line_imgsz: int,
     line_device: str,
@@ -3732,39 +4119,81 @@ def run_page_line_donut_ocr_preview_ui(
     line_merge_gap_px: int,
     donut_model_dir: str,
     donut_preproc: str,
-    donut_device: str,
+    bdrc_ocr_model_dir: str,
+    ocr_device: str,
     donut_max_len: int,
     donut_num_beams: int,
     max_lines: int,
 ):
     empty_html = _render_line_ocr_cards_html_ui(
         [],
-        note="Minimaler Quick-OCR-Workflow: Seite -> Lines -> DONUT oder direktes Line-Image -> DONUT.",
+        note="Quick-OCR: Classical CV, YOLO-Line oder BDRC-Line mit DONUT oder BDRC OCR.",
     )
-    mode = str(input_mode or "Page -> Lines -> DONUT").strip()
+    mode = str(input_mode or "Page -> Lines -> OCR").strip()
+    engine = str(ocr_engine or "DONUT").strip()
+    backend = str(line_backend or "Classical CV").strip()
     requested_preproc = str(donut_preproc or "bdrc").strip().lower()
-    # Quick tab is opinionated: use BDRC preprocessing, while the lower-level helper still prefers
-    # the train-script preprocessing implementation when importable.
-    effective_preproc = "bdrc"
+    effective_preproc = requested_preproc if requested_preproc in {"bdrc", "gray", "rgb"} else "bdrc"
+    auto_notes: List[str] = []
+    if backend == "BDRC Line Model" and not str(bdrc_line_model_path or "").strip():
+        try:
+            bdrc_line_model_path, note = _ensure_default_bdrc_line_model_ui(bdrc_line_model_path)
+            if note:
+                auto_notes.append(note)
+        except Exception as exc:
+            debug = {"ok": False, "mode": mode, "ocr_engine": engine, "line_backend": backend, "error": f"BDRC line auto-download failed: {type(exc).__name__}: {exc}"}
+            return None, "BDRC line auto-download failed.", "", empty_html, json.dumps(debug, ensure_ascii=False, indent=2)
+    if engine == "BDRC OCR" and not str(bdrc_ocr_model_dir or "").strip():
+        try:
+            bdrc_ocr_model_dir, note = _ensure_default_bdrc_ocr_model_ui(bdrc_ocr_model_dir)
+            if note:
+                auto_notes.append(note)
+        except Exception as exc:
+            debug = {"ok": False, "mode": mode, "ocr_engine": engine, "line_backend": backend, "error": f"BDRC OCR auto-download failed: {type(exc).__name__}: {exc}"}
+            return None, "BDRC OCR auto-download failed.", "", empty_html, json.dumps(debug, ensure_ascii=False, indent=2)
     line_device_norm = str(line_device or "").strip()
     if line_device_norm.lower() == "auto":
         line_device_norm = ""
+    ocr_device_norm = str(ocr_device or "").strip()
+    if ocr_device_norm.lower() == "auto":
+        ocr_device_norm = "auto"
 
-    if mode == "Single Line -> DONUT":
-        line_img = direct_line_image if direct_line_image is not None else image
-        if line_img is None:
-            debug = {
-                "ok": False,
-                "mode": mode,
-                "error": "Please upload a line image (or provide an image in the fallback page slot).",
-            }
-            return None, "Please upload a line image.", "", empty_html, json.dumps(debug, ensure_ascii=False, indent=2)
+    def _crop_from_record(src_img: np.ndarray, rec: Dict[str, Any]) -> np.ndarray:
+        crop = rec.get("ocr_crop")
+        if isinstance(crop, np.ndarray) and crop.size > 0:
+            return np.asarray(crop).astype(np.uint8, copy=False)
+        box = rec.get("line_box") or []
+        if not isinstance(box, (list, tuple)) or len(box) != 4:
+            return np.zeros((1, 1, 3), dtype=np.uint8)
+        x1, y1, x2, y2 = [int(v) for v in box]
+        return np.asarray(src_img[y1:y2, x1:x2]).astype(np.uint8, copy=False)
 
+    def _run_selected_ocr(line_img: np.ndarray) -> Tuple[np.ndarray, str, Dict[str, Any]]:
+        if engine == "BDRC OCR":
+            if not str(bdrc_ocr_model_dir or "").strip():
+                return line_img, "", {"ok": False, "backend": "bdrc_ocr", "error": "BDRC OCR model missing."}
+            if _run_bdrc_ocr is None:
+                return line_img, "", {"ok": False, "backend": "bdrc_ocr", "error": "BDRC OCR helpers unavailable."}
+            try:
+                text, dbg, preview_gray = _run_bdrc_ocr(
+                    np.asarray(line_img).astype(np.uint8, copy=False),
+                    model_path=bdrc_ocr_model_dir,
+                    device=ocr_device_norm,
+                    target_encoding="unicode",
+                )
+                preview = (
+                    np.stack([preview_gray] * 3, axis=-1)
+                    if isinstance(preview_gray, np.ndarray) and preview_gray.ndim == 2
+                    else np.asarray(preview_gray).astype(np.uint8, copy=False)
+                )
+                return preview, str(text or ""), dict(dbg)
+            except Exception as exc:
+                return line_img, "", {"ok": False, "backend": "bdrc_ocr", "error": f"{type(exc).__name__}: {exc}"}
         preview, pred_text, debug_json = run_donut_ocr_inference_ui(
             image=line_img,
             model_root_or_model_dir=donut_model_dir,
             image_preprocess_pipeline=effective_preproc,
-            device_preference=donut_device,
+            device_preference=ocr_device_norm,
             generation_max_length=donut_max_len,
             num_beams=donut_num_beams,
         )
@@ -3772,125 +4201,230 @@ def run_page_line_donut_ocr_preview_ui(
             debug_obj = json.loads(debug_json or "{}")
         except Exception:
             debug_obj = {"raw_debug": debug_json}
+        return (
+            preview if preview is not None else np.asarray(line_img).astype(np.uint8, copy=False),
+            str(pred_text or ""),
+            debug_obj,
+        )
+
+    if mode == "Single Line -> OCR":
+        line_img = direct_line_image if direct_line_image is not None else image
+        if line_img is None:
+            debug = {
+                "ok": False,
+                "mode": mode,
+                "ocr_engine": engine,
+                "error": "Please upload a line image (or provide an image in the fallback page slot).",
+            }
+            return None, "Please upload a line image.", "", empty_html, json.dumps(debug, ensure_ascii=False, indent=2)
+
+        overlay_out, pred_text, debug_obj = _run_selected_ocr(line_img)
         ok = bool(isinstance(debug_obj, dict) and debug_obj.get("ok"))
         line_arr = np.asarray(line_img).astype(np.uint8, copy=False)
         h = int(line_arr.shape[0]) if line_arr.ndim >= 2 else 0
         w = int(line_arr.shape[1]) if line_arr.ndim >= 2 else 0
-        text_out = str(pred_text or "")
-        err_text = "" if ok else str((debug_obj.get("error") if isinstance(debug_obj, dict) else "") or "DONUT OCR failed.")
+        err_text = "" if ok else str((debug_obj.get("error") if isinstance(debug_obj, dict) else "") or f"{engine} OCR failed.")
         html_out = _render_line_ocr_cards_html_ui(
             [
                 {
                     "line_no": 1,
                     "line_id": 1,
                     "line_box": [0, 0, w, h],
-                    "text": text_out if ok else "",
+                    "text": pred_text if ok else "",
                     "ok": ok,
                     "error": err_text,
                     "image_uri": _image_np_to_data_uri_png_ui(line_arr, max_width_px=420),
                 }
             ],
-            note="Direkter Zeilenmodus. Nur BDRC-Vorverarbeitung + DONUT OCR (UI nutzt Train-Script-Preprocessing-Helper, falls verfügbar).",
+            note=f"Direkter Zeilenmodus. OCR-Engine: {engine}.",
         )
         debug = {
             "ok": ok,
             "mode": mode,
+            "ocr_engine": engine,
             "requested_donut_preprocess": requested_preproc,
-            "effective_donut_preprocess": effective_preproc,
+            "effective_donut_preprocess": effective_preproc if engine == "DONUT" else "bdrc_ocr_internal",
+            "line_backend": backend,
+            "auto_download_notes": auto_notes or None,
             "line_device_requested": str(line_device or ""),
             "line_device_effective": (line_device_norm if line_device_norm else "auto"),
+            "ocr_device_effective": ocr_device_norm,
             "line_image_size": {"width": w, "height": h},
             "ocr": debug_obj,
         }
-        status = "Single line mode: BDRC preprocess + DONUT OCR."
+        status = f"Single line mode: {engine}."
         if not ok:
             status += f" Error: {err_text}"
-        overlay_out = preview if preview is not None else line_arr
-        return overlay_out, status, text_out, html_out, json.dumps(debug, ensure_ascii=False, indent=2)
+        if auto_notes:
+            status += " " + " ".join(auto_notes)
+        return overlay_out, status, pred_text, html_out, json.dumps(debug, ensure_ascii=False, indent=2)
 
     if image is None:
-        debug = {"ok": False, "mode": mode, "error": "Please upload a page image."}
+        debug = {"ok": False, "mode": mode, "ocr_engine": engine, "line_backend": backend, "error": "Please upload a page image."}
         return None, "Please upload a page image.", "", empty_html, json.dumps(debug, ensure_ascii=False, indent=2)
 
-    split_out = run_tibetan_text_line_split_classical(
-        image=image,
-        model_path=line_model_path,
-        conf=line_conf,
-        imgsz=line_imgsz,
-        device=line_device_norm,
-        min_line_height=line_min_height,
-        projection_smooth=line_projection_smooth,
-        projection_threshold_rel=line_projection_threshold_rel,
-        merge_gap_px=line_merge_gap_px,
-        draw_parent_boxes=True,
-        detect_red_text=False,
-        red_min_redness=26,
-        red_min_saturation=35,
-        red_column_fill_rel=0.07,
-        red_merge_gap_px=14,
-        red_min_width_px=18,
-        draw_red_boxes=False,
-    )
-    (
-        overlay,
-        split_status,
-        split_json,
-        _line_profile,
-        _selected_line_view,
-        _hierarchy_view,
-        _selected_line_profile,
-        _click_status,
-        click_state,
-    ) = split_out
-
-    line_records_raw = []
-    source_image = None
-    if isinstance(click_state, dict):
-        line_records_raw = click_state.get("line_boxes") or []
-        source_image = click_state.get("image")
-    if source_image is None:
-        source_image = image
-
-    try:
-        src = np.asarray(source_image).astype(np.uint8, copy=False)
-    except Exception:
-        src = np.asarray(image).astype(np.uint8, copy=False)
-
-    if src.size == 0 or src.ndim < 2:
-        debug = {
-            "ok": False,
-            "stage": "line_split",
-            "split_status": split_status,
-            "error": "Source image unavailable after line split.",
-        }
-        return overlay, split_status, "", empty_html, json.dumps(debug, ensure_ascii=False, indent=2)
-
+    src = np.asarray(image).astype(np.uint8, copy=False)
     h, w = src.shape[:2]
+    overlay = src
+    split_status = ""
+    split_json_obj: Any = {}
     parsed_lines: List[Dict[str, Any]] = []
-    for rec in line_records_raw:
-        if not isinstance(rec, dict):
-            continue
-        box = rec.get("line_box") or []
-        if not isinstance(box, (list, tuple)) or len(box) != 4:
-            continue
+
+    if backend == "YOLO Line Model":
+        if not str(yolo_line_model_path or "").strip():
+            debug = {"ok": False, "mode": mode, "ocr_engine": engine, "line_backend": backend, "error": "YOLO line model missing."}
+            return overlay, "YOLO line model missing.", "", empty_html, json.dumps(debug, ensure_ascii=False, indent=2)
+        if _predict_line_regions is None or _normalize_line_segmentation_preprocess_pipeline is None:
+            debug = {"ok": False, "mode": mode, "ocr_engine": engine, "line_backend": backend, "error": "YOLO line helpers unavailable."}
+            return overlay, "YOLO line helpers unavailable.", "", empty_html, json.dumps(debug, ensure_ascii=False, indent=2)
         try:
-            x1, y1, x2, y2 = [int(v) for v in box]
-        except Exception:
-            continue
-        x1 = max(0, min(w - 1, x1))
-        y1 = max(0, min(h - 1, y1))
-        x2 = max(0, min(w, x2))
-        y2 = max(0, min(h, y2))
-        if x2 <= x1 or y2 <= y1:
-            continue
-        parsed_lines.append(
-            {
-                "line_id": int(rec.get("line_id", len(parsed_lines) + 1)),
-                "line_box": [x1, y1, x2, y2],
+            predictions = _predict_line_regions(
+                src,
+                model_path=yolo_line_model_path,
+                conf=float(line_conf or _DEFAULT_LINE_SEGMENTATION_CONF),
+                imgsz=int(line_imgsz or _DEFAULT_LINE_SEGMENTATION_IMGSZ),
+                preprocess_pipeline=_normalize_line_segmentation_preprocess_pipeline(yolo_line_preproc or "gray"),
+                device=line_device_norm,
+            )
+            for idx, pred in enumerate(predictions, start=1):
+                box = getattr(pred, "box", None) or []
+                if len(box) != 4:
+                    continue
+                x1, y1, x2, y2 = [int(v) for v in box]
+                x1 = max(0, min(w - 1, x1))
+                y1 = max(0, min(h - 1, y1))
+                x2 = max(0, min(w, x2))
+                y2 = max(0, min(h, y2))
+                if x2 <= x1 or y2 <= y1:
+                    continue
+                parsed_lines.append({"line_id": idx, "line_box": [x1, y1, x2, y2]})
+            split_status = f"Detected {len(parsed_lines)} line(s) with YOLO line model."
+            split_json_obj = {
+                "backend": "yolo_line",
+                "line_model": str(yolo_line_model_path or ""),
+                "line_preprocess": str(yolo_line_preproc or "gray"),
+                "predict_conf": float(line_conf or _DEFAULT_LINE_SEGMENTATION_CONF),
+                "predict_imgsz": int(line_imgsz or _DEFAULT_LINE_SEGMENTATION_IMGSZ),
             }
+        except Exception as exc:
+            debug = {"ok": False, "mode": mode, "ocr_engine": engine, "line_backend": backend, "error": f"{type(exc).__name__}: {exc}"}
+            return overlay, f"YOLO line inference failed: {exc}", "", empty_html, json.dumps(debug, ensure_ascii=False, indent=2)
+    elif backend == "BDRC Line Model":
+        if not str(bdrc_line_model_path or "").strip():
+            debug = {"ok": False, "mode": mode, "ocr_engine": engine, "line_backend": backend, "error": "BDRC line model missing."}
+            return overlay, "BDRC line model missing.", "", empty_html, json.dumps(debug, ensure_ascii=False, indent=2)
+        if _predict_bdrc_line_regions is None:
+            debug = {"ok": False, "mode": mode, "ocr_engine": engine, "line_backend": backend, "error": "BDRC line helpers unavailable."}
+            return overlay, "BDRC line helpers unavailable.", "", empty_html, json.dumps(debug, ensure_ascii=False, indent=2)
+        try:
+            predictions, split_json_obj = _predict_bdrc_line_regions(
+                src,
+                model_path=bdrc_line_model_path,
+                device=line_device_norm,
+                group_lines=bool(bdrc_line_merge_lines),
+                k_factor=float(bdrc_line_k_factor),
+                bbox_tolerance=float(bdrc_line_bbox_tolerance),
+                use_rotation=bool(bdrc_line_use_rotation),
+                use_tps=bool(bdrc_line_use_tps),
+                tps_threshold=float(bdrc_line_tps_threshold),
+            )
+            for idx, pred in enumerate(predictions, start=1):
+                box = list(getattr(pred, "box", []) or [])
+                if len(box) != 4:
+                    continue
+                x1, y1, x2, y2 = [int(v) for v in box]
+                x1 = max(0, min(w - 1, x1))
+                y1 = max(0, min(h - 1, y1))
+                x2 = max(0, min(w, x2))
+                y2 = max(0, min(h, y2))
+                if x2 <= x1 or y2 <= y1:
+                    continue
+                rec: Dict[str, Any] = {"line_id": idx, "line_box": [x1, y1, x2, y2]}
+                crop_image = getattr(pred, "crop_image", None)
+                if isinstance(crop_image, np.ndarray) and crop_image.size > 0:
+                    rec["ocr_crop"] = np.asarray(crop_image).astype(np.uint8, copy=False)
+                parsed_lines.append(rec)
+            split_status = f"Detected {len(parsed_lines)} line(s) with BDRC line model."
+            if bool((split_json_obj or {}).get("tps_applied")):
+                split_status += " TPS dewarping applied."
+        except Exception as exc:
+            debug = {"ok": False, "mode": mode, "ocr_engine": engine, "line_backend": backend, "error": f"{type(exc).__name__}: {exc}"}
+            return overlay, f"BDRC line inference failed: {exc}", "", empty_html, json.dumps(debug, ensure_ascii=False, indent=2)
+    else:
+        if not str(classical_layout_model_path or "").strip():
+            debug = {"ok": False, "mode": mode, "ocr_engine": engine, "line_backend": backend, "error": "Classical layout model missing."}
+            return overlay, "Classical layout model missing.", "", empty_html, json.dumps(debug, ensure_ascii=False, indent=2)
+        split_out = run_tibetan_text_line_split_classical(
+            image=image,
+            model_path=classical_layout_model_path,
+            conf=line_conf,
+            imgsz=line_imgsz,
+            device=line_device_norm,
+            min_line_height=line_min_height,
+            projection_smooth=line_projection_smooth,
+            projection_threshold_rel=line_projection_threshold_rel,
+            merge_gap_px=line_merge_gap_px,
+            draw_parent_boxes=True,
+            detect_red_text=False,
+            red_min_redness=26,
+            red_min_saturation=35,
+            red_column_fill_rel=0.07,
+            red_merge_gap_px=14,
+            red_min_width_px=18,
+            draw_red_boxes=False,
         )
+        (
+            overlay,
+            split_status,
+            split_json,
+            _line_profile,
+            _selected_line_view,
+            _hierarchy_view,
+            _selected_line_profile,
+            _click_status,
+            click_state,
+        ) = split_out
+        line_records_raw = []
+        source_image = None
+        if isinstance(click_state, dict):
+            line_records_raw = click_state.get("line_boxes") or []
+            source_image = click_state.get("image")
+        if source_image is not None:
+            src = np.asarray(source_image).astype(np.uint8, copy=False)
+            h, w = src.shape[:2]
+        for rec in line_records_raw:
+            if not isinstance(rec, dict):
+                continue
+            box = rec.get("line_box") or []
+            if not isinstance(box, (list, tuple)) or len(box) != 4:
+                continue
+            try:
+                x1, y1, x2, y2 = [int(v) for v in box]
+            except Exception:
+                continue
+            x1 = max(0, min(w - 1, x1))
+            y1 = max(0, min(h - 1, y1))
+            x2 = max(0, min(w, x2))
+            y2 = max(0, min(h, y2))
+            if x2 <= x1 or y2 <= y1:
+                continue
+            parsed_lines.append({"line_id": int(rec.get("line_id", len(parsed_lines) + 1)), "line_box": [x1, y1, x2, y2]})
+        try:
+            split_json_obj = json.loads(split_json or "{}")
+        except Exception:
+            split_json_obj = split_json
 
     parsed_lines = sorted(parsed_lines, key=lambda r: (int(r["line_box"][1]), int(r["line_box"][0]), int(r["line_id"])))
+    if backend in {"YOLO Line Model", "BDRC Line Model"} and parsed_lines:
+        overlay_pil = Image.fromarray(np.asarray(src).astype(np.uint8, copy=False)).convert("RGB")
+        draw = ImageDraw.Draw(overlay_pil)
+        font = _load_overlay_font()
+        for idx, rec in enumerate(parsed_lines, start=1):
+            x1, y1, x2, y2 = [int(v) for v in rec["line_box"]]
+            draw.rectangle((x1, y1, x2, y2), outline=(0, 255, 255), width=3)
+            draw.rectangle((x1, max(0, y1 - 18), min(w, x1 + 62), y1), fill=(0, 0, 0))
+            draw.text((x1 + 4, max(0, y1 - 16)), f"line {idx}", fill=(255, 255, 255), font=font)
+        overlay = np.asarray(overlay_pil).astype(np.uint8, copy=False)
     total_detected_lines = len(parsed_lines)
     line_limit = max(0, int(max_lines))
     truncated = False
@@ -3899,16 +4433,19 @@ def run_page_line_donut_ocr_preview_ui(
         truncated = True
 
     if not parsed_lines:
-        note = "Keine Zeilen erkannt. Prüfe YOLO-Modellpfad/Klassen oder das Bild."
+        note = "Keine Zeilen erkannt. Prüfe Modellpfad oder Backend-Konfiguration."
         html_out = _render_line_ocr_cards_html_ui([], note=note)
         debug = {
             "ok": False,
             "stage": "line_split",
+            "mode": mode,
+            "ocr_engine": engine,
+            "line_backend": backend,
             "split_status": split_status,
             "total_detected_lines": int(total_detected_lines),
-            "split_json": json.loads(split_json) if (split_json or "").strip().startswith("{") else split_json,
+            "split_json": split_json_obj,
         }
-        return overlay, split_status, "", html_out, json.dumps(debug, ensure_ascii=False, indent=2)
+        return overlay, split_status or note, "", html_out, json.dumps(debug, ensure_ascii=False, indent=2)
 
     html_rows: List[Dict[str, Any]] = []
     copy_lines: List[str] = []
@@ -3917,7 +4454,7 @@ def run_page_line_donut_ocr_preview_ui(
 
     for line_no, rec in enumerate(parsed_lines, start=1):
         x1, y1, x2, y2 = [int(v) for v in rec["line_box"]]
-        crop = src[y1:y2, x1:x2]
+        crop = _crop_from_record(src, rec)
         if crop.size == 0:
             ocr_failures += 1
             html_rows.append(
@@ -3943,68 +4480,55 @@ def run_page_line_donut_ocr_preview_ui(
             )
             continue
 
-        _, pred_text, debug_json = run_donut_ocr_inference_ui(
-            image=crop,
-            model_root_or_model_dir=donut_model_dir,
-            image_preprocess_pipeline=effective_preproc,
-            device_preference=donut_device,
-            generation_max_length=donut_max_len,
-            num_beams=donut_num_beams,
-        )
-        try:
-            debug_obj = json.loads(debug_json or "{}")
-        except Exception:
-            debug_obj = {"raw_debug": debug_json}
+        _preview, pred_text, debug_obj = _run_selected_ocr(crop)
         ok = bool(isinstance(debug_obj, dict) and debug_obj.get("ok"))
         if not ok:
             ocr_failures += 1
-        text_out = str(pred_text or "")
         err_text = ""
         if not ok:
-            err_text = str((debug_obj.get("error") if isinstance(debug_obj, dict) else "") or "DONUT OCR failed.")
+            err_text = str((debug_obj.get("error") if isinstance(debug_obj, dict) else "") or f"{engine} OCR failed.")
         html_rows.append(
             {
                 "line_no": int(line_no),
                 "line_id": int(rec["line_id"]),
                 "line_box": [x1, y1, x2, y2],
-                "text": text_out if ok else "",
+                "text": pred_text if ok else "",
                 "ok": ok,
                 "error": err_text,
                 "image_uri": _image_np_to_data_uri_png_ui(crop, max_width_px=360),
             }
         )
-        copy_lines.append(f"[{line_no:02d}] {text_out if ok else ''}")
+        copy_lines.append(f"[{line_no:02d}] {pred_text if ok else ''}")
         ocr_debug_rows.append(
             {
                 "line_no": int(line_no),
                 "line_id": int(rec["line_id"]),
                 "line_box": [x1, y1, x2, y2],
                 "ok": ok,
-                "text": (text_out if ok else ""),
+                "text": (pred_text if ok else ""),
                 "error": err_text,
                 "debug": debug_obj,
             }
         )
 
-    note = f"Erkannte Zeilen: {total_detected_lines}. DONUT ausgeführt auf {len(parsed_lines)} Zeile(n)."
+    note = f"Erkannte Zeilen: {total_detected_lines}. {engine} ausgeführt auf {len(parsed_lines)} Zeile(n)."
     if truncated:
         note += f" Anzeige/Verarbeitung auf max_lines={line_limit} begrenzt."
     if ocr_failures:
         note += f" OCR-Fehler: {ocr_failures}."
     html_out = _render_line_ocr_cards_html_ui(html_rows, note=note)
 
-    split_json_obj: Any
-    try:
-        split_json_obj = json.loads(split_json or "{}")
-    except Exception:
-        split_json_obj = split_json
     debug = {
         "ok": ocr_failures == 0,
         "mode": mode,
+        "ocr_engine": engine,
+        "line_backend": backend,
         "requested_donut_preprocess": requested_preproc,
-        "effective_donut_preprocess": effective_preproc,
+        "effective_donut_preprocess": effective_preproc if engine == "DONUT" else "bdrc_ocr_internal",
+        "auto_download_notes": auto_notes or None,
         "line_device_requested": str(line_device or ""),
         "line_device_effective": (line_device_norm if line_device_norm else "auto"),
+        "ocr_device_effective": ocr_device_norm,
         "split_status": split_status,
         "ocr_status": note,
         "total_detected_lines": int(total_detected_lines),
@@ -4014,10 +4538,37 @@ def run_page_line_donut_ocr_preview_ui(
         "split_json": split_json_obj,
         "ocr_lines": ocr_debug_rows,
     }
-    final_status = split_status + " " + note + " DONUT preprocess=bdrc (train-script helper preferred)."
+    final_status = f"{split_status} {note}".strip()
+    if auto_notes:
+        final_status += " " + " ".join(auto_notes)
     copy_text = "\n".join(copy_lines)
-    return overlay, final_status.strip(), copy_text, html_out, json.dumps(debug, ensure_ascii=False, indent=2)
+    return overlay, final_status, copy_text, html_out, json.dumps(debug, ensure_ascii=False, indent=2)
 
+
+def scan_bdrc_line_models_ui(models_dir: str):
+    base = Path(models_dir).expanduser().resolve()
+    if not base.exists() or not base.is_dir():
+        return gr.update(choices=[], value=None), "", f"Directory not found: {base}"
+    if _find_bdrc_line_model_dirs is None:
+        return gr.update(choices=[], value=None), "", "BDRC line model helpers are unavailable."
+    found = _find_bdrc_line_model_dirs(base)
+    choices = [str(p) for p in found]
+    best = choices[0] if choices else ""
+    msg = f"Found {len(choices)} BDRC line model(s)." if choices else f"No BDRC line model found under {base}"
+    return gr.update(choices=choices, value=(best or None)), best, msg
+
+
+def scan_bdrc_ocr_models_ui(models_dir: str):
+    base = Path(models_dir).expanduser().resolve()
+    if not base.exists() or not base.is_dir():
+        return gr.update(choices=[], value=None), "", f"Directory not found: {base}"
+    if _find_bdrc_ocr_model_dirs is None:
+        return gr.update(choices=[], value=None), "", "BDRC OCR model helpers are unavailable."
+    found = _find_bdrc_ocr_model_dirs(base)
+    choices = [str(p) for p in found]
+    best = choices[0] if choices else ""
+    msg = f"Found {len(choices)} BDRC OCR model(s)." if choices else f"No BDRC OCR model found under {base}"
+    return gr.update(choices=choices, value=(best or None)), best, msg
 
 def scan_donut_ocr_models_ui(models_dir: str):
     base = Path(models_dir).expanduser().resolve()
@@ -5422,7 +5973,9 @@ def run_line_clip_dataset_debug_retrieval_ui(
 
 
 def refresh_image_list(dataset_dir: str, split: str):
-    split_images = Path(dataset_dir).expanduser().resolve() / split / "images"
+    split_images, _, _ = _resolve_yolo_split_io_dirs(dataset_dir, split)
+    if split_images is None:
+        return gr.update(choices=[], value=None), f"Could not resolve image split for dataset={dataset_dir!r} split={split!r}"
     images = _list_images(split_images)
     value = images[0] if images else None
     return gr.update(choices=images, value=value), f"{len(images)} image(s) found in {split_images}"
@@ -5431,8 +5984,11 @@ def refresh_image_list(dataset_dir: str, split: str):
 def preview_sample(dataset_dir: str, split: str, image_name: str):
     if not dataset_dir or not image_name:
         return None, "Select dataset/split/image first."
-    image_path = Path(dataset_dir).expanduser().resolve() / split / "images" / image_name
-    label_path = Path(dataset_dir).expanduser().resolve() / split / "labels" / f"{Path(image_name).stem}.txt"
+    split_images, split_labels, _ = _resolve_yolo_split_io_dirs(dataset_dir, split)
+    if split_images is None or split_labels is None:
+        return None, f"Could not resolve dataset split for dataset={dataset_dir!r} split={split!r}"
+    image_path = split_images / image_name
+    label_path = split_labels / f"{Path(image_name).stem}.txt"
     if not image_path.exists():
         return None, f"Image not found: {image_path}"
     rendered, summary = _draw_yolo_boxes(image_path, label_path)
@@ -5440,7 +5996,9 @@ def preview_sample(dataset_dir: str, split: str, image_name: str):
 
 
 def preview_adjacent_sample(dataset_dir: str, split: str, current_image: str, step: int):
-    split_images = Path(dataset_dir).expanduser().resolve() / split / "images"
+    split_images, _, _ = _resolve_yolo_split_io_dirs(dataset_dir, split)
+    if split_images is None:
+        return gr.update(choices=[], value=None), None, "No images found."
     images = _list_images(split_images)
     if not images:
         return gr.update(choices=[], value=None), None, "No images found."
@@ -6679,11 +7237,17 @@ def _archive_layout_best_model(
     run_tok = _sanitize_slug(name, default="run")
     ts = time.strftime("%Y%m%d-%H%M%S")
 
-    target_dir = (ROOT / "models" / "layoutModels").resolve()
+    task = _infer_ultralytics_task(dataset=dataset, model=model)
+    if task == "segment":
+        target_dir = (ROOT / "models" / "line_segmentation").resolve()
+        prefix = "line_seg"
+    else:
+        target_dir = (ROOT / "models" / "layoutModels").resolve()
+        prefix = "layout"
     target_dir.mkdir(parents=True, exist_ok=True)
 
     filename = (
-        f"layout_{dataset_tok}_{model_tok}_lr{lr0}_ep{int(epochs)}_bs{int(batch)}_"
+        f"{prefix}_{dataset_tok}_{model_tok}_lr{lr0}_ep{int(epochs)}_bs{int(batch)}_"
         f"sz{int(imgsz)}_pat{int(patience)}_{run_tok}_{ts}.pt"
     )
     target = target_dir / filename
@@ -6709,6 +7273,7 @@ def run_ultralytics_train_live(
     wandb_tags: str,
     wandb_name: str,
 ):
+    task = _infer_ultralytics_task(dataset, model)
     cmd = _build_ultralytics_train_cmd(
         dataset=dataset,
         model=model,
@@ -6759,7 +7324,10 @@ def run_ultralytics_train_live(
     stream_failed = False
     stream_fail_msg = ""
 
-    yield f"Running ...\nExpected best model path: {expected_best_model}\n", str(expected_best_model)
+    yield (
+        f"Running ...\nTask: {task}\nModel: {model}\nExpected best model path: {expected_best_model}\n",
+        str(expected_best_model),
+    )
 
     while True:
         got_output = False
@@ -6797,7 +7365,9 @@ def run_ultralytics_train_live(
             tail = _tail_lines_newest_first(log_lines, 800)
             if stream_failed and stream_fail_msg:
                 tail = f"{tail}\n[warning] {stream_fail_msg}" if tail else f"[warning] {stream_fail_msg}"
-            running_msg = f"Running ...\nExpected best model path: {expected_best_model}\n\n{tail}"
+            running_msg = (
+                f"Running ...\nTask: {task}\nModel: {model}\nExpected best model path: {expected_best_model}\n\n{tail}"
+            )
             yield running_msg, str(expected_best_model)
             last_emit_ts = now
             last_emit_count = len(log_lines)
@@ -6857,13 +7427,7 @@ def run_ultralytics_train_live(
 
 
 def _ultralytics_model_presets() -> List[str]:
-    return [
-        "yolo26n.pt",
-        "yolo26s.pt",
-        "yolo26m.pt",
-        "yolo26l.pt",
-        "yolo26x.pt",
-    ]
+    return _ultralytics_detect_model_presets() + _ultralytics_segment_model_presets()
 
 
 def scan_ultralytics_models(models_dir: str):
@@ -6904,6 +7468,17 @@ def run_ultralytics_train_from_ui(
     wandb_name: str,
 ):
     model = resolve_train_model(model_choice, model_override)
+    task = _infer_ultralytics_task(dataset, model)
+    if task == "segment" and _model_looks_clearly_wrong_for_segment_task(model):
+        recommended = _default_ultralytics_model_for_task("segment")
+        msg = (
+            "Refusing to start line-segmentation training with a model that does not look like a segmentation checkpoint.\n"
+            f"Dataset: {dataset}\n"
+            f"Selected model: {model or '(empty)'}\n"
+            f"Recommended: {recommended} or a checkpoint from {(ROOT / 'models' / 'line_segmentation').resolve()}"
+        )
+        yield msg, ""
+        return
     yield from run_ultralytics_train_live(
         dataset=dataset,
         model=model,
@@ -8914,6 +9489,72 @@ def _line_runs_from_threshold_mask(
     return merged
 
 
+def _filter_line_boxes_by_mean_height(
+    line_boxes: List[Tuple[int, int, int, int]],
+    *,
+    tolerance_ratio: float = 0.50,
+) -> List[Tuple[int, int, int, int]]:
+    if not line_boxes:
+        return []
+
+    valid_boxes = [box for box in line_boxes if int(box[3]) > int(box[1])]
+    if not valid_boxes:
+        return []
+
+    heights = np.asarray([int(y2) - int(y1) for _, y1, _, y2 in valid_boxes], dtype=np.float32)
+    mean_height = float(np.mean(heights)) if heights.size > 0 else 0.0
+    if mean_height <= 0.0:
+        return valid_boxes
+
+    tol = max(0.0, float(tolerance_ratio))
+    min_height = mean_height * max(0.0, 1.0 - tol)
+    max_height = mean_height * (1.0 + tol)
+    return [
+        box
+        for box in valid_boxes
+        if min_height <= float(int(box[3]) - int(box[1])) <= max_height
+    ]
+
+
+def _expand_line_boxes_vertically(
+    line_boxes: List[Tuple[int, int, int, int]],
+    *,
+    image_height: int,
+    top_pad_ratio: float = 0.30,
+    bottom_pad_ratio: float = 0.0,
+) -> List[Tuple[int, int, int, int]]:
+    if not line_boxes:
+        return []
+
+    out: List[Tuple[int, int, int, int]] = []
+    max_h = max(1, int(image_height))
+    for x1, y1, x2, y2 in line_boxes:
+        height = max(1, int(y2) - int(y1))
+        top_pad = max(1, int(math.ceil(float(height) * max(0.0, float(top_pad_ratio)))))
+        bottom_pad = max(0, int(math.ceil(float(height) * max(0.0, float(bottom_pad_ratio)))))
+        ny1 = max(0, int(y1) - top_pad)
+        ny2 = min(max_h, int(y2) + bottom_pad)
+        if int(x2) > int(x1) and ny2 > ny1:
+            out.append((int(x1), ny1, int(x2), ny2))
+    return out
+
+
+def _filter_tall_narrow_boxes(
+    line_boxes: List[Tuple[int, int, int, int]],
+) -> List[Tuple[int, int, int, int]]:
+    if not line_boxes:
+        return []
+
+    kept: List[Tuple[int, int, int, int]] = []
+    for x1, y1, x2, y2 in line_boxes:
+        box_w = max(1, int(x2) - int(x1))
+        box_h = max(1, int(y2) - int(y1))
+        if (float(box_w) / float(box_h)) < 1.0:
+            continue
+        kept.append((int(x1), int(y1), int(x2), int(y2)))
+    return kept
+
+
 def _segment_lines_in_text_crop(
     crop_rgb: np.ndarray,
     min_line_height: int,
@@ -9041,7 +9682,18 @@ def _segment_lines_in_text_crop(
         if tx2 > tx1 and ty2 > ty1:
             tightened.append((tx1, ty1, tx2, ty2))
 
-    return tightened
+    filtered = _filter_line_boxes_by_mean_height(tightened, tolerance_ratio=0.50)
+    if not filtered:
+        return []
+    filtered = _filter_tall_narrow_boxes(filtered)
+    if not filtered:
+        return []
+    return _expand_line_boxes_vertically(
+        filtered,
+        image_height=h,
+        top_pad_ratio=0.30,
+        bottom_pad_ratio=0.0,
+    )
 
 
 def _segment_red_runs_in_line_crop(
@@ -10461,19 +11113,29 @@ def build_ui() -> gr.Blocks:
             choices = _list_dataset_names(base)
             return gr.update(choices=choices, value=(choices[0] if choices else None))
 
-        # 12b) Minimal end-to-end page -> lines -> DONUT OCR preview
-        with gr.Tab("12b. Page -> Lines -> DONUT OCR"):
+        # 12b) Minimal end-to-end page -> lines -> OCR preview
+        with gr.Tab("12b. Page -> Lines -> OCR"):
             gr.Markdown(
-                "Minimal workflow: entweder Seite hochladen (Textbox-Erkennung + Line-Segmentierung + DONUT OCR) "
-                "oder direkt ein einzelnes Line-Image hochladen (nur BDRC-Vorverarbeitung + DONUT OCR). "
-                "Die Vorverarbeitung orientiert sich am DONUT-Train-Script (`bdrc`, Helper wird bevorzugt)."
+                "Minimal workflow: Seite hochladen und zwischen `Classical CV`, `YOLO Line Model` oder "
+                "`BDRC Line Model` wählen, danach `DONUT` oder `BDRC OCR` ausführen. "
+                "Alternativ direkt ein einzelnes Line-Image hochladen."
             )
             with gr.Row():
                 with gr.Column(scale=1):
                     lineocr_input_mode = gr.Radio(
-                        choices=["Page -> Lines -> DONUT", "Single Line -> DONUT"],
-                        value="Page -> Lines -> DONUT",
+                        choices=["Page -> Lines -> OCR", "Single Line -> OCR"],
+                        value="Page -> Lines -> OCR",
                         label="Input Mode",
+                    )
+                    lineocr_ocr_engine = gr.Radio(
+                        choices=["DONUT", "BDRC OCR"],
+                        value="DONUT",
+                        label="OCR Engine",
+                    )
+                    lineocr_line_backend = gr.Radio(
+                        choices=["Classical CV", "YOLO Line Model", "BDRC Line Model"],
+                        value="Classical CV",
+                        label="Line Backend",
                     )
                     lineocr_image = gr.Image(type="numpy", label="Page Image (for page mode)", sources=["upload", "clipboard"])
                     lineocr_direct_line_image = gr.Image(
@@ -10482,22 +11144,71 @@ def build_ui() -> gr.Blocks:
                         sources=["upload", "clipboard"],
                     )
                     with gr.Accordion("Model Selection", open=True):
-                        lineocr_line_models_dir = gr.Textbox(
-                            label="Scan line models dir",
+                        lineocr_classical_models_dir = gr.Textbox(
+                            label="Scan classical layout models dir",
                             value=str((workspace_root / "models" / "layoutModels").resolve()),
                         )
                         with gr.Row():
-                            lineocr_line_scan_btn = gr.Button("Scan Line Models")
-                            lineocr_line_scan_status = gr.Textbox(label="Line Scan Status", interactive=False)
-                        lineocr_line_model_select = gr.Dropdown(
+                            lineocr_classical_scan_btn = gr.Button("Scan Classical Layout Models")
+                            lineocr_classical_scan_status = gr.Textbox(label="Classical Scan Status", interactive=False)
+                        lineocr_classical_model_select = gr.Dropdown(
                             choices=[],
                             value=None,
-                            label="Detected Ultralytics line/text model",
+                            label="Detected layout model",
                             allow_custom_value=True,
                         )
-                        lineocr_line_model = gr.Textbox(
-                            label="line_model_path",
+                        lineocr_classical_model = gr.Textbox(
+                            label="classical_layout_model_path",
                             value=str((ROOT / "runs" / "detect" / "train" / "weights" / "best.pt").resolve()),
+                        )
+
+                        lineocr_yolo_line_models_dir = gr.Textbox(
+                            label="Scan YOLO line models dir",
+                            value=str((workspace_root / "models" / "line_segmentation").resolve()),
+                        )
+                        with gr.Row():
+                            lineocr_yolo_line_scan_btn = gr.Button("Scan YOLO Line Models")
+                            lineocr_yolo_line_scan_status = gr.Textbox(label="YOLO Line Scan Status", interactive=False)
+                        lineocr_yolo_line_model_select = gr.Dropdown(
+                            choices=[],
+                            value=None,
+                            label="Detected YOLO line model",
+                            allow_custom_value=True,
+                        )
+                        lineocr_yolo_line_model = gr.Textbox(
+                            label="yolo_line_model_path",
+                            value="",
+                        )
+
+                        lineocr_bdrc_models_dir = gr.Textbox(
+                            label="Scan BDRC models dir",
+                            value=str((workspace_root / "models" / "bdrc").resolve()),
+                        )
+                        with gr.Row():
+                            lineocr_bdrc_line_scan_btn = gr.Button("Scan BDRC Line Models")
+                            lineocr_bdrc_line_scan_status = gr.Textbox(label="BDRC Line Scan Status", interactive=False)
+                        lineocr_bdrc_line_model_select = gr.Dropdown(
+                            choices=[],
+                            value=None,
+                            label="Detected BDRC line model",
+                            allow_custom_value=True,
+                        )
+                        lineocr_bdrc_line_model = gr.Textbox(
+                            label="bdrc_line_model_path",
+                            value="",
+                        )
+                        with gr.Row():
+                            lineocr_bdrc_ocr_scan_btn = gr.Button("Scan BDRC OCR Models")
+                            lineocr_bdrc_ocr_scan_status = gr.Textbox(label="BDRC OCR Scan Status", interactive=False)
+                        lineocr_bdrc_ocr_model_select = gr.Dropdown(
+                            choices=[],
+                            value=None,
+                            label="Detected BDRC OCR model",
+                            allow_custom_value=True,
+                        )
+                        lineocr_bdrc_ocr_model_dir = gr.Textbox(
+                            label="bdrc_ocr_model_dir",
+                            value="",
                         )
 
                         lineocr_donut_models_dir = gr.Textbox(
@@ -10528,6 +11239,41 @@ def build_ui() -> gr.Blocks:
                             label="line_device",
                         )
                         with gr.Row():
+                            lineocr_bdrc_merge_lines = gr.Checkbox(
+                                label="bdrc_merge_lines",
+                                value=_DEFAULT_BDRC_LINE_MERGE_LINES,
+                            )
+                            lineocr_bdrc_use_rotation = gr.Checkbox(
+                                label="bdrc_use_rotation",
+                                value=_DEFAULT_UI_BDRC_LINE_USE_ROTATION,
+                            )
+                            lineocr_bdrc_use_tps = gr.Checkbox(
+                                label="bdrc_use_tps",
+                                value=_DEFAULT_UI_BDRC_LINE_USE_TPS,
+                            )
+                            lineocr_bdrc_tps_threshold = gr.Slider(
+                                0.0,
+                                1.0,
+                                value=float(_DEFAULT_BDRC_LINE_TPS_THRESHOLD),
+                                step=0.01,
+                                label="bdrc_tps_threshold",
+                            )
+                        with gr.Row():
+                            lineocr_bdrc_k_factor = gr.Slider(
+                                0.5,
+                                5.0,
+                                value=float(_DEFAULT_BDRC_LINE_K_FACTOR),
+                                step=0.1,
+                                label="bdrc_k_factor",
+                            )
+                            lineocr_bdrc_bbox_tolerance = gr.Slider(
+                                1.0,
+                                6.0,
+                                value=float(_DEFAULT_BDRC_LINE_BBOX_TOLERANCE),
+                                step=0.1,
+                                label="bdrc_bbox_tolerance",
+                            )
+                        with gr.Row():
                             lineocr_min_line_height = gr.Number(label="min_line_height_px", value=10, precision=0)
                             lineocr_merge_gap = gr.Number(label="line_merge_gap_px", value=5, precision=0)
                         with gr.Row():
@@ -10540,25 +11286,30 @@ def build_ui() -> gr.Blocks:
                                 label="projection_threshold_rel",
                             )
                         with gr.Row():
-                            lineocr_donut_preproc = gr.Textbox(
-                                label="donut_preprocess (fixed in Quick tab)",
-                                value="bdrc",
-                                interactive=False,
+                            lineocr_yolo_line_preproc = gr.Dropdown(
+                                choices=["gray", "bdrc", "rgb", "none"],
+                                value="gray",
+                                label="yolo_line_preprocess",
                             )
-                            lineocr_donut_device = gr.Dropdown(
+                            lineocr_donut_preproc = gr.Dropdown(
+                                choices=["bdrc", "gray", "rgb"],
+                                value="bdrc",
+                                label="donut_preprocess",
+                            )
+                            lineocr_ocr_device = gr.Dropdown(
                                 choices=["auto", "cuda:0", "cuda:1", "cuda:2", "cuda:3", "cpu"],
                                 value="auto",
-                                label="donut_device",
+                                label="ocr_device",
                             )
                         with gr.Row():
-                            lineocr_donut_max_len = gr.Number(label="generation_max_length", value=512, precision=0)
-                            lineocr_donut_beams = gr.Number(label="num_beams", value=1, precision=0)
+                            lineocr_donut_max_len = gr.Number(label="generation_max_length (DONUT)", value=512, precision=0)
+                            lineocr_donut_beams = gr.Number(label="num_beams (DONUT)", value=1, precision=0)
                         lineocr_max_lines = gr.Number(label="max_lines (0=all)", value=0, precision=0)
 
                     lineocr_run_btn = gr.Button("Run Quick OCR (Page/Line)", variant="primary")
 
                 with gr.Column(scale=1):
-                    lineocr_overlay = gr.Image(type="numpy", label="Preview (Page Overlay or Preprocessed Line)")
+                    lineocr_overlay = gr.Image(type="numpy", label="Preview (Page Overlay or OCR Preprocess)")
                     lineocr_status = gr.Textbox(label="Status", lines=3, interactive=False)
                     lineocr_copy_text = gr.Textbox(label="Line Text (Copy/Paste)", lines=10)
                     lineocr_cards_html = gr.HTML(
@@ -10570,15 +11321,74 @@ def build_ui() -> gr.Blocks:
                     with gr.Accordion("Debug JSON", open=False):
                         lineocr_debug_json = gr.Code(label="Workflow Debug JSON", language="json")
 
-            lineocr_line_scan_btn.click(
+            lineocr_classical_scan_btn.click(
                 fn=scan_ultralytics_inference_models,
-                inputs=[lineocr_line_models_dir],
-                outputs=[lineocr_line_model_select, lineocr_line_scan_status],
+                inputs=[lineocr_classical_models_dir],
+                outputs=[lineocr_classical_model_select, lineocr_classical_scan_status],
             )
-            lineocr_line_model_select.change(
+            lineocr_classical_model_select.change(
                 fn=lambda x: x or "",
-                inputs=[lineocr_line_model_select],
-                outputs=[lineocr_line_model],
+                inputs=[lineocr_classical_model_select],
+                outputs=[lineocr_classical_model],
+            )
+            lineocr_yolo_line_scan_btn.click(
+                fn=scan_ultralytics_inference_models,
+                inputs=[lineocr_yolo_line_models_dir],
+                outputs=[lineocr_yolo_line_model_select, lineocr_yolo_line_scan_status],
+            )
+            lineocr_yolo_line_model_select.change(
+                fn=lambda x: x or "",
+                inputs=[lineocr_yolo_line_model_select],
+                outputs=[lineocr_yolo_line_model],
+            )
+            lineocr_bdrc_line_scan_btn.click(
+                fn=scan_bdrc_line_models_ui,
+                inputs=[lineocr_bdrc_models_dir],
+                outputs=[lineocr_bdrc_line_model_select, lineocr_bdrc_line_model, lineocr_bdrc_line_scan_status],
+            )
+            lineocr_bdrc_line_model_select.change(
+                fn=lambda x: x or "",
+                inputs=[lineocr_bdrc_line_model_select],
+                outputs=[lineocr_bdrc_line_model],
+            )
+            lineocr_bdrc_ocr_scan_btn.click(
+                fn=scan_bdrc_ocr_models_ui,
+                inputs=[lineocr_bdrc_models_dir],
+                outputs=[lineocr_bdrc_ocr_model_select, lineocr_bdrc_ocr_model_dir, lineocr_bdrc_ocr_scan_status],
+            )
+            lineocr_bdrc_ocr_model_select.change(
+                fn=lambda x: x or "",
+                inputs=[lineocr_bdrc_ocr_model_select],
+                outputs=[lineocr_bdrc_ocr_model_dir],
+            )
+
+            def _on_quick_ocr_engine_change(engine: str, current_path: str):
+                if str(engine or "").strip() != "BDRC OCR":
+                    return gr.update(), gr.update()
+                try:
+                    chosen, note = _ensure_default_bdrc_ocr_model_ui(current_path)
+                    return chosen, (note or "BDRC OCR model ready.")
+                except Exception as exc:
+                    return gr.update(), f"BDRC OCR auto-download failed: {type(exc).__name__}: {exc}"
+
+            def _on_quick_line_backend_change(backend: str, current_path: str):
+                if str(backend or "").strip() != "BDRC Line Model":
+                    return gr.update(), gr.update()
+                try:
+                    chosen, note = _ensure_default_bdrc_line_model_ui(current_path)
+                    return chosen, (note or "BDRC line model ready.")
+                except Exception as exc:
+                    return gr.update(), f"BDRC line auto-download failed: {type(exc).__name__}: {exc}"
+
+            lineocr_ocr_engine.change(
+                fn=_on_quick_ocr_engine_change,
+                inputs=[lineocr_ocr_engine, lineocr_bdrc_ocr_model_dir],
+                outputs=[lineocr_bdrc_ocr_model_dir, lineocr_bdrc_ocr_scan_status],
+            )
+            lineocr_line_backend.change(
+                fn=_on_quick_line_backend_change,
+                inputs=[lineocr_line_backend, lineocr_bdrc_line_model],
+                outputs=[lineocr_bdrc_line_model, lineocr_bdrc_line_scan_status],
             )
             lineocr_donut_scan_btn.click(
                 fn=scan_donut_ocr_models_ui,
@@ -10596,7 +11406,18 @@ def build_ui() -> gr.Blocks:
                     lineocr_input_mode,
                     lineocr_image,
                     lineocr_direct_line_image,
-                    lineocr_line_model,
+                    lineocr_ocr_engine,
+                    lineocr_line_backend,
+                    lineocr_classical_model,
+                    lineocr_yolo_line_model,
+                    lineocr_yolo_line_preproc,
+                    lineocr_bdrc_line_model,
+                    lineocr_bdrc_merge_lines,
+                    lineocr_bdrc_k_factor,
+                    lineocr_bdrc_bbox_tolerance,
+                    lineocr_bdrc_use_rotation,
+                    lineocr_bdrc_use_tps,
+                    lineocr_bdrc_tps_threshold,
                     lineocr_line_conf,
                     lineocr_line_imgsz,
                     lineocr_line_device,
@@ -10606,7 +11427,8 @@ def build_ui() -> gr.Blocks:
                     lineocr_merge_gap,
                     lineocr_donut_model_dir,
                     lineocr_donut_preproc,
-                    lineocr_donut_device,
+                    lineocr_bdrc_ocr_model_dir,
+                    lineocr_ocr_device,
                     lineocr_donut_max_len,
                     lineocr_donut_beams,
                     lineocr_max_lines,
@@ -10914,12 +11736,12 @@ def build_ui() -> gr.Blocks:
 
         # 4) Visual QA
         with gr.Tab("4. Dataset Preview"):
-            gr.Markdown("Inspect generated dataset and render YOLO label boxes.")
+            gr.Markdown("Inspect YOLO detect/segment datasets and render bounding boxes or polygons.")
             with gr.Row():
                 dataset_base = gr.Textbox(label="Datasets Base Directory", value=default_dataset_base)
                 scan_datasets_btn = gr.Button("Scan Datasets")
             dataset_select = gr.Dropdown(label="Dataset Directory", choices=[default_dataset], value=default_dataset)
-            split_select = gr.Dropdown(label="Split", choices=["train", "val"], value="train")
+            split_select = gr.Dropdown(label="Split", choices=["train", "val", "test"], value="train")
             with gr.Row():
                 refresh_images_btn = gr.Button("Refresh Image List")
                 image_select = gr.Dropdown(label="Image", choices=[])
@@ -10955,10 +11777,21 @@ def build_ui() -> gr.Blocks:
 
         # 5) Training
         with gr.Tab("5. Ultralytics Training"):
-            gr.Markdown("Train a detection model via `train_model.py`.")
+            gr.Markdown(
+                "Train a YOLO detection or segmentation model. "
+                "The tab auto-detects polygon line datasets and suggests matching model/project defaults."
+            )
             train_dataset_choices = _list_dataset_names(default_dataset_base)
             default_train_dataset = train_dataset_choices[0] if train_dataset_choices else "tibetan-yolo"
+            default_train_task = _infer_ultralytics_task(default_train_dataset, "")
             train_model_presets = _ultralytics_model_presets()
+            default_train_model = _default_ultralytics_model_for_task(default_train_task)
+            default_train_project = _default_ultralytics_project_for_task(default_train_task)
+            default_train_status = _summarize_ultralytics_training_mode(
+                default_train_dataset,
+                default_train_model,
+                default_train_project,
+            )
 
             with gr.Row():
                 train_dataset_base = gr.Textbox(label="Datasets Base Directory", value=default_dataset_base)
@@ -10975,7 +11808,7 @@ def build_ui() -> gr.Blocks:
             train_model = gr.Dropdown(
                 label="model",
                 choices=train_model_presets,
-                value=train_model_presets[0],
+                value=default_train_model,
                 allow_custom_value=True,
             )
             train_model_scan_msg = gr.Textbox(label="Model Scan Status", interactive=False)
@@ -10993,10 +11826,11 @@ def build_ui() -> gr.Blocks:
                 with gr.Column():
                     train_workers = gr.Number(label="workers", value=8, precision=0)
                     train_device = gr.Textbox(label="device", value="cuda:0")
-                    train_project = gr.Textbox(label="project", value=str((workspace_root / "runs" / "detect").resolve()))
+                    train_project = gr.Textbox(label="project", value=default_train_project)
                     train_name = gr.Textbox(label="name", value="train-ui")
                     train_patience = gr.Number(label="patience", value=50, precision=0)
                     train_export = gr.Checkbox(label="export", value=True)
+            train_task_hint = gr.Textbox(label="Training Mode", value=default_train_status, lines=6, interactive=False)
 
             with gr.Accordion("Weights & Biases", open=False):
                 train_wandb = gr.Checkbox(label="wandb", value=False)
@@ -11014,6 +11848,21 @@ def build_ui() -> gr.Blocks:
                 fn=scan_ultralytics_models,
                 inputs=[train_models_dir],
                 outputs=[train_model, train_model_scan_msg],
+            )
+            train_dataset.change(
+                fn=_refresh_ultralytics_training_defaults,
+                inputs=[train_dataset, train_model, train_model_override, train_project],
+                outputs=[train_model, train_project, train_task_hint],
+            )
+            train_model.change(
+                fn=_refresh_ultralytics_training_status_only,
+                inputs=[train_dataset, train_model, train_model_override, train_project],
+                outputs=[train_project, train_task_hint],
+            )
+            train_model_override.change(
+                fn=_refresh_ultralytics_training_status_only,
+                inputs=[train_dataset, train_model, train_model_override, train_project],
+                outputs=[train_project, train_task_hint],
             )
             train_run_btn.click(
                 fn=run_ultralytics_train_from_ui,
