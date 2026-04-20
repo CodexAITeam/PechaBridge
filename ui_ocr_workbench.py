@@ -4810,7 +4810,7 @@ function() {
 
 if __name__ == "__main__":
     app = build_ui()
-    host = os.environ.get("UI_HOST", "127.0.0.1")
+    host = os.environ.get("UI_HOST", "0.0.0.0")
     try:
         port = int(os.environ.get("UI_PORT", "7865"))
     except ValueError:
