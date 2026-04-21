@@ -332,6 +332,80 @@ def _upload_file_with_progress(
 # Main upload logic
 # ---------------------------------------------------------------------------
 
+def update_model_card(
+    checkpoint_path: str,
+    repo_id: str,
+    token: str,
+    *,
+    dry_run: bool = False,
+    commit_message: str = "",
+) -> None:
+    """Push only the README.md (model card) to an existing HF repo.
+
+    This is useful for updating the model card without re-uploading the full
+    model weights.  The preprocessing pipeline is read from the repro bundle
+    if present, otherwise defaults to 'bdrc'.
+    """
+    _require_hf_hub()
+    from huggingface_hub import HfApi
+
+    ckpt = Path(checkpoint_path).expanduser().resolve()
+    has_repro = (ckpt / "repro").is_dir()
+    preprocess_pipeline = _read_repro_preprocess_pipeline(ckpt) or "bdrc"
+
+    readme_content = _build_readme(
+        repo_id=repo_id,
+        ckpt=ckpt,
+        preprocess_pipeline=preprocess_pipeline,
+        has_repro=has_repro,
+    )
+
+    print(f"\n{'='*60}")
+    print(f"  Update HF Model Card (README only)")
+    print(f"{'='*60}")
+    print(f"  Checkpoint : {ckpt}")
+    print(f"  Repo ID    : {repo_id}")
+    print(f"  Dry-run    : {dry_run}")
+    print(f"{'='*60}\n")
+
+    if dry_run:
+        print("--- README.md (dry-run, not uploaded) ---")
+        print(readme_content)
+        print("-----------------------------------------")
+        return
+
+    import tempfile
+    api = HfApi(token=token or None)
+    msg = commit_message or f"Update model card (README.md) via PechaBridge"
+    with tempfile.NamedTemporaryFile(mode="w", suffix=".md", delete=False, encoding="utf-8") as f:
+        f.write(readme_content)
+        tmp_path = Path(f.name)
+    try:
+        _upload_file_with_progress(
+            api=api,
+            local_path=tmp_path,
+            path_in_repo="README.md",
+            repo_id=repo_id,
+            commit_message=msg,
+        )
+        print(f"\n✓ Model card updated: https://huggingface.co/{repo_id}")
+    finally:
+        tmp_path.unlink(missing_ok=True)
+
+
+def _read_repro_preprocess_pipeline(ckpt: Path) -> Optional[str]:
+    """Read the preprocessing pipeline name from a repro bundle if present."""
+    import json
+    repro_file = ckpt / "repro" / "image_preprocess.json"
+    if repro_file.exists():
+        try:
+            data = json.loads(repro_file.read_text(encoding="utf-8"))
+            return str(data.get("pipeline") or data.get("preprocess_pipeline") or "").strip() or None
+        except Exception:
+            pass
+    return None
+
+
 def upload_donut_checkpoint(
     checkpoint_path: str,
     repo_id: str,
@@ -600,6 +674,17 @@ Examples:
         help="Show what would be uploaded without actually uploading anything.",
     )
     parser.add_argument(
+        "--readme-only",
+        "--readme_only",
+        dest="readme_only",
+        action="store_true",
+        default=False,
+        help=(
+            "Only update the README.md (model card) on HF — do not re-upload model weights. "
+            "Useful for fixing the model card without a full re-upload."
+        ),
+    )
+    parser.add_argument(
         "--commit-message",
         default="",
         metavar="MSG",
@@ -629,14 +714,23 @@ def main(argv: Optional[List[str]] = None) -> int:
         )
         return 1
 
-    upload_donut_checkpoint(
-        checkpoint_path=args.checkpoint,
-        repo_id=args.repo_id,
-        token=token,
-        private=args.private,
-        dry_run=args.dry_run,
-        commit_message=args.commit_message,
-    )
+    if getattr(args, "readme_only", False):
+        update_model_card(
+            checkpoint_path=args.checkpoint,
+            repo_id=args.repo_id,
+            token=token,
+            dry_run=args.dry_run,
+            commit_message=args.commit_message,
+        )
+    else:
+        upload_donut_checkpoint(
+            checkpoint_path=args.checkpoint,
+            repo_id=args.repo_id,
+            token=token,
+            private=args.private,
+            dry_run=args.dry_run,
+            commit_message=args.commit_message,
+        )
     return 0
 
 
