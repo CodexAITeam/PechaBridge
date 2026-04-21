@@ -44,6 +44,10 @@ from scripts.download_pechabridge_models import (
     create_parser as create_download_pechabridge_models_parser,
     main as _download_pechabridge_models_main,
 )
+from scripts.download_sbb_images import (
+    create_parser as create_download_sbb_images_parser,
+    run as _run_download_sbb_images,
+)
 from scripts.eval_ocr_tokenizer import create_parser as create_eval_ocr_tokenizer_parser
 from scripts.train_line_segmentation import create_parser as create_train_line_segmentation_parser
 from scripts.warm_line_clip_workbench_cache import (
@@ -273,6 +277,16 @@ def _build_root_parser() -> argparse.ArgumentParser:
     )
     download_pb_parser.set_defaults(handler=_run_download_pechabridge_models)
 
+    download_sbb_parent = create_download_sbb_images_parser(add_help=False)
+    download_sbb_parser = subparsers.add_parser(
+        "download-sbb-images",
+        aliases=["download-stabi-images", "download-sbb"],
+        parents=[download_sbb_parent],
+        help="Download page images from the Staatsbibliothek zu Berlin (SBB / Stabi) by PPN",
+        description=download_sbb_parent.description,
+    )
+    download_sbb_parser.set_defaults(handler=_run_download_sbb_images_cmd)
+
     bosentencepiece_parent = create_download_bosentencepiece_tokenizer_parser(add_help=False)
     bosentencepiece_parser = subparsers.add_parser(
         "download-bosentencepiece-tokenizer",
@@ -494,6 +508,10 @@ def _run_download_bosentencepiece_tokenizer(args: argparse.Namespace) -> int:
     from scripts.download_bosentencepiece_tokenizer import run
 
     return int(run(args))
+
+
+def _run_download_sbb_images_cmd(args: argparse.Namespace) -> int:
+    return int(_run_download_sbb_images(args))
 
 
 def _run_batch_ocr(args: argparse.Namespace) -> int:

@@ -980,7 +980,43 @@ def run(args: argparse.Namespace) -> int:
     layout_model = str(getattr(args, "layout_model", "") or "").strip()
     line_model = str(getattr(args, "line_model", "") or "").strip()
     bdrc_line_model = str(getattr(args, "bdrc_line_model", "") or "").strip()
-    input_dir = Path(args.input_dir).expanduser().resolve()
+
+    # --- SBB download (--ppn) ---
+    ppn_raw = str(getattr(args, "ppn", "") or "").strip()
+    if ppn_raw:
+        ppn = ppn_raw[3:] if ppn_raw.upper().startswith("PPN") else ppn_raw
+        sbb_output_dir = str(getattr(args, "sbb_output_dir", "") or "").strip() or f"sbb_images/{ppn}"
+        sbb_max_pages = int(getattr(args, "sbb_max_pages", 0) or 0)
+        sbb_workers = int(getattr(args, "sbb_workers", 8) or 8)
+        sbb_verify_ssl = bool(getattr(args, "sbb_verify_ssl", True))
+        LOGGER.info("PPN provided — downloading SBB images for PPN %s into %s …", ppn, sbb_output_dir)
+        try:
+            from scripts.download_sbb_images import run as _download_sbb
+            import argparse as _ap
+            _dl_args = _ap.Namespace(
+                ppn=ppn,
+                output_dir=sbb_output_dir,
+                max_pages=sbb_max_pages,
+                workers=sbb_workers,
+                verify_ssl=sbb_verify_ssl,
+                show_metadata=False,
+            )
+            rc = _download_sbb(_dl_args)
+            if rc != 0:
+                LOGGER.error("SBB download failed (exit code %d). Aborting.", rc)
+                return 1
+        except Exception as exc:
+            LOGGER.error("SBB download raised an exception: %s: %s", type(exc).__name__, exc)
+            return 1
+        # Override input_dir with the downloaded folder
+        _input_dir_str = sbb_output_dir
+    else:
+        _input_dir_str = str(getattr(args, "input_dir", "") or "").strip()
+        if not _input_dir_str:
+            LOGGER.error("Either --ppn or --input-dir must be provided.")
+            return 1
+
+    input_dir = Path(_input_dir_str).expanduser().resolve()
     device_pref = str(getattr(args, "device", "auto") or "auto").strip().lower()
     max_len = int(getattr(args, "max_len", 0) or 0)
     line_preprocess = str(getattr(args, "line_preprocess", "gray") or "gray").strip().lower()
@@ -1367,6 +1403,10 @@ def create_parser(add_help: bool = True) -> argparse.ArgumentParser:
         prog="batch-ocr",
         description=(
             "Batch OCR a folder of Pecha images using a layout model + OCR engine.\n\n"
+            "SBB / Stabi one-command workflow:\n"
+            "  Pass --ppn <PPN> to download images from the Staatsbibliothek zu Berlin\n"
+            "  automatically before OCR. --input-dir is then optional.\n"
+            "  Example: python cli.py batch-ocr --ppn 337138764X --layout-engine bdrc_line --ocr-engine bdrc_ocr\n\n"
             "OCR engines (--ocr-engine):\n"
             "  donut      (default) DONUT VisionEncoderDecoder model. Preprocessing pipeline\n"
             "             is auto-detected from the repro bundle (repro/image_preprocess.json).\n"
@@ -1583,12 +1623,72 @@ def create_parser(add_help: bool = True) -> argparse.ArgumentParser:
         "--input_dir",
         dest="input_dir",
         type=str,
-        required=True,
+        default="",
         help=(
             "Directory containing Pecha images to OCR. "
             "Supported formats: jpg, jpeg, png, tif, tiff, bmp, webp. "
-            "Files are processed in sorted order."
+            "Files are processed in sorted order. "
+            "Required unless --ppn is given (in which case images are downloaded first)."
         ),
+    )
+
+    # --- SBB download options ---
+    sbb_group = parser.add_argument_group(
+        "SBB / Stabi download options",
+        description=(
+            "When --ppn is provided, images are downloaded from the Staatsbibliothek zu Berlin "
+            "before OCR runs. --input-dir is then optional (defaults to sbb_images/<PPN>)."
+        ),
+    )
+    sbb_group.add_argument(
+        "--ppn",
+        type=str,
+        default="",
+        metavar="PPN",
+        help=(
+            "PPN (Pica Production Number) of an SBB document. "
+            "When set, all pages are downloaded from the SBB METS API before OCR. "
+            "Example: --ppn 337138764X. "
+            "Overrides --input-dir (the downloaded folder is used as input)."
+        ),
+    )
+    sbb_group.add_argument(
+        "--sbb-output-dir",
+        "--sbb_output_dir",
+        dest="sbb_output_dir",
+        type=str,
+        default="",
+        metavar="DIR",
+        help=(
+            "Directory to save downloaded SBB images. "
+            "Defaults to sbb_images/<PPN>. Only used when --ppn is set."
+        ),
+    )
+    sbb_group.add_argument(
+        "--sbb-max-pages",
+        "--sbb_max_pages",
+        dest="sbb_max_pages",
+        type=int,
+        default=0,
+        metavar="N",
+        help="Maximum number of SBB pages to download (0 = all). Only used when --ppn is set.",
+    )
+    sbb_group.add_argument(
+        "--sbb-workers",
+        "--sbb_workers",
+        dest="sbb_workers",
+        type=int,
+        default=8,
+        metavar="N",
+        help="Number of parallel download threads for SBB images. Default: 8.",
+    )
+    sbb_group.add_argument(
+        "--sbb-no-verify-ssl",
+        "--sbb_no_verify_ssl",
+        dest="sbb_verify_ssl",
+        action="store_false",
+        default=True,
+        help="Disable SSL certificate verification for SBB downloads.",
     )
     parser.add_argument(
         "--device",

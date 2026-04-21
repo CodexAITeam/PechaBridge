@@ -1,12 +1,10 @@
 ![PechaBridge Hero](assets/hero_pb.jpeg)
 
-# PechaBridge Workbench
+# PechaBridge
 
-## Project Description
+PechaBridge is a library for **Tibetan document understanding** with a focus on training OCR and Line Segmentation models for text retrieval in Tibetan script.
 
-PechaBridge is a workflow for **Tibetan document understanding** with a focus on training OCR and Line Segmentation models for text retrieval in Tibetan script.
-
-The primary entrypoint for end-to-end usage is the **OCR Workbencg** (`ui_ocr_workbench.py`).
+The primary entrypoint for end-to-end usage is the **OCR Workbench** (`ui_ocr_workbench.py`).
 
 ## Example: SBB Pecha OCR
 
@@ -25,15 +23,15 @@ Sample OCR output for the page shown above:
 སྨན་སྦུར་ཆུ་གཙང་དག་བཞི་ཁྲུས། །ཡ དི་བཞིན་སྲིན་ཕུད་མཁན་
 ``` 
 
-```markdown
-> ⚠ The transcript above is an early-stage model output and may contain
-> recognition errors. Accuracy improves with more training data.
-``` 
+⚠ The transcript above is current model output (April 2026) and may contain
+recognition errors. Accuracy improves with more training data.
 
 ## Core Features
 
+- **End-to-end Tibetan Pecha OCR pipeline**: Automatically segments lines on digitised Pecha pages (e.g. from the Staatsbibliothek zu Berlin) using a YOLO-based line segmentation model, then transcribes each line with a fine-tuned Donut VLM. A single `batch-ocr` CLI command covers download → line detection → OCR → transcript export.
 - **Synthetic multi-class dataset generation**: Creates YOLO-ready pages for Tibetan number words, Tibetan text blocks, and Chinese number words.
-- **OCR-ready target export**: Optionally saves rendered OCR targets with deterministic line linearization and optional OCR crop export by label.
+
+### Advanced Research Features
 - **Standalone DONUT/TroCR OCR training**: Trains OCR directly on OpenPecha/BDRC line manifests (`train-donut-ocr`) with `none|pb|gray|bdrc|rgb` image preprocessing and CER evaluation.
 - **Retrieval encoder training + eval**: Trains ViT/DINOv2 patch encoders with mp-InfoNCE and exports FAISS-ready embeddings plus cross-page evaluation.
 - **Dual vision-text encoder (CLIP-style) training**: Trains DINOv2 + text encoder (e.g. ByT5) on line image/text manifests (`line_clip`) for text-to-line and line-to-text retrieval.
@@ -159,7 +157,7 @@ models/
 # BDRC line segmentation + BDRC OCR:
 python cli.py batch-ocr \
     --layout-engine   bdrc_line \
-    --bdrc-line-model models/bdrc/Lines \
+    --bdrc-line-model models/bdrc/Layout \
     --ocr-engine      bdrc_ocr \
     --bdrc-ocr-model  models/bdrc/OCRModels/Woodblock \
     --input-dir       /path/to/pecha/images
@@ -167,7 +165,7 @@ python cli.py batch-ocr \
 # BDRC line segmentation + PechaBridge DONUT OCR:
 python cli.py batch-ocr \
     --layout-engine   bdrc_line \
-    --bdrc-line-model models/bdrc/Lines \
+    --bdrc-line-model models/bdrc/Layout \
     --ocr-engine      donut \
     --ocr-model       models/ocr/PechaBridgeOCR \
     --input-dir       /path/to/pecha/images
@@ -175,6 +173,82 @@ python cli.py batch-ocr \
 
 > **Tip:** `--bdrc-line-model` and `--bdrc-ocr-model` are optional — when
 > omitted the CLI auto-downloads the models into `models/bdrc/` on first use.
+> The auto-selected model is `models/bdrc/Layout/` (multi-class layout model),
+> which matches the OCR Workbench UI default.
+
+---
+
+## Downloading and OCR-ing Pecha Images from the Staatsbibliothek zu Berlin (SBB / Stabi)
+
+The [Staatsbibliothek zu Berlin (SBB)](https://staatsbibliothek-berlin.de) provides
+free access to digitised Tibetan manuscripts and block prints via their IIIF API.
+You can download full-resolution page images for any digitised work using its **PPN**
+(Pica Production Number).
+
+### One-command workflow: download → line detection → OCR → transcript export
+
+Pass `--ppn` directly to `batch-ocr` to run the full pipeline in a single command.
+Images are downloaded automatically before OCR starts:
+
+```bash
+# Full pipeline with BDRC layout + DONUT OCR (recommended for pecha pages):
+python cli.py batch-ocr \
+    --ppn           337138764X \
+    --layout-engine bdrc_line \
+    --ocr-engine    donut \
+    --ocr-model     models/ocr/PechaBridgeOCR
+
+# Full pipeline with BDRC layout + BDRC OCR (no --ocr-model needed):
+python cli.py batch-ocr \
+    --ppn           337138764X \
+    --layout-engine bdrc_line \
+    --ocr-engine    bdrc_ocr
+
+# Limit to the first 10 pages and save images to a custom folder:
+python cli.py batch-ocr \
+    --ppn              337138764X \
+    --layout-engine    bdrc_line \
+    --ocr-engine       bdrc_ocr \
+    --sbb-max-pages    10 \
+    --sbb-output-dir   sbb_images/PPN337138764X
+```
+
+Downloaded images are saved to `sbb_images/<PPN>/` by default (override with `--sbb-output-dir`).
+
+### Download only (no OCR)
+
+Use `download-sbb-images` to fetch images without running OCR.
+A `metadata.json` file is always written alongside the images; it contains the full
+document metadata (title, author, date, publisher, language, identifiers, subjects, …)
+plus the ordered list of source URLs so transcripts can be matched back to the correct
+page later.
+
+```bash
+# Download all pages of PPN337138764X into sbb_images/337138764X/ (default):
+python cli.py download-sbb-images --ppn 337138764X
+
+# Download into a custom output directory:
+python cli.py download-sbb-images --ppn 337138764X --output-dir sbb_images/PPN337138764X
+
+# Limit to the first 10 pages:
+python cli.py download-sbb-images --ppn 337138764X --max-pages 10
+
+# Print document metadata to the terminal as well:
+python cli.py download-sbb-images --ppn 337138764X --show-metadata
+
+# Reduce parallel workers (default: 8) or disable SSL verification:
+python cli.py download-sbb-images --ppn 337138764X --workers 4 --no-verify-ssl
+```
+
+The output directory will contain:
+- `*.jpg` / `*.png` — full-resolution page images (one file per page)
+- `metadata.json` — full document metadata + per-page `{index, filename, source_url}` entries
+
+> **Note:** The SBB IIIF API is publicly accessible — no login or API key required.
+> Replace `337138764X` with any other SBB PPN to download a different work.
+> You can find PPNs in the [SBB catalogue](https://stabikat.de) or the
+> [SBB digital collections](https://digital.staatsbibliothek-berlin.de).
+> The UI workbench (`ui_workbench.py`) also has a built-in **PPN Downloader** tab.
 
 ---
 

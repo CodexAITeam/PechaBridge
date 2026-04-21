@@ -237,77 +237,177 @@ def process_sbb_images(ppn: str, processor_func, max_images: int = 0, download: 
 def get_sbb_metadata(ppn: str, verify_ssl: bool = True) -> dict:
     """
     Get metadata for a document from the Staatsbibliothek zu Berlin.
-    
+
+    Extracts all commonly available MODS fields from the METS XML, including
+    title, subtitle, authors/contributors, origin info (place, publisher, date),
+    physical description, identifiers (URN, etc.), subjects/classifications,
+    abstract, notes, language, and record info.
+
     Args:
         ppn: PPN (Pica Production Number) of the document
         verify_ssl: Whether to verify SSL certificates
-        
+
     Returns:
-        dict: Document metadata
+        dict: Document metadata with the following keys (None if not available):
+            ppn, title, subtitle, title_part, authors, author (first author),
+            contributors, date, date_other, place, publisher, edition,
+            physical_description, extent, identifiers, subjects, classifications,
+            abstract, notes, language, languages, record_origin, record_creation_date,
+            pages, url
     """
     metadata = {
         'ppn': ppn,
         'title': None,
+        'subtitle': None,
+        'title_part': None,
+        'authors': [],
         'author': None,
+        'contributors': [],
         'date': None,
+        'date_other': None,
+        'place': None,
         'publisher': None,
+        'edition': None,
+        'physical_description': None,
+        'extent': None,
+        'identifiers': {},
+        'subjects': [],
+        'classifications': [],
+        'abstract': None,
+        'notes': [],
         'language': None,
+        'languages': [],
+        'record_origin': None,
+        'record_creation_date': None,
         'pages': 0,
         'url': f"https://digital.staatsbibliothek-berlin.de/werkansicht?PPN={ppn}"
     }
-    
+
+    def _text(el) -> Optional[str]:
+        return el.text.strip() if el is not None and el.text else None
+
     try:
         metadata_url = f"https://content.staatsbibliothek-berlin.de/dc/{ppn}.mets.xml"
-        
-        # Create SSL context
+
         if not verify_ssl:
             ssl_context = ssl._create_unverified_context()
         else:
             ssl_context = None
-            
-        # Open URL with or without SSL verification
+
         with urllib.request.urlopen(metadata_url, context=ssl_context) as response:
             root = ET.parse(response).getroot()
-            
-            # Namespace for METS XML
+
             ns = {
                 'mets': 'http://www.loc.gov/METS/',
                 'mods': 'http://www.loc.gov/mods/v3'
             }
-            
-            # Extract metadata
+
             mods = root.find('.//mods:mods', ns)
             if mods is not None:
-                # Title
-                title_info = mods.find('.//mods:titleInfo/mods:title', ns)
+                # --- Title ---
+                title_info = mods.find('.//mods:titleInfo', ns)
                 if title_info is not None:
-                    metadata['title'] = title_info.text
-                
-                # Author
-                name = mods.find('.//mods:name[@type="personal"]/mods:namePart', ns)
-                if name is not None:
-                    metadata['author'] = name.text
-                
-                # Date
-                date = mods.find('.//mods:originInfo/mods:dateIssued', ns)
-                if date is not None:
-                    metadata['date'] = date.text
-                
-                # Publisher
-                publisher = mods.find('.//mods:originInfo/mods:publisher', ns)
-                if publisher is not None:
-                    metadata['publisher'] = publisher.text
-                
-                # Language
-                language = mods.find('.//mods:language/mods:languageTerm', ns)
-                if language is not None:
-                    metadata['language'] = language.text
-            
+                    metadata['title'] = _text(title_info.find('mods:title', ns))
+                    metadata['subtitle'] = _text(title_info.find('mods:subTitle', ns))
+                    metadata['title_part'] = _text(title_info.find('mods:partName', ns))
+
+                # --- Authors / contributors ---
+                authors = []
+                contributors = []
+                for name_el in mods.findall('.//mods:name', ns):
+                    role_el = name_el.find('.//mods:roleTerm', ns)
+                    role = _text(role_el) or ""
+                    name_parts = [_text(p) for p in name_el.findall('mods:namePart', ns) if p.text]
+                    full_name = " ".join(filter(None, name_parts)).strip() or None
+                    if full_name:
+                        if role.lower() in ("", "aut", "author", "creator"):
+                            authors.append(full_name)
+                        else:
+                            contributors.append({"name": full_name, "role": role})
+                metadata['authors'] = authors
+                metadata['author'] = authors[0] if authors else None
+                metadata['contributors'] = contributors
+
+                # --- Origin info ---
+                origin = mods.find('.//mods:originInfo', ns)
+                if origin is not None:
+                    metadata['publisher'] = _text(origin.find('mods:publisher', ns))
+                    metadata['edition'] = _text(origin.find('mods:edition', ns))
+                    # Prefer dateIssued, fall back to dateCreated / copyrightDate
+                    for date_tag in ('mods:dateIssued', 'mods:dateCreated', 'mods:copyrightDate'):
+                        d = _text(origin.find(date_tag, ns))
+                        if d:
+                            metadata['date'] = d
+                            break
+                    metadata['date_other'] = _text(origin.find('mods:dateOther', ns))
+                    place_el = origin.find('.//mods:placeTerm[@type="text"]', ns)
+                    if place_el is None:
+                        place_el = origin.find('.//mods:placeTerm', ns)
+                    metadata['place'] = _text(place_el)
+
+                # --- Physical description ---
+                phys = mods.find('.//mods:physicalDescription', ns)
+                if phys is not None:
+                    metadata['physical_description'] = _text(phys.find('mods:form', ns))
+                    metadata['extent'] = _text(phys.find('mods:extent', ns))
+
+                # --- Identifiers (URN, ISBN, ISSN, etc.) ---
+                identifiers: dict = {}
+                for id_el in mods.findall('.//mods:identifier', ns):
+                    id_type = id_el.get('type', 'unknown')
+                    id_val = _text(id_el)
+                    if id_val:
+                        identifiers[id_type] = id_val
+                metadata['identifiers'] = identifiers
+
+                # --- Subjects ---
+                subjects = []
+                for subj in mods.findall('.//mods:subject', ns):
+                    parts = []
+                    for child in subj:
+                        t = _text(child)
+                        if t:
+                            parts.append(t)
+                    if parts:
+                        subjects.append(" -- ".join(parts))
+                metadata['subjects'] = subjects
+
+                # --- Classifications ---
+                classifications = []
+                for cls in mods.findall('.//mods:classification', ns):
+                    authority = cls.get('authority', '')
+                    val = _text(cls)
+                    if val:
+                        classifications.append({"authority": authority, "value": val})
+                metadata['classifications'] = classifications
+
+                # --- Abstract ---
+                metadata['abstract'] = _text(mods.find('.//mods:abstract', ns))
+
+                # --- Notes ---
+                notes = [_text(n) for n in mods.findall('.//mods:note', ns) if n.text]
+                metadata['notes'] = [n for n in notes if n]
+
+                # --- Language ---
+                languages = []
+                for lang_el in mods.findall('.//mods:language/mods:languageTerm', ns):
+                    lang = _text(lang_el)
+                    if lang:
+                        languages.append(lang)
+                metadata['languages'] = languages
+                metadata['language'] = languages[0] if languages else None
+
+                # --- Record info ---
+                rec = mods.find('.//mods:recordInfo', ns)
+                if rec is not None:
+                    metadata['record_origin'] = _text(rec.find('mods:recordOrigin', ns))
+                    metadata['record_creation_date'] = _text(rec.find('mods:recordCreationDate', ns))
+
             # Count pages
             files = root.findall('.//mets:fileGrp[@USE="DEFAULT"]/mets:file', ns)
             metadata['pages'] = len(files)
-            
+
     except Exception as e:
         print(f"Error retrieving metadata: {e}")
-    
+
     return metadata
