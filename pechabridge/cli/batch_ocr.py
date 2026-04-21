@@ -565,11 +565,15 @@ def _detect_lines_bdrc(
 ) -> List[Dict[str, Any]]:
     from pechabridge.ocr.bdrc_inference import predict_bdrc_line_regions
 
+    # 0.0 means "use library default" (0.9 for line models, 0.8 for layout models).
+    # Passing 0.0 explicitly would accept every pixel as a line — massively over-detecting.
+    effective_threshold: Optional[float] = float(class_threshold) if float(class_threshold) > 0.0 else None
+
     predictions, _debug = predict_bdrc_line_regions(
         image_np,
         model_path=bdrc_line_model_path,
         device=device,
-        class_threshold=class_threshold,
+        class_threshold=effective_threshold,
         group_lines=bool(merge_lines),
         k_factor=k_factor,
         bbox_tolerance=bbox_tolerance,
@@ -1481,7 +1485,9 @@ def create_parser(add_help: bool = True) -> argparse.ArgumentParser:
         default=0.0,
         help=(
             "Optional explicit class threshold for BDRC line/layout ONNX inference. "
-            "0.0 means use backend defaults."
+            "0.0 (default) means use the library default (0.9 for line models, 0.8 for layout models), "
+            "matching the OCR Workbench UI behaviour. "
+            "Set to a value > 0.0 to override explicitly."
         ),
     )
     parser.add_argument(
