@@ -351,9 +351,19 @@ def _load_bdrc_ocr_runtime(
 
 def _ensure_default_bdrc_line_model_dir() -> Tuple[str, str]:
     from pechabridge.ocr.bdrc_model_download import ensure_default_bdrc_line_assets
+    from pechabridge.ocr.bdrc_inference import find_bdrc_line_model_dirs
 
     result = ensure_default_bdrc_line_assets(REPO_ROOT / "models" / "bdrc")
-    chosen = str(result.line_dir)
+    # Mirror the UI's auto-selection logic: find_bdrc_line_model_dirs() returns all
+    # valid BDRC line/layout model dirs sorted alphabetically. The UI picks the first
+    # one, which is models/bdrc/Layout/ (photi.onnx, multi-class layout model) because
+    # "Layout" sorts before "Lines". The Layout model produces significantly better
+    # results on Tibetan pecha pages than the binary Lines model (PhotiLines.onnx).
+    found = find_bdrc_line_model_dirs(result.root)
+    if found:
+        chosen = str(found[0])
+    else:
+        chosen = str(result.line_dir)
     if result.downloaded_items:
         note = f"Auto-downloaded default BDRC line assets ({', '.join(result.downloaded_items)}) to {result.root}"
     else:
