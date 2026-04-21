@@ -989,25 +989,48 @@ def run(args: argparse.Namespace) -> int:
         sbb_max_pages = int(getattr(args, "sbb_max_pages", 0) or 0)
         sbb_workers = int(getattr(args, "sbb_workers", 8) or 8)
         sbb_verify_ssl = bool(getattr(args, "sbb_verify_ssl", True))
-        LOGGER.info("PPN provided — downloading SBB images for PPN %s into %s …", ppn, sbb_output_dir)
-        try:
-            from scripts.download_sbb_images import run as _download_sbb
-            import argparse as _ap
-            _dl_args = _ap.Namespace(
-                ppn=ppn,
-                output_dir=sbb_output_dir,
-                max_pages=sbb_max_pages,
-                workers=sbb_workers,
-                verify_ssl=sbb_verify_ssl,
-                show_metadata=False,
+        sbb_force = bool(getattr(args, "sbb_force_download", False))
+
+        # Skip download if images are already present (unless --sbb-force-download)
+        _sbb_dir = Path(sbb_output_dir).expanduser().resolve()
+        _already_downloaded = (
+            _sbb_dir.is_dir()
+            and (_sbb_dir / "metadata.json").exists()
+            and any(
+                p.suffix.lower() in {".jpg", ".jpeg", ".png", ".tif", ".tiff", ".bmp", ".webp"}
+                for p in _sbb_dir.iterdir()
+                if p.is_file()
             )
-            rc = _download_sbb(_dl_args)
-            if rc != 0:
-                LOGGER.error("SBB download failed (exit code %d). Aborting.", rc)
+        )
+        if _already_downloaded and not sbb_force:
+            LOGGER.info(
+                "SBB images already present in %s — skipping download. "
+                "Use --sbb-force-download to re-download.",
+                _sbb_dir,
+            )
+        else:
+            if sbb_force and _already_downloaded:
+                LOGGER.info("--sbb-force-download set — re-downloading SBB images for PPN %s …", ppn)
+            else:
+                LOGGER.info("PPN provided — downloading SBB images for PPN %s into %s …", ppn, sbb_output_dir)
+            try:
+                from scripts.download_sbb_images import run as _download_sbb
+                import argparse as _ap
+                _dl_args = _ap.Namespace(
+                    ppn=ppn,
+                    output_dir=sbb_output_dir,
+                    max_pages=sbb_max_pages,
+                    workers=sbb_workers,
+                    verify_ssl=sbb_verify_ssl,
+                    show_metadata=False,
+                )
+                rc = _download_sbb(_dl_args)
+                if rc != 0:
+                    LOGGER.error("SBB download failed (exit code %d). Aborting.", rc)
+                    return 1
+            except Exception as exc:
+                LOGGER.error("SBB download raised an exception: %s: %s", type(exc).__name__, exc)
                 return 1
-        except Exception as exc:
-            LOGGER.error("SBB download raised an exception: %s: %s", type(exc).__name__, exc)
-            return 1
         # Override input_dir with the downloaded folder
         _input_dir_str = sbb_output_dir
     else:
@@ -1689,6 +1712,18 @@ def create_parser(add_help: bool = True) -> argparse.ArgumentParser:
         action="store_false",
         default=True,
         help="Disable SSL certificate verification for SBB downloads.",
+    )
+    sbb_group.add_argument(
+        "--sbb-force-download",
+        "--sbb_force_download",
+        dest="sbb_force_download",
+        action="store_true",
+        default=False,
+        help=(
+            "Force re-download of SBB images even if the output directory already contains "
+            "images and a metadata.json. By default, download is skipped when images are "
+            "already present."
+        ),
     )
     parser.add_argument(
         "--device",
