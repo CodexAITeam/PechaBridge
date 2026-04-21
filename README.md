@@ -97,11 +97,11 @@ Both UI workbenches (`ui_ocr_workbench.py`, `ui_workbench.py`) scan these direct
 
 ```bash
 python cli.py batch-ocr \
-    --ocr-model    models/ocr/PechaBridgeOCR \
-    --line-model   models/line_segmentation/PechaBridgeLineSegmentation.pt \
+    --ocr-model     models/ocr/PechaBridgeOCR \
+    --line-model    models/line_segmentation/PechaBridgeLineSegmentation.pt \
     --layout-engine yolo_line \
-    --engine donut \
-    --input-dir /path/to/pecha/images
+    --ocr-engine    donut \
+    --input-dir     /path/to/pecha/images
 ```
 
 Each image produces a `.txt` transcript and an `*_overlay.jpg` with the
@@ -160,7 +160,7 @@ models/
 python cli.py batch-ocr \
     --layout-engine   bdrc_line \
     --bdrc-line-model models/bdrc/Lines \
-    --engine          bdrc_ocr \
+    --ocr-engine      bdrc_ocr \
     --bdrc-ocr-model  models/bdrc/OCRModels/Woodblock \
     --input-dir       /path/to/pecha/images
 
@@ -168,7 +168,7 @@ python cli.py batch-ocr \
 python cli.py batch-ocr \
     --layout-engine   bdrc_line \
     --bdrc-line-model models/bdrc/Lines \
-    --engine          donut \
+    --ocr-engine      donut \
     --ocr-model       models/ocr/PechaBridgeOCR \
     --input-dir       /path/to/pecha/images
 ```

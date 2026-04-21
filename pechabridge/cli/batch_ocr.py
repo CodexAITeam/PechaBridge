@@ -20,14 +20,14 @@ Usage examples::
 
     # Tesseract engine (no --ocr-model needed)
     python cli.py batch-ocr \\
-        --engine       tesseract \\
+        --ocr-engine   tesseract \\
         --layout-model models/layout/yolo_layout.pt \\
         --input-dir    /data/pechas/W1234 \\
         --tess-lang    bod
 
     # BDRC OCR + BDRC line model
     python cli.py batch-ocr \\
-        --engine          bdrc_ocr \\
+        --ocr-engine      bdrc_ocr \\
         --layout-engine   bdrc_line \\
         --bdrc-ocr-model  models/bdrc/ocr/Woodblock \\
         --bdrc-line-model models/bdrc/Models/Lines \\
@@ -559,6 +559,7 @@ def _detect_lines_bdrc(
     bbox_tolerance: float,
     class_threshold: float,
     merge_lines: bool,
+    use_rotation: bool,
     use_tps: bool,
     tps_threshold: float,
 ) -> List[Dict[str, Any]]:
@@ -572,6 +573,7 @@ def _detect_lines_bdrc(
         group_lines=bool(merge_lines),
         k_factor=k_factor,
         bbox_tolerance=bbox_tolerance,
+        use_rotation=bool(use_rotation),
         use_tps=bool(use_tps),
         tps_threshold=float(tps_threshold),
     )
@@ -778,7 +780,8 @@ def _ocr_image(
     bdrc_line_bbox_tolerance: float = 3.0,
     bdrc_line_class_threshold: float = 0.0,
     bdrc_line_merge_lines: bool = True,
-    bdrc_line_use_tps: bool = True,
+    bdrc_line_use_rotation: bool = False,
+    bdrc_line_use_tps: bool = False,
     bdrc_line_tps_threshold: float = 0.25,
 ) -> Tuple[str, int, Any, List[Dict[str, Any]]]:
     """Run full OCR on a single image.
@@ -821,6 +824,7 @@ def _ocr_image(
             bbox_tolerance=bdrc_line_bbox_tolerance,
             class_threshold=bdrc_line_class_threshold,
             merge_lines=bdrc_line_merge_lines,
+            use_rotation=bdrc_line_use_rotation,
             use_tps=bdrc_line_use_tps,
             tps_threshold=bdrc_line_tps_threshold,
         )
@@ -957,7 +961,7 @@ def _yaml_str(value: str) -> str:
 # ---------------------------------------------------------------------------
 
 def run(args: argparse.Namespace) -> int:
-    engine = str(getattr(args, "engine", "donut") or "donut").strip().lower()
+    engine = str(getattr(args, "ocr_engine", None) or getattr(args, "engine", "donut") or "donut").strip().lower()
     layout_engine = str(getattr(args, "layout_engine", "cv") or "cv").strip().lower()
     layout_model = str(getattr(args, "layout_model", "") or "").strip()
     line_model = str(getattr(args, "line_model", "") or "").strip()
@@ -970,7 +974,8 @@ def run(args: argparse.Namespace) -> int:
     bdrc_line_bbox_tolerance = float(getattr(args, "bdrc_line_bbox_tolerance", 3.0) or 3.0)
     bdrc_line_class_threshold = float(getattr(args, "bdrc_line_class_threshold", 0.0) or 0.0)
     bdrc_line_merge_lines = bool(getattr(args, "bdrc_line_merge_lines", True))
-    bdrc_line_use_tps = bool(getattr(args, "bdrc_line_use_tps", True))
+    bdrc_line_use_rotation = bool(getattr(args, "bdrc_line_use_rotation", False))
+    bdrc_line_use_tps = bool(getattr(args, "bdrc_line_use_tps", False))
     bdrc_line_tps_threshold = float(getattr(args, "bdrc_line_tps_threshold", 0.25) or 0.25)
 
     # Tesseract OCR-specific args
@@ -1211,7 +1216,7 @@ def run(args: argparse.Namespace) -> int:
 
     # --- Write repro.yaml ---
     cli_argv_repro = [
-        "--engine", engine,
+        "--ocr-engine", engine,
         "--layout-engine", layout_engine,
         "--input-dir", str(input_dir),
         "--device", device,
@@ -1229,6 +1234,7 @@ def run(args: argparse.Namespace) -> int:
             "--bdrc-line-tps-threshold", str(bdrc_line_tps_threshold),
         ]
         cli_argv_repro += ["--bdrc-line-merge-lines"] if bdrc_line_merge_lines else ["--bdrc-line-no-merge-lines"]
+        cli_argv_repro += ["--bdrc-line-use-rotation"] if bdrc_line_use_rotation else ["--bdrc-line-no-use-rotation"]
         cli_argv_repro += ["--bdrc-line-use-tps"] if bdrc_line_use_tps else ["--bdrc-line-no-use-tps"]
     if engine == "tesseract":
         cli_argv_repro += [
@@ -1304,6 +1310,7 @@ def run(args: argparse.Namespace) -> int:
                 bdrc_line_bbox_tolerance=bdrc_line_bbox_tolerance,
                 bdrc_line_class_threshold=bdrc_line_class_threshold,
                 bdrc_line_merge_lines=bdrc_line_merge_lines,
+                bdrc_line_use_rotation=bdrc_line_use_rotation,
                 bdrc_line_use_tps=bdrc_line_use_tps,
                 bdrc_line_tps_threshold=bdrc_line_tps_threshold,
             )
@@ -1346,7 +1353,7 @@ def create_parser(add_help: bool = True) -> argparse.ArgumentParser:
         prog="batch-ocr",
         description=(
             "Batch OCR a folder of Pecha images using a layout model + OCR engine.\n\n"
-            "OCR engines (--engine):\n"
+            "OCR engines (--ocr-engine):\n"
             "  donut      (default) DONUT VisionEncoderDecoder model. Preprocessing pipeline\n"
             "             is auto-detected from the repro bundle (repro/image_preprocess.json).\n"
             "  bdrc_ocr   BDRC-style ONNX OCR model with BDRC line normalization.\n"
@@ -1358,7 +1365,7 @@ def create_parser(add_help: bool = True) -> argparse.ArgumentParser:
             "  bdrc_line  BDRC ONNX line/layout model with BDRC contour postprocessing.\n"
             "             Auto-downloads the default BDRC line model when --bdrc-line-model is omitted.\n"
             "  tesseract  Tesseract page segmentation (PSM 3). No --layout-model needed.\n"
-            "             Combine with --engine donut or --engine bdrc_ocr to use\n"
+            "             Combine with --ocr-engine donut or --ocr-engine bdrc_ocr to use\n"
             "             Tesseract layout + OCR.\n\n"
             "Output is written to a subfolder of the input directory's parent:\n"
             "  DONUT+YOLO:      <input_dir_name>__<checkpoint_name>/\n"
@@ -1375,11 +1382,15 @@ def create_parser(add_help: bool = True) -> argparse.ArgumentParser:
 
     # --- Engine selection ---
     parser.add_argument(
-        "--engine",
+        "--ocr-engine",
+        "--ocr_engine",
+        "--engine",       # backward-compat alias
+        "--engine_",      # internal alias (argparse dest collision workaround)
+        dest="ocr_engine",
         type=str,
         default="donut",
         choices=["donut", "bdrc_ocr", "tesseract"],
-        help="OCR engine to use. 'donut' (default), 'bdrc_ocr' or 'tesseract'.",
+        help="OCR engine to use. 'donut' (default), 'bdrc_ocr' or 'tesseract'. Alias: --engine.",
     )
     parser.add_argument(
         "--layout-engine",
@@ -1396,7 +1407,7 @@ def create_parser(add_help: bool = True) -> argparse.ArgumentParser:
             "'bdrc_line' uses a BDRC line/layout ONNX model specified by --bdrc-line-model. "
             "'tesseract' uses pytesseract page segmentation (PSM 3) — "
             "no --layout-model needed. "
-            "Combining --layout-engine tesseract with --engine donut lets you use "
+            "Combining --layout-engine tesseract with --ocr-engine donut lets you use "
             "Tesseract's page segmentation to crop lines and then run DONUT on each crop."
         ),
     )
@@ -1489,19 +1500,40 @@ def create_parser(add_help: bool = True) -> argparse.ArgumentParser:
         help="Disable contour grouping for BDRC line detection.",
     )
     parser.add_argument(
+        "--bdrc-line-use-rotation",
+        "--bdrc_line_use_rotation",
+        dest="bdrc_line_use_rotation",
+        action="store_true",
+        default=False,
+        help=(
+            "Enable BDRC page rotation correction before line extraction. "
+            "Default: disabled (matches OCR Workbench UI default)."
+        ),
+    )
+    parser.add_argument(
+        "--bdrc-line-no-use-rotation",
+        "--bdrc_line_no_use_rotation",
+        dest="bdrc_line_use_rotation",
+        action="store_false",
+        help="Disable BDRC page rotation correction (default).",
+    )
+    parser.add_argument(
         "--bdrc-line-use-tps",
         "--bdrc_line_use_tps",
         dest="bdrc_line_use_tps",
         action="store_true",
-        default=True,
-        help="Enable BDRC global TPS dewarping before final line extraction. Default: enabled.",
+        default=False,
+        help=(
+            "Enable BDRC global TPS dewarping before final line extraction. "
+            "Default: disabled (matches OCR Workbench UI default)."
+        ),
     )
     parser.add_argument(
         "--bdrc-line-no-use-tps",
         "--bdrc_line_no_use_tps",
         dest="bdrc_line_use_tps",
         action="store_false",
-        help="Disable BDRC global TPS dewarping.",
+        help="Disable BDRC global TPS dewarping (default).",
     )
     parser.add_argument(
         "--bdrc-line-tps-threshold",
@@ -1562,7 +1594,7 @@ def create_parser(add_help: bool = True) -> argparse.ArgumentParser:
         type=str,
         default="",
         help=(
-            "Path to the DONUT OCR checkpoint directory (required for --engine donut). "
+            "Path to the DONUT OCR checkpoint directory (required for --ocr-engine donut). "
             "Must contain config.json and model weights. "
             "If a repro/ subdirectory is present, the preprocessing pipeline and "
             "tokenizer/image_processor are loaded from it automatically."
@@ -1590,7 +1622,7 @@ def create_parser(add_help: bool = True) -> argparse.ArgumentParser:
         default="",
         help=(
             "Path to a BDRC OCR model directory (or model_config.json/onnx file). "
-            "Optional when --engine bdrc_ocr. If omitted, the default BDRC OCR bundle "
+            "Optional when --ocr-engine bdrc_ocr. If omitted, the default BDRC OCR bundle "
             "is downloaded into models/bdrc automatically."
         ),
     )
@@ -1610,7 +1642,7 @@ def create_parser(add_help: bool = True) -> argparse.ArgumentParser:
     # --- Tesseract OCR engine options ---
     tess_group = parser.add_argument_group(
         "Tesseract OCR engine options",
-        "Used when --engine tesseract (OCR) or --layout-engine tesseract (layout detection).",
+        "Used when --ocr-engine tesseract (OCR) or --layout-engine tesseract (layout detection).",
     )
     tess_group.add_argument(
         "--tess-lang",
@@ -1619,7 +1651,7 @@ def create_parser(add_help: bool = True) -> argparse.ArgumentParser:
         type=str,
         default="bod",
         help=(
-            "Tesseract language code for OCR (--engine tesseract). "
+            "Tesseract language code for OCR (--ocr-engine tesseract). "
             "Default: 'bod' (Tibetan). Falls back to 'eng' if 'bod' is not installed."
         ),
     )

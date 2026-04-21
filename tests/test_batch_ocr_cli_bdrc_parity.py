@@ -11,7 +11,7 @@ def test_batch_ocr_parser_accepts_bdrc_parity_flags() -> None:
             "/tmp/in",
             "--layout-engine",
             "bdrc_line",
-            "--engine",
+            "--ocr-engine",
             "bdrc_ocr",
             "--bdrc-line-no-merge-lines",
             "--bdrc-line-no-use-tps",

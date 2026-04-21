@@ -200,7 +200,7 @@ def _build_readme(repo_id: str, ckpt: Path, preprocess_pipeline: str, has_repro:
         "python cli.py batch-ocr \\",
         f'    --ocr-model {repo_id} \\',
         "    --input-dir /path/to/images \\",
-        "    --engine donut",
+        "    --ocr-engine donut",
         "```",
     ]
     return "\n".join(lines) + "\n"
@@ -449,9 +449,9 @@ def upload_donut_checkpoint(
     print(f"{'='*60}")
     print(f"\nTo use it with PechaBridge:")
     print(f"  python cli.py batch-ocr \\")
-    print(f"      --ocr-model {repo_id} \\")
-    print(f"      --input-dir /path/to/images \\")
-    print(f"      --engine donut")
+    print(f"      --ocr-model  {repo_id} \\")
+    print(f"      --input-dir  /path/to/images \\")
+    print(f"      --ocr-engine donut")
 
 
 # ---------------------------------------------------------------------------

@@ -243,11 +243,11 @@ def _print_usage_hint(results: dict) -> None:
     if ocr_path and line_path:
         print("\n  # Batch OCR (DONUT + YOLO line segmentation):")
         print(f"  python cli.py batch-ocr \\")
-        print(f"      --ocr-model    {ocr_path} \\")
-        print(f"      --line-model   {line_path} \\")
+        print(f"      --ocr-model     {ocr_path} \\")
+        print(f"      --line-model    {line_path} \\")
         print(f"      --layout-engine yolo_line \\")
-        print(f"      --engine donut \\")
-        print(f"      --input-dir /path/to/images")
+        print(f"      --ocr-engine    donut \\")
+        print(f"      --input-dir     /path/to/images")
 
     if ocr_path:
         print(f"\n  # OCR model path for --ocr-model:")
