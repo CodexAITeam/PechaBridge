@@ -39,19 +39,24 @@ Output is written to a subfolder of the input directory's parent::
     /data/pechas/W1234__checkpoint-5000/
         repro.yaml
         image_001.txt
+        image_001_overlay.jpg   ← line-box overlay (saved by default)
         ...
 
     # BDRC OCR:
     /data/pechas/W1234__bdrc_ocr_Woodblock/
         repro.yaml
         image_001.txt
+        image_001_overlay.jpg
         ...
 
     # Tesseract:
     /data/pechas/W1234__tesseract_bod/
         repro.yaml
         image_001.txt
+        image_001_overlay.jpg
         ...
+
+Pass ``--no-save-overlay`` to skip saving the overlay images.
 """
 
 from __future__ import annotations
@@ -692,6 +697,68 @@ def _normalize_box(
 
 
 # ---------------------------------------------------------------------------
+# Line-box overlay renderer (mirrors ui_ocr_workbench._render_overlay)
+# ---------------------------------------------------------------------------
+
+def _render_line_box_overlay(
+    image_np: Any,  # np.ndarray HxWx3 uint8
+    line_records: List[Dict[str, Any]],
+) -> Any:  # PIL Image RGB
+    """Render detected line bounding boxes onto the source image.
+
+    Draws a cyan double-stroke rectangle and a numbered label for every
+    detected line, exactly as the OCR Workbench UI does.  Returns a PIL
+    ``Image`` in RGB mode so the caller can save it in any format.
+    """
+    from PIL import Image, ImageDraw, ImageFont
+
+    panel = Image.fromarray(np.asarray(image_np).astype(np.uint8)).convert("RGB")
+    draw = ImageDraw.Draw(panel)
+
+    # Load a small font; fall back to the built-in bitmap font if unavailable.
+    try:
+        font = ImageFont.truetype("DejaVuSans.ttf", 13)
+    except Exception:
+        font = ImageFont.load_default()
+
+    def _draw_strong_rect(
+        box: List[int],
+        color: Tuple[int, int, int],
+        inner_width: int = 4,
+        outer_width: int = 8,
+    ) -> None:
+        x1, y1, x2, y2 = [int(v) for v in box]
+        draw.rectangle((x1, y1, x2, y2), outline=(0, 0, 0), width=max(2, int(outer_width)))
+        draw.rectangle((x1, y1, x2, y2), outline=color, width=max(2, int(inner_width)))
+
+    # Sort records top-to-bottom before numbering (same order as transcript)
+    sorted_records = sorted(
+        line_records,
+        key=lambda r: (
+            int((r.get("line_box") or [0, 0, 0, 0])[1]),
+            int((r.get("line_box") or [0, 0, 0, 0])[0]),
+        ),
+    )
+
+    for i, rec in enumerate(sorted_records, start=1):
+        box = rec.get("line_box")
+        if not box or len(box) < 4:
+            continue
+        x1, y1, x2, y2 = [int(v) for v in box[:4]]
+        _draw_strong_rect([x1, y1, x2, y2], color=(0, 255, 255), inner_width=4, outer_width=8)
+        tag = f"line {i}"
+        tx1 = x1 + 2
+        ty1 = max(0, y1 - 20)
+        tx2 = x1 + 18 + 8 * len(tag)
+        ty2 = max(16, y1 - 2)
+        draw.rectangle((tx1, ty1, tx2, ty2), fill=(0, 0, 0))
+        draw.rectangle((tx1, ty1, tx2, ty2), outline=(0, 255, 255), width=2)
+        draw.text((tx1 + 4, ty1 + 2), tag, fill=(255, 255, 255), font=font)
+
+    return panel
+
+
+# ---------------------------------------------------------------------------
 # Per-image OCR
 # ---------------------------------------------------------------------------
 
@@ -713,10 +780,14 @@ def _ocr_image(
     bdrc_line_merge_lines: bool = True,
     bdrc_line_use_tps: bool = True,
     bdrc_line_tps_threshold: float = 0.25,
-) -> Tuple[str, int]:
+) -> Tuple[str, int, Any, List[Dict[str, Any]]]:
     """Run full OCR on a single image.
 
-    Returns ``(transcript_text, line_count)``.
+    Returns ``(transcript_text, line_count, image_np, line_records)``.
+
+    ``image_np`` is the original image as a ``np.ndarray`` (HxWx3 uint8) and
+    ``line_records`` is the list of detected line dicts (each with a
+    ``"line_box"`` key) so the caller can render an overlay image.
 
     ``layout_engine`` controls how line bounding boxes are detected:
     - ``"cv"``        (default) Classical CV segmentation via
@@ -761,11 +832,17 @@ def _ocr_image(
     )
 
     lines: List[Tuple[int, int, str]] = []  # (y1, line_id, text)
+    valid_records: List[Dict[str, Any]] = []  # records that passed box validation
     for rec in line_records:
         box = _normalize_box(rec.get("line_box") or [], w, h)
         if box is None:
             continue
         x1, y1, x2, y2 = box
+        # Store the normalised box back so the overlay uses clipped coordinates
+        rec_with_norm = dict(rec)
+        rec_with_norm["line_box"] = list(box)
+        valid_records.append(rec_with_norm)
+
         crop_np = rec.get("ocr_crop")
         if not isinstance(crop_np, np.ndarray) or crop_np.size == 0:
             crop_np = img_np[y1:y2, x1:x2]
@@ -784,7 +861,7 @@ def _ocr_image(
     # Sort top-to-bottom, then left-to-right by line_id as tiebreaker
     lines.sort(key=lambda t: (t[0], t[1]))
     transcript = "\n".join(t for _, _, t in lines)
-    return transcript, len(lines)
+    return transcript, len(lines), img_np, valid_records
 
 
 # ---------------------------------------------------------------------------
@@ -1178,14 +1255,18 @@ def run(args: argparse.Namespace) -> int:
     )
     LOGGER.info("repro.yaml written to %s", out_dir / "repro.yaml")
 
+    save_overlay = bool(getattr(args, "save_overlay", True))
+
     # --- Process each image ---
     total_lines = 0
     errors = 0
     for i, img_path in enumerate(image_files, start=1):
         LOGGER.info("[%d/%d] Processing %s …", i, len(image_files), img_path.name)
         n_lines = 0
+        img_np_result: Any = None
+        line_records_result: List[Dict[str, Any]] = []
         try:
-            transcript, n_lines = _ocr_image(
+            transcript, n_lines, img_np_result, line_records_result = _ocr_image(
                 img_path,
                 engine=engine,
                 runtime=runtime,
@@ -1213,6 +1294,16 @@ def run(args: argparse.Namespace) -> int:
         out_txt = out_dir / (img_path.stem + ".txt")
         out_txt.write_text(transcript, encoding="utf-8")
         LOGGER.info("  → %s (%d line(s))", out_txt.name, n_lines)
+
+        # --- Save line-box overlay image ---
+        if save_overlay and img_np_result is not None:
+            try:
+                overlay_pil = _render_line_box_overlay(img_np_result, line_records_result)
+                out_overlay = out_dir / (img_path.stem + "_overlay.jpg")
+                overlay_pil.save(str(out_overlay), format="JPEG", quality=92)
+                LOGGER.info("  → %s (overlay)", out_overlay.name)
+            except Exception as exc:
+                LOGGER.warning("  Could not save overlay for %s: %s", img_path.name, exc)
 
     LOGGER.info(
         "Done. %d image(s) processed, %d total line(s), %d error(s). Output: %s",
@@ -1252,7 +1343,9 @@ def create_parser(add_help: bool = True) -> argparse.ArgumentParser:
             "  BDRC+BDRCLine:   <input_dir_name>__bdrc_ocr_<model_name>__bdrc_line/\n"
             "  DONUT+TessLayout:<input_dir_name>__<checkpoint_name>__tess_layout/\n"
             "  Tesseract:       <input_dir_name>__tesseract_<lang>/\n\n"
-            "Each image produces a .txt file (one line per detected text line).\n"
+            "Each image produces a .txt file (one line per detected text line) and\n"
+            "an *_overlay.jpg with the detected line boxes drawn on the source image\n"
+            "(pass --no-save-overlay to skip the overlay images).\n"
             "A repro.yaml documents the full run config and CLI command."
         ),
         add_help=add_help,
@@ -1395,6 +1488,25 @@ def create_parser(add_help: bool = True) -> argparse.ArgumentParser:
         type=float,
         default=0.25,
         help="Minimum curved-line ratio required before BDRC TPS dewarping is applied. Default: 0.25.",
+    )
+    parser.add_argument(
+        "--save-overlay",
+        "--save_overlay",
+        dest="save_overlay",
+        action="store_true",
+        default=True,
+        help=(
+            "Save a JPEG overlay image (*_overlay.jpg) next to each .txt file, "
+            "with the detected line bounding boxes drawn on the source image. "
+            "Enabled by default."
+        ),
+    )
+    parser.add_argument(
+        "--no-save-overlay",
+        "--no_save_overlay",
+        dest="save_overlay",
+        action="store_false",
+        help="Skip saving the line-box overlay images.",
     )
     parser.add_argument(
         "--input-dir",
