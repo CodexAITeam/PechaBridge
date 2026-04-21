@@ -266,8 +266,9 @@ def _print_usage_hint(results: dict) -> None:
 # CLI
 # ---------------------------------------------------------------------------
 
-def create_parser() -> argparse.ArgumentParser:
+def create_parser(add_help: bool = True) -> argparse.ArgumentParser:
     parser = argparse.ArgumentParser(
+        add_help=add_help,
         description=(
             "Download PechaBridge OCR and Line Segmentation models from HuggingFace.\n\n"
             "Places models in the exact directory structure expected by the UI workbenches\n"
