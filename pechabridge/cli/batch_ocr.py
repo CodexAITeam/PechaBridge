@@ -1135,6 +1135,28 @@ def run(args: argparse.Namespace) -> int:
     out_dir.mkdir(parents=True, exist_ok=True)
     LOGGER.info("Output directory: %s", out_dir)
 
+    # --- Log resolved model configuration ---
+    LOGGER.info("=" * 60)
+    LOGGER.info("  batch-ocr configuration")
+    LOGGER.info("  engine        : %s", engine)
+    LOGGER.info("  layout_engine : %s", layout_engine)
+    if layout_engine == "cv":
+        LOGGER.info("  layout_model  : %s", layout_model)
+    elif layout_engine == "yolo_line":
+        LOGGER.info("  line_model    : %s", line_model)
+    elif layout_engine == "bdrc_line":
+        LOGGER.info("  bdrc_line_model : %s", bdrc_line_model)
+    if engine == "donut":
+        LOGGER.info("  ocr_model     : %s", ocr_model)
+    elif engine == "bdrc_ocr":
+        LOGGER.info("  bdrc_ocr_model: %s", bdrc_ocr_model)
+    elif engine == "tesseract":
+        LOGGER.info("  tess_lang     : %s", tess_lang)
+    LOGGER.info("  device        : %s", device)
+    LOGGER.info("  input_dir     : %s", input_dir)
+    LOGGER.info("  output_dir    : %s", out_dir)
+    LOGGER.info("=" * 60)
+
     # --- Load OCR runtime ---
     tess_lang_used = tess_lang
     if engine == "tesseract":

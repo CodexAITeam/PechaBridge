@@ -104,6 +104,80 @@ python cli.py batch-ocr \
     --input-dir /path/to/pecha/images
 ```
 
+Each image produces a `.txt` transcript and an `*_overlay.jpg` with the
+detected line boxes drawn on the source image (pass `--no-save-overlay` to
+skip the overlay images).
+
+---
+
+## BDRC Models
+
+PechaBridge also integrates the excellent OCR pipeline from the
+**[BDRC Tibetan OCR App](https://github.com/buda-base/tibetan-ocr-app)**
+by [Buddhist Digital Resource Center (BDRC)](https://bdrc.io).
+Many thanks to the BDRC team for their outstanding work on open Tibetan OCR
+tooling and for making their models freely available! 🙏
+
+The BDRC assets (line/layout ONNX models + OCR model bundle) are downloaded
+from the BDRC GitHub release — no HuggingFace account needed.
+
+### Download BDRC models
+
+```bash
+# Download all BDRC assets (line model, layout model, OCR bundle):
+python cli.py download-bdrc-models
+
+# Download only the line/layout ONNX models:
+python cli.py download-bdrc-models --assets line,layout
+
+# Download only the OCR model bundle:
+python cli.py download-bdrc-models --assets ocr
+
+# Force re-download:
+python cli.py download-bdrc-models --force
+```
+
+After download the directory layout is:
+
+```
+models/
+  bdrc/
+    Lines/
+      PhotiLines.onnx      ← BDRC line segmentation ONNX model
+      config.json
+    Layout/
+      photi.onnx           ← BDRC layout ONNX model
+      config.json
+    OCRModels/
+      Woodblock/           ← BDRC OCR model (auto-selected by default)
+        ...
+```
+
+### Batch OCR with BDRC models
+
+```bash
+# BDRC line segmentation + BDRC OCR:
+python cli.py batch-ocr \
+    --layout-engine   bdrc_line \
+    --bdrc-line-model models/bdrc/Lines \
+    --engine          bdrc_ocr \
+    --bdrc-ocr-model  models/bdrc/OCRModels/Woodblock \
+    --input-dir       /path/to/pecha/images
+
+# BDRC line segmentation + PechaBridge DONUT OCR:
+python cli.py batch-ocr \
+    --layout-engine   bdrc_line \
+    --bdrc-line-model models/bdrc/Lines \
+    --engine          donut \
+    --ocr-model       models/ocr/PechaBridgeOCR \
+    --input-dir       /path/to/pecha/images
+```
+
+> **Tip:** `--bdrc-line-model` and `--bdrc-ocr-model` are optional — when
+> omitted the CLI auto-downloads the models into `models/bdrc/` on first use.
+
+---
+
 ## OCR Workbench
 
 The **OCR Workbench** (`ui_ocr_workbench.py`) is a dedicated Gradio UI for interactive Tibetan OCR on pecha page images.
