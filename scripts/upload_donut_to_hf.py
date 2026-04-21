@@ -221,21 +221,35 @@ def _build_readme(repo_id: str, ckpt: Path, preprocess_pipeline: str, has_repro:
         f"full preprocessing pipeline (`{preprocess_pipeline}` pipeline was used for this checkpoint).",
         "",
         "```python",
-        "# Minimal example — apply BDRC gray preprocessing first",
+        "# Minimal example — BDRC gray preprocessing applied explicitly",
         "import torch",
         "from transformers import VisionEncoderDecoderModel, AutoTokenizer",
-        "from pechabridge.ocr.preprocess_bdrc import BDRCPreprocessConfig, preprocess_line_image_bdrc",
+        "from pechabridge.ocr.preprocess_bdrc import (",
+        "    BDRCPreprocessConfig,",
+        "    preprocess_image_bdrc,       # returns grayscale PIL Image (mode 'L')",
+        "    bdrc_image_to_normalized_tensor,  # grayscale PIL → float32 HW in [-1, 1]",
+        ")",
         "from PIL import Image",
         "import numpy as np",
         "",
         f'model = VisionEncoderDecoderModel.from_pretrained("{repo_id}")',
         f'tokenizer = AutoTokenizer.from_pretrained("{repo_id}")',
         "",
-        "# Load and preprocess a line crop with the BDRC pipeline",
+        "# 1. Load the line crop as RGB",
         "image = Image.open('line_crop.png').convert('RGB')",
-        "cfg = BDRCPreprocessConfig()  # uses training defaults",
-        "preprocessed = preprocess_line_image_bdrc(np.array(image), cfg)  # returns float32 CHW in [-1, 1]",
-        "pixel_values = torch.tensor(preprocessed).unsqueeze(0)  # add batch dim",
+        "",
+        "# 2. Apply BDRC preprocessing:",
+        "#    - converts to grayscale (luma by default)",
+        "#    - optionally normalises background, binarises, pads/resizes",
+        "#    Returns a grayscale PIL Image (mode 'L')",
+        "cfg = BDRCPreprocessConfig.ocr_line_defaults()  # defaults used during training",
+        "gray_pil = preprocess_image_bdrc(image, cfg)",
+        "",
+        "# 3. Normalise to float32 in [-1, 1] and build a 3-channel tensor",
+        "#    (model expects C=3; replicate the single gray channel)",
+        "gray_hw = bdrc_image_to_normalized_tensor(image, cfg)  # shape: (H, W), float32",
+        "pixel_values = torch.tensor(gray_hw).unsqueeze(0).unsqueeze(0)  # (1, 1, H, W)",
+        "pixel_values = pixel_values.expand(-1, 3, -1, -1)               # (1, 3, H, W)",
         "",
         "generated_ids = model.generate(pixel_values)",
         "text = tokenizer.batch_decode(generated_ids, skip_special_tokens=True)[0]",
@@ -346,8 +360,15 @@ def update_model_card(
     model weights.  The preprocessing pipeline is read from the repro bundle
     if present, otherwise defaults to 'bdrc'.
     """
-    _require_hf_hub()
-    from huggingface_hub import HfApi
+    try:
+        from huggingface_hub import HfApi
+    except ImportError:
+        print(
+            "ERROR: huggingface_hub is not installed.\n"
+            "Install it with:  pip install huggingface-hub",
+            file=sys.stderr,
+        )
+        sys.exit(1)
 
     ckpt = Path(checkpoint_path).expanduser().resolve()
     has_repro = (ckpt / "repro").is_dir()
@@ -376,16 +397,19 @@ def update_model_card(
 
     import tempfile
     api = HfApi(token=token or None)
-    msg = commit_message or f"Update model card (README.md) via PechaBridge"
+    msg = commit_message or "Update model card (README.md) via PechaBridge"
     with tempfile.NamedTemporaryFile(mode="w", suffix=".md", delete=False, encoding="utf-8") as f:
         f.write(readme_content)
         tmp_path = Path(f.name)
     try:
-        _upload_file_with_progress(
-            api=api,
-            local_path=tmp_path,
+        # Use path string directly — HF API requires a seekable file-like object
+        # or a plain path; _upload_file_with_progress wraps in a non-seekable reader.
+        print(f"  Uploading README.md ({tmp_path.stat().st_size} bytes) …")
+        api.upload_file(
+            path_or_fileobj=str(tmp_path),
             path_in_repo="README.md",
             repo_id=repo_id,
+            repo_type="model",
             commit_message=msg,
         )
         print(f"\n✓ Model card updated: https://huggingface.co/{repo_id}")
