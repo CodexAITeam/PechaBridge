@@ -30,7 +30,11 @@ class SearchHit:
     matched_line: str
     context: str
     metadata: dict[str, Any]
+    collection_metadata: dict[str, Any]
     back_translation: str | None
+    scan_url: str | None
+    scan_filename: str | None
+    scan_index: int | None
 
 
 @dataclass(frozen=True)
@@ -130,12 +134,14 @@ class SemanticSearchWorkbenchService:
         total_matches = max(1, len(matches))
         for rank, match in enumerate(matches, start=1):
             metadata = dict(match.document.metadata)
+            collection_metadata = self.corpus_loader.resolve_collection_metadata(metadata)
             source_label = self.corpus_loader.build_source_label(metadata)
             context = self.corpus_loader.get_context_window(
                 relative_source_file=metadata["source_file"],
                 center_line_index=int(metadata["line_index"]),
                 context_lines=requested_context_lines,
             )
+            page_scan = self.corpus_loader.resolve_page_scan(metadata)
             back_translation = None
             if should_back_translate and context:
                 progress_start = 0.78
@@ -155,7 +161,19 @@ class SemanticSearchWorkbenchService:
                     matched_line=match.document.page_content,
                     context=context,
                     metadata=metadata,
+                    collection_metadata=collection_metadata,
                     back_translation=back_translation,
+                    scan_url=(str(page_scan.get("source_url")) if page_scan and page_scan.get("source_url") else None),
+                    scan_filename=(
+                        str(page_scan.get("filename"))
+                        if page_scan and page_scan.get("filename")
+                        else None
+                    ),
+                    scan_index=(
+                        int(page_scan["index"])
+                        if page_scan and isinstance(page_scan.get("index"), int)
+                        else None
+                    ),
                 )
             )
 

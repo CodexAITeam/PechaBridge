@@ -8,7 +8,7 @@ corpus:
   file_glob: "*.txt"
   metadata_filename: metadata.json
   text_encoding: utf-8
-  page_number_pattern: "([0-9]+)"
+  page_number_pattern: ".*-([0-9]+)$"
 
 chunking:
   split_separator: "\n"

@@ -12,6 +12,9 @@ from typing import Any
 
 from .config import SemanticSearchConfig
 
+_NUMERIC_TOKEN_PATTERN = re.compile(r"(\d+)")
+_PAGE_IMAGE_NUMBER_PATTERN = re.compile(r".*-([0-9]+)(?:_|$)")
+
 
 @dataclass(frozen=True)
 class TranscriptLine:
@@ -33,6 +36,7 @@ class TranscriptCorpusLoader:
     def __init__(self, config: SemanticSearchConfig) -> None:
         self.config = config
         self._page_pattern = re.compile(config.corpus.page_number_pattern)
+        self._metadata_cache: dict[str, dict[str, Any]] = {}
 
     def load(self) -> tuple[list[TranscriptLine], CorpusStats]:
         transcripts_root = self.config.corpus.transcripts_root
@@ -48,6 +52,10 @@ class TranscriptCorpusLoader:
         for pecha_dir in sorted(path for path in transcripts_root.iterdir() if path.is_dir()):
             pecha_count += 1
             collection_metadata = self._load_collection_metadata(pecha_dir)
+            pecha_relative_path = pecha_dir.relative_to(transcripts_root).as_posix()
+            metadata_relative_path = (
+                Path(pecha_relative_path) / self.config.corpus.metadata_filename
+            ).as_posix()
             transcript_files = sorted(pecha_dir.glob(self.config.corpus.file_glob))
             for transcript_file in transcript_files:
                 if transcript_file.name == self.config.corpus.metadata_filename:
@@ -65,12 +73,13 @@ class TranscriptCorpusLoader:
                     ).hexdigest()
                     metadata = {
                         "pecha_title": pecha_dir.name,
+                        "pecha_path": pecha_relative_path,
+                        "metadata_file": metadata_relative_path,
                         "page_number": page_number,
                         "source_file": relative_path.as_posix(),
                         "source_filename": transcript_file.name,
                         "line_index": line_index,
                         "line_number": line_index + 1,
-                        "collection_metadata": collection_metadata,
                     }
                     metadata.update(self._flatten_collection_metadata(collection_metadata))
                     records.append(TranscriptLine(point_id=record_id, text=line_text, metadata=metadata))
@@ -119,13 +128,76 @@ class TranscriptCorpusLoader:
             f"line {metadata['line_number']} | {metadata['source_file']}"
         )
 
+    def resolve_collection_metadata(self, metadata: dict[str, Any]) -> dict[str, Any]:
+        # Backward compatibility for older Qdrant payloads that inlined the full metadata.json.
+        embedded_metadata = metadata.get("collection_metadata")
+        if isinstance(embedded_metadata, dict):
+            return copy.deepcopy(embedded_metadata)
+
+        metadata_path = self.resolve_metadata_path(metadata)
+        if metadata_path is None:
+            return {}
+        return self._load_collection_metadata_from_path(metadata_path)
+
+    def resolve_page_scan(self, metadata: dict[str, Any]) -> dict[str, Any] | None:
+        collection_metadata = self.resolve_collection_metadata(metadata)
+        pages = collection_metadata.get("pages")
+        if not isinstance(pages, list) or not pages:
+            return None
+
+        source_filename = str(metadata.get("source_filename", ""))
+        page_number = metadata.get("page_number")
+        source_tokens = set(self._extract_numeric_tokens(source_filename))
+        page_number_int = self._coerce_int(page_number)
+
+        for page in pages:
+            if not isinstance(page, dict):
+                continue
+            page_index = self._coerce_int(page.get("index"))
+            page_filename = str(page.get("filename", ""))
+            page_filename_number = self._extract_page_number_from_scan_filename(page_filename)
+            if page_number_int is not None and page_index is not None and page_index + 1 == page_number_int:
+                return copy.deepcopy(page)
+            if page_number_int is not None and page_index is not None and page_index == page_number_int:
+                return copy.deepcopy(page)
+            if page_number_int is not None and page_filename_number is not None and page_filename_number == page_number_int:
+                return copy.deepcopy(page)
+            page_tokens = set(self._extract_numeric_tokens(page_filename))
+            if page_number_int is None and source_tokens and page_tokens and source_tokens.intersection(page_tokens):
+                return copy.deepcopy(page)
+
+        for page in pages:
+            if not isinstance(page, dict):
+                continue
+            if page.get("source_url"):
+                return copy.deepcopy(page)
+        return None
+
+    def resolve_metadata_path(self, metadata: dict[str, Any]) -> Path | None:
+        metadata_file = metadata.get("metadata_file")
+        if isinstance(metadata_file, str) and metadata_file:
+            return (self.config.corpus.transcripts_root / metadata_file).resolve()
+
+        pecha_path = metadata.get("pecha_path")
+        if isinstance(pecha_path, str) and pecha_path:
+            return (
+                self.config.corpus.transcripts_root
+                / pecha_path
+                / self.config.corpus.metadata_filename
+            ).resolve()
+
+        source_file = metadata.get("source_file")
+        if isinstance(source_file, str) and source_file:
+            return (
+                self.resolve_source_path(source_file).parent / self.config.corpus.metadata_filename
+            ).resolve()
+        return None
+
     def _load_collection_metadata(self, pecha_dir: Path) -> dict[str, Any]:
         metadata_path = pecha_dir / self.config.corpus.metadata_filename
         if not metadata_path.exists():
             return {}
-        return copy.deepcopy(
-            json.loads(metadata_path.read_text(encoding=self.config.corpus.text_encoding))
-        )
+        return self._load_collection_metadata_from_path(metadata_path)
 
     def _extract_page_number(self, transcript_file: Path) -> int | str:
         match = self._page_pattern.search(transcript_file.stem)
@@ -156,3 +228,47 @@ class TranscriptCorpusLoader:
             if isinstance(value, (str, int, float, bool)) or value is None:
                 flattened[f"collection_{key}"] = value
         return flattened
+
+    def _load_collection_metadata_from_path(self, metadata_path: Path) -> dict[str, Any]:
+        resolved_path = metadata_path.resolve()
+        cache_key = resolved_path.as_posix()
+        cached_metadata = self._metadata_cache.get(cache_key)
+        if cached_metadata is not None:
+            return copy.deepcopy(cached_metadata)
+
+        if not resolved_path.exists():
+            return {}
+
+        loaded_metadata = json.loads(
+            resolved_path.read_text(encoding=self.config.corpus.text_encoding)
+        )
+        if not isinstance(loaded_metadata, dict):
+            return {}
+
+        self._metadata_cache[cache_key] = loaded_metadata
+        return copy.deepcopy(loaded_metadata)
+
+    @staticmethod
+    def _extract_numeric_tokens(value: str) -> list[int]:
+        return [
+            int(token)
+            for token in _NUMERIC_TOKEN_PATTERN.findall(value)
+        ]
+
+    @staticmethod
+    def _coerce_int(value: Any) -> int | None:
+        if isinstance(value, bool):
+            return None
+        if isinstance(value, int):
+            return value
+        if isinstance(value, str) and value.isdigit():
+            return int(value)
+        return None
+
+    @staticmethod
+    def _extract_page_number_from_scan_filename(value: str) -> int | None:
+        match = _PAGE_IMAGE_NUMBER_PATTERN.search(value)
+        if not match:
+            return None
+        token = match.group(1)
+        return int(token) if token.isdigit() else None

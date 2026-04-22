@@ -324,6 +324,8 @@ German / English / Tibetan query
   -> embed the Tibetan query with a custom Hugging Face text encoder
   -> search line embeddings in local Qdrant
   -> reconstruct the context window around each hit
+  -> resolve the corresponding metadata.json for the hit's pecha
+  -> render the associated page scan from the metadata pages/source_url mapping
   -> optionally back-translate the context into English
   -> inspect ranked results, sources, and metadata in Gradio
 ```
@@ -333,8 +335,21 @@ German / English / Tibetan query
 - The translated Classical Tibetan query actually used for retrieval
 - Ranked hits with source labels (`pecha | page | line | file`)
 - The matched line plus configurable context lines around it
+- The associated page scan for the matched transcript page, when `metadata.json` provides a `pages[].source_url`
 - Optional English back-translation of each context window
 - Local Qdrant collection status and a manual reindex action
+- Search controls for result count (`top_k`) and context-window radius
+
+### Current UX / Research Focus
+
+The current UI is deliberately retrieval-first rather than answer-first.
+It is optimized for philological inspection and traceability:
+
+- the translated Tibetan query is shown explicitly
+- each hit is rendered as a card with score, source, matched line, and context
+- the matching line is visually highlighted inside the context window
+- English back-translation and collection metadata are available as expandable details
+- the associated page image can be opened directly from the result card
 
 ### Expected Transcript Layout
 
@@ -352,6 +367,19 @@ transcripts/
 ```
 
 Each page file is split on newline boundaries and indexed line-by-line. The page number is derived from the filename using the regex configured in `semantic-search-config.yaml`.
+For the standard SBB-style filename layout `PPN337138764X-00000001.txt`, this corresponds to page `1`, `PPN337138764X-00000005.txt` to page `5`, and so on.
+
+The `metadata.json` is expected to contain a `pages` list with entries such as:
+
+```json
+{
+  "index": 4,
+  "filename": "PPN337138764X-00000005_ca6508937e54_4.jpg",
+  "source_url": "https://content.staatsbibliothek-berlin.de/dc/PPN337138764X-00000005/full/max/0/default.jpg"
+}
+```
+
+This is what allows the workbench to render the correct source scan for a retrieval hit.
 
 ### Configuration
 
@@ -368,6 +396,14 @@ The YAML controls:
 - chunking and context-window parameters
 - OpenAI translation model settings
 - Gradio host and port settings
+
+The bundled example config uses the page-number regex:
+
+```yaml
+page_number_pattern: ".*-([0-9]+)$"
+```
+
+so that transcript filenames like `PPN337138764X-00000005.txt` map to page `5`.
 
 Sensitive values such as the OpenAI API key are loaded via `.env` using `python-dotenv`.
 
@@ -419,7 +455,9 @@ python cli.py semantic-search-workbench \
 
 - The workbench uses a local on-disk Qdrant instance, so the vector index persists between runs.
 - Search quality depends strongly on transcript cleanliness and on the configured Tibetan text encoder.
-- The current UI is retrieval-first: it focuses on translated queries, evidence windows, and metadata inspection rather than answer generation.
+- The current UI is retrieval-first: it focuses on translated queries, evidence windows, metadata inspection, and page-scan validation rather than answer generation.
+- To keep Qdrant payloads lightweight, the workbench stores references such as `pecha_path` and `metadata_file` per line and loads `metadata.json` lazily when a hit is rendered.
+- Older indices that embedded the full `metadata.json` still work as a fallback, but rebuilding the index is recommended after upgrading to the current metadata-reference layout.
 
 ## Running the Workbench
 

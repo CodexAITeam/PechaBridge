@@ -296,6 +296,43 @@ WORKBENCH_CSS = """
   padding: 0 14px 14px;
 }
 
+.ssw-scan-panel {
+  margin-top: 14px;
+}
+
+.ssw-scan-frame {
+  display: block;
+  border-radius: 18px;
+  overflow: hidden;
+  border: 1px solid rgba(86, 57, 38, 0.12);
+  background: rgba(255, 253, 248, 0.96);
+  box-shadow: 0 12px 24px rgba(76, 50, 33, 0.08);
+}
+
+.ssw-scan-image {
+  display: block;
+  width: 100%;
+  max-height: 340px;
+  object-fit: contain;
+  background: linear-gradient(180deg, rgba(245, 240, 232, 0.85), rgba(238, 231, 221, 0.90));
+}
+
+.ssw-scan-caption {
+  padding: 10px 12px 12px;
+  color: var(--ssw-muted);
+  font: 400 13px/1.55 "Avenir Next", "Segoe UI", sans-serif;
+}
+
+.ssw-scan-caption a {
+  color: var(--ssw-accent);
+  text-decoration: none;
+  font-weight: 700;
+}
+
+.ssw-scan-caption a:hover {
+  text-decoration: underline;
+}
+
 .ssw-pre {
   margin: 0;
   white-space: pre-wrap;
@@ -641,12 +678,12 @@ def _render_hit_card(hit: SearchHit) -> str:
                 body=_render_preformatted(hit.back_translation),
             )
         )
-    collection_metadata = hit.metadata.get("collection_metadata") or {}
-    if collection_metadata:
-        details_blocks.append(
-            _render_details_block(
-                title="Collection metadata",
-                body=_render_preformatted(
+        collection_metadata = hit.collection_metadata or {}
+        if collection_metadata:
+            details_blocks.append(
+                _render_details_block(
+                    title="Collection metadata",
+                    body=_render_preformatted(
                     json.dumps(collection_metadata, ensure_ascii=False, indent=2)
                 ),
             )
@@ -666,6 +703,7 @@ def _render_hit_card(hit: SearchHit) -> str:
         f'<div class="ssw-match-line">{html.escape(hit.matched_line)}</div>'
         '<div class="ssw-section-label">Context Window</div>'
         f'{_render_context_box(hit.context)}'
+        f'{_render_scan_block(hit)}'
         f'{"".join(details_blocks)}'
         "</article>"
     )
@@ -700,3 +738,34 @@ def _render_details_block(title: str, body: str) -> str:
 
 def _render_preformatted(content: str) -> str:
     return f'<pre class="ssw-pre">{html.escape(content)}</pre>'
+
+
+def _render_scan_block(hit: SearchHit) -> str:
+    if not hit.scan_url:
+        return ""
+
+    scan_meta_parts: list[str] = []
+    if hit.scan_filename:
+        scan_meta_parts.append(html.escape(hit.scan_filename))
+    if hit.scan_index is not None:
+        scan_meta_parts.append(f"metadata index {hit.scan_index}")
+    scan_meta = " · ".join(scan_meta_parts)
+    scan_meta_html = (
+        f"{scan_meta}<br>"
+        if scan_meta
+        else ""
+    )
+    scan_url = html.escape(hit.scan_url, quote=True)
+    alt_text = html.escape(f"Page scan for {hit.source_label}", quote=True)
+    return (
+        '<section class="ssw-scan-panel">'
+        '<div class="ssw-section-label">Associated Page Scan</div>'
+        f'<a class="ssw-scan-frame" href="{scan_url}" target="_blank" rel="noopener noreferrer">'
+        f'<img class="ssw-scan-image" src="{scan_url}" alt="{alt_text}" loading="lazy" referrerpolicy="no-referrer">'
+        "</a>"
+        '<div class="ssw-scan-caption">'
+        f"{scan_meta_html}"
+        f'<a href="{scan_url}" target="_blank" rel="noopener noreferrer">Open full image</a>'
+        "</div>"
+        "</section>"
+    )

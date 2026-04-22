@@ -78,6 +78,9 @@ The workbench expects:
 - a `metadata.json` file in each pecha folder
 - OpenAI credentials in `pechabridge/semantic_search_workbench/.env`
 
+For the standard transcript filename layout `PPN337138764X-00000001.txt`, the trailing numeric block is treated as the page number.
+The bundled example config uses `page_number_pattern: ".*-([0-9]+)$"` for this.
+
 The bundled example config lives at:
 
 ```text
@@ -87,8 +90,14 @@ pechabridge/semantic_search_workbench/semantic-search-config.yaml
 Retrieval flow:
 
 ```text
-query -> Tibetan translation -> custom embeddings -> Qdrant similarity search -> context window reconstruction -> optional back-translation
+query -> Tibetan translation -> custom embeddings -> Qdrant similarity search -> context window reconstruction -> metadata.json lookup -> page-scan resolution -> optional back-translation
 ```
+
+Metadata strategy:
+
+- Qdrant stores lightweight per-line references such as `pecha_title`, `pecha_path`, `metadata_file`, `page_number`, and `source_file`
+- the full `metadata.json` is loaded lazily from disk when a hit is rendered
+- this keeps the vector payloads smaller while still allowing page-image lookup via `pages[].source_url`
 
 ## Example CLI Workflow
 
