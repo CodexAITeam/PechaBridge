@@ -25,6 +25,10 @@ from pechabridge.cli.mine_mnn_pairs import create_parser as create_mnn_pairs_par
 from pechabridge.cli.weak_ocr_label import create_parser as create_weak_ocr_label_parser, run as run_weak_ocr_label
 from pechabridge.eval.eval_faiss_crosspage import create_parser as create_eval_faiss_crosspage_parser
 from pechabridge.eval.eval_faiss_crosspage import run as run_eval_faiss_crosspage
+from pechabridge.semantic_search_workbench.cli import (
+    create_parser as create_semantic_search_workbench_parser,
+)
+from pechabridge.semantic_search_workbench.cli import run as run_semantic_search_workbench
 from scripts.download_merge_openpecha_ocr_lines import (
     create_parser as create_download_openpecha_ocr_lines_parser,
 )
@@ -324,6 +328,15 @@ def _build_root_parser() -> argparse.ArgumentParser:
     )
     weak_ocr_parser.set_defaults(handler=_run_weak_ocr_label)
 
+    semantic_search_parent = create_semantic_search_workbench_parser(add_help=False)
+    semantic_search_parser = subparsers.add_parser(
+        "semantic-search-workbench",
+        parents=[semantic_search_parent],
+        help="Launch the Gradio-based Semantic Search Workbench for Tibetan transcripts",
+        description=semantic_search_parent.description,
+    )
+    semantic_search_parser.set_defaults(handler=_run_semantic_search_workbench)
+
     mnn_parent = create_mnn_pairs_parser(add_help=False)
     mnn_parser = subparsers.add_parser(
         "mine-mnn-pairs",
@@ -526,6 +539,10 @@ def _run_gen_patches(args: argparse.Namespace) -> int:
 def _run_weak_ocr_label(args: argparse.Namespace) -> int:
     run_weak_ocr_label(args)
     return 0
+
+
+def _run_semantic_search_workbench(args: argparse.Namespace) -> int:
+    return int(run_semantic_search_workbench(args))
 
 
 def _run_mine_mnn_pairs(args: argparse.Namespace) -> int:

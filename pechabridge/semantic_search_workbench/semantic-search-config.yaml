@@ -1,0 +1,72 @@
+environment:
+  dotenv_path: .env
+  required_env_vars:
+    - OPENAI_API_KEY
+
+corpus:
+  transcripts_root: ../../data/semantic_search/transcripts
+  file_glob: "*.txt"
+  metadata_filename: metadata.json
+  text_encoding: utf-8
+  page_number_pattern: "([0-9]+)"
+
+chunking:
+  split_separator: "\n"
+  strip_lines: true
+  keep_empty_lines: false
+  min_line_length: 1
+  context_lines: 2
+
+embedding:
+  huggingface_model_id: your-org/your-tibetan-clip-model
+  device: cpu
+  batch_size: 16
+  max_length: 256
+  normalize_embeddings: true
+  trust_remote_code: false
+  cache_dir: ../../data/semantic_search/hf-cache
+  document_prefix: ""
+  query_prefix: ""
+
+qdrant:
+  storage_path: ../../data/semantic_search/qdrant
+  collection_name: tibetan_transcript_lines
+  distance: cosine
+  force_recreate_collection: false
+
+translation:
+  enabled: true
+  provider: openai
+  model: gpt-4.1-mini
+  api_key_env: OPENAI_API_KEY
+  base_url_env: OPENAI_BASE_URL
+  organization_env: OPENAI_ORG_ID
+  max_output_tokens: 300
+  temperature: 0.0
+  translate_query_prompt: |
+    You are a scholarly translation bridge for Tibetan textual retrieval.
+    Translate the user's query into concise Classical Tibetan suitable for semantic search.
+    If the input is already in Tibetan, preserve it and only normalize obvious whitespace noise.
+    Return only the Classical Tibetan search query. Do not explain your reasoning.
+  back_translate_prompt: |
+    You are assisting a semantic search UI for historical Tibetan sources.
+    Translate the Tibetan passage into concise scholarly English.
+    Preserve named entities and uncertain terminology as faithfully as possible.
+    Return only the English translation.
+
+search:
+  top_k: 5
+  score_threshold: null
+  rebuild_index_on_start: true
+  include_back_translation_default: true
+
+ui:
+  title: Semantic Search Workbench
+  description: >
+    Search historical Tibetan transcript lines through a custom Hugging Face CLIP-style encoder,
+    an OpenAI-based translation bridge, and a local Qdrant vector index.
+  server_name: 127.0.0.1
+  server_port: 7860
+  share: false
+  show_api: false
+  concurrency_limit: 4
