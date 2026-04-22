@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import copy
 import hashlib
 import json
 import re
@@ -84,7 +85,12 @@ class TranscriptCorpusLoader:
     def resolve_source_path(self, relative_source_file: str) -> Path:
         return (self.config.corpus.transcripts_root / relative_source_file).resolve()
 
-    def get_context_window(self, relative_source_file: str, center_line_index: int) -> str:
+    def get_context_window(
+        self,
+        relative_source_file: str,
+        center_line_index: int,
+        context_lines: int | None = None,
+    ) -> str:
         source_path = self.resolve_source_path(relative_source_file)
         raw_lines = self._split_raw_lines(
             source_path.read_text(encoding=self.config.corpus.text_encoding)
@@ -92,8 +98,13 @@ class TranscriptCorpusLoader:
         if not raw_lines:
             return ""
 
-        start_index = max(0, center_line_index - self.config.chunking.context_lines)
-        end_index = min(len(raw_lines), center_line_index + self.config.chunking.context_lines + 1)
+        window_radius = (
+            self.config.chunking.context_lines
+            if context_lines is None
+            else max(0, int(context_lines))
+        )
+        start_index = max(0, center_line_index - window_radius)
+        end_index = min(len(raw_lines), center_line_index + window_radius + 1)
         context_rows: list[str] = []
         for line_number, line_text in enumerate(raw_lines[start_index:end_index], start=start_index + 1):
             if not self.config.chunking.keep_empty_lines and not line_text:
@@ -112,7 +123,9 @@ class TranscriptCorpusLoader:
         metadata_path = pecha_dir / self.config.corpus.metadata_filename
         if not metadata_path.exists():
             return {}
-        return json.loads(metadata_path.read_text(encoding=self.config.corpus.text_encoding))
+        return copy.deepcopy(
+            json.loads(metadata_path.read_text(encoding=self.config.corpus.text_encoding))
+        )
 
     def _extract_page_number(self, transcript_file: Path) -> int | str:
         match = self._page_pattern.search(transcript_file.stem)

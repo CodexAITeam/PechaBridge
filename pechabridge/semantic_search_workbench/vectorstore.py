@@ -83,18 +83,19 @@ class QdrantSemanticIndex:
             )
         return len(records)
 
-    def similarity_search(self, query: str) -> list[SearchMatch]:
+    def similarity_search(self, query: str, top_k: int | None = None) -> list[SearchMatch]:
         self.ensure_collection(recreate=False)
+        limit = self.search_config.top_k if top_k is None else max(1, int(top_k))
         query_vector = self.embeddings.embed_query(query)
         if hasattr(self._vectorstore, "similarity_search_with_score_by_vector"):
             raw_results = self._vectorstore.similarity_search_with_score_by_vector(
                 embedding=query_vector,
-                k=self.search_config.top_k,
+                k=limit,
             )
         else:  # pragma: no cover - fallback for older LangChain variants
             raw_results = self._vectorstore.similarity_search_with_score(
                 query=query,
-                k=self.search_config.top_k,
+                k=limit,
             )
         matches = [
             SearchMatch(document=document, score=score)

@@ -52,9 +52,43 @@ Available subcommands:
 - `eval-ocr-tokenizer`
 - `train-donut-ocr`
 - `run-donut-ocr-workflow`
+- `semantic-search-workbench`
 - `download-openpecha-ocr-lines`
 - `download-openpecha-line-segmentation`
 - `train-line-segmentation`
+
+## Semantic Search Workbench
+
+Launch the transcript retrieval UI through the unified CLI:
+
+```bash
+python cli.py semantic-search-workbench \
+  --config pechabridge/semantic_search_workbench/semantic-search-config.yaml
+```
+
+Useful flags:
+
+- `--reindex` rebuilds the local Qdrant collection before the Gradio app starts
+- `--reindex-only` rebuilds the collection and exits without launching the UI
+
+The workbench expects:
+
+- transcript files grouped by pecha folder
+- one text file per page
+- a `metadata.json` file in each pecha folder
+- OpenAI credentials in `pechabridge/semantic_search_workbench/.env`
+
+The bundled example config lives at:
+
+```text
+pechabridge/semantic_search_workbench/semantic-search-config.yaml
+```
+
+Retrieval flow:
+
+```text
+query -> Tibetan translation -> custom embeddings -> Qdrant similarity search -> context window reconstruction -> optional back-translation
+```
 
 ## Example CLI Workflow
 

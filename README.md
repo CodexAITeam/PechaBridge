@@ -30,6 +30,7 @@ recognition errors. Accuracy improves with more training data.
 
 - **End-to-end Tibetan Pecha OCR pipeline**: Automatically segments lines on digitised Pecha pages (e.g. from the Staatsbibliothek zu Berlin) using a YOLO-based line segmentation model, then transcribes each line with a fine-tuned Donut VLM. A single `batch-ocr` CLI command covers download → line detection → OCR → transcript export.
 - **Synthetic multi-class dataset generation**: Creates YOLO-ready pages for Tibetan number words, Tibetan text blocks, and Chinese number words.
+- **Semantic Search Workbench for Tibetan transcripts**: Indexes line-level transcript data in local Qdrant, translates German or English queries into Classical Tibetan, and returns ranked passages with configurable context windows in a Gradio UI.
 
 ### Advanced Research Features
 - **Standalone DONUT/TroCR OCR training**: Trains OCR directly on OpenPecha/BDRC line manifests (`train-donut-ocr`) with `none|pb|gray|bdrc|rgb` image preprocessing and CER evaluation.
@@ -310,6 +311,116 @@ Upload page image
 - The preprocessing pipeline (`bdrc`, `gray`, `rgb`) is read automatically from `repro/image_preprocess.json` inside the checkpoint — no manual selection needed when using downloaded models.
 - For remote server usage, use SSH port forwarding and keep `UI_SHARE=false`.
 
+## Semantic Search Workbench
+
+The **Semantic Search Workbench** is a Gradio-based retrieval UI for historical Tibetan transcripts.
+It is meant for cases where transcripts already exist as page-wise text files and should be searched semantically instead of by exact string match.
+
+Current retrieval flow:
+
+```text
+German / English / Tibetan query
+  -> translate into Classical Tibetan with OpenAI
+  -> embed the Tibetan query with a custom Hugging Face text encoder
+  -> search line embeddings in local Qdrant
+  -> reconstruct the context window around each hit
+  -> optionally back-translate the context into English
+  -> inspect ranked results, sources, and metadata in Gradio
+```
+
+### What The UI Shows
+
+- The translated Classical Tibetan query actually used for retrieval
+- Ranked hits with source labels (`pecha | page | line | file`)
+- The matched line plus configurable context lines around it
+- Optional English back-translation of each context window
+- Local Qdrant collection status and a manual reindex action
+
+### Expected Transcript Layout
+
+The workbench expects transcript files grouped by pecha, with one text file per page and a `metadata.json` per pecha folder:
+
+```text
+transcripts/
+  pecha_1/
+    metadata.json
+    page_0001.txt
+    page_0002.txt
+  pecha_2/
+    metadata.json
+    page_0001.txt
+```
+
+Each page file is split on newline boundaries and indexed line-by-line. The page number is derived from the filename using the regex configured in `semantic-search-config.yaml`.
+
+### Configuration
+
+All runtime settings are externalized.
+
+- Example YAML config: `pechabridge/semantic_search_workbench/semantic-search-config.yaml`
+- Example env file: `pechabridge/semantic_search_workbench/.env.example`
+
+The YAML controls:
+
+- transcript root and file naming rules
+- Hugging Face model ID for the custom Tibetan CLIP-style text encoder
+- local Qdrant storage path, collection name, and distance metric
+- chunking and context-window parameters
+- OpenAI translation model settings
+- Gradio host and port settings
+
+Sensitive values such as the OpenAI API key are loaded via `.env` using `python-dotenv`.
+
+### Quick Start
+
+1. Install dependencies:
+
+   ```bash
+   pip install -r requirements.txt
+   ```
+
+2. Create the environment file:
+
+   ```bash
+   cp pechabridge/semantic_search_workbench/.env.example \
+      pechabridge/semantic_search_workbench/.env
+   ```
+
+3. Edit the example config and point it to your transcript corpus plus Hugging Face model:
+
+   ```text
+   pechabridge/semantic_search_workbench/semantic-search-config.yaml
+   ```
+
+4. Launch the workbench from the unified CLI:
+
+   ```bash
+   python cli.py semantic-search-workbench \
+       --config pechabridge/semantic_search_workbench/semantic-search-config.yaml
+   ```
+
+Optional: force a full Qdrant rebuild before starting the UI:
+
+```bash
+python cli.py semantic-search-workbench \
+    --config pechabridge/semantic_search_workbench/semantic-search-config.yaml \
+    --reindex
+```
+
+Or rebuild the index only and exit:
+
+```bash
+python cli.py semantic-search-workbench \
+    --config pechabridge/semantic_search_workbench/semantic-search-config.yaml \
+    --reindex-only
+```
+
+### Notes
+
+- The workbench uses a local on-disk Qdrant instance, so the vector index persists between runs.
+- Search quality depends strongly on transcript cleanliness and on the configured Tibetan text encoder.
+- The current UI is retrieval-first: it focuses on translated queries, evidence windows, and metadata inspection rather than answer generation.
+
 ## Running the Workbench
 
 Both `ui_ocr_workbench.py` and `ui_workbench.py` accept optional runtime flags via environment variables:
@@ -412,6 +523,10 @@ python cli.py probe-line-clip-workbench-random-samples \
   --cross-split eval:test \
   --samples-per-split 200 \
   --summary-only
+
+# Launch the Semantic Search Workbench
+python cli.py semantic-search-workbench \
+  --config pechabridge/semantic_search_workbench/semantic-search-config.yaml
 
 # Train Donut/TroCR OCR directly on line manifests (with CER on eval split)
 python cli.py train-donut-ocr \
