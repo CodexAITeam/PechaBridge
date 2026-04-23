@@ -319,8 +319,13 @@ It is meant for cases where transcripts already exist as page-wise text files an
 Current retrieval flow:
 
 ```text
-German / English / Tibetan query
+DE / EN query
   -> translate into Classical Tibetan with OpenAI
+Tibetan Unicode query
+  -> use directly for retrieval
+Wylie / EWTS query
+  -> convert locally to Tibetan Unicode with pyewts
+all modes
   -> embed the Tibetan query with a custom Hugging Face text encoder
   -> search line embeddings in local Qdrant
   -> reconstruct the context window around each hit
@@ -332,24 +337,28 @@ German / English / Tibetan query
 
 ### What The UI Shows
 
-- The translated Classical Tibetan query actually used for retrieval
-- Ranked hits with source labels (`pecha | page | line | file`)
+- Explicit query input modes: `DE / EN`, `Tibetan`, and `Wylie (EWTS)`
+- The Tibetan query actually used for retrieval, whether translated or converted from Wylie
+- Ranked hits with source labels (`pecha | page | line | file`) and human-readable relevance labels
 - The matched line plus configurable context lines around it
 - The associated page scan for the matched transcript page, when `metadata.json` provides a `pages[].source_url`
+- Direct browser links to the source transcript, `metadata.json`, and full page image
 - Optional English back-translation of each context window
 - Local Qdrant collection status and a manual reindex action
 - Search controls for result count (`top_k`) and context-window radius
+- A Research Workspace for filtering hits by pecha, focusing one hit in a text/scan reading panel, pinning hits for comparison, and exporting selected evidence as Markdown or JSON
 
 ### Current UX / Research Focus
 
 The current UI is deliberately retrieval-first rather than answer-first.
 It is optimized for philological inspection and traceability:
 
-- the translated Tibetan query is shown explicitly
+- the Tibetan retrieval query is shown explicitly
 - each hit is rendered as a card with score, source, matched line, and context
 - the matching line is visually highlighted inside the context window
 - English back-translation and collection metadata are available as expandable details
 - the associated page image can be opened directly from the result card
+- the Phase 2 Research Workspace supports pecha-level filtering, focused close reading, pinned-hit comparison, and note-friendly exports
 
 ### Expected Transcript Layout
 

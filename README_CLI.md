@@ -90,8 +90,17 @@ pechabridge/semantic_search_workbench/semantic-search-config.yaml
 Retrieval flow:
 
 ```text
-query -> Tibetan translation -> custom embeddings -> Qdrant similarity search -> context window reconstruction -> metadata.json lookup -> page-scan resolution -> optional back-translation
+DE / EN query -> OpenAI translation -> custom embeddings -> Qdrant similarity search
+Tibetan query -> direct embedding -> Qdrant similarity search
+Wylie / EWTS query -> pyewts conversion -> custom embeddings -> Qdrant similarity search
+Qdrant hit -> context window reconstruction -> metadata.json lookup -> page-scan resolution -> optional back-translation
 ```
+
+UI workflow:
+
+- choose the query mode explicitly: `DE / EN`, `Tibetan`, or `Wylie (EWTS)`
+- inspect ranked hit cards with matched lines, context windows, source links, and page scans
+- use the Research Workspace to filter by pecha, focus one hit with its scan, pin up to five hits for comparison, and export selected evidence as Markdown or JSON
 
 Metadata strategy:
 
