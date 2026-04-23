@@ -99,6 +99,15 @@ class UIConfig:
 
 
 @dataclass(frozen=True)
+class APIConfig:
+    enabled: bool
+    host: str
+    port: int
+    docs_enabled: bool
+    log_level: str
+
+
+@dataclass(frozen=True)
 class SemanticSearchConfig:
     config_path: Path
     environment: EnvironmentConfig
@@ -109,6 +118,7 @@ class SemanticSearchConfig:
     translation: TranslationConfig
     search: SearchConfig
     ui: UIConfig
+    api: APIConfig
 
     @classmethod
     def from_file(cls, config_path: str | os.PathLike[str]) -> "SemanticSearchConfig":
@@ -138,6 +148,7 @@ class SemanticSearchConfig:
         translation_raw = raw["translation"]
         search_raw = raw["search"]
         ui_raw = raw["ui"]
+        api_raw = raw.get("api", {})
 
         return cls(
             config_path=config_path,
@@ -204,6 +215,13 @@ class SemanticSearchConfig:
                 show_api=bool(ui_raw["show_api"]),
                 concurrency_limit=int(ui_raw["concurrency_limit"]),
             ),
+            api=APIConfig(
+                enabled=bool(api_raw.get("enabled", False)),
+                host=str(api_raw.get("host", ui_raw["server_name"])),
+                port=int(api_raw.get("port", int(ui_raw["server_port"]) + 1)),
+                docs_enabled=bool(api_raw.get("docs_enabled", True)),
+                log_level=str(api_raw.get("log_level", "info")),
+            ),
         )
 
     def as_runtime_summary(self) -> dict[str, Any]:
@@ -216,4 +234,7 @@ class SemanticSearchConfig:
             "translation_model": self.translation.model,
             "server_name": self.ui.server_name,
             "server_port": self.ui.server_port,
+            "api_enabled": self.api.enabled,
+            "api_host": self.api.host,
+            "api_port": self.api.port,
         }

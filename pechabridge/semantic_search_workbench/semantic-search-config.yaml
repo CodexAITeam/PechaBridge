@@ -70,3 +70,10 @@ ui:
   share: false
   show_api: false
   concurrency_limit: 4
+
+api:
+  enabled: true
+  host: 127.0.0.1
+  port: 7861
+  docs_enabled: true
+  log_level: info

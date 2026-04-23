@@ -10,6 +10,7 @@ import gradio as gr
 
 from .config import SemanticSearchConfig
 from .service import IndexSummary, SearchHit, SearchResponse, SemanticSearchWorkbenchService
+from . import ui_workspace as workspace
 
 
 WORKBENCH_CSS = """
@@ -582,8 +583,8 @@ def build_workbench(
             gr.update(choices=["All pechas"], value="All pechas", interactive=False),
             gr.update(choices=[], value=[], interactive=False),
             gr.update(choices=[], value=None, interactive=False),
-            _render_focus_empty_state(),
-            _render_compare_empty_state(),
+            workspace.render_focus_empty_state(),
+            workspace.render_compare_empty_state(),
             "",
             "",
         )
@@ -604,22 +605,22 @@ def build_workbench(
             _render_search_activity_status(response),
             response,
             gr.update(
-                choices=_build_pecha_filter_choices(response),
+                choices=workspace.build_pecha_filter_choices(response),
                 value="All pechas",
                 interactive=bool(response.results),
             ),
             gr.update(
-                choices=_build_hit_choices(response),
+                choices=workspace.build_hit_choices(response),
                 value=[],
                 interactive=bool(response.results),
             ),
             gr.update(
-                choices=_build_hit_choices(response),
-                value=_first_hit_choice(response),
+                choices=workspace.build_hit_choices(response),
+                value=workspace.first_hit_choice(response),
                 interactive=bool(response.results),
             ),
-            _render_focus_panel(_first_hit(response)),
-            _render_compare_empty_state(response),
+            workspace.render_focus_panel(workspace.first_hit(response)),
+            workspace.render_compare_empty_state(response),
             "",
             "",
         )
@@ -675,20 +676,20 @@ def build_workbench(
             return (
                 gr.update(choices=[], value=[], interactive=False),
                 gr.update(choices=[], value=None, interactive=False),
-                _render_focus_empty_state(),
-                _render_compare_empty_state(),
+                workspace.render_focus_empty_state(),
+                workspace.render_compare_empty_state(),
                 "",
                 "",
             )
 
-        choices = _build_hit_choices(response, pecha_filter=pecha_filter)
+        choices = workspace.build_hit_choices(response, pecha_filter=pecha_filter)
         first_choice = choices[0] if choices else None
-        focus_hit = _resolve_focus_hit(response, first_choice)
+        focus_hit = workspace.resolve_focus_hit(response, first_choice)
         return (
             gr.update(choices=choices, value=[], interactive=bool(choices)),
             gr.update(choices=choices, value=first_choice, interactive=bool(choices)),
-            _render_focus_panel(focus_hit),
-            _render_compare_empty_state(response, pecha_filter=pecha_filter),
+            workspace.render_focus_panel(focus_hit),
+            workspace.render_compare_empty_state(response, pecha_filter=pecha_filter),
             "",
             "",
         )
@@ -699,32 +700,32 @@ def build_workbench(
         response: SearchResponse | None,
     ) -> tuple[str, str, str, str]:
         if response is None:
-            return (_render_focus_empty_state(), _render_compare_empty_state(), "", "")
+            return (workspace.render_focus_empty_state(), workspace.render_compare_empty_state(), "", "")
 
-        selected_hits = _resolve_selected_hits(response, selected_hit_labels)
-        focus_hit = _resolve_focus_hit(response, focused_hit_label)
+        selected_hits = workspace.resolve_selected_hits(response, selected_hit_labels)
+        focus_hit = workspace.resolve_focus_hit(response, focused_hit_label)
         if focus_hit is None and selected_hits:
             focus_hit = selected_hits[0]
         if focus_hit is None:
-            focus_hit = _first_hit(response)
+            focus_hit = workspace.first_hit(response)
 
         comparison_hits = selected_hits[:5]
         return (
-            _render_focus_panel(focus_hit),
-            _render_compare_panel(response, comparison_hits),
-            _render_export_markdown(response, comparison_hits),
-            _render_export_json(response, comparison_hits),
+            workspace.render_focus_panel(focus_hit),
+            workspace.render_compare_panel(response, comparison_hits),
+            workspace.render_export_markdown(response, comparison_hits),
+            workspace.render_export_json(response, comparison_hits),
         )
 
     def on_clear_workspace(
         response: SearchResponse | None,
     ) -> tuple[gr.CheckboxGroup, gr.Dropdown, str, str, str, str]:
-        first_choice = _first_hit_choice(response) if response is not None else None
+        first_choice = workspace.first_hit_choice(response) if response is not None else None
         return (
             gr.update(value=[]),
             gr.update(value=first_choice),
-            _render_focus_panel(_first_hit(response) if response is not None else None),
-            _render_compare_empty_state(response),
+            workspace.render_focus_panel(workspace.first_hit(response) if response is not None else None),
+            workspace.render_compare_empty_state(response),
             "",
             "",
         )
@@ -854,9 +855,9 @@ def build_workbench(
                         clear_workspace_button = gr.Button("Clear Pins")
 
                 with gr.Column(scale=8, min_width=420):
-                    focus_html = gr.HTML(_render_focus_empty_state())
+                    focus_html = gr.HTML(workspace.render_focus_empty_state())
 
-            compare_html = gr.HTML(_render_compare_empty_state())
+            compare_html = gr.HTML(workspace.render_compare_empty_state())
             with gr.Accordion("Export Selected Hits", open=False):
                 export_markdown = gr.Textbox(
                     label="Markdown Export",
@@ -1335,297 +1336,3 @@ def _describe_score(score: float) -> tuple[str, str, str]:
     if score >= 0.72:
         return ("Moderate similarity", "medium", "a useful nearby match")
     return ("Exploratory match", "low", "a looser semantic neighbor")
-
-
-def _render_focus_empty_state() -> str:
-    return (
-        '<section class="ssw-empty-state">'
-        '<h2 class="ssw-empty-title">No focused hit yet</h2>'
-        '<p class="ssw-empty-copy">'
-        "Run a search first. The workspace will then show one focused hit as a text-and-scan reading panel."
-        "</p>"
-        "</section>"
-    )
-
-
-def _render_focus_panel(hit: SearchHit | None) -> str:
-    if hit is None:
-        return _render_focus_empty_state()
-
-    score_label, score_tone, score_hint = _describe_score(hit.score)
-    return (
-        '<section class="ssw-workspace-card ssw-focus-card">'
-        '<div class="ssw-card-head">'
-        '<div>'
-        '<div class="ssw-card-kicker">Focused Reading</div>'
-        f'<h3 class="ssw-focus-title">{html.escape(_build_source_title(hit))}</h3>'
-        f'<p class="ssw-compare-meta">{html.escape(_build_citation(hit))}</p>'
-        "</div>"
-        f'<div class="ssw-score-pill" data-tone="{score_tone}">{html.escape(score_label)} · {hit.score:.4f}</div>'
-        "</div>"
-        '<div class="ssw-focus-layout">'
-        "<div>"
-        f'{_render_source_links(hit)}'
-        '<div class="ssw-section-label">Matched Line</div>'
-        f'<div class="ssw-match-line">{html.escape(hit.matched_line)}</div>'
-        '<div class="ssw-section-label">Context Window</div>'
-        f'{_render_context_box(hit.context)}'
-        f'<p class="ssw-export-copy">Interpret as {html.escape(score_hint)}; verify wording against the scan before citing.</p>'
-        "</div>"
-        f'<div>{_render_scan_block(hit)}</div>'
-        "</div>"
-        "</section>"
-    )
-
-
-def _render_compare_empty_state(
-    response: SearchResponse | None = None,
-    pecha_filter: str | None = None,
-) -> str:
-    filter_copy = (
-        f" Current filter: {html.escape(pecha_filter)}."
-        if pecha_filter and pecha_filter != "All pechas"
-        else ""
-    )
-    if response is not None and not response.results:
-        return (
-            '<section class="ssw-empty-state">'
-            '<h2 class="ssw-empty-title">No hits available for comparison</h2>'
-            '<p class="ssw-empty-copy">Run a broader search or adjust the query mode first.</p>'
-            "</section>"
-        )
-    return (
-        '<section class="ssw-empty-state">'
-        '<h2 class="ssw-empty-title">Select hits to compare</h2>'
-        '<p class="ssw-empty-copy">'
-        "Pin up to five hits in the Research Workspace controls. The comparison view and exports will update from those selections."
-        f"{filter_copy}"
-        "</p>"
-        "</section>"
-    )
-
-
-def _render_compare_panel(response: SearchResponse, hits: list[SearchHit]) -> str:
-    if not hits:
-        return _render_compare_empty_state(response)
-
-    cards = "".join(_render_compare_card(hit) for hit in hits)
-    return (
-        '<section class="ssw-panel">'
-        '<div class="ssw-results-head">'
-        "<div>"
-        '<h2 class="ssw-results-title">Pinned Hit Comparison</h2>'
-        '<p class="ssw-results-subtitle">'
-        f"Comparing {len(hits)} selected hit(s). Keep this small and deliberate for close philological reading."
-        "</p>"
-        "</div>"
-        '<div class="ssw-chip-row">'
-        f'<span class="ssw-chip">Original query: {html.escape(response.original_query)}</span>'
-        f'<span class="ssw-chip">Retrieval mode: {html.escape(response.query_mode)}</span>'
-        "</div>"
-        "</div>"
-        f'<div class="ssw-compare-grid">{cards}</div>'
-        "</section>"
-    )
-
-
-def _render_compare_card(hit: SearchHit) -> str:
-    score_label, score_tone, _ = _describe_score(hit.score)
-    scan_link = (
-        f'<a class="ssw-link-chip" href="{html.escape(hit.scan_url, quote=True)}" target="_blank" rel="noopener noreferrer">Scan</a>'
-        if hit.scan_url
-        else '<span class="ssw-link-chip">No scan</span>'
-    )
-    source_link = (
-        f'<a class="ssw-link-chip" href="{html.escape(hit.source_file_url, quote=True)}" target="_blank" rel="noopener noreferrer">Transcript</a>'
-        if hit.source_file_url
-        else ""
-    )
-    return (
-        '<article class="ssw-compare-card">'
-        f'<div class="ssw-card-kicker">Hit {hit.rank}</div>'
-        f'<h3 class="ssw-compare-title">{html.escape(_build_source_title(hit))}</h3>'
-        f'<p class="ssw-compare-meta">{html.escape(_build_citation(hit))}</p>'
-        f'<div class="ssw-score-pill" data-tone="{score_tone}">{html.escape(score_label)} · {hit.score:.4f}</div>'
-        '<div class="ssw-section-label" style="margin-top: 12px;">Matched Line</div>'
-        f'<div class="ssw-match-line">{html.escape(hit.matched_line)}</div>'
-        '<div class="ssw-section-label">Context Window</div>'
-        f'{_render_context_box(hit.context)}'
-        f'<div class="ssw-link-row">{source_link}{scan_link}</div>'
-        "</article>"
-    )
-
-
-def _build_pecha_filter_choices(response: SearchResponse) -> list[str]:
-    pechas = sorted(
-        {
-            str(hit.metadata.get("pecha_title"))
-            for hit in response.results
-            if hit.metadata.get("pecha_title")
-        }
-    )
-    return ["All pechas", *pechas]
-
-
-def _build_hit_choices(
-    response: SearchResponse,
-    pecha_filter: str | None = None,
-) -> list[str]:
-    return [_hit_choice_label(hit) for hit in _filtered_hits(response, pecha_filter)]
-
-
-def _filtered_hits(
-    response: SearchResponse,
-    pecha_filter: str | None = None,
-) -> list[SearchHit]:
-    if not pecha_filter or pecha_filter == "All pechas":
-        return list(response.results)
-    return [
-        hit
-        for hit in response.results
-        if str(hit.metadata.get("pecha_title", "")) == pecha_filter
-    ]
-
-
-def _first_hit(response: SearchResponse | None) -> SearchHit | None:
-    if response is None or not response.results:
-        return None
-    return response.results[0]
-
-
-def _first_hit_choice(response: SearchResponse | None) -> str | None:
-    first_hit = _first_hit(response)
-    return _hit_choice_label(first_hit) if first_hit is not None else None
-
-
-def _hit_choice_label(hit: SearchHit) -> str:
-    page = hit.metadata.get("page_number", "?")
-    line = hit.metadata.get("line_number", "?")
-    return (
-        f"Hit {hit.rank}: {_build_source_title(hit)} · "
-        f"p. {page} · l. {line} · {hit.score:.4f}"
-    )
-
-
-def _resolve_selected_hits(
-    response: SearchResponse,
-    selected_hit_labels: list[str] | str | None,
-) -> list[SearchHit]:
-    if selected_hit_labels is None:
-        return []
-    labels = (
-        [selected_hit_labels]
-        if isinstance(selected_hit_labels, str)
-        else list(selected_hit_labels)
-    )
-    ranks = {_rank_from_hit_choice(label) for label in labels}
-    ranks.discard(None)
-    return [hit for hit in response.results if hit.rank in ranks]
-
-
-def _resolve_focus_hit(
-    response: SearchResponse,
-    focused_hit_label: str | None,
-) -> SearchHit | None:
-    rank = _rank_from_hit_choice(focused_hit_label)
-    if rank is None:
-        return None
-    for hit in response.results:
-        if hit.rank == rank:
-            return hit
-    return None
-
-
-def _rank_from_hit_choice(label: str | None) -> int | None:
-    if not label:
-        return None
-    prefix = str(label).split(":", 1)[0].strip()
-    if not prefix.lower().startswith("hit "):
-        return None
-    rank_token = prefix[4:].strip()
-    return int(rank_token) if rank_token.isdigit() else None
-
-
-def _render_export_markdown(response: SearchResponse, hits: list[SearchHit]) -> str:
-    if not hits:
-        return ""
-
-    sections = [
-        "# Semantic Search Workbench Export",
-        "",
-        f"- Original query: {response.original_query}",
-        f"- Retrieval query: {response.translated_query}",
-        f"- Query mode: {response.query_mode}",
-        f"- Selected hits: {len(hits)}",
-        "",
-    ]
-    for hit in hits:
-        score_label, _, _ = _describe_score(hit.score)
-        sections.extend(
-            [
-                f"## Hit {hit.rank}: {_build_source_title(hit)}",
-                "",
-                f"- Citation: {_build_citation(hit)}",
-                f"- Relevance: {score_label} ({hit.score:.4f})",
-                f"- Source file: {hit.metadata.get('source_file', '')}",
-                f"- Metadata file: {hit.metadata.get('metadata_file', '')}",
-                f"- Scan URL: {hit.scan_url or ''}",
-                "",
-                "### Matched Line",
-                "",
-                hit.matched_line,
-                "",
-                "### Context",
-                "",
-                "```text",
-                hit.context,
-                "```",
-                "",
-            ]
-        )
-        if hit.back_translation:
-            sections.extend(
-                [
-                    "### English Back-Translation",
-                    "",
-                    hit.back_translation,
-                    "",
-                ]
-            )
-    return "\n".join(sections).strip()
-
-
-def _render_export_json(response: SearchResponse, hits: list[SearchHit]) -> str:
-    if not hits:
-        return ""
-    payload = {
-        "original_query": response.original_query,
-        "tibetan_retrieval_query": response.translated_query,
-        "query_mode": response.query_mode,
-        "top_k": response.top_k,
-        "context_lines": response.context_lines,
-        "selected_hits": [_hit_to_export_payload(hit) for hit in hits],
-    }
-    return json.dumps(payload, ensure_ascii=False, indent=2)
-
-
-def _hit_to_export_payload(hit: SearchHit) -> dict[str, object]:
-    score_label, _, _ = _describe_score(hit.score)
-    return {
-        "rank": hit.rank,
-        "score": hit.score,
-        "relevance_label": score_label,
-        "title": _build_source_title(hit),
-        "citation": _build_citation(hit),
-        "page_number": hit.metadata.get("page_number"),
-        "line_number": hit.metadata.get("line_number"),
-        "source_file": hit.metadata.get("source_file"),
-        "metadata_file": hit.metadata.get("metadata_file"),
-        "matched_line": hit.matched_line,
-        "context": hit.context,
-        "back_translation": hit.back_translation,
-        "scan_url": hit.scan_url,
-        "scan_filename": hit.scan_filename,
-        "source_file_url": hit.source_file_url,
-        "metadata_file_url": hit.metadata_file_url,
-    }

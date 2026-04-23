@@ -70,6 +70,8 @@ Useful flags:
 
 - `--reindex` rebuilds the local Qdrant collection before the Gradio app starts
 - `--reindex-only` rebuilds the collection and exits without launching the UI
+- `--api-only` starts only the FastAPI microservice
+- `--no-api` disables the FastAPI microservice for this run even if `api.enabled` is true in the config
 
 The workbench expects:
 
@@ -101,6 +103,12 @@ UI workflow:
 - choose the query mode explicitly: `DE / EN`, `Tibetan`, or `Wylie (EWTS)`
 - inspect ranked hit cards with matched lines, context windows, source links, and page scans
 - use the Research Workspace to filter by pecha, focus one hit with its scan, pin up to five hits for comparison, and export selected evidence as Markdown or JSON
+
+FastAPI microservice:
+
+- enabled via the `api` section in `semantic-search-config.yaml`
+- exposes `GET /health`, `GET /config`, `GET /index`, `POST /index/rebuild`, and `POST /search`
+- can run alongside Gradio or by itself with `--api-only`
 
 Metadata strategy:
 

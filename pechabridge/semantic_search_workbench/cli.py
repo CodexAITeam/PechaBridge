@@ -31,6 +31,16 @@ def create_parser(add_help: bool = True) -> argparse.ArgumentParser:
         action="store_true",
         help="Rebuild the index and exit without launching the Gradio workbench.",
     )
+    parser.add_argument(
+        "--api-only",
+        action="store_true",
+        help="Start only the FastAPI workbench microservice and do not launch Gradio.",
+    )
+    parser.add_argument(
+        "--no-api",
+        action="store_true",
+        help="Disable the FastAPI microservice for this run even if api.enabled is true in the config.",
+    )
     return parser
 
 
@@ -51,6 +61,28 @@ def run(args: argparse.Namespace) -> int:
 
     if args.reindex_only:
         return 0
+
+    api_enabled = bool(config.api.enabled and not args.no_api)
+    if args.api_only:
+        from .api import run_api_server
+
+        LOGGER.info(
+            "Starting Semantic Search Workbench API on %s:%s.",
+            config.api.host,
+            config.api.port,
+        )
+        run_api_server(service=service, config=config, initial_index_summary=summary)
+        return 0
+
+    if api_enabled:
+        from .api import start_api_server_thread
+
+        start_api_server_thread(service=service, config=config, initial_index_summary=summary)
+        LOGGER.info(
+            "Semantic Search Workbench API available on http://%s:%s.",
+            config.api.host,
+            config.api.port,
+        )
 
     app = build_workbench(service=service, initial_index_summary=summary)
     launch_workbench(app=app, config=config)

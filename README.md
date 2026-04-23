@@ -30,7 +30,7 @@ recognition errors. Accuracy improves with more training data.
 
 - **End-to-end Tibetan Pecha OCR pipeline**: Automatically segments lines on digitised Pecha pages (e.g. from the Staatsbibliothek zu Berlin) using a YOLO-based line segmentation model, then transcribes each line with a fine-tuned Donut VLM. A single `batch-ocr` CLI command covers download → line detection → OCR → transcript export.
 - **Synthetic multi-class dataset generation**: Creates YOLO-ready pages for Tibetan number words, Tibetan text blocks, and Chinese number words.
-- **Semantic Search Workbench for Tibetan transcripts**: Indexes line-level transcript data in local Qdrant, translates German or English queries into Classical Tibetan, and returns ranked passages with configurable context windows in a Gradio UI.
+- **Semantic Search Workbench for Tibetan transcripts**: Indexes line-level transcript data in local Qdrant, supports DE/EN, Tibetan Unicode, and Wylie/EWTS query modes, and returns ranked passages with configurable context windows in a Gradio UI plus optional FastAPI endpoints.
 
 ### Advanced Research Features
 - **Standalone DONUT/TroCR OCR training**: Trains OCR directly on OpenPecha/BDRC line manifests (`train-donut-ocr`) with `none|pb|gray|bdrc|rgb` image preprocessing and CER evaluation.
@@ -347,6 +347,7 @@ all modes
 - Local Qdrant collection status and a manual reindex action
 - Search controls for result count (`top_k`) and context-window radius
 - A Research Workspace for filtering hits by pecha, focusing one hit in a text/scan reading panel, pinning hits for comparison, and exporting selected evidence as Markdown or JSON
+- An optional FastAPI microservice layer for health checks, index status/rebuild, and JSON search responses
 
 ### Current UX / Research Focus
 
@@ -359,6 +360,26 @@ It is optimized for philological inspection and traceability:
 - English back-translation and collection metadata are available as expandable details
 - the associated page image can be opened directly from the result card
 - the Phase 2 Research Workspace supports pecha-level filtering, focused close reading, pinned-hit comparison, and note-friendly exports
+
+### Modular UI And API Layout
+
+The workbench is split into smaller modules:
+
+- `ui.py` builds the Gradio layout and wires events
+- `ui_workspace.py` renders and exports the Research Workspace state
+- `api.py` exposes the same search/index service through FastAPI endpoints
+- `service.py` remains the application service for translation, Qdrant search, context reconstruction, and scan resolution
+
+When `api.enabled: true` is set in `semantic-search-config.yaml`, the CLI starts the FastAPI microservice alongside Gradio.
+The default example config exposes it on `127.0.0.1:7861`.
+
+Useful API endpoints:
+
+- `GET /health`
+- `GET /config`
+- `GET /index`
+- `POST /index/rebuild`
+- `POST /search`
 
 ### Expected Transcript Layout
 
@@ -405,6 +426,7 @@ The YAML controls:
 - chunking and context-window parameters
 - OpenAI translation model settings
 - Gradio host and port settings
+- FastAPI microservice host, port, docs, and log-level settings
 
 The bundled example config uses the page-number regex:
 
@@ -458,6 +480,14 @@ Or rebuild the index only and exit:
 python cli.py semantic-search-workbench \
     --config pechabridge/semantic_search_workbench/semantic-search-config.yaml \
     --reindex-only
+```
+
+Run only the FastAPI microservice:
+
+```bash
+python cli.py semantic-search-workbench \
+    --config pechabridge/semantic_search_workbench/semantic-search-config.yaml \
+    --api-only
 ```
 
 ### Notes
