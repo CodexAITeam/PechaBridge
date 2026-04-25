@@ -1,13 +1,13 @@
 #!/usr/bin/env python3
 """Download and merge OpenPecha OCR Hugging Face datasets into a line dataset.
 
-Output format is TextHierarchy-like (line folders with `line.png`) plus merged metadata.
+Output format is split-local line image files plus merged metadata.
 Known HF split names are normalized into `train`, `test`, `eval` output folders.
 
 out_dir/
   train|test|eval/
-    TextHierarchy/
-      dataset=<dataset>/doc=<doc_id>/page=<page_id>/line_<id>/line.png
+    images/
+      dataset=<dataset>/doc=<doc_id>/page=<page_id>/line_<id>.png
     meta/
       lines.jsonl
       lines.parquet
@@ -570,16 +570,38 @@ def _probe_existing_png_meta(path: Path) -> Dict[str, Any]:
         return {"width_px": -1, "height_px": -1, "image_mode": ""}
 
 
+def _build_line_image_rel_path(
+    *,
+    canonical_split: str,
+    dataset_short: str,
+    doc_id: str,
+    page_id: str,
+    line_id: int,
+    dup_idx: int,
+) -> Path:
+    file_name = f"line_{int(line_id):06d}.png"
+    if int(dup_idx) > 0:
+        file_name = f"line_{int(line_id):06d}_dup{int(dup_idx):03d}.png"
+    return (
+        Path(canonical_split)
+        / "images"
+        / f"dataset={dataset_short}"
+        / f"doc={doc_id}"
+        / f"page={page_id}"
+        / file_name
+    )
+
+
 def create_parser(add_help: bool = True) -> argparse.ArgumentParser:
     parser = argparse.ArgumentParser(
-        description="Download and merge OpenPecha OCR HF datasets into a TextHierarchy-style line dataset.",
+        description="Download and merge OpenPecha OCR HF datasets into a split-local line image dataset.",
         add_help=add_help,
     )
     parser.add_argument(
         "--output-dir",
         type=str,
         required=True,
-        help="Output dataset directory (creates train/test/eval subfolders with TextHierarchy/ and meta/).",
+        help="Output dataset directory (creates train/test/eval subfolders with images/ and meta/).",
     )
     parser.add_argument(
         "--dataset",
@@ -688,9 +710,9 @@ def run(args: argparse.Namespace) -> Dict[str, Any]:
             if state is not None:
                 return state
             split_root = out_dir / canonical_split
-            split_text_root = split_root / "TextHierarchy"
+            split_image_root = split_root / "images"
             split_meta_dir = split_root / "meta"
-            split_text_root.mkdir(parents=True, exist_ok=True)
+            split_image_root.mkdir(parents=True, exist_ok=True)
             split_meta_dir.mkdir(parents=True, exist_ok=True)
             split_jsonl_path = split_meta_dir / "lines.jsonl"
             split_parquet_path = split_meta_dir / "lines.parquet"
@@ -698,7 +720,7 @@ def run(args: argparse.Namespace) -> Dict[str, Any]:
             split_fp = stack.enter_context(split_jsonl_path.open(split_mode, encoding="utf-8"))
             state = {
                 "root": split_root,
-                "text_root": split_text_root,
+                "image_root": split_image_root,
                 "meta_dir": split_meta_dir,
                 "jsonl_path": split_jsonl_path,
                 "parquet_path": split_parquet_path,
@@ -888,21 +910,19 @@ def run(args: argparse.Namespace) -> Dict[str, Any]:
                             dup_idx = int(path_collision_counters[collision_key])
                             path_collision_counters[collision_key] += 1
 
-                            split_state = _ensure_split_output(canonical_split)
-                            line_dir_name = (
-                                f"line_{int(line_id):06d}" if dup_idx == 0 else f"line_{int(line_id):06d}_dup{dup_idx:03d}"
+                            _ensure_split_output(canonical_split)
+                            line_rel_path = _build_line_image_rel_path(
+                                canonical_split=canonical_split,
+                                dataset_short=dataset_short,
+                                doc_id=doc_id,
+                                page_id=page_id,
+                                line_id=int(line_id),
+                                dup_idx=int(dup_idx),
                             )
-                            line_dir = (
-                                Path(split_state["text_root"])
-                                / f"dataset={dataset_short}"
-                                / f"doc={doc_id}"
-                                / f"page={page_id}"
-                                / line_dir_name
-                            )
-                            line_png = line_dir / "line.png"
-                            line_rel_path = str(line_png.relative_to(out_dir))
+                            line_png = out_dir / line_rel_path
+                            line_rel_path_str = str(line_rel_path)
                             existing_paths = existing_line_paths_by_split.setdefault(canonical_split, set())
-                            if line_rel_path in existing_paths:
+                            if line_rel_path_str in existing_paths:
                                 totals["rows_skipped_already_present"] += 1
                                 counts_by_dataset[dataset_id]["rows_skipped_already_present"] += 1
                                 counts_by_canonical_split[canonical_split]["rows_skipped_already_present"] += 1
@@ -912,7 +932,7 @@ def run(args: argparse.Namespace) -> Dict[str, Any]:
                             for key, value in row.items():
                                 pref_key = f"src__{key}"
                                 if image_source_col and key == image_source_col:
-                                    source_record[pref_key] = line_rel_path
+                                    source_record[pref_key] = line_rel_path_str
                                 else:
                                     source_record[pref_key] = _serialize_source_value(value)
 
@@ -928,11 +948,11 @@ def run(args: argparse.Namespace) -> Dict[str, Any]:
                                 "doc_id": doc_id,
                                 "page_id": page_id,
                                 "line_id": int(line_id),
-                                "line_path": line_rel_path,
+                                "line_path": line_rel_path_str,
                                 "text": text_value,
                                 "image_column": image_source_col or "",
                                 "text_column": text_col or "",
-                                "line_folder_dup_idx": int(dup_idx),
+                                "line_path_dup_idx": int(dup_idx),
                                 "width_px": -1,
                                 "height_px": -1,
                                 "image_mode": "",
@@ -946,7 +966,7 @@ def run(args: argparse.Namespace) -> Dict[str, Any]:
                                 rec["image_mode"] = str(img_meta.get("image_mode", ""))
                                 _safe_jsonl_write_line(root_fp, rec)
                                 _safe_jsonl_write_line(split_outputs[canonical_split]["fp"], rec)
-                                existing_paths.add(line_rel_path)
+                                existing_paths.add(line_rel_path_str)
                                 totals["rows_saved"] += 1
                                 totals["rows_resumed_from_existing_image"] += 1
                                 counts_by_dataset[dataset_id]["rows_saved"] += 1
@@ -999,7 +1019,7 @@ def run(args: argparse.Namespace) -> Dict[str, Any]:
         "split_outputs": {
             k: {
                 "root": str(v["root"]),
-                "text_root": str(v["text_root"]),
+                "image_root": str(v["image_root"]),
                 "meta_jsonl": str(v["jsonl_path"]),
                 "meta_parquet": str(v["parquet_path"]),
             }
