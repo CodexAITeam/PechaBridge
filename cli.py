@@ -276,7 +276,10 @@ def _build_root_parser() -> argparse.ArgumentParser:
         "download-models",
         aliases=["download-pechabridge-models"],
         parents=[download_pb_parent],
-        help="Download PechaBridge OCR + Line Segmentation models from HuggingFace into models/",
+        help=(
+            "Download PechaBridge models from HuggingFace into models/. "
+            "Includes OCR, Line Segmentation, and Dual Encoder (--models ocr,line,encoder or 'all')."
+        ),
         description=download_pb_parent.description,
     )
     download_pb_parser.set_defaults(handler=_run_download_pechabridge_models)

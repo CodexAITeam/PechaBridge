@@ -1,10 +1,11 @@
 #!/usr/bin/env python3
-"""Download PechaBridge OCR and Line Segmentation models from HuggingFace Hub.
+"""Download PechaBridge OCR, Line Segmentation, and Dual Encoder models from HuggingFace Hub.
 
 Downloads models into the exact directory structure expected by:
 - ui_ocr_workbench.py  (auto-scans models/ocr/ and models/line_segmentation/)
 - ui_workbench.py      (scans models/line_segmentation/)
 - cli.py batch-ocr     (--ocr-model, --line-model)
+- Semantic Search Workbench (huggingface_model_id in YAML config)
 
 Target layout after download
 -----------------------------
@@ -24,10 +25,22 @@ models/
         ...
   line_segmentation/
     PechaBridgeLineSegmentation.pt   ← YOLO .pt file
+  encoders/
+    PechaBridgeDualEncoder/          ← Dual image-text encoder (HF snapshot)
+      text_encoder/
+        config.json
+        model.safetensors
+        tokenizer_config.json
+        added_tokens.json
+      vit_backbone/
+        config.json
+        model.safetensors
+        preprocessor_config.json
+      training_config.json
 
 Usage
 -----
-    # Download both (default):
+    # Download all models (OCR + line segmentation + dual encoder):
     python scripts/download_pechabridge_models.py
 
     # Download only OCR model:
@@ -35,6 +48,12 @@ Usage
 
     # Download only line segmentation model:
     python scripts/download_pechabridge_models.py --models line
+
+    # Download only dual encoder:
+    python scripts/download_pechabridge_models.py --models encoder
+
+    # Download OCR + encoder (no line segmentation):
+    python scripts/download_pechabridge_models.py --models ocr,encoder
 
     # Custom destination:
     python scripts/download_pechabridge_models.py --dest /path/to/models
@@ -64,10 +83,14 @@ DEFAULT_MODELS_ROOT = REPO_ROOT / "models"
 
 OCR_HF_REPO = "TibetanCodexAITeam/PechaBridgeOCR"
 LINE_SEG_HF_REPO = "TibetanCodexAITeam/PechaBridgeLineSegmentation"
+DUAL_ENCODER_HF_REPO = "TibetanCodexAITeam/PechaBridgeDualEncoder"
 
 # The .pt file name inside the line segmentation HF repo.
 # snapshot_download fetches the whole repo; we then look for the .pt file.
 LINE_SEG_PT_GLOB = "*.pt"
+
+# Sub-directory name used locally for the dual encoder.
+DUAL_ENCODER_LOCAL_NAME = "PechaBridgeDualEncoder"
 
 
 # ---------------------------------------------------------------------------
@@ -208,6 +231,77 @@ def download_line_segmentation_model(
 
 
 # ---------------------------------------------------------------------------
+# Download: Dual Image-Text Encoder
+# ---------------------------------------------------------------------------
+
+def download_dual_encoder(
+    models_root: Path,
+    *,
+    token: Optional[str],
+    force: bool,
+) -> Path:
+    """Download the dual encoder into models/encoders/PechaBridgeDualEncoder/.
+
+    The HF repo layout is:
+        text_encoder/   ← ByT5 text encoder + tokenizer
+        vit_backbone/   ← DINOv2 image encoder + preprocessor
+        training_config.json
+
+    After download the Semantic Search Workbench can be pointed at:
+        models/encoders/PechaBridgeDualEncoder/text_encoder
+    """
+    encoder_dir = models_root / "encoders" / DUAL_ENCODER_LOCAL_NAME
+    encoder_dir.mkdir(parents=True, exist_ok=True)
+
+    print(f"\n[Dual Encoder]  {DUAL_ENCODER_HF_REPO}")
+    _snapshot(DUAL_ENCODER_HF_REPO, encoder_dir, token=token, force=force)
+
+    # Verify the result looks usable
+    text_enc_dir = encoder_dir / "text_encoder"
+    vit_dir = encoder_dir / "vit_backbone"
+
+    if not (text_enc_dir / "config.json").exists():
+        print(
+            f"WARNING: text_encoder/config.json not found in {encoder_dir}. "
+            "The download may be incomplete.",
+            file=sys.stderr,
+        )
+    else:
+        print(f"  ✓ Text encoder ready at : {text_enc_dir}")
+
+    if not (vit_dir / "config.json").exists():
+        print(
+            f"WARNING: vit_backbone/config.json not found in {encoder_dir}. "
+            "The download may be incomplete.",
+            file=sys.stderr,
+        )
+    else:
+        print(f"  ✓ ViT backbone ready at : {vit_dir}")
+
+    training_cfg = encoder_dir / "training_config.json"
+    if training_cfg.exists():
+        import json
+        try:
+            data = json.loads(training_cfg.read_text(encoding="utf-8"))
+            metrics = data.get("last_val_metrics", {})
+            i2t_r1 = metrics.get("val_i2t_r1")
+            t2i_r1 = metrics.get("val_t2i_r1")
+            if i2t_r1 is not None and t2i_r1 is not None:
+                print(
+                    f"  ✓ Training config present  "
+                    f"(i2t R@1={i2t_r1*100:.2f}%  t2i R@1={t2i_r1*100:.2f}%)"
+                )
+            else:
+                print(f"  ✓ Training config present")
+        except Exception:
+            print(f"  ✓ Training config present")
+    else:
+        print("  ⚠ No training_config.json found.")
+
+    return encoder_dir
+
+
+# ---------------------------------------------------------------------------
 # Main
 # ---------------------------------------------------------------------------
 
@@ -229,6 +323,9 @@ def download_models(
     if "line" in which:
         results["line"] = download_line_segmentation_model(models_root, token=token, force=force)
 
+    if "encoder" in which:
+        results["encoder"] = download_dual_encoder(models_root, token=token, force=force)
+
     return results
 
 
@@ -239,6 +336,7 @@ def _print_usage_hint(results: dict) -> None:
 
     ocr_path = results.get("ocr")
     line_path = results.get("line")
+    encoder_path = results.get("encoder")
 
     if ocr_path and line_path:
         print("\n  # Batch OCR (DONUT + YOLO line segmentation):")
@@ -257,8 +355,18 @@ def _print_usage_hint(results: dict) -> None:
         print(f"\n  # Line segmentation model path for --line-model:")
         print(f"  {line_path}")
 
+    if encoder_path:
+        text_enc_path = encoder_path / "text_encoder"
+        print(f"\n  # Dual encoder downloaded to:")
+        print(f"  {encoder_path}")
+        print(f"\n  # Use the text encoder in the Semantic Search Workbench by setting")
+        print(f"  # huggingface_model_id in your workbench YAML config to:")
+        print(f"  #   {text_enc_path}")
+        print(f"  # or the HF repo subfolder:")
+        print(f"  #   {DUAL_ENCODER_HF_REPO}/text_encoder")
+
     print(f"\n  # The UI workbenches (ui_ocr_workbench.py, ui_workbench.py)")
-    print(f"  # will auto-detect these models on startup.")
+    print(f"  # will auto-detect OCR and line segmentation models on startup.")
     print()
 
 
@@ -270,9 +378,9 @@ def create_parser(add_help: bool = True) -> argparse.ArgumentParser:
     parser = argparse.ArgumentParser(
         add_help=add_help,
         description=(
-            "Download PechaBridge OCR and Line Segmentation models from HuggingFace.\n\n"
-            "Places models in the exact directory structure expected by the UI workbenches\n"
-            "and CLI tools (models/ocr/ and models/line_segmentation/)."
+            "Download PechaBridge OCR, Line Segmentation, and Dual Encoder models from HuggingFace.\n\n"
+            "Places models in the exact directory structure expected by the UI workbenches,\n"
+            "CLI tools, and the Semantic Search Workbench."
         ),
         formatter_class=argparse.RawDescriptionHelpFormatter,
         epilog="""
@@ -281,9 +389,13 @@ Models downloaded:
                     → models/ocr/PechaBridgeOCR/
   Line Segmentation: TibetanCodexAITeam/PechaBridgeLineSegmentation
                     → models/line_segmentation/PechaBridgeLineSegmentation.pt
+  Dual Encoder:     TibetanCodexAITeam/PechaBridgeDualEncoder
+                    → models/encoders/PechaBridgeDualEncoder/
+                       text_encoder/   (use this path in semantic_search.yaml)
+                       vit_backbone/
 
 Examples:
-  # Download both models (default):
+  # Download all models (default):
   python scripts/download_pechabridge_models.py
 
   # Download only OCR model:
@@ -291,6 +403,12 @@ Examples:
 
   # Download only line segmentation model:
   python scripts/download_pechabridge_models.py --models line
+
+  # Download only dual encoder:
+  python scripts/download_pechabridge_models.py --models encoder
+
+  # Download OCR + encoder (no line segmentation):
+  python scripts/download_pechabridge_models.py --models ocr,encoder
 
   # Custom destination root:
   python scripts/download_pechabridge_models.py --dest /data/models
@@ -309,7 +427,7 @@ Examples:
         metavar="SELECTION",
         help=(
             "Which models to download. "
-            "Comma-separated list of: ocr, line. "
+            "Comma-separated list of: ocr, line, encoder. "
             "Use 'all' to download everything (default: all)."
         ),
     )
@@ -351,12 +469,16 @@ def main(argv: Optional[List[str]] = None) -> int:
     # Resolve which models to download
     raw = str(args.models or "all").strip().lower()
     if raw == "all":
-        which = ["ocr", "line"]
+        which = ["ocr", "line", "encoder"]
     else:
         which = [x.strip() for x in raw.split(",") if x.strip()]
-        invalid = set(which) - {"ocr", "line"}
+        invalid = set(which) - {"ocr", "line", "encoder"}
         if invalid:
-            print(f"ERROR: Unknown model selection: {sorted(invalid)}. Use 'ocr', 'line', or 'all'.", file=sys.stderr)
+            print(
+                f"ERROR: Unknown model selection: {sorted(invalid)}. "
+                "Use 'ocr', 'line', 'encoder', or 'all'.",
+                file=sys.stderr,
+            )
             return 1
 
     models_root = Path(args.dest).expanduser().resolve()
