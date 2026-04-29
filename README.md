@@ -611,7 +611,7 @@ python cli.py train-donut-ocr \
   --val_manifest ./datasets/openpecha_ocr_lines/eval/meta/lines.jsonl \
   --output_dir ./models/donut_openpecha_rgb \
   --model_name_or_path microsoft/trocr-base-stage1 \
-  --tokenizer_path openpecha/BoSentencePiece \
+  --tokenizer_path ./ext/BoSentencePiece \
   --image_preprocess_pipeline rgb
 
 # Cross-page FAISS evaluation from exported embeddings
@@ -629,6 +629,8 @@ python cli.py run-donut-ocr-workflow \
   --font_path_chinese ext/simkai.ttf \
   --model_output_dir ./models/donut-ocr-label1
 ```
+
+For the full OCR training workflow, including dataset download, tiny-run warmup, non-square letterboxed training, and checkpoint selection, see [docs/donut_training_guide.md](docs/donut_training_guide.md).
 
 ## Model Outputs And Workbench Compatibility
 
@@ -685,7 +687,7 @@ Then use the Workbench export actions.
 
 ## Documentation Guide
 
-- **NEW:** Full DONUT OCR training playbook (Tiny-Pretraining, Anti-Collapse, Full-Run recipes): [docs/donut_training_guide.md](docs/donut_training_guide.md)
+- Full DONUT/TroCR OCR training guide (dataset download, tiny runs, preprocessing, letterboxing, full runs, checkpoint selection): [docs/donut_training_guide.md](docs/donut_training_guide.md)
 - CLI command reference and end-to-end examples: [README_CLI.md](README_CLI.md)
 - Pseudo-labeling and Label Studio workflow: [README_PSEUDO_LABELING_LABEL_STUDIO.md](README_PSEUDO_LABELING_LABEL_STUDIO.md)
 - Patch dataset generation (YOLO textbox -> lines -> sub-patches): [docs/dataset_generation.md](docs/dataset_generation.md)
