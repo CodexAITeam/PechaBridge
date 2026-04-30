@@ -3067,7 +3067,7 @@ def run(args) -> Dict[str, object]:
         model.generation_config.min_new_tokens = int(gen_min_new_tokens)
     else:
         try:
-            model.generation_config.min_new_tokens = 0
+            model.generation_config.min_new_tokens = None
         except Exception:
             pass
     LOGGER.info(

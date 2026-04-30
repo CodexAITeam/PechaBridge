@@ -136,7 +136,8 @@ def _configure_model_for_eval(model, tokenizer, decoder_start_token: str, genera
     model.generation_config.max_length = int(generation_max_length)
     model.generation_config.num_beams = 1
     try:
-        model.generation_config.min_new_tokens = max(0, int(generation_min_new_tokens))
+        min_new_tokens = max(0, int(generation_min_new_tokens))
+        model.generation_config.min_new_tokens = int(min_new_tokens) if min_new_tokens > 0 else None
     except Exception:
         pass
 
@@ -170,7 +171,7 @@ def _run_checkpoint(
         for batch in dl:
             pixel_values = batch["pixel_values"].to(device)
             labels = batch["labels"].detach().cpu().numpy()
-            gen_ids = model.generate(
+            generate_kwargs = dict(
                 pixel_values=pixel_values,
                 decoder_start_token_id=model.config.decoder_start_token_id,
                 eos_token_id=model.config.eos_token_id,
@@ -178,8 +179,11 @@ def _run_checkpoint(
                 max_length=int(args.generation_max_length),
                 num_beams=1,
                 do_sample=False,
-                min_new_tokens=max(0, int(args.generation_min_new_tokens)),
             )
+            min_new_tokens = max(0, int(args.generation_min_new_tokens))
+            if min_new_tokens > 0:
+                generate_kwargs["min_new_tokens"] = int(min_new_tokens)
+            gen_ids = model.generate(**generate_kwargs)
             pred_norms = train_mod._decode_for_metric(tokenizer, gen_ids.detach().cpu().numpy(), newline_token=args.metric_newline_token)
             labels = np.where(labels == -100, tokenizer.pad_token_id, labels)
             ref_norms = train_mod._decode_for_metric(tokenizer, labels, newline_token=args.metric_newline_token)
