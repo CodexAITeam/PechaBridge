@@ -2136,6 +2136,20 @@ def _encoder_pos_embeddings_are_square_grid(model) -> bool:
     return int(s * s) == int(n)
 
 
+def _encoder_position_embedding_count(model) -> Optional[int]:
+    """Return the total encoder position embedding count, including CLS."""
+    enc = getattr(model, "encoder", None)
+    if enc is None:
+        return None
+    try:
+        pos = getattr(getattr(enc, "embeddings", None), "position_embeddings", None)
+    except Exception:
+        pos = None
+    if not torch.is_tensor(pos) or pos.ndim != 3:
+        return None
+    return int(pos.shape[1])
+
+
 def _set_encoder_patch_image_size(model, target_h: int, target_w: int) -> None:
     """Keep ViT patch embedding geometry in sync with letterboxed input size."""
     enc = getattr(model, "encoder", None)
@@ -3164,13 +3178,34 @@ def run(args) -> Dict[str, object]:
             target_w=int(target_width),
             checkpoint_source=str(args.model_name_or_path),
         )
+    target_grid = _target_patch_grid(model, int(target_height), int(target_width)) if use_target_geometry else None
+    target_pos_tokens = (
+        int(target_grid[0] * target_grid[1]) + 1
+        if target_grid is not None
+        else None
+    )
+    encoder_pos_tokens = _encoder_position_embedding_count(model)
+    encoder_pos_matches_target = bool(
+        target_pos_tokens is not None
+        and encoder_pos_tokens is not None
+        and int(encoder_pos_tokens) == int(target_pos_tokens)
+    )
     encoder_pos_is_square = _encoder_pos_embeddings_are_square_grid(model)
     force_interpolate_pos_encoding = bool(
         use_target_geometry
         and encoder_supports_interp
         and encoder_pos_is_square
         and not materialized_pos
+        and not encoder_pos_matches_target
     )
+    if bool(use_target_geometry) and bool(encoder_supports_interp) and bool(encoder_pos_matches_target) and not bool(materialized_pos):
+        LOGGER.info(
+            "Disabled interpolate_pos_encoding because encoder position embeddings already match "
+            "the target patch count (position_tokens=%d target_height=%d target_width=%d).",
+            int(encoder_pos_tokens or 0),
+            int(target_height),
+            int(target_width),
+        )
     if bool(use_target_geometry) and bool(encoder_supports_interp) and not bool(encoder_pos_is_square):
         LOGGER.info(
             "Disabled interpolate_pos_encoding because loaded encoder position embeddings are non-square "
