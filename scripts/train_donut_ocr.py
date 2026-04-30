@@ -1922,6 +1922,33 @@ def _configure_image_processor(image_processor, image_size: int):
     except Exception as exc:
         LOGGER.warning("Could not update image processor pad/resize behavior: %s", exc)
 
+
+def _configure_image_processor_fixed_resize(image_processor, target_height: int, target_width: int) -> None:
+    """Force anisotropic resize to a fixed HxW canvas without padding."""
+    target_height = max(1, int(target_height))
+    target_width = max(1, int(target_width))
+    try:
+        image_processor.size = {"height": target_height, "width": target_width}
+    except Exception as exc:
+        LOGGER.warning(
+            "Could not set image processor fixed resize size to [%d,%d]: %s",
+            target_height,
+            target_width,
+            exc,
+        )
+    try:
+        if hasattr(image_processor, "do_resize"):
+            image_processor.do_resize = True
+        if hasattr(image_processor, "do_thumbnail"):
+            image_processor.do_thumbnail = False
+        if hasattr(image_processor, "do_pad"):
+            image_processor.do_pad = False
+        if hasattr(image_processor, "random_padding"):
+            image_processor.random_padding = False
+    except Exception as exc:
+        LOGGER.warning("Could not update image processor fixed resize flags: %s", exc)
+
+
 def _image_preprocess_pipeline_name(args) -> str:
     mode = str(getattr(args, "image_preprocess_pipeline", "none") or "none").strip().lower()
     # Backward-compatible alias: bdrc_no_bin -> gray
@@ -2858,6 +2885,9 @@ def run(args) -> Dict[str, object]:
     _dist_barrier()
 
     enable_letterboxing = bool(getattr(args, "enable_letterboxing", False))
+    enable_fixed_resize = bool(getattr(args, "enable_fixed_resize", False))
+    if enable_letterboxing and enable_fixed_resize:
+        raise ValueError("--enable_letterboxing and --enable_fixed_resize are mutually exclusive.")
     target_width = max(1, int(getattr(args, "target_width", 2560) or 2560))
     target_height = max(1, int(getattr(args, "target_height", 320) or 320))
 
@@ -2869,11 +2899,14 @@ def run(args) -> Dict[str, object]:
             image_processor.size = {"height": int(target_height), "width": int(target_width)}
         except Exception as exc:
             LOGGER.warning("Could not set image processor letterbox size to [%d,%d]: %s", int(target_height), int(target_width), exc)
+    elif enable_fixed_resize:
+        _configure_image_processor_fixed_resize(image_processor, int(target_height), int(target_width))
     image_preproc_mode = _image_preprocess_pipeline_name(args)
     LOGGER.info("Donut OCR image preprocessing pipeline: %s", image_preproc_mode)
     LOGGER.info(
-        "Donut OCR letterboxing: enabled=%s target_height=%d target_width=%d",
+        "Donut OCR geometry: letterboxing=%s fixed_resize=%s target_height=%d target_width=%d",
         bool(enable_letterboxing),
+        bool(enable_fixed_resize),
         int(target_height),
         int(target_width),
     )
@@ -2900,12 +2933,13 @@ def run(args) -> Dict[str, object]:
     _set_encoder_patch_image_size(model, int(target_height), int(target_width))
     encoder_supports_interp = _encoder_supports_interpolate_pos_encoding(model)
     encoder_pos_is_square = _encoder_pos_embeddings_are_square_grid(model)
+    use_target_geometry = bool(enable_letterboxing or enable_fixed_resize)
     force_interpolate_pos_encoding = bool(
-        enable_letterboxing
+        use_target_geometry
         and encoder_supports_interp
         and encoder_pos_is_square
     )
-    if bool(enable_letterboxing) and bool(encoder_supports_interp) and not bool(encoder_pos_is_square):
+    if bool(use_target_geometry) and bool(encoder_supports_interp) and not bool(encoder_pos_is_square):
         LOGGER.info(
             "Disabled interpolate_pos_encoding because loaded encoder position embeddings are non-square "
             "(already adapted checkpoint)."

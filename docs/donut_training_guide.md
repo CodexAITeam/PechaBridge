@@ -12,9 +12,10 @@ It covers:
 4. optional manifest preparation,
 5. creating a safe tiny dataset,
 6. why a tiny run is worth doing first,
-7. square vs non-square training,
-8. recommended tiny and full training commands,
-9. how to select checkpoints and read training logs.
+7. Trackio and Hugging Face Space logging,
+8. square vs non-square training,
+9. recommended tiny and full training commands,
+10. how to select checkpoints and read training logs.
 
 The examples assume a local clone of the repo. Replace paths as needed.
 
@@ -71,6 +72,50 @@ export DATASET_ROOT=$PB_ROOT/datasets/openpecha_ocr_lines
 export TINY_DIR=$PB_ROOT/datasets/openpecha_ocr_lines_tiny_abs
 export MODEL_DIR=$PB_ROOT/models
 ```
+
+## 2.1 Optional: Trackio and Hugging Face Space logging
+
+Trackio is included in `requirements.txt` and can be used as a lightweight experiment tracker through the standard `Transformers` `report_to` integration.
+
+Important default behavior:
+
+1. `--report_to trackio` enables Trackio logging in the trainer,
+2. without further configuration, Trackio logs locally on the training machine,
+3. to send logs to a Hugging Face Space, you must set `TRACKIO_SPACE_ID`,
+4. for Hugging Face Space logging, you should also authenticate on the machine with `huggingface-cli login` or an equivalent `HF_TOKEN` setup.
+
+For a public or private Hugging Face Space, the recommended setup is:
+
+```bash
+huggingface-cli login
+
+export TRACKIO_SPACE_ID="username/your-trackio-space"
+export TRACKIO_PROJECT="donut-ocr"
+export TRACKIO_PROJECT_NAME="donut-ocr"
+```
+
+Notes:
+
+1. `TRACKIO_PROJECT` is the official Trackio/Transformers project variable.
+2. `TRACKIO_PROJECT_NAME` is also useful in this repo because PechaBridge logs that variable in its startup diagnostics.
+3. If `TRACKIO_SPACE_ID` is not set, PechaBridge will still run, but Trackio will default to local logging rather than your Hugging Face Space.
+
+In the training command itself, enable logging with:
+
+```bash
+--report_to trackio \
+--run_name gray_lb_256x1024_full
+```
+
+Example for the Hugging Face Space used by this project:
+
+```bash
+export TRACKIO_SPACE_ID="TibetanCodexAITeam/donut-ocr"
+export TRACKIO_PROJECT="donut-ocr"
+export TRACKIO_PROJECT_NAME="donut-ocr"
+```
+
+If you only want local dashboards and do not want Hugging Face logging, you can skip `TRACKIO_SPACE_ID` and just use `--report_to trackio`.
 
 ## 3. Download the tokenizer
 
@@ -328,6 +373,26 @@ Practical recommendation:
 2. keep dimensions divisible by 16,
 3. move to `256 x 1536` or `320 x 2560` only if memory and throughput allow it.
 
+### Non-square input without padding: `--enable_fixed_resize`
+
+If you want a fixed non-square tensor shape without preserving aspect ratio, use:
+
+```bash
+--enable_fixed_resize \
+--target_height 256 \
+--target_width 1024
+```
+
+This forces the image processor to resize every line directly to `target_height x target_width` with no letterbox padding.
+
+Compared with letterboxing:
+
+1. it uses the whole canvas for text,
+2. it avoids large padded areas,
+3. it distorts line geometry because height and width are scaled independently.
+
+This is useful when the square `384 x 384` baseline works well and you want to test whether a wider fixed input helps without introducing letterbox padding.
+
 ## 10. Recommended tiny run
 
 The recommended first experiment is a non-square `gray` run with letterboxing.
@@ -418,6 +483,14 @@ CUDA_VISIBLE_DEVICES=0 python cli.py train-donut-ocr \
 
 Remember: without `--enable_letterboxing`, long lines are still being pushed into a square representation.
 
+For a fixed non-square resize baseline, replace `--image_size 384` with:
+
+```bash
+--enable_fixed_resize \
+--target_height 256 \
+--target_width 1024
+```
+
 ## 12. How to read tiny-run health signals
 
 The tiny run is healthy when most of the following are true:
@@ -490,6 +563,9 @@ export VAL_MANIFEST=$DATASET_ROOT/eval/meta/lines.jsonl
 
 export TINY_RUN=/dev/shm/donut_tiny_gray_lb_256x1024
 export LAST_TINY_CKPT=$(find "$TINY_RUN" -maxdepth 1 -type d -name 'checkpoint-[0-9]*' | sort -V | tail -n 1)
+export TRACKIO_SPACE_ID="TibetanCodexAITeam/donut-ocr"
+export TRACKIO_PROJECT="donut-ocr"
+export TRACKIO_PROJECT_NAME="donut-ocr"
 
 CUDA_VISIBLE_DEVICES=0 python cli.py train-donut-ocr \
   --train_manifest "$TRAIN_MANIFEST" \
