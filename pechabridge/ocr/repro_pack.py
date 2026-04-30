@@ -145,6 +145,53 @@ def _encoder_pos_embeddings_are_square_grid(model) -> bool:
     return int(s * s) == int(n)
 
 
+def _encoder_position_embedding_count(model) -> Optional[int]:
+    enc = getattr(model, "encoder", None)
+    if enc is None:
+        return None
+    try:
+        pos = getattr(getattr(enc, "embeddings", None), "position_embeddings", None)
+    except Exception:
+        pos = None
+    if not torch.is_tensor(pos) or pos.ndim != 3:
+        return None
+    return int(pos.shape[1])
+
+
+def _encoder_patch_size(model) -> Tuple[int, int]:
+    enc = getattr(model, "encoder", None)
+    patch_size = getattr(getattr(getattr(enc, "embeddings", None), "patch_embeddings", None), "patch_size", None)
+    if patch_size is None:
+        return 16, 16
+    try:
+        if isinstance(patch_size, int):
+            return max(1, int(patch_size)), max(1, int(patch_size))
+        return max(1, int(patch_size[0])), max(1, int(patch_size[1]))
+    except Exception:
+        return 16, 16
+
+
+def _target_position_count_from_pixels(model, pixel_values: torch.Tensor) -> Optional[int]:
+    if not torch.is_tensor(pixel_values) or pixel_values.ndim < 4:
+        return None
+    ph, pw = _encoder_patch_size(model)
+    height = int(pixel_values.shape[-2])
+    width = int(pixel_values.shape[-1])
+    return int(max(1, height // ph) * max(1, width // pw) + 1)
+
+
+def _should_force_interpolate_pos_encoding(model, pixel_values: torch.Tensor) -> bool:
+    if not _encoder_supports_interpolate_pos_encoding(model):
+        return False
+    if not _encoder_pos_embeddings_are_square_grid(model):
+        return False
+    current_count = _encoder_position_embedding_count(model)
+    target_count = _target_position_count_from_pixels(model, pixel_values)
+    if current_count is not None and target_count is not None and int(current_count) == int(target_count):
+        return False
+    return True
+
+
 def _sha256_file(path: Path, chunk_size: int = 1 << 20) -> str:
     h = hashlib.sha256()
     with path.open("rb") as f:
@@ -469,9 +516,7 @@ class ReproPack:
 
         was_training = bool(getattr(gen_model, "training", False))
         device = next(gen_model.parameters()).device
-        gen_kwargs = self._generate_kwargs(gen_model)
-        if _encoder_supports_interpolate_pos_encoding(gen_model) and _encoder_pos_embeddings_are_square_grid(gen_model):
-            gen_kwargs.setdefault("interpolate_pos_encoding", True)
+        base_gen_kwargs = self._generate_kwargs(gen_model)
         newline_token = str(getattr(self.args, "metric_newline_token", "<NL>") or "<NL>")
         local_rows: List[Dict[str, Any]] = []
         local_edit_sum = 0
@@ -483,6 +528,9 @@ class ReproPack:
         with torch.no_grad():
             for batch in loader:
                 pixel_values = batch["pixel_values"].to(device)
+                gen_kwargs = dict(base_gen_kwargs)
+                if _should_force_interpolate_pos_encoding(gen_model, pixel_values):
+                    gen_kwargs.setdefault("interpolate_pos_encoding", True)
                 gen_ids = gen_model.generate(pixel_values=pixel_values, **gen_kwargs)
                 pred_raw_list = self.tokenizer.batch_decode(gen_ids, skip_special_tokens=True)
                 metas = batch["meta"]
