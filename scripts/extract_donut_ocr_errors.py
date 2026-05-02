@@ -4,6 +4,7 @@
 from __future__ import annotations
 
 import argparse
+import csv
 import json
 import logging
 import re
@@ -108,6 +109,8 @@ def create_parser(add_help: bool = True) -> argparse.ArgumentParser:
     parser.add_argument("--seed", type=int, default=42, help="Seed for deterministic train/val split of extracted errors.")
     parser.add_argument("--dataset_train_manifest", "--dataset-train-manifest", dest="dataset_train_manifest", type=str, default="train_manifest.jsonl", help="Filename for extracted training manifest under --output_dataset_dir.")
     parser.add_argument("--dataset_val_manifest", "--dataset-val-manifest", dest="dataset_val_manifest", type=str, default="val_manifest.jsonl", help="Filename for extracted validation manifest under --output_dataset_dir.")
+    parser.add_argument("--dataset_cer_table", "--dataset-cer-table", dest="dataset_cer_table", type=str, default="cer_table.csv", help="Filename for the extracted filename/CER CSV table under --output_dataset_dir.")
+    parser.add_argument("--output_table_csv", "--output-table-csv", dest="output_table_csv", type=str, default="", help="Optional explicit filename/CER CSV table output path.")
     parser.add_argument(
         "--output_all_jsonl",
         "--output-all-jsonl",
@@ -722,11 +725,19 @@ def run(args: argparse.Namespace) -> Dict[str, object]:
     else:
         summary_json = output_jsonl.with_suffix(".summary.json")
     output_all_jsonl = Path(str(args.output_all_jsonl)).expanduser().resolve() if str(getattr(args, "output_all_jsonl", "") or "").strip() else None
+    if str(getattr(args, "output_table_csv", "") or "").strip():
+        output_table_csv = Path(str(args.output_table_csv)).expanduser().resolve()
+    elif output_dataset_dir is not None:
+        output_table_csv = output_dataset_dir / str(getattr(args, "dataset_cer_table", "cer_table.csv") or "cer_table.csv")
+    else:
+        output_table_csv = None
     copy_images_dir = Path(str(args.copy_images_dir)).expanduser().resolve() if str(getattr(args, "copy_images_dir", "") or "").strip() else None
     dataset_train_manifest = None
     dataset_val_manifest = None
     dataset_train_fp = None
     dataset_val_fp = None
+    table_fp = None
+    table_writer = None
     dataset_counts = {"train": 0, "val": 0}
 
     tokenizer = _build_tokenizer(args, checkpoint)
@@ -766,6 +777,8 @@ def run(args: argparse.Namespace) -> Dict[str, object]:
     summary_json.parent.mkdir(parents=True, exist_ok=True)
     if output_all_jsonl is not None:
         output_all_jsonl.parent.mkdir(parents=True, exist_ok=True)
+    if output_table_csv is not None:
+        output_table_csv.parent.mkdir(parents=True, exist_ok=True)
     if output_dataset_dir is not None:
         dataset_train_manifest = output_dataset_dir / str(getattr(args, "dataset_train_manifest", "train_manifest.jsonl") or "train_manifest.jsonl")
         dataset_val_manifest = output_dataset_dir / str(getattr(args, "dataset_val_manifest", "val_manifest.jsonl") or "val_manifest.jsonl")
@@ -799,6 +812,10 @@ def run(args: argparse.Namespace) -> Dict[str, object]:
             dataset_train_fp = dataset_train_manifest.open("w", encoding="utf-8")
             dataset_val_fp = dataset_val_manifest.open("w", encoding="utf-8") if dataset_val_manifest is not None and float(getattr(args, "val_fraction", 0.0) or 0.0) > 0.0 else None
         all_fp_ctx = output_all_jsonl.open("w", encoding="utf-8") if output_all_jsonl is not None else None
+        if output_table_csv is not None:
+            table_fp = output_table_csv.open("w", encoding="utf-8", newline="")
+            table_writer = csv.writer(table_fp)
+            table_writer.writerow(["filename", "cer"])
         try:
             with torch.no_grad():
                 for batch in tqdm(loader, desc="extract-cer-errors"):
@@ -896,6 +913,9 @@ def run(args: argparse.Namespace) -> Dict[str, object]:
                                 record["dataset_image"] = image_rel
                                 record["dataset_split"] = err_split
                                 dataset_counts[err_split] = int(dataset_counts.get(err_split, 0)) + 1
+                            if table_writer is not None:
+                                table_filename = str(record.get("dataset_image") or record.get("copied_image") or Path(image_path).name)
+                                table_writer.writerow([table_filename, f"{float(sample_cer):.8f}"])
                             error_fp.write(json.dumps(record, ensure_ascii=False) + "\n")
                         if all_fp_ctx is not None:
                             all_fp_ctx.write(json.dumps(record, ensure_ascii=False) + "\n")
@@ -906,6 +926,8 @@ def run(args: argparse.Namespace) -> Dict[str, object]:
         finally:
             if all_fp_ctx is not None:
                 all_fp_ctx.close()
+            if table_fp is not None:
+                table_fp.close()
             if dataset_train_fp is not None:
                 dataset_train_fp.close()
             if dataset_val_fp is not None:
@@ -920,6 +942,7 @@ def run(args: argparse.Namespace) -> Dict[str, object]:
         "output_dataset_dir": str(output_dataset_dir) if output_dataset_dir is not None else "",
         "dataset_train_manifest": str(dataset_train_manifest) if dataset_train_manifest is not None else "",
         "dataset_val_manifest": str(dataset_val_manifest) if dataset_val_manifest is not None and dataset_val_fp is not None else "",
+        "cer_table_csv": str(output_table_csv) if output_table_csv is not None else "",
         "dataset_counts": dataset_counts,
         "val_fraction": float(getattr(args, "val_fraction", 0.0) or 0.0),
         "output_all_jsonl": str(output_all_jsonl) if output_all_jsonl is not None else "",
