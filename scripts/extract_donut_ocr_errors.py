@@ -10,6 +10,7 @@ import logging
 import re
 import shutil
 import sys
+import time
 from dataclasses import dataclass
 from hashlib import sha256
 from pathlib import Path
@@ -90,6 +91,7 @@ def create_parser(add_help: bool = True) -> argparse.ArgumentParser:
     )
     parser.add_argument("--output_jsonl", "--output-jsonl", dest="output_jsonl", type=str, default="", help="Error JSONL output path.")
     parser.add_argument("--summary_json", "--summary-json", dest="summary_json", type=str, default="", help="Summary JSON output path.")
+    parser.add_argument("--summary_report", "--summary-report", dest="summary_report", type=str, default="", help="Markdown summary report output path.")
     parser.add_argument(
         "--output_dataset_dir",
         "--output-dataset-dir",
@@ -110,6 +112,7 @@ def create_parser(add_help: bool = True) -> argparse.ArgumentParser:
     parser.add_argument("--dataset_train_manifest", "--dataset-train-manifest", dest="dataset_train_manifest", type=str, default="train_manifest.jsonl", help="Filename for extracted training manifest under --output_dataset_dir.")
     parser.add_argument("--dataset_val_manifest", "--dataset-val-manifest", dest="dataset_val_manifest", type=str, default="val_manifest.jsonl", help="Filename for extracted validation manifest under --output_dataset_dir.")
     parser.add_argument("--dataset_cer_table", "--dataset-cer-table", dest="dataset_cer_table", type=str, default="cer_table.csv", help="Filename for the extracted filename/CER CSV table under --output_dataset_dir.")
+    parser.add_argument("--dataset_summary_report", "--dataset-summary-report", dest="dataset_summary_report", type=str, default="summary_report.md", help="Filename for the Markdown quality/performance report under --output_dataset_dir.")
     parser.add_argument("--output_table_csv", "--output-table-csv", dest="output_table_csv", type=str, default="", help="Optional explicit filename/CER CSV table output path.")
     parser.add_argument(
         "--output_all_jsonl",
@@ -692,8 +695,186 @@ def _safe_float_stats(values: Sequence[float]) -> Dict[str, Optional[float]]:
     }
 
 
+def _safe_percentile_stats(values: Sequence[float]) -> Dict[str, Optional[float]]:
+    keys = ("p50", "p75", "p90", "p95", "p99")
+    if not values:
+        return {key: None for key in keys}
+    arr = np.asarray([float(v) for v in values], dtype=np.float64)
+    return {
+        "p50": float(np.percentile(arr, 50)),
+        "p75": float(np.percentile(arr, 75)),
+        "p90": float(np.percentile(arr, 90)),
+        "p95": float(np.percentile(arr, 95)),
+        "p99": float(np.percentile(arr, 99)),
+    }
+
+
+def _cer_bucket_counts(values: Sequence[float]) -> Dict[str, int]:
+    buckets = {
+        "eq_0": 0,
+        "gt_0_lte_0p01": 0,
+        "gt_0p01_lte_0p05": 0,
+        "gt_0p05_lte_0p10": 0,
+        "gt_0p10_lte_0p20": 0,
+        "gt_0p20_lte_0p50": 0,
+        "gt_0p50_lte_1p00": 0,
+        "gt_1p00": 0,
+    }
+    for value in values:
+        v = float(value)
+        if v <= 0.0:
+            buckets["eq_0"] += 1
+        elif v <= 0.01:
+            buckets["gt_0_lte_0p01"] += 1
+        elif v <= 0.05:
+            buckets["gt_0p01_lte_0p05"] += 1
+        elif v <= 0.10:
+            buckets["gt_0p05_lte_0p10"] += 1
+        elif v <= 0.20:
+            buckets["gt_0p10_lte_0p20"] += 1
+        elif v <= 0.50:
+            buckets["gt_0p20_lte_0p50"] += 1
+        elif v <= 1.00:
+            buckets["gt_0p50_lte_1p00"] += 1
+        else:
+            buckets["gt_1p00"] += 1
+    return buckets
+
+
+def _fmt_report_value(value: object, *, digits: int = 4, percent: bool = False) -> str:
+    if value is None:
+        return "n/a"
+    if isinstance(value, float):
+        if percent:
+            return f"{value * 100.0:.2f}%"
+        return f"{value:.{digits}f}"
+    return str(value)
+
+
+def _markdown_table(rows: Sequence[Tuple[str, object]], *, value_digits: int = 4) -> str:
+    lines = ["| Metric | Value |", "| --- | --- |"]
+    for key, value in rows:
+        lines.append(f"| {key} | {_fmt_report_value(value, digits=value_digits)} |")
+    return "\n".join(lines)
+
+
+def _write_summary_report(summary: Dict[str, object], path: Path) -> None:
+    quality = summary.get("quality_metrics")
+    quality = quality if isinstance(quality, dict) else {}
+    performance = summary.get("performance_metrics")
+    performance = performance if isinstance(performance, dict) else {}
+    length_metrics = summary.get("length_metrics")
+    length_metrics = length_metrics if isinstance(length_metrics, dict) else {}
+    cer_distribution = summary.get("cer_distribution")
+    cer_distribution = cer_distribution if isinstance(cer_distribution, dict) else {}
+    outputs = summary.get("outputs")
+    outputs = outputs if isinstance(outputs, dict) else {}
+
+    bucket_labels = {
+        "eq_0": "CER = 0",
+        "gt_0_lte_0p01": "0 < CER <= 1%",
+        "gt_0p01_lte_0p05": "1% < CER <= 5%",
+        "gt_0p05_lte_0p10": "5% < CER <= 10%",
+        "gt_0p10_lte_0p20": "10% < CER <= 20%",
+        "gt_0p20_lte_0p50": "20% < CER <= 50%",
+        "gt_0p50_lte_1p00": "50% < CER <= 100%",
+        "gt_1p00": "CER > 100%",
+    }
+    valid_n = max(1, int(quality.get("valid_n", 0) or 0))
+    bucket_lines = ["| Bucket | Count | Ratio |", "| --- | ---: | ---: |"]
+    bucket_counts = cer_distribution.get("buckets")
+    bucket_counts = bucket_counts if isinstance(bucket_counts, dict) else {}
+    for key, label in bucket_labels.items():
+        count = int(bucket_counts.get(key, 0) or 0)
+        bucket_lines.append(f"| {label} | {count} | {count / valid_n:.2%} |")
+
+    sections = [
+        "# Donut OCR Error Extraction Report",
+        "",
+        "## Run",
+        _markdown_table(
+            [
+                ("Checkpoint", summary.get("checkpoint", "")),
+                ("Manifest", summary.get("manifest", "")),
+                ("CER threshold", quality.get("cer_threshold")),
+                ("Device", summary.get("device", "")),
+                ("Image pipeline", summary.get("image_preprocess_pipeline", "")),
+                ("Image processor size", summary.get("image_processor_size", "")),
+            ]
+        ),
+        "",
+        "## Quality",
+        _markdown_table(
+            [
+                (
+                    "Global CER",
+                    f"{float(quality.get('global_cer', 0.0) or 0.0):.4f} ({float(quality.get('global_cer_percent', 0.0) or 0.0):.2f}%)",
+                ),
+                ("Sample CER mean", quality.get("sample_cer_mean")),
+                ("Sample CER median", quality.get("sample_cer_p50")),
+                ("Sample CER p95", quality.get("sample_cer_p95")),
+                ("Sample CER max", quality.get("sample_cer_max")),
+                ("Manifest rows selected", quality.get("manifest_rows_selected")),
+                ("Usable samples after scan", quality.get("usable_samples")),
+                ("Total evaluated samples", quality.get("total_seen")),
+                ("Valid samples", quality.get("valid_n")),
+                ("High-CER samples", quality.get("error_n")),
+                ("High-CER ratio", f"{float(quality.get('error_ratio_valid', 0.0) or 0.0):.2%}"),
+                ("Empty predictions", quality.get("empty_pred_count")),
+                ("Empty prediction ratio", f"{float(quality.get('empty_pred_ratio', 0.0) or 0.0):.2%}"),
+                ("Empty references", quality.get("empty_ref_count")),
+            ]
+        ),
+        "",
+        "## Lengths",
+        _markdown_table(
+            [
+                ("Prediction length mean", length_metrics.get("pred_len_mean")),
+                ("Prediction length p95", length_metrics.get("pred_len_p95")),
+                ("Reference length mean", length_metrics.get("ref_len_mean")),
+                ("Reference length p95", length_metrics.get("ref_len_p95")),
+                ("Prediction/reference length ratio mean", length_metrics.get("pred_ref_len_ratio_mean")),
+            ]
+        ),
+        "",
+        "## CER Distribution",
+        "\n".join(bucket_lines),
+        "",
+        "## Performance",
+        _markdown_table(
+            [
+                ("Total wall time seconds", performance.get("total_wall_time_seconds")),
+                ("Evaluation time seconds", performance.get("eval_time_seconds")),
+                ("Samples per second", performance.get("samples_per_second")),
+                ("Batches per second", performance.get("batches_per_second")),
+                ("Batch size", performance.get("batch_size")),
+                ("Num workers", performance.get("num_workers")),
+                ("Batches", performance.get("batches")),
+                ("CUDA peak memory GB", performance.get("cuda_peak_memory_gb")),
+            ]
+        ),
+        "",
+        "## Outputs",
+        _markdown_table(
+            [
+                ("Errors JSONL", outputs.get("errors_jsonl", "")),
+                ("All predictions JSONL", outputs.get("all_jsonl", "")),
+                ("CER table CSV", outputs.get("cer_table_csv", "")),
+                ("Dataset dir", outputs.get("dataset_dir", "")),
+                ("Train manifest", outputs.get("train_manifest", "")),
+                ("Val manifest", outputs.get("val_manifest", "")),
+                ("Summary JSON", outputs.get("summary_json", "")),
+                ("Summary report", str(path)),
+            ]
+        ),
+        "",
+    ]
+    path.write_text("\n".join(sections), encoding="utf-8")
+
+
 def run(args: argparse.Namespace) -> Dict[str, object]:
     _configure_logging()
+    run_start_time = time.perf_counter()
     if bool(getattr(args, "enable_letterboxing", False)) and bool(getattr(args, "enable_fixed_resize", False)):
         raise ValueError("--enable_letterboxing and --enable_fixed_resize are mutually exclusive.")
     checkpoint = Path(str(args.checkpoint)).expanduser().resolve()
@@ -724,6 +905,12 @@ def run(args: argparse.Namespace) -> Dict[str, object]:
         summary_json = output_dataset_dir / "summary.json"
     else:
         summary_json = output_jsonl.with_suffix(".summary.json")
+    if str(getattr(args, "summary_report", "") or "").strip():
+        summary_report = Path(str(args.summary_report)).expanduser().resolve()
+    elif output_dataset_dir is not None:
+        summary_report = output_dataset_dir / str(getattr(args, "dataset_summary_report", "summary_report.md") or "summary_report.md")
+    else:
+        summary_report = output_jsonl.with_suffix(".summary_report.md")
     output_all_jsonl = Path(str(args.output_all_jsonl)).expanduser().resolve() if str(getattr(args, "output_all_jsonl", "") or "").strip() else None
     if str(getattr(args, "output_table_csv", "") or "").strip():
         output_table_csv = Path(str(args.output_table_csv)).expanduser().resolve()
@@ -775,6 +962,7 @@ def run(args: argparse.Namespace) -> Dict[str, object]:
 
     output_jsonl.parent.mkdir(parents=True, exist_ok=True)
     summary_json.parent.mkdir(parents=True, exist_ok=True)
+    summary_report.parent.mkdir(parents=True, exist_ok=True)
     if output_all_jsonl is not None:
         output_all_jsonl.parent.mkdir(parents=True, exist_ok=True)
     if output_table_csv is not None:
@@ -803,10 +991,21 @@ def run(args: argparse.Namespace) -> Dict[str, object]:
     edit_sum = 0
     ref_len_sum = 0
     cer_values: List[float] = []
+    error_cer_values: List[float] = []
+    pred_len_values: List[float] = []
+    ref_len_values: List[float] = []
+    pred_ref_len_ratios: List[float] = []
+    batch_count = 0
     limit_errors = max(0, int(getattr(args, "limit_errors", 0) or 0))
     newline_token = str(getattr(args, "metric_newline_token", "<NL>") or "<NL>")
     generation_max_length = int(getattr(model.generation_config, "max_length", 160) or 160)
+    if device.type == "cuda":
+        try:
+            torch.cuda.reset_peak_memory_stats(device)
+        except Exception:
+            pass
 
+    eval_start_time = time.perf_counter()
     with output_jsonl.open("w", encoding="utf-8") as error_fp:
         if output_dataset_dir is not None and dataset_train_manifest is not None:
             dataset_train_fp = dataset_train_manifest.open("w", encoding="utf-8")
@@ -819,6 +1018,7 @@ def run(args: argparse.Namespace) -> Dict[str, object]:
         try:
             with torch.no_grad():
                 for batch in tqdm(loader, desc="extract-cer-errors"):
+                    batch_count += 1
                     pixel_values = batch["pixel_values"].to(device)
                     labels = batch["labels"].detach().cpu().numpy()
                     gen_kwargs = dict(
@@ -864,8 +1064,12 @@ def run(args: argparse.Namespace) -> Dict[str, object]:
                             ref_len_sum += int(ref_len)
                             sample_cer = float(edit_distance / ref_len)
                             cer_values.append(float(sample_cer))
+                            ref_len_values.append(float(len(ref)))
                         if not pred:
                             empty_pred_n += 1
+                        pred_len_values.append(float(len(pred)))
+                        if ref:
+                            pred_ref_len_ratios.append(float(len(pred) / max(1, len(ref))))
                         row_index = int(meta.get("row_index", -1))
                         image_path = str(meta.get("image", ""))
                         record: Dict[str, object] = {
@@ -890,6 +1094,7 @@ def run(args: argparse.Namespace) -> Dict[str, object]:
                                     record[key] = row.get(key)
                         if sample_cer is not None and float(sample_cer) > threshold:
                             error_n += 1
+                            error_cer_values.append(float(sample_cer))
                             if copy_images_dir is not None and image_path:
                                 copied = _copy_error_image(Path(image_path), copy_images_dir, row_index=row_index, cer=float(sample_cer))
                                 if copied:
@@ -933,12 +1138,92 @@ def run(args: argparse.Namespace) -> Dict[str, object]:
             if dataset_val_fp is not None:
                 dataset_val_fp.close()
 
+    if device.type == "cuda":
+        try:
+            torch.cuda.synchronize(device)
+        except Exception:
+            pass
+    eval_elapsed_seconds = max(0.0, time.perf_counter() - eval_start_time)
+    total_elapsed_seconds = max(0.0, time.perf_counter() - run_start_time)
+    cuda_peak_memory_gb: Optional[float] = None
+    if device.type == "cuda":
+        try:
+            cuda_peak_memory_gb = float(torch.cuda.max_memory_allocated(device) / (1024.0 ** 3))
+        except Exception:
+            cuda_peak_memory_gb = None
+
     global_cer = float(edit_sum / max(1, ref_len_sum))
+    sample_cer_stats = _safe_float_stats(cer_values)
+    sample_cer_percentiles = _safe_percentile_stats(cer_values)
+    error_cer_stats = _safe_float_stats(error_cer_values)
+    pred_len_stats = _safe_float_stats(pred_len_values)
+    ref_len_stats = _safe_float_stats(ref_len_values)
+    pred_ref_len_ratio_stats = _safe_float_stats(pred_ref_len_ratios)
+    pred_len_percentiles = _safe_percentile_stats(pred_len_values)
+    ref_len_percentiles = _safe_percentile_stats(ref_len_values)
+    cer_buckets = _cer_bucket_counts(cer_values)
+    quality_metrics: Dict[str, object] = {
+        "cer_threshold": float(threshold),
+        "global_cer": float(global_cer),
+        "global_cer_percent": float(global_cer * 100.0),
+        "manifest_rows_selected": int(len(rows)),
+        "usable_samples": int(len(dataset)),
+        "valid_n": int(valid_n),
+        "total_seen": int(total_seen),
+        "error_n": int(error_n),
+        "error_ratio_valid": float(error_n / max(1, valid_n)),
+        "empty_ref_count": int(empty_ref_n),
+        "empty_pred_count": int(empty_pred_n),
+        "empty_pred_ratio": float(empty_pred_n / max(1, total_seen)),
+        "sample_cer_min": sample_cer_stats.get("min"),
+        "sample_cer_max": sample_cer_stats.get("max"),
+        "sample_cer_mean": sample_cer_stats.get("mean"),
+        "sample_cer_std": sample_cer_stats.get("std"),
+        "sample_cer_p50": sample_cer_percentiles.get("p50"),
+        "sample_cer_p75": sample_cer_percentiles.get("p75"),
+        "sample_cer_p90": sample_cer_percentiles.get("p90"),
+        "sample_cer_p95": sample_cer_percentiles.get("p95"),
+        "sample_cer_p99": sample_cer_percentiles.get("p99"),
+        "error_cer_stats": error_cer_stats,
+    }
+    length_metrics: Dict[str, object] = {
+        "pred_len_stats": pred_len_stats,
+        "ref_len_stats": ref_len_stats,
+        "pred_ref_len_ratio_stats": pred_ref_len_ratio_stats,
+        "pred_len_mean": pred_len_stats.get("mean"),
+        "pred_len_p95": pred_len_percentiles.get("p95"),
+        "ref_len_mean": ref_len_stats.get("mean"),
+        "ref_len_p95": ref_len_percentiles.get("p95"),
+        "pred_ref_len_ratio_mean": pred_ref_len_ratio_stats.get("mean"),
+    }
+    performance_metrics: Dict[str, object] = {
+        "total_wall_time_seconds": float(total_elapsed_seconds),
+        "eval_time_seconds": float(eval_elapsed_seconds),
+        "samples_per_second": float(total_seen / max(1e-9, eval_elapsed_seconds)),
+        "valid_samples_per_second": float(valid_n / max(1e-9, eval_elapsed_seconds)),
+        "batches_per_second": float(batch_count / max(1e-9, eval_elapsed_seconds)),
+        "batches": int(batch_count),
+        "batch_size": int(max(1, int(getattr(args, "batch_size", 16) or 16))),
+        "num_workers": int(max(0, int(getattr(args, "num_workers", 0) or 0))),
+        "generation_max_length": int(generation_max_length),
+        "cuda_peak_memory_gb": cuda_peak_memory_gb,
+    }
+    outputs: Dict[str, object] = {
+        "errors_jsonl": str(output_jsonl),
+        "all_jsonl": str(output_all_jsonl) if output_all_jsonl is not None else "",
+        "cer_table_csv": str(output_table_csv) if output_table_csv is not None else "",
+        "dataset_dir": str(output_dataset_dir) if output_dataset_dir is not None else "",
+        "train_manifest": str(dataset_train_manifest) if dataset_train_manifest is not None else "",
+        "val_manifest": str(dataset_val_manifest) if dataset_val_manifest is not None and dataset_val_fp is not None else "",
+        "summary_json": str(summary_json),
+        "summary_report": str(summary_report),
+    }
     summary: Dict[str, object] = {
         "checkpoint": str(checkpoint),
         "manifest": str(manifest),
         "output_jsonl": str(output_jsonl),
         "summary_json": str(summary_json),
+        "summary_report": str(summary_report),
         "output_dataset_dir": str(output_dataset_dir) if output_dataset_dir is not None else "",
         "dataset_train_manifest": str(dataset_train_manifest) if dataset_train_manifest is not None else "",
         "dataset_val_manifest": str(dataset_val_manifest) if dataset_val_manifest is not None and dataset_val_fp is not None else "",
@@ -956,7 +1241,17 @@ def run(args: argparse.Namespace) -> Dict[str, object]:
         "error_ratio_valid": float(error_n / max(1, valid_n)),
         "empty_ref_count": int(empty_ref_n),
         "empty_pred_count": int(empty_pred_n),
-        "sample_cer_stats": _safe_float_stats(cer_values),
+        "sample_cer_stats": sample_cer_stats,
+        "sample_cer_percentiles": sample_cer_percentiles,
+        "error_cer_stats": error_cer_stats,
+        "length_metrics": length_metrics,
+        "cer_distribution": {
+            "buckets": cer_buckets,
+            "percentiles": sample_cer_percentiles,
+        },
+        "quality_metrics": quality_metrics,
+        "performance_metrics": performance_metrics,
+        "outputs": outputs,
         "dataset_scan_stats": dataset.stats,
         "device": str(device),
         "image_preprocess_pipeline": image_preprocess_pipeline,
@@ -964,13 +1259,15 @@ def run(args: argparse.Namespace) -> Dict[str, object]:
         "image_processor_size": getattr(image_processor, "size", None),
     }
     summary_json.write_text(json.dumps(summary, ensure_ascii=False, indent=2), encoding="utf-8")
+    _write_summary_report(summary, summary_report)
     LOGGER.info(
-        "Extraction done: global_cer=%.4f (%.2f%%) valid=%d errors=%d threshold=%.4f output=%s",
+        "Extraction done: global_cer=%.4f (%.2f%%) valid=%d errors=%d threshold=%.4f samples_per_second=%.3f output=%s",
         float(global_cer),
         float(global_cer * 100.0),
         int(valid_n),
         int(error_n),
         float(threshold),
+        float(performance_metrics["samples_per_second"]),
         output_jsonl,
     )
     return summary
