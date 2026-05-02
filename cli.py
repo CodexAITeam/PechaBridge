@@ -53,6 +53,7 @@ from scripts.download_sbb_images import (
     run as _run_download_sbb_images,
 )
 from scripts.eval_ocr_tokenizer import create_parser as create_eval_ocr_tokenizer_parser
+from scripts.extract_donut_ocr_errors import create_parser as create_extract_donut_ocr_errors_parser
 from scripts.train_line_segmentation import create_parser as create_train_line_segmentation_parser
 from scripts.warm_line_clip_workbench_cache import (
     create_parser as create_warm_line_clip_workbench_cache_parser,
@@ -166,6 +167,16 @@ def _build_root_parser() -> argparse.ArgumentParser:
         description=train_donut_parent.description,
     )
     train_donut_parser.set_defaults(handler=_run_train_donut_ocr)
+
+    extract_donut_errors_parent = create_extract_donut_ocr_errors_parser(add_help=False)
+    extract_donut_errors_parser = subparsers.add_parser(
+        "extract-donut-ocr-errors",
+        aliases=["extract-donut-errors", "extract-ocr-errors"],
+        parents=[extract_donut_errors_parent],
+        help="Extract high-CER OCR samples from a Donut/TrOCR checkpoint into JSONL or a fine-tune dataset",
+        description=extract_donut_errors_parent.description,
+    )
+    extract_donut_errors_parser.set_defaults(handler=_run_extract_donut_ocr_errors)
 
     workflow_parent = create_run_donut_ocr_workflow_parser(add_help=False)
     workflow_parser = subparsers.add_parser(
@@ -451,6 +462,13 @@ def _run_eval_ocr_tokenizer(args: argparse.Namespace) -> int:
 
 def _run_train_donut_ocr(args: argparse.Namespace) -> int:
     from scripts.train_donut_ocr import run
+
+    run(args)
+    return 0
+
+
+def _run_extract_donut_ocr_errors(args: argparse.Namespace) -> int:
+    from scripts.extract_donut_ocr_errors import run
 
     run(args)
     return 0
