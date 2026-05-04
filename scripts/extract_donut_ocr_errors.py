@@ -53,6 +53,23 @@ TEXT_KEYS: Tuple[str, ...] = (
     "src__label",
     "src__text",
 )
+SOURCE_DATASET_KEYS: Tuple[str, ...] = (
+    "source_dataset",
+    "source_dataset_short",
+    "source_split",
+    "dataset",
+    "source",
+    "hf_dataset",
+    "dataset_name",
+    "src__dataset",
+    "src__source_dataset",
+)
+DEFAULT_EXCLUDED_SOURCE_DATASETS: Tuple[str, ...] = (
+    "google books",
+    "google_books",
+    "google-books",
+    "googlebooks",
+)
 
 
 def create_parser(add_help: bool = True) -> argparse.ArgumentParser:
@@ -114,6 +131,29 @@ def create_parser(add_help: bool = True) -> argparse.ArgumentParser:
     parser.add_argument("--dataset_cer_table", "--dataset-cer-table", dest="dataset_cer_table", type=str, default="cer_table.csv", help="Filename for the extracted filename/CER CSV table under --output_dataset_dir.")
     parser.add_argument("--dataset_summary_report", "--dataset-summary-report", dest="dataset_summary_report", type=str, default="summary_report.md", help="Filename for the Markdown quality/performance report under --output_dataset_dir.")
     parser.add_argument("--output_table_csv", "--output-table-csv", dest="output_table_csv", type=str, default="", help="Optional explicit filename/CER CSV table output path.")
+    parser.add_argument(
+        "--source_datasets",
+        "--source-datasets",
+        dest="source_datasets",
+        type=str,
+        default="",
+        help="Optional comma-separated allow-list of source_dataset values to evaluate.",
+    )
+    parser.add_argument(
+        "--exclude_source_datasets",
+        "--exclude-source-datasets",
+        dest="exclude_source_datasets",
+        type=str,
+        default=",".join(DEFAULT_EXCLUDED_SOURCE_DATASETS),
+        help="Comma-separated source_dataset values to skip. Defaults to Google Books variants.",
+    )
+    parser.add_argument(
+        "--include_google_books",
+        "--include-google-books",
+        dest="include_google_books",
+        action="store_true",
+        help="Disable the default Google Books source_dataset exclusion.",
+    )
     parser.add_argument(
         "--output_all_jsonl",
         "--output-all-jsonl",
@@ -225,6 +265,48 @@ def _first_nonempty(row: Dict[str, object], keys: Sequence[str]) -> str:
             if text.strip():
                 return text
     return ""
+
+
+def _normalize_source_dataset(value: str) -> str:
+    text = str(value or "").strip().lower()
+    text = re.sub(r"[\s_\-./:]+", " ", text)
+    return re.sub(r"\s+", " ", text).strip()
+
+
+def _parse_source_dataset_filter(raw: str) -> set[str]:
+    return {
+        norm
+        for norm in (_normalize_source_dataset(part) for part in str(raw or "").split(","))
+        if norm
+    }
+
+
+def _source_dataset_for_row(row: Dict[str, object]) -> str:
+    direct = _first_nonempty(row, SOURCE_DATASET_KEYS)
+    if direct:
+        return direct
+    for nested_key in ("row", "metadata", "meta", "source_metadata", "src"):
+        nested = row.get(nested_key)
+        if isinstance(nested, dict):
+            value = _first_nonempty(nested, SOURCE_DATASET_KEYS)
+            if value:
+                return value
+    return ""
+
+
+def _source_dataset_allowed(
+    row: Dict[str, object],
+    *,
+    include_sources: set[str],
+    exclude_sources: set[str],
+) -> Tuple[bool, str, str]:
+    source = _source_dataset_for_row(row)
+    norm = _normalize_source_dataset(source)
+    if include_sources and norm not in include_sources:
+        return False, source, "not_included"
+    if exclude_sources and norm in exclude_sources:
+        return False, source, "excluded"
+    return True, source, ""
 
 
 def _checkpoint_step(path: Path) -> Optional[int]:
@@ -545,6 +627,8 @@ class ExtractionDataset(Dataset):
         enable_letterboxing: bool,
         target_height: int,
         target_width: int,
+        include_source_datasets: set[str],
+        exclude_source_datasets: set[str],
     ):
         self.manifest_path = manifest_path
         self.image_processor = image_processor
@@ -565,12 +649,31 @@ class ExtractionDataset(Dataset):
         self.stats = {
             "rows_total": 0,
             "kept": 0,
+            "source_not_included": 0,
+            "source_excluded": 0,
             "missing_image_field": 0,
             "missing_text_field": 0,
             "image_not_found": 0,
+            "source_counts": {},
+            "kept_source_counts": {},
         }
         for row_index, row in rows:
             self.stats["rows_total"] += 1
+            allowed, source_dataset, source_filter_reason = _source_dataset_allowed(
+                row,
+                include_sources=include_source_datasets,
+                exclude_sources=exclude_source_datasets,
+            )
+            source_key = str(source_dataset or "UNKNOWN")
+            source_counts = self.stats["source_counts"]
+            if isinstance(source_counts, dict):
+                source_counts[source_key] = int(source_counts.get(source_key, 0)) + 1
+            if not allowed:
+                if source_filter_reason == "not_included":
+                    self.stats["source_not_included"] += 1
+                else:
+                    self.stats["source_excluded"] += 1
+                continue
             image_raw = _first_nonempty(row, IMAGE_KEYS)
             text_raw = _first_nonempty(row, TEXT_KEYS)
             if not image_raw:
@@ -596,6 +699,9 @@ class ExtractionDataset(Dataset):
                 )
             )
             self.stats["kept"] += 1
+            kept_source_counts = self.stats["kept_source_counts"]
+            if isinstance(kept_source_counts, dict):
+                kept_source_counts[source_key] = int(kept_source_counts.get(source_key, 0)) + 1
         LOGGER.info("Loaded extraction dataset: %s", json.dumps(self.stats, ensure_ascii=False))
 
     def __len__(self) -> int:
@@ -961,6 +1067,14 @@ def run(args: argparse.Namespace) -> Dict[str, object]:
     table_fp = None
     table_writer = None
     dataset_counts = {"train": 0, "val": 0}
+    include_source_datasets = _parse_source_dataset_filter(str(getattr(args, "source_datasets", "") or ""))
+    exclude_source_raw = "" if bool(getattr(args, "include_google_books", False)) else str(getattr(args, "exclude_source_datasets", "") or "")
+    exclude_source_datasets = _parse_source_dataset_filter(exclude_source_raw)
+    LOGGER.info(
+        "Source dataset filter: include=%s exclude=%s",
+        sorted(include_source_datasets),
+        sorted(exclude_source_datasets),
+    )
 
     tokenizer = _build_tokenizer(args, checkpoint)
     image_processor_path = _resolve_image_processor_path(args, checkpoint)
@@ -981,6 +1095,8 @@ def run(args: argparse.Namespace) -> Dict[str, object]:
         enable_letterboxing=bool(getattr(args, "enable_letterboxing", False)),
         target_height=int(getattr(args, "target_height", 256) or 256),
         target_width=int(getattr(args, "target_width", 1024) or 1024),
+        include_source_datasets=include_source_datasets,
+        exclude_source_datasets=exclude_source_datasets,
     )
     if len(dataset) <= 0:
         raise RuntimeError("No usable samples after manifest scan.")
@@ -1268,6 +1384,11 @@ def run(args: argparse.Namespace) -> Dict[str, object]:
         "val_fraction": float(getattr(args, "val_fraction", 0.0) or 0.0),
         "output_all_jsonl": str(output_all_jsonl) if output_all_jsonl is not None else "",
         "copy_images_dir": str(copy_images_dir) if copy_images_dir is not None else "",
+        "source_dataset_filter": {
+            "include": sorted(include_source_datasets),
+            "exclude": sorted(exclude_source_datasets),
+            "include_google_books": bool(getattr(args, "include_google_books", False)),
+        },
         "cer_threshold": float(threshold),
         "global_cer": float(global_cer),
         "global_cer_percent": float(global_cer * 100.0),
