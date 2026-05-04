@@ -556,6 +556,113 @@ def _configure_generation(model, tokenizer, args: argparse.Namespace) -> None:
         LOGGER.warning("Tokenizer audit failed: %s", exc)
 
 
+def _load_repro_generate_config(checkpoint: Path) -> Dict[str, object]:
+    path = Path(checkpoint) / "repro" / "generate_config.json"
+    if not path.exists():
+        return {}
+    try:
+        data = json.loads(path.read_text(encoding="utf-8"))
+    except Exception as exc:
+        LOGGER.warning("Could not read repro generate config %s: %s", path, exc)
+        return {}
+    return data if isinstance(data, dict) else {}
+
+
+def _apply_repro_generate_config(model, checkpoint: Path) -> Dict[str, object]:
+    """Apply checkpoint repro generate_config fields for UI/train parity."""
+    cfg = _load_repro_generate_config(checkpoint)
+    if not cfg:
+        return {}
+    gen_cfg = getattr(model, "generation_config", None)
+    if gen_cfg is None:
+        return cfg
+    applied: Dict[str, object] = {}
+    for key in (
+        "decoder_start_token_id",
+        "bos_token_id",
+        "eos_token_id",
+        "pad_token_id",
+        "max_length",
+        "max_new_tokens",
+        "min_new_tokens",
+        "num_beams",
+        "do_sample",
+        "temperature",
+        "top_p",
+        "repetition_penalty",
+        "no_repeat_ngram_size",
+        "length_penalty",
+        "early_stopping",
+        "bad_words_ids",
+        "forced_bos_token_id",
+        "forced_eos_token_id",
+        "use_cache",
+    ):
+        value = cfg.get(key)
+        if value is None:
+            continue
+        try:
+            setattr(gen_cfg, key, value)
+            if key in {"decoder_start_token_id", "eos_token_id", "pad_token_id"}:
+                setattr(model.config, key, value)
+            applied[key] = value
+        except Exception as exc:
+            LOGGER.warning("Could not apply repro generation field %s=%r: %s", key, value, exc)
+    if applied:
+        LOGGER.info(
+            "Applied repro generate_config fields for extraction parity: %s",
+            json.dumps(applied, ensure_ascii=False, default=str),
+        )
+    return cfg
+
+
+def _build_generate_kwargs(model, pixel_values: torch.Tensor, args: argparse.Namespace) -> Dict[str, object]:
+    gen_cfg = getattr(model, "generation_config", None)
+    cfg_keys = (
+        "decoder_start_token_id",
+        "bos_token_id",
+        "eos_token_id",
+        "pad_token_id",
+        "max_length",
+        "max_new_tokens",
+        "min_new_tokens",
+        "num_beams",
+        "do_sample",
+        "temperature",
+        "top_p",
+        "repetition_penalty",
+        "no_repeat_ngram_size",
+        "length_penalty",
+        "early_stopping",
+        "bad_words_ids",
+        "forced_bos_token_id",
+        "forced_eos_token_id",
+        "use_cache",
+    )
+    kwargs: Dict[str, object] = {"pixel_values": pixel_values}
+    for key in cfg_keys:
+        value = getattr(gen_cfg, key, None) if gen_cfg is not None else None
+        if value is not None:
+            kwargs[key] = value
+    gen_max = int(getattr(args, "generation_max_length", 0) or 0)
+    if gen_max > 0:
+        kwargs["max_length"] = int(gen_max)
+    elif "max_length" not in kwargs and "max_new_tokens" not in kwargs:
+        kwargs["max_length"] = 160
+    if "num_beams" not in kwargs:
+        kwargs["num_beams"] = 1
+    if "do_sample" not in kwargs:
+        kwargs["do_sample"] = False
+    min_new_tokens = max(0, int(getattr(args, "generation_min_new_tokens", 0) or 0))
+    if min_new_tokens > 0:
+        kwargs["min_new_tokens"] = int(min_new_tokens)
+    elif int(getattr(args, "generation_min_new_tokens", 0) or 0) == 0:
+        kwargs.pop("min_new_tokens", None)
+    if _should_force_interpolate_pos_encoding(model, pixel_values):
+        kwargs["interpolate_pos_encoding"] = True
+    return {k: v for k, v in kwargs.items() if v is not None}
+
+
 def _decoder_vocab_size(model) -> Optional[int]:
     try:
         emb = model.decoder.get_input_embeddings()
@@ -1105,6 +1212,7 @@ def run(args: argparse.Namespace) -> Dict[str, object]:
     _ensure_vocab_size(model, tokenizer)
     _configure_model_geometry(model, image_processor, args, checkpoint)
     _configure_generation(model, tokenizer, args)
+    _apply_repro_generate_config(model, checkpoint)
 
     device = torch.device(str(getattr(args, "device", "cpu") or "cpu"))
     model.to(device)
@@ -1149,7 +1257,7 @@ def run(args: argparse.Namespace) -> Dict[str, object]:
     batch_count = 0
     limit_errors = max(0, int(getattr(args, "limit_errors", 0) or 0))
     newline_token = str(getattr(args, "metric_newline_token", "<NL>") or "<NL>")
-    generation_max_length = int(getattr(model.generation_config, "max_length", 160) or 160)
+    logged_generate_kwargs = False
     if device.type == "cuda":
         try:
             torch.cuda.reset_peak_memory_stats(device)
@@ -1172,22 +1280,11 @@ def run(args: argparse.Namespace) -> Dict[str, object]:
                     batch_count += 1
                     pixel_values = batch["pixel_values"].to(device)
                     labels = batch["labels"].detach().cpu().numpy()
-                    gen_kwargs = dict(
-                        pixel_values=pixel_values,
-                        decoder_start_token_id=int(model.config.decoder_start_token_id),
-                        eos_token_id=int(model.config.eos_token_id) if getattr(model.config, "eos_token_id", None) is not None else None,
-                        pad_token_id=int(model.config.pad_token_id),
-                        max_length=int(generation_max_length),
-                        num_beams=1,
-                        do_sample=False,
-                    )
-                    gen_kwargs = {k: v for k, v in gen_kwargs.items() if v is not None}
-                    min_new_tokens = max(0, int(getattr(args, "generation_min_new_tokens", 0) or 0))
-                    if min_new_tokens > 0:
-                        gen_kwargs["min_new_tokens"] = int(min_new_tokens)
-                    gen_kwargs["use_cache"] = True
-                    if _should_force_interpolate_pos_encoding(model, pixel_values):
-                        gen_kwargs["interpolate_pos_encoding"] = True
+                    gen_kwargs = _build_generate_kwargs(model, pixel_values, args)
+                    if not logged_generate_kwargs:
+                        loggable = {k: v for k, v in gen_kwargs.items() if k != "pixel_values"}
+                        LOGGER.info("Effective generate kwargs: %s", json.dumps(loggable, ensure_ascii=False, default=str))
+                        logged_generate_kwargs = True
                     gen_ids = model.generate(**gen_kwargs)
                     pred_norms = train_mod._decode_for_metric(
                         tokenizer,

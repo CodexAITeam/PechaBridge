@@ -308,6 +308,24 @@ class SentencePieceTokenizerAdapter:
             ids = ids[: int(max_length)]
         return {"input_ids": ids}
 
+    def encode(
+        self,
+        text: str,
+        add_special_tokens: bool = False,
+        truncation: bool = False,
+        max_length: Optional[int] = None,
+        **kwargs: Any,
+    ) -> List[int]:
+        """HF-compatible convenience wrapper around ``__call__``."""
+        encoded = self(
+            text,
+            add_special_tokens=add_special_tokens,
+            truncation=truncation,
+            max_length=max_length,
+            **kwargs,
+        )
+        return [int(x) for x in encoded.get("input_ids", [])]
+
     def _decode_base_ids(self, ids: Sequence[int]) -> str:
         if not ids:
             return ""
