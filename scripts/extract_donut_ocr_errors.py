@@ -378,11 +378,27 @@ def _build_tokenizer(args: argparse.Namespace, checkpoint: Path):
 
 def _configure_generation(model, tokenizer, args: argparse.Namespace) -> None:
     decoder_start_token = str(getattr(args, "decoder_start_token", "<s_ocr>") or "<s_ocr>")
+    decoder_start_candidates = train_mod._special_ids_for_token_literal(tokenizer, decoder_start_token)
     decoder_start_id = train_mod._resolve_single_token_id_no_mutation(tokenizer, decoder_start_token)
+    checkpoint_decoder_start_id = getattr(getattr(model, "config", None), "decoder_start_token_id", None)
+    try:
+        checkpoint_decoder_start_id_int = int(checkpoint_decoder_start_id)
+    except Exception:
+        checkpoint_decoder_start_id_int = None
+    if checkpoint_decoder_start_id_int is not None and checkpoint_decoder_start_id_int in decoder_start_candidates:
+        decoder_start_id = checkpoint_decoder_start_id_int
     if decoder_start_id is None:
         raise ValueError(f"decoder_start_token not found in tokenizer: {decoder_start_token!r}")
     task_end_token = train_mod._paired_end_token_for_start(decoder_start_token)
+    task_end_candidates = train_mod._special_ids_for_token_literal(tokenizer, task_end_token) if task_end_token else []
     task_end_id = train_mod._resolve_single_token_id_no_mutation(tokenizer, task_end_token) if task_end_token else None
+    checkpoint_eos_id = getattr(getattr(model, "config", None), "eos_token_id", None)
+    try:
+        checkpoint_eos_id_int = int(checkpoint_eos_id)
+    except Exception:
+        checkpoint_eos_id_int = None
+    if checkpoint_eos_id_int is not None and checkpoint_eos_id_int in task_end_candidates:
+        task_end_id = checkpoint_eos_id_int
     effective_eos = int(task_end_id) if task_end_id is not None else (
         int(tokenizer.eos_token_id) if tokenizer.eos_token_id is not None else None
     )
@@ -397,6 +413,16 @@ def _configure_generation(model, tokenizer, args: argparse.Namespace) -> None:
     model.generation_config.pad_token_id = int(tokenizer.pad_token_id)
     if effective_eos is not None:
         model.generation_config.eos_token_id = int(effective_eos)
+    for config_obj in (
+        getattr(model, "config", None),
+        getattr(getattr(model, "config", None), "decoder", None),
+        getattr(getattr(model, "decoder", None), "config", None),
+        getattr(model, "generation_config", None),
+    ):
+        try:
+            setattr(config_obj, "use_cache", True)
+        except Exception:
+            pass
     gen_max = int(getattr(args, "generation_max_length", 0) or 0)
     if gen_max <= 0:
         gen_max = int(getattr(model.generation_config, "max_length", 0) or 0) or 160
@@ -430,13 +456,22 @@ def _configure_generation(model, tokenizer, args: argparse.Namespace) -> None:
     except Exception:
         pass
     LOGGER.info(
-        "Generation config: start_id=%s eos_id=%s pad_id=%s max_length=%d min_new=%d",
+        "Generation config: start_id=%s eos_id=%s pad_id=%s max_length=%d min_new=%d use_cache=%s",
         str(decoder_start_id),
         str(effective_eos),
         str(tokenizer.pad_token_id),
         int(gen_max),
         int(min_new),
+        str(getattr(model.generation_config, "use_cache", None)),
     )
+    try:
+        train_mod._log_token_audit(
+            tokenizer,
+            decoder_start_token=decoder_start_token,
+            task_end_token=task_end_token,
+        )
+    except Exception as exc:
+        LOGGER.warning("Tokenizer audit failed: %s", exc)
 
 
 def _decoder_vocab_size(model) -> Optional[int]:
@@ -1034,6 +1069,7 @@ def run(args: argparse.Namespace) -> Dict[str, object]:
                     min_new_tokens = max(0, int(getattr(args, "generation_min_new_tokens", 0) or 0))
                     if min_new_tokens > 0:
                         gen_kwargs["min_new_tokens"] = int(min_new_tokens)
+                    gen_kwargs["use_cache"] = True
                     if _should_force_interpolate_pos_encoding(model, pixel_values):
                         gen_kwargs["interpolate_pos_encoding"] = True
                     gen_ids = model.generate(**gen_kwargs)
