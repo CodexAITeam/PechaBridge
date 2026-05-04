@@ -1445,6 +1445,11 @@ def run(args: argparse.Namespace) -> Dict[str, object]:
         "ref_len_p95": ref_len_percentiles.get("p95"),
         "pred_ref_len_ratio_mean": pred_ref_len_ratio_stats.get("mean"),
     }
+    effective_generation_max_length = int(
+        getattr(args, "generation_max_length", 0)
+        or getattr(getattr(model, "generation_config", None), "max_length", 0)
+        or 160
+    )
     performance_metrics: Dict[str, object] = {
         "total_wall_time_seconds": float(total_elapsed_seconds),
         "eval_time_seconds": float(eval_elapsed_seconds),
@@ -1454,7 +1459,7 @@ def run(args: argparse.Namespace) -> Dict[str, object]:
         "batches": int(batch_count),
         "batch_size": int(max(1, int(getattr(args, "batch_size", 16) or 16))),
         "num_workers": int(max(0, int(getattr(args, "num_workers", 0) or 0))),
-        "generation_max_length": int(generation_max_length),
+        "generation_max_length": int(effective_generation_max_length),
         "cuda_peak_memory_gb": cuda_peak_memory_gb,
     }
     outputs: Dict[str, object] = {
