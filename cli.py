@@ -54,6 +54,7 @@ from scripts.download_sbb_images import (
 )
 from scripts.eval_ocr_tokenizer import create_parser as create_eval_ocr_tokenizer_parser
 from scripts.extract_donut_ocr_errors import create_parser as create_extract_donut_ocr_errors_parser
+from scripts.ocr_error_review_workbench import create_parser as create_ocr_error_review_workbench_parser
 from scripts.train_line_segmentation import create_parser as create_train_line_segmentation_parser
 from scripts.warm_line_clip_workbench_cache import (
     create_parser as create_warm_line_clip_workbench_cache_parser,
@@ -177,6 +178,16 @@ def _build_root_parser() -> argparse.ArgumentParser:
         description=extract_donut_errors_parent.description,
     )
     extract_donut_errors_parser.set_defaults(handler=_run_extract_donut_ocr_errors)
+
+    ocr_error_workbench_parent = create_ocr_error_review_workbench_parser(add_help=False)
+    ocr_error_workbench_parser = subparsers.add_parser(
+        "donut-ocr-error-workbench",
+        aliases=["ocr-error-workbench", "review-donut-ocr-errors"],
+        parents=[ocr_error_workbench_parent],
+        help="Launch a live Gradio workbench for reviewing extracted Donut OCR high-CER samples",
+        description=ocr_error_workbench_parent.description,
+    )
+    ocr_error_workbench_parser.set_defaults(handler=_run_ocr_error_review_workbench)
 
     workflow_parent = create_run_donut_ocr_workflow_parser(add_help=False)
     workflow_parser = subparsers.add_parser(
@@ -472,6 +483,12 @@ def _run_extract_donut_ocr_errors(args: argparse.Namespace) -> int:
 
     run(args)
     return 0
+
+
+def _run_ocr_error_review_workbench(args: argparse.Namespace) -> int:
+    from scripts.ocr_error_review_workbench import run
+
+    return int(run(args))
 
 
 def _run_donut_ocr_workflow(args: argparse.Namespace) -> int:
