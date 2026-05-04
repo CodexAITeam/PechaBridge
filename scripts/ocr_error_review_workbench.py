@@ -30,6 +30,13 @@ TABLE_COLUMNS = [
     "source_dataset",
 ]
 
+WORKBENCH_CSS = """
+.ocr-hero {padding: 18px 22px; border-radius: 18px; background: linear-gradient(135deg,#f4efe4,#e5f0ec); border: 1px solid #d8cfbd;}
+.ocr-hero h1 {margin: 0 0 6px 0; font-size: 28px;}
+.ocr-hero p {margin: 0; color: #4c4639;}
+textarea {font-family: ui-monospace, SFMono-Regular, Menlo, monospace !important;}
+"""
+
 
 @dataclass
 class WorkbenchConfig:
@@ -288,14 +295,7 @@ def _sample_view(records: Sequence[Dict[str, Any]], index: int, dataset_dir: Pat
 
 
 def build_workbench(config: WorkbenchConfig) -> gr.Blocks:
-    css = """
-    .ocr-hero {padding: 18px 22px; border-radius: 18px; background: linear-gradient(135deg,#f4efe4,#e5f0ec); border: 1px solid #d8cfbd;}
-    .ocr-hero h1 {margin: 0 0 6px 0; font-size: 28px;}
-    .ocr-hero p {margin: 0; color: #4c4639;}
-    textarea {font-family: ui-monospace, SFMono-Regular, Menlo, monospace !important;}
-    """
-
-    with gr.Blocks(title="Donut OCR Error Review", css=css) as app:
+    with gr.Blocks(title="Donut OCR Error Review") as app:
         gr.HTML(
             "<section class='ocr-hero'><h1>Donut OCR Error Review</h1>"
             "<p>Inspect high-CER samples while the extractor is still writing the dataset.</p></section>"
@@ -323,9 +323,9 @@ def build_workbench(config: WorkbenchConfig) -> gr.Blocks:
             metadata = gr.Markdown(label="Metadata")
 
         with gr.Row():
-            pred_text = gr.Textbox(label="Prediction", lines=7, show_copy_button=True)
-            ref_text = gr.Textbox(label="Ground truth / CER reference", lines=7, show_copy_button=True)
-        raw_text = gr.Textbox(label="Raw manifest text", lines=4, show_copy_button=True)
+            pred_text = gr.Textbox(label="Prediction", lines=7)
+            ref_text = gr.Textbox(label="Ground truth / CER reference", lines=7)
+        raw_text = gr.Textbox(label="Raw manifest text", lines=4)
         diff_html = gr.HTML(label="Diff")
 
         def reload_data(min_cer_value: float, search_value: str, max_records_value: int, newest_value: bool):
@@ -410,6 +410,7 @@ def run(args: argparse.Namespace) -> int:
         share=config.share,
         allowed_paths=config.allowed_paths,
         show_api=False,
+        css=WORKBENCH_CSS,
     )
     return 0
 
