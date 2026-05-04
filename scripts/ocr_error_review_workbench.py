@@ -5,6 +5,7 @@ from __future__ import annotations
 
 import argparse
 import html
+import inspect
 import json
 import logging
 from collections import deque
@@ -399,12 +400,33 @@ def build_workbench(config: WorkbenchConfig) -> gr.Blocks:
     return app
 
 
+def _launch_with_supported_kwargs(app: gr.Blocks, **kwargs: Any) -> None:
+    try:
+        signature = inspect.signature(app.launch)
+        supported = set(signature.parameters.keys())
+        filtered = {key: value for key, value in kwargs.items() if key in supported}
+        dropped = sorted(set(kwargs.keys()) - set(filtered.keys()))
+        if dropped:
+            LOGGER.info("Dropping unsupported Gradio launch kwargs for this version: %s", ", ".join(dropped))
+        app.launch(**filtered)
+    except (TypeError, ValueError):
+        # Very old or wrapped Gradio launch signatures can be hard to inspect.
+        minimal = {
+            key: value
+            for key, value in kwargs.items()
+            if key in {"server_name", "server_port", "share"}
+        }
+        app.launch(**minimal)
+
+
 def run(args: argparse.Namespace) -> int:
     _configure_logging()
     config = _resolve_config(args)
     LOGGER.info("Launching OCR error review workbench for %s", config.errors_jsonl)
     app = build_workbench(config)
-    app.queue(default_concurrency_limit=2).launch(
+    queued_app = app.queue(default_concurrency_limit=2)
+    _launch_with_supported_kwargs(
+        queued_app,
         server_name=config.host,
         server_port=config.port,
         share=config.share,
