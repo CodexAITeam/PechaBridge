@@ -56,8 +56,7 @@ make_random_manifest() {
   local src="$2"
   local n="$3"
   local seed="$4"
-  local tmp_dir="$5"
-  local dst="$tmp_dir/${split}_random_${n}_seed_${seed}.jsonl"
+  local dst="$5"
 
   python - "$src" "$dst" "$n" "$seed" "$split" <<'PY'
 import random
@@ -199,10 +198,10 @@ fi
 TRAIN_OUT="$OUTPUT_ROOT/donut_error_extract_${DATASET_NAME}_train_${CHECKPOINT_NAME}_${THRESHOLD_SLUG}${SAMPLE_SLUG}"
 VAL_OUT="$OUTPUT_ROOT/donut_error_extract_${DATASET_NAME}_val_${CHECKPOINT_NAME}_${THRESHOLD_SLUG}${SAMPLE_SLUG}"
 
-TMP_MANIFEST_DIR=""
 cleanup_tmp_manifests() {
-  if [[ -n "$TMP_MANIFEST_DIR" && -d "$TMP_MANIFEST_DIR" ]]; then
-    rm -rf "$TMP_MANIFEST_DIR"
+  if [[ "$RANDOM_SAMPLE" != "0" ]]; then
+    [[ "$EFFECTIVE_TRAIN_MANIFEST" != "$TRAIN_MANIFEST" ]] && rm -f "$EFFECTIVE_TRAIN_MANIFEST"
+    [[ "$EFFECTIVE_VAL_MANIFEST" != "$VAL_MANIFEST" ]] && rm -f "$EFFECTIVE_VAL_MANIFEST"
   fi
 }
 trap cleanup_tmp_manifests EXIT
@@ -210,9 +209,10 @@ trap cleanup_tmp_manifests EXIT
 EFFECTIVE_TRAIN_MANIFEST="$TRAIN_MANIFEST"
 EFFECTIVE_VAL_MANIFEST="$VAL_MANIFEST"
 if [[ "$RANDOM_SAMPLE" != "0" ]]; then
-  TMP_MANIFEST_DIR="$(mktemp -d "${TMPDIR:-/tmp}/donut_error_extract_manifests.XXXXXX")"
-  EFFECTIVE_TRAIN_MANIFEST="$(make_random_manifest train "$TRAIN_MANIFEST" "$RANDOM_SAMPLE" "$RANDOM_SEED" "$TMP_MANIFEST_DIR")"
-  EFFECTIVE_VAL_MANIFEST="$(make_random_manifest val "$VAL_MANIFEST" "$RANDOM_SAMPLE" "$RANDOM_SEED" "$TMP_MANIFEST_DIR")"
+  EFFECTIVE_TRAIN_MANIFEST="$(mktemp "$(dirname "$TRAIN_MANIFEST")/.donut_error_extract_train_random_${RANDOM_SAMPLE}_seed_${RANDOM_SEED}.jsonl.XXXXXX")"
+  EFFECTIVE_VAL_MANIFEST="$(mktemp "$(dirname "$VAL_MANIFEST")/.donut_error_extract_val_random_${RANDOM_SAMPLE}_seed_${RANDOM_SEED}.jsonl.XXXXXX")"
+  make_random_manifest train "$TRAIN_MANIFEST" "$RANDOM_SAMPLE" "$RANDOM_SEED" "$EFFECTIVE_TRAIN_MANIFEST" >/dev/null
+  make_random_manifest val "$VAL_MANIFEST" "$RANDOM_SAMPLE" "$RANDOM_SEED" "$EFFECTIVE_VAL_MANIFEST" >/dev/null
 fi
 
 run_one train "$EFFECTIVE_TRAIN_MANIFEST" "$TRAIN_OUT"
