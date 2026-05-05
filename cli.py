@@ -55,6 +55,9 @@ from scripts.download_sbb_images import (
 from scripts.eval_ocr_tokenizer import create_parser as create_eval_ocr_tokenizer_parser
 from scripts.extract_donut_ocr_errors import create_parser as create_extract_donut_ocr_errors_parser
 from scripts.ocr_error_review_workbench import create_parser as create_ocr_error_review_workbench_parser
+from scripts.summarize_donut_ocr_extraction_metrics import (
+    create_parser as create_summarize_donut_ocr_extraction_metrics_parser,
+)
 from scripts.train_line_segmentation import create_parser as create_train_line_segmentation_parser
 from scripts.warm_line_clip_workbench_cache import (
     create_parser as create_warm_line_clip_workbench_cache_parser,
@@ -188,6 +191,16 @@ def _build_root_parser() -> argparse.ArgumentParser:
         description=ocr_error_workbench_parent.description,
     )
     ocr_error_workbench_parser.set_defaults(handler=_run_ocr_error_review_workbench)
+
+    summarize_donut_extractions_parent = create_summarize_donut_ocr_extraction_metrics_parser(add_help=False)
+    summarize_donut_extractions_parser = subparsers.add_parser(
+        "summarize-donut-ocr-extractions",
+        aliases=["summarize-donut-errors", "summarize-ocr-extractions"],
+        parents=[summarize_donut_extractions_parent],
+        help="Summarize Donut OCR extraction CER metrics by checkpoint and source dataset",
+        description=summarize_donut_extractions_parent.description,
+    )
+    summarize_donut_extractions_parser.set_defaults(handler=_run_summarize_donut_ocr_extraction_metrics)
 
     workflow_parent = create_run_donut_ocr_workflow_parser(add_help=False)
     workflow_parser = subparsers.add_parser(
@@ -489,6 +502,13 @@ def _run_ocr_error_review_workbench(args: argparse.Namespace) -> int:
     from scripts.ocr_error_review_workbench import run
 
     return int(run(args))
+
+
+def _run_summarize_donut_ocr_extraction_metrics(args: argparse.Namespace) -> int:
+    from scripts.summarize_donut_ocr_extraction_metrics import run
+
+    run(args)
+    return 0
 
 
 def _run_donut_ocr_workflow(args: argparse.Namespace) -> int:
