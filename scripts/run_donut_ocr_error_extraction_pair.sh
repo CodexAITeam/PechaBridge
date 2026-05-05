@@ -12,6 +12,8 @@ set -euo pipefail
 #   CER_THRESHOLD=-1
 #   DATASET_IMAGE_MODE=reference  # copy | reference | symlink
 #   LOG_STAGE_TIMINGS=1  # log per-batch load/generate/decode/write timings
+#   RANDOM_SAMPLE=2560  # random sample this many rows from each manifest into temp files
+#   RANDOM_SEED=42
 #   CUDA_VISIBLE_DEVICES=0
 #   RUN_EXTRACT=1  # execute commands; otherwise only print them
 
@@ -40,6 +42,47 @@ threshold_slug() {
   fi
   local normalized="${threshold//./p}"
   printf 'gt%s' "$normalized"
+}
+
+make_random_manifest() {
+  local split="$1"
+  local src="$2"
+  local n="$3"
+  local seed="$4"
+  local tmp_dir="$5"
+  local dst="$tmp_dir/${split}_random_${n}_seed_${seed}.jsonl"
+
+  python - "$src" "$dst" "$n" "$seed" "$split" <<'PY'
+import random
+import sys
+from pathlib import Path
+
+src = Path(sys.argv[1]).expanduser()
+dst = Path(sys.argv[2]).expanduser()
+n = int(sys.argv[3])
+seed = int(sys.argv[4])
+split = str(sys.argv[5])
+
+rows = []
+with src.open(encoding="utf-8") as f:
+    for line in f:
+        if line.strip():
+            rows.append(line)
+
+rng = random.Random(seed)
+if n > 0 and n < len(rows):
+    selected = rng.sample(rows, n)
+else:
+    selected = list(rows)
+
+dst.parent.mkdir(parents=True, exist_ok=True)
+with dst.open("w", encoding="utf-8") as out:
+    out.writelines(selected)
+
+print(f"random_manifest split={split} source={src} rows_total={len(rows)} rows_written={len(selected)} seed={seed} output={dst}", file=sys.stderr)
+PY
+
+  printf '%s' "$dst"
 }
 
 run_one() {
@@ -132,10 +175,33 @@ VAL_FRACTION="${VAL_FRACTION:-0}"
 LOG_STAGE_TIMINGS="${LOG_STAGE_TIMINGS:-0}"
 STAGE_TIMING_EVERY_N="${STAGE_TIMING_EVERY_N:-1}"
 STAGE_TIMING_WARMUP_BATCHES="${STAGE_TIMING_WARMUP_BATCHES:-0}"
+RANDOM_SAMPLE="${RANDOM_SAMPLE:-0}"
+RANDOM_SEED="${RANDOM_SEED:-42}"
 RUN_EXTRACT="${RUN_EXTRACT:-0}"
 
-TRAIN_OUT="$OUTPUT_ROOT/donut_error_extract_${DATASET_NAME}_train_${CHECKPOINT_NAME}_${THRESHOLD_SLUG}"
-VAL_OUT="$OUTPUT_ROOT/donut_error_extract_${DATASET_NAME}_val_${CHECKPOINT_NAME}_${THRESHOLD_SLUG}"
+SAMPLE_SLUG=""
+if [[ "$RANDOM_SAMPLE" != "0" ]]; then
+  SAMPLE_SLUG="_sample${RANDOM_SAMPLE}_seed${RANDOM_SEED}"
+fi
 
-run_one train "$TRAIN_MANIFEST" "$TRAIN_OUT"
-run_one val "$VAL_MANIFEST" "$VAL_OUT"
+TRAIN_OUT="$OUTPUT_ROOT/donut_error_extract_${DATASET_NAME}_train_${CHECKPOINT_NAME}_${THRESHOLD_SLUG}${SAMPLE_SLUG}"
+VAL_OUT="$OUTPUT_ROOT/donut_error_extract_${DATASET_NAME}_val_${CHECKPOINT_NAME}_${THRESHOLD_SLUG}${SAMPLE_SLUG}"
+
+TMP_MANIFEST_DIR=""
+cleanup_tmp_manifests() {
+  if [[ -n "$TMP_MANIFEST_DIR" && -d "$TMP_MANIFEST_DIR" ]]; then
+    rm -rf "$TMP_MANIFEST_DIR"
+  fi
+}
+trap cleanup_tmp_manifests EXIT
+
+EFFECTIVE_TRAIN_MANIFEST="$TRAIN_MANIFEST"
+EFFECTIVE_VAL_MANIFEST="$VAL_MANIFEST"
+if [[ "$RANDOM_SAMPLE" != "0" ]]; then
+  TMP_MANIFEST_DIR="$(mktemp -d "${TMPDIR:-/tmp}/donut_error_extract_manifests.XXXXXX")"
+  EFFECTIVE_TRAIN_MANIFEST="$(make_random_manifest train "$TRAIN_MANIFEST" "$RANDOM_SAMPLE" "$RANDOM_SEED" "$TMP_MANIFEST_DIR")"
+  EFFECTIVE_VAL_MANIFEST="$(make_random_manifest val "$VAL_MANIFEST" "$RANDOM_SAMPLE" "$RANDOM_SEED" "$TMP_MANIFEST_DIR")"
+fi
+
+run_one train "$EFFECTIVE_TRAIN_MANIFEST" "$TRAIN_OUT"
+run_one val "$EFFECTIVE_VAL_MANIFEST" "$VAL_OUT"
