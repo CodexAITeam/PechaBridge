@@ -130,6 +130,17 @@ def create_parser(add_help: bool = True) -> argparse.ArgumentParser:
     parser.add_argument("--dataset_val_manifest", "--dataset-val-manifest", dest="dataset_val_manifest", type=str, default="val_manifest.jsonl", help="Filename for extracted validation manifest under --output_dataset_dir.")
     parser.add_argument("--dataset_cer_table", "--dataset-cer-table", dest="dataset_cer_table", type=str, default="cer_table.csv", help="Filename for the extracted filename/CER CSV table under --output_dataset_dir.")
     parser.add_argument("--dataset_summary_report", "--dataset-summary-report", dest="dataset_summary_report", type=str, default="summary_report.md", help="Filename for the Markdown quality/performance report under --output_dataset_dir.")
+    parser.add_argument(
+        "--dataset_image_mode",
+        "--dataset-image-mode",
+        dest="dataset_image_mode",
+        choices=["copy", "reference", "symlink"],
+        default="copy",
+        help=(
+            "How extracted dataset manifests refer to images: copy images into the dataset, "
+            "reference original absolute paths, or create symlinks under images/. Default: copy."
+        ),
+    )
     parser.add_argument("--output_table_csv", "--output-table-csv", dest="output_table_csv", type=str, default="", help="Optional explicit filename/CER CSV table output path.")
     parser.add_argument(
         "--source_datasets",
@@ -906,20 +917,34 @@ def _write_dataset_manifest_row(
     source_row: Optional[Dict[str, object]],
     record: Dict[str, object],
     split_name: str,
+    image_mode: str,
 ) -> str:
-    image_rel = _dataset_image_rel_path(source_image, row_index=int(record["row_index"]), cer=float(record["cer"]))
-    dst_image = dataset_dir / image_rel
-    dst_image.parent.mkdir(parents=True, exist_ok=True)
-    if not dst_image.exists():
-        shutil.copy2(source_image, dst_image)
+    mode = str(image_mode or "copy").strip().lower()
+    if mode == "reference":
+        image_ref = str(source_image)
+    else:
+        image_ref = _dataset_image_rel_path(source_image, row_index=int(record["row_index"]), cer=float(record["cer"]))
+        dst_image = dataset_dir / image_ref
+        dst_image.parent.mkdir(parents=True, exist_ok=True)
+        if not dst_image.exists():
+            if mode == "symlink":
+                try:
+                    dst_image.symlink_to(source_image)
+                except Exception as exc:
+                    LOGGER.warning("Could not symlink image %s -> %s: %s", dst_image, source_image, exc)
+                    shutil.copy2(source_image, dst_image)
+                    mode = "copy"
+            else:
+                shutil.copy2(source_image, dst_image)
 
     manifest_row: Dict[str, object] = dict(source_row or {})
-    manifest_row["image"] = image_rel
+    manifest_row["image"] = image_ref
     manifest_row["text"] = str(record.get("text_raw", "") or manifest_row.get("text", "") or "")
     manifest_row["source_image"] = str(source_image)
     manifest_row["source_manifest"] = str(record.get("manifest", ""))
     manifest_row["source_row_index"] = int(record.get("row_index", -1))
     manifest_row["error_split"] = str(split_name)
+    manifest_row["error_image_mode"] = str(mode)
     manifest_row["error_cer"] = float(record.get("cer", 0.0) or 0.0)
     manifest_row["error_edit_distance"] = int(record.get("edit_distance", 0) or 0)
     manifest_row["error_ref_len"] = int(record.get("ref_len", 0) or 0)
@@ -928,7 +953,7 @@ def _write_dataset_manifest_row(
     manifest_row["error_ref"] = str(record.get("ref", "") or "")
     manifest_row["error_checkpoint"] = str(record.get("checkpoint", "") or "")
     fp.write(json.dumps(manifest_row, ensure_ascii=False) + "\n")
-    return image_rel
+    return image_ref
 
 
 def _safe_float_stats(values: Sequence[float]) -> Dict[str, Optional[float]]:
@@ -1363,8 +1388,10 @@ def run(args: argparse.Namespace) -> Dict[str, object]:
                                     source_row=source_row,
                                     record=record,
                                     split_name=err_split,
+                                    image_mode=str(getattr(args, "dataset_image_mode", "copy") or "copy"),
                                 )
                                 record["dataset_image"] = image_rel
+                                record["dataset_image_mode"] = str(getattr(args, "dataset_image_mode", "copy") or "copy")
                                 record["dataset_split"] = err_split
                                 dataset_counts[err_split] = int(dataset_counts.get(err_split, 0)) + 1
                             if table_writer is not None:
@@ -1483,6 +1510,7 @@ def run(args: argparse.Namespace) -> Dict[str, object]:
         "dataset_val_manifest": str(dataset_val_manifest) if dataset_val_manifest is not None and dataset_val_fp is not None else "",
         "cer_table_csv": str(output_table_csv) if output_table_csv is not None else "",
         "dataset_counts": dataset_counts,
+        "dataset_image_mode": str(getattr(args, "dataset_image_mode", "copy") or "copy"),
         "val_fraction": float(getattr(args, "val_fraction", 0.0) or 0.0),
         "output_all_jsonl": str(output_all_jsonl) if output_all_jsonl is not None else "",
         "copy_images_dir": str(copy_images_dir) if copy_images_dir is not None else "",

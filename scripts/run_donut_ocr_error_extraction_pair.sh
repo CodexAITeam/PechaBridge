@@ -10,6 +10,7 @@ set -euo pipefail
 #   PB_ROOT=/home/nico/Code/PechaBridge
 #   DATASET_NAME=openpecha_ocr_lines
 #   CER_THRESHOLD=-1
+#   DATASET_IMAGE_MODE=reference  # copy | reference | symlink
 #   CUDA_VISIBLE_DEVICES=0
 #   RUN_EXTRACT=1  # execute commands; otherwise only print them
 
@@ -62,6 +63,7 @@ run_one() {
     --batch_size "$BATCH_SIZE"
     --device "$DEVICE"
     --num_workers "$NUM_WORKERS"
+    --dataset_image_mode "$DATASET_IMAGE_MODE"
   )
 
   if [[ "${INCLUDE_GOOGLE_BOOKS}" == "1" ]]; then
@@ -116,6 +118,7 @@ GENERATION_MAX_LENGTH="${GENERATION_MAX_LENGTH:-160}"
 BATCH_SIZE="${BATCH_SIZE:-64}"
 DEVICE="${DEVICE:-cuda:0}"
 NUM_WORKERS="${NUM_WORKERS:-4}"
+DATASET_IMAGE_MODE="${DATASET_IMAGE_MODE:-reference}"
 INCLUDE_GOOGLE_BOOKS="${INCLUDE_GOOGLE_BOOKS:-1}"
 SOURCE_DATASETS="${SOURCE_DATASETS:-}"
 EXCLUDE_SOURCE_DATASETS="${EXCLUDE_SOURCE_DATASETS:-}"
