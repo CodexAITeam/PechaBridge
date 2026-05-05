@@ -25,6 +25,13 @@ require_env() {
   fi
 }
 
+trim_value() {
+  local value="$1"
+  value="${value#"${value%%[![:space:]]*}"}"
+  value="${value%"${value##*[![:space:]]}"}"
+  printf '%s' "$value"
+}
+
 slugify() {
   local value="$1"
   value="${value//[^[:alnum:]_.-]/_}"
@@ -57,8 +64,8 @@ import random
 import sys
 from pathlib import Path
 
-src = Path(sys.argv[1]).expanduser()
-dst = Path(sys.argv[2]).expanduser()
+src = Path(sys.argv[1].strip()).expanduser()
+dst = Path(sys.argv[2].strip()).expanduser()
 n = int(sys.argv[3])
 seed = int(sys.argv[4])
 split = str(sys.argv[5])
@@ -148,6 +155,11 @@ require_env CKPT
 require_env RUN
 require_env TRAIN_MANIFEST
 require_env VAL_MANIFEST
+
+CKPT="$(trim_value "$CKPT")"
+RUN="$(trim_value "$RUN")"
+TRAIN_MANIFEST="$(trim_value "$TRAIN_MANIFEST")"
+VAL_MANIFEST="$(trim_value "$VAL_MANIFEST")"
 
 PB_ROOT="${PB_ROOT:-/home/nico/Code/PechaBridge}"
 DATASET_NAME="$(slugify "${DATASET_NAME:-openpecha_ocr_lines}")"
