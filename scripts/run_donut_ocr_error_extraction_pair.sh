@@ -14,6 +14,7 @@ set -euo pipefail
 #   LOG_STAGE_TIMINGS=1  # log per-batch load/generate/decode/write timings
 #   RANDOM_SAMPLE=2560  # random sample this many rows from each manifest into temp files
 #   RANDOM_SEED=42
+#   RANDOM_VAL_SEED=43  # defaults to RANDOM_SEED + 1
 #   CUDA_VISIBLE_DEVICES=0
 #   RUN_EXTRACT=1  # execute commands; otherwise only print them
 
@@ -89,6 +90,57 @@ print(f"random_manifest split={split} source={src} rows_total={len(rows)} rows_w
 PY
 
   printf '%s' "$dst"
+}
+
+manifest_sha() {
+  python - "$1" <<'PY'
+import hashlib
+import sys
+from pathlib import Path
+
+path = Path(sys.argv[1].strip()).expanduser()
+h = hashlib.sha256()
+with path.open("rb") as f:
+    for chunk in iter(lambda: f.read(1024 * 1024), b""):
+        h.update(chunk)
+print(h.hexdigest())
+PY
+}
+
+log_manifest_fingerprint() {
+  local split="$1"
+  local path="$2"
+  python - "$split" "$path" <<'PY'
+import hashlib
+import json
+import sys
+from pathlib import Path
+
+split = sys.argv[1]
+path = Path(sys.argv[2].strip()).expanduser()
+count = 0
+first = None
+h = hashlib.sha256()
+with path.open("rb") as f:
+    for raw in f:
+        if raw.strip():
+            count += 1
+            h.update(raw)
+            if first is None:
+                try:
+                    row = json.loads(raw)
+                    first = {
+                        "image": row.get("image") or row.get("image_path") or row.get("path"),
+                        "source_dataset": row.get("source_dataset") or row.get("dataset") or row.get("source"),
+                    }
+                except Exception:
+                    first = {"raw_prefix": raw[:120].decode("utf-8", errors="replace")}
+print(
+    "manifest_fingerprint "
+    f"split={split} rows={count} sha256={h.hexdigest()[:16]} path={path} first={json.dumps(first, ensure_ascii=False)}",
+    file=sys.stderr,
+)
+PY
 }
 
 run_one() {
@@ -188,11 +240,12 @@ STAGE_TIMING_EVERY_N="${STAGE_TIMING_EVERY_N:-1}"
 STAGE_TIMING_WARMUP_BATCHES="${STAGE_TIMING_WARMUP_BATCHES:-0}"
 RANDOM_SAMPLE="${RANDOM_SAMPLE:-0}"
 RANDOM_SEED="${RANDOM_SEED:-42}"
+RANDOM_VAL_SEED="${RANDOM_VAL_SEED:-$((RANDOM_SEED + 1))}"
 RUN_EXTRACT="${RUN_EXTRACT:-0}"
 
 SAMPLE_SLUG=""
 if [[ "$RANDOM_SAMPLE" != "0" ]]; then
-  SAMPLE_SLUG="_sample${RANDOM_SAMPLE}_seed${RANDOM_SEED}"
+  SAMPLE_SLUG="_sample${RANDOM_SAMPLE}_seed${RANDOM_SEED}_vseed${RANDOM_VAL_SEED}"
 fi
 
 TRAIN_OUT="$OUTPUT_ROOT/donut_error_extract_${DATASET_NAME}_train_${CHECKPOINT_NAME}_${THRESHOLD_SLUG}${SAMPLE_SLUG}"
@@ -209,10 +262,18 @@ trap cleanup_tmp_manifests EXIT
 EFFECTIVE_TRAIN_MANIFEST="$TRAIN_MANIFEST"
 EFFECTIVE_VAL_MANIFEST="$VAL_MANIFEST"
 if [[ "$RANDOM_SAMPLE" != "0" ]]; then
+  if [[ "$TRAIN_MANIFEST" == "$VAL_MANIFEST" ]]; then
+    echo "WARNING: TRAIN_MANIFEST and VAL_MANIFEST point to the same path: $TRAIN_MANIFEST" >&2
+  fi
   EFFECTIVE_TRAIN_MANIFEST="$(mktemp "$(dirname "$TRAIN_MANIFEST")/.donut_error_extract_train_random_${RANDOM_SAMPLE}_seed_${RANDOM_SEED}.jsonl.XXXXXX")"
-  EFFECTIVE_VAL_MANIFEST="$(mktemp "$(dirname "$VAL_MANIFEST")/.donut_error_extract_val_random_${RANDOM_SAMPLE}_seed_${RANDOM_SEED}.jsonl.XXXXXX")"
+  EFFECTIVE_VAL_MANIFEST="$(mktemp "$(dirname "$VAL_MANIFEST")/.donut_error_extract_val_random_${RANDOM_SAMPLE}_seed_${RANDOM_VAL_SEED}.jsonl.XXXXXX")"
   make_random_manifest train "$TRAIN_MANIFEST" "$RANDOM_SAMPLE" "$RANDOM_SEED" "$EFFECTIVE_TRAIN_MANIFEST" >/dev/null
-  make_random_manifest val "$VAL_MANIFEST" "$RANDOM_SAMPLE" "$RANDOM_SEED" "$EFFECTIVE_VAL_MANIFEST" >/dev/null
+  make_random_manifest val "$VAL_MANIFEST" "$RANDOM_SAMPLE" "$RANDOM_VAL_SEED" "$EFFECTIVE_VAL_MANIFEST" >/dev/null
+  log_manifest_fingerprint train "$EFFECTIVE_TRAIN_MANIFEST"
+  log_manifest_fingerprint val "$EFFECTIVE_VAL_MANIFEST"
+  if [[ "$(manifest_sha "$EFFECTIVE_TRAIN_MANIFEST")" == "$(manifest_sha "$EFFECTIVE_VAL_MANIFEST")" ]]; then
+    echo "WARNING: sampled train and val manifests have identical content." >&2
+  fi
 fi
 
 run_one train "$EFFECTIVE_TRAIN_MANIFEST" "$TRAIN_OUT"
