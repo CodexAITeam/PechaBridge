@@ -198,6 +198,9 @@ def create_parser(add_help: bool = True) -> argparse.ArgumentParser:
     parser.add_argument("--batch_size", "--batch-size", dest="batch_size", type=int, default=16, help="Evaluation batch size.")
     parser.add_argument("--num_workers", "--num-workers", dest="num_workers", type=int, default=0, help="DataLoader workers.")
     parser.add_argument("--device", type=str, default="cuda:0" if torch.cuda.is_available() else "cpu", help="Evaluation device.")
+    parser.add_argument("--log_stage_timings", "--log-stage-timings", dest="log_stage_timings", action="store_true", help="Log per-batch stage timings for load/preprocess, generate, decode+CER, and write/copy.")
+    parser.add_argument("--stage_timing_every_n", "--stage-timing-every-n", dest="stage_timing_every_n", type=int, default=1, help="Log stage timings every N measured batches when --log_stage_timings is enabled.")
+    parser.add_argument("--stage_timing_warmup_batches", "--stage-timing-warmup-batches", dest="stage_timing_warmup_batches", type=int, default=0, help="Skip the first N batches from stage timing aggregates.")
     parser.add_argument("--max_samples", "--max-samples", dest="max_samples", type=int, default=0, help="Evaluate at most N manifest rows after --start_index. 0 = all.")
     parser.add_argument("--start_index", "--start-index", dest="start_index", type=int, default=0, help="Skip manifest rows before this 0-based row index.")
     parser.add_argument("--limit_errors", "--limit-errors", dest="limit_errors", type=int, default=0, help="Stop after writing N high-CER errors. 0 = no limit.")
@@ -968,6 +971,57 @@ def _safe_float_stats(values: Sequence[float]) -> Dict[str, Optional[float]]:
     }
 
 
+def _add_stage_timing(
+    totals: Dict[str, float],
+    maximums: Dict[str, float],
+    name: str,
+    seconds: float,
+) -> None:
+    value = max(0.0, float(seconds))
+    totals[name] = float(totals.get(name, 0.0) + value)
+    maximums[name] = max(float(maximums.get(name, 0.0)), value)
+
+
+def _stage_timing_summary(
+    totals: Dict[str, float],
+    maximums: Dict[str, float],
+    measured_batches: int,
+    *,
+    enabled: bool,
+    every_n: int,
+    warmup_batches: int,
+) -> Dict[str, object]:
+    count = max(0, int(measured_batches))
+    total_batch = float(totals.get("batch_total", 0.0))
+    stage_names = [
+        "load_preprocess_wait",
+        "to_device",
+        "generate",
+        "decode_cer",
+        "write_copy",
+        "batch_total",
+    ]
+    means = {
+        name: (float(totals.get(name, 0.0)) / max(1, count) if count > 0 else 0.0)
+        for name in stage_names
+    }
+    shares = {
+        name: (float(totals.get(name, 0.0)) / max(1e-9, total_batch) if total_batch > 0 else 0.0)
+        for name in stage_names
+        if name != "batch_total"
+    }
+    return {
+        "enabled": bool(enabled),
+        "logged_every_n": int(every_n),
+        "warmup_batches": int(warmup_batches),
+        "batches_measured": int(count),
+        "totals_seconds": {name: float(totals.get(name, 0.0)) for name in stage_names},
+        "mean_seconds_per_batch": means,
+        "max_seconds_per_batch": {name: float(maximums.get(name, 0.0)) for name in stage_names},
+        "share_of_measured_batch_total": shares,
+    }
+
+
 def _safe_percentile_stats(values: Sequence[float]) -> Dict[str, Optional[float]]:
     keys = ("p50", "p75", "p90", "p95", "p99")
     if not values:
@@ -1061,6 +1115,31 @@ def _write_summary_report(summary: Dict[str, object], path: Path) -> None:
         count = int(bucket_counts.get(key, 0) or 0)
         bucket_lines.append(f"| {label} | {count} | {count / valid_n:.2%} |")
 
+    stage_timing = performance.get("stage_timing")
+    stage_timing = stage_timing if isinstance(stage_timing, dict) else {}
+    stage_means = stage_timing.get("mean_seconds_per_batch")
+    stage_means = stage_means if isinstance(stage_means, dict) else {}
+    stage_shares = stage_timing.get("share_of_measured_batch_total")
+    stage_shares = stage_shares if isinstance(stage_shares, dict) else {}
+    stage_section: List[str] = []
+    if bool(stage_timing.get("enabled", False)):
+        stage_section = [
+            "",
+            "## Stage Timing",
+            _markdown_table(
+                [
+                    ("Measured batches", stage_timing.get("batches_measured")),
+                    ("Mean load/preprocess wait seconds", stage_means.get("load_preprocess_wait")),
+                    ("Mean to-device seconds", stage_means.get("to_device")),
+                    ("Mean generate seconds", stage_means.get("generate")),
+                    ("Mean decode+CER seconds", stage_means.get("decode_cer")),
+                    ("Mean write/copy seconds", stage_means.get("write_copy")),
+                    ("Generate share", f"{float(stage_shares.get('generate', 0.0) or 0.0):.2%}"),
+                    ("Write/copy share", f"{float(stage_shares.get('write_copy', 0.0) or 0.0):.2%}"),
+                ]
+            ),
+        ]
+
     sections = [
         "# Donut OCR Error Extraction Report",
         "",
@@ -1126,6 +1205,7 @@ def _write_summary_report(summary: Dict[str, object], path: Path) -> None:
                 ("CUDA peak memory GB", performance.get("cuda_peak_memory_gb")),
             ]
         ),
+        *stage_section,
         "",
         "## Outputs",
         _markdown_table(
@@ -1283,6 +1363,12 @@ def run(args: argparse.Namespace) -> Dict[str, object]:
     limit_errors = max(0, int(getattr(args, "limit_errors", 0) or 0))
     newline_token = str(getattr(args, "metric_newline_token", "<NL>") or "<NL>")
     logged_generate_kwargs = False
+    log_stage_timings = bool(getattr(args, "log_stage_timings", False))
+    stage_timing_every_n = max(1, int(getattr(args, "stage_timing_every_n", 1) or 1))
+    stage_timing_warmup_batches = max(0, int(getattr(args, "stage_timing_warmup_batches", 0) or 0))
+    stage_timing_totals: Dict[str, float] = {}
+    stage_timing_max: Dict[str, float] = {}
+    stage_timing_measured_batches = 0
     if device.type == "cuda":
         try:
             torch.cuda.reset_peak_memory_stats(device)
@@ -1290,6 +1376,7 @@ def run(args: argparse.Namespace) -> Dict[str, object]:
             pass
 
     eval_start_time = time.perf_counter()
+    stage_prev_batch_done_t = eval_start_time
     with output_jsonl.open("w", encoding="utf-8") as error_fp:
         if output_dataset_dir is not None and dataset_train_manifest is not None:
             dataset_train_fp = dataset_train_manifest.open("w", encoding="utf-8")
@@ -1302,15 +1389,39 @@ def run(args: argparse.Namespace) -> Dict[str, object]:
         try:
             with torch.no_grad():
                 for batch in tqdm(loader, desc="extract-cer-errors"):
+                    batch_ready_t = time.perf_counter()
+                    load_preprocess_wait_s = batch_ready_t - stage_prev_batch_done_t
+                    batch_stage_start_t = batch_ready_t
                     batch_count += 1
+                    to_device_start_t = time.perf_counter()
                     pixel_values = batch["pixel_values"].to(device)
                     labels = batch["labels"].detach().cpu().numpy()
+                    if log_stage_timings and device.type == "cuda":
+                        try:
+                            torch.cuda.synchronize(device)
+                        except Exception:
+                            pass
+                    to_device_s = time.perf_counter() - to_device_start_t
                     gen_kwargs = _build_generate_kwargs(model, pixel_values, args)
                     if not logged_generate_kwargs:
                         loggable = {k: v for k, v in gen_kwargs.items() if k != "pixel_values"}
                         LOGGER.info("Effective generate kwargs: %s", json.dumps(loggable, ensure_ascii=False, default=str))
                         logged_generate_kwargs = True
+                    if log_stage_timings and device.type == "cuda":
+                        try:
+                            torch.cuda.synchronize(device)
+                        except Exception:
+                            pass
+                    generate_start_t = time.perf_counter()
                     gen_ids = model.generate(**gen_kwargs)
+                    if log_stage_timings and device.type == "cuda":
+                        try:
+                            torch.cuda.synchronize(device)
+                        except Exception:
+                            pass
+                    generate_s = time.perf_counter() - generate_start_t
+                    decode_cer_start_t = time.perf_counter()
+                    write_copy_s = 0.0
                     pred_norms = train_mod._decode_for_metric(
                         tokenizer,
                         gen_ids.detach().cpu().numpy(),
@@ -1370,7 +1481,9 @@ def run(args: argparse.Namespace) -> Dict[str, object]:
                             error_n += 1
                             error_cer_values.append(float(sample_cer))
                             if copy_images_dir is not None and image_path:
+                                write_start_t = time.perf_counter()
                                 copied = _copy_error_image(Path(image_path), copy_images_dir, row_index=row_index, cer=float(sample_cer))
+                                write_copy_s += time.perf_counter() - write_start_t
                                 if copied:
                                     record["copied_image"] = copied
                             if output_dataset_dir is not None and dataset_train_fp is not None and image_path:
@@ -1381,6 +1494,7 @@ def run(args: argparse.Namespace) -> Dict[str, object]:
                                 )
                                 target_fp = dataset_val_fp if err_split == "val" and dataset_val_fp is not None else dataset_train_fp
                                 source_row = row if isinstance(row, dict) else None
+                                write_start_t = time.perf_counter()
                                 image_rel = _write_dataset_manifest_row(
                                     target_fp,
                                     dataset_dir=output_dataset_dir,
@@ -1390,18 +1504,52 @@ def run(args: argparse.Namespace) -> Dict[str, object]:
                                     split_name=err_split,
                                     image_mode=str(getattr(args, "dataset_image_mode", "copy") or "copy"),
                                 )
+                                write_copy_s += time.perf_counter() - write_start_t
                                 record["dataset_image"] = image_rel
                                 record["dataset_image_mode"] = str(getattr(args, "dataset_image_mode", "copy") or "copy")
                                 record["dataset_split"] = err_split
                                 dataset_counts[err_split] = int(dataset_counts.get(err_split, 0)) + 1
                             if table_writer is not None:
+                                write_start_t = time.perf_counter()
                                 table_filename = str(record.get("dataset_image") or record.get("copied_image") or Path(image_path).name)
                                 table_writer.writerow([table_filename, f"{float(sample_cer):.8f}"])
+                                write_copy_s += time.perf_counter() - write_start_t
+                            write_start_t = time.perf_counter()
                             error_fp.write(json.dumps(record, ensure_ascii=False) + "\n")
+                            write_copy_s += time.perf_counter() - write_start_t
                         if all_fp_ctx is not None:
+                            write_start_t = time.perf_counter()
                             all_fp_ctx.write(json.dumps(record, ensure_ascii=False) + "\n")
+                            write_copy_s += time.perf_counter() - write_start_t
                         if limit_errors > 0 and error_n >= limit_errors:
                             break
+                    decode_cer_s = max(0.0, time.perf_counter() - decode_cer_start_t - write_copy_s)
+                    batch_total_s = time.perf_counter() - batch_stage_start_t
+                    if log_stage_timings and batch_count > stage_timing_warmup_batches:
+                        stage_timing_measured_batches += 1
+                        for stage_name, stage_seconds in (
+                            ("load_preprocess_wait", load_preprocess_wait_s),
+                            ("to_device", to_device_s),
+                            ("generate", generate_s),
+                            ("decode_cer", decode_cer_s),
+                            ("write_copy", write_copy_s),
+                            ("batch_total", batch_total_s),
+                        ):
+                            _add_stage_timing(stage_timing_totals, stage_timing_max, stage_name, stage_seconds)
+                        if stage_timing_measured_batches % stage_timing_every_n == 0:
+                            LOGGER.info(
+                                "stage_timing batch=%d measured=%d samples=%d load_preprocess_wait=%.4fs to_device=%.4fs generate=%.4fs decode_cer=%.4fs write_copy=%.4fs total=%.4fs",
+                                int(batch_count),
+                                int(stage_timing_measured_batches),
+                                int(len(batch["meta"])),
+                                float(load_preprocess_wait_s),
+                                float(to_device_s),
+                                float(generate_s),
+                                float(decode_cer_s),
+                                float(write_copy_s),
+                                float(batch_total_s),
+                            )
+                    stage_prev_batch_done_t = time.perf_counter()
                     if limit_errors > 0 and error_n >= limit_errors:
                         break
         finally:
@@ -1477,6 +1625,14 @@ def run(args: argparse.Namespace) -> Dict[str, object]:
         or getattr(getattr(model, "generation_config", None), "max_length", 0)
         or 160
     )
+    stage_timing_metrics = _stage_timing_summary(
+        stage_timing_totals,
+        stage_timing_max,
+        stage_timing_measured_batches,
+        enabled=log_stage_timings,
+        every_n=stage_timing_every_n,
+        warmup_batches=stage_timing_warmup_batches,
+    )
     performance_metrics: Dict[str, object] = {
         "total_wall_time_seconds": float(total_elapsed_seconds),
         "eval_time_seconds": float(eval_elapsed_seconds),
@@ -1488,6 +1644,7 @@ def run(args: argparse.Namespace) -> Dict[str, object]:
         "num_workers": int(max(0, int(getattr(args, "num_workers", 0) or 0))),
         "generation_max_length": int(effective_generation_max_length),
         "cuda_peak_memory_gb": cuda_peak_memory_gb,
+        "stage_timing": stage_timing_metrics,
     }
     outputs: Dict[str, object] = {
         "errors_jsonl": str(output_jsonl),

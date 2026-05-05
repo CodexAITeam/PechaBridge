@@ -11,6 +11,7 @@ set -euo pipefail
 #   DATASET_NAME=openpecha_ocr_lines
 #   CER_THRESHOLD=-1
 #   DATASET_IMAGE_MODE=reference  # copy | reference | symlink
+#   LOG_STAGE_TIMINGS=1  # log per-batch load/generate/decode/write timings
 #   CUDA_VISIBLE_DEVICES=0
 #   RUN_EXTRACT=1  # execute commands; otherwise only print them
 
@@ -81,6 +82,9 @@ run_one() {
   if [[ "${LIMIT_ERRORS}" != "0" ]]; then
     cmd+=(--limit_errors "$LIMIT_ERRORS")
   fi
+  if [[ "${LOG_STAGE_TIMINGS}" == "1" ]]; then
+    cmd+=(--log_stage_timings --stage_timing_every_n "$STAGE_TIMING_EVERY_N" --stage_timing_warmup_batches "$STAGE_TIMING_WARMUP_BATCHES")
+  fi
   if [[ "$split" == "val" ]]; then
     cmd+=(--val_fraction 0)
   elif [[ "${VAL_FRACTION}" != "0" ]]; then
@@ -125,6 +129,9 @@ EXCLUDE_SOURCE_DATASETS="${EXCLUDE_SOURCE_DATASETS:-}"
 MAX_SAMPLES="${MAX_SAMPLES:-0}"
 LIMIT_ERRORS="${LIMIT_ERRORS:-0}"
 VAL_FRACTION="${VAL_FRACTION:-0}"
+LOG_STAGE_TIMINGS="${LOG_STAGE_TIMINGS:-0}"
+STAGE_TIMING_EVERY_N="${STAGE_TIMING_EVERY_N:-1}"
+STAGE_TIMING_WARMUP_BATCHES="${STAGE_TIMING_WARMUP_BATCHES:-0}"
 RUN_EXTRACT="${RUN_EXTRACT:-0}"
 
 TRAIN_OUT="$OUTPUT_ROOT/donut_error_extract_${DATASET_NAME}_train_${CHECKPOINT_NAME}_${THRESHOLD_SLUG}"
