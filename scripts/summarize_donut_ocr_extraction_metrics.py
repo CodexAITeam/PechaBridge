@@ -53,6 +53,12 @@ def create_parser(add_help: bool = True) -> argparse.ArgumentParser:
         default=0,
         help="Optional max rows to include in the Markdown table (0 = all rows).",
     )
+    parser.add_argument(
+        "--cer_thresholds",
+        "--cer-thresholds",
+        default="0.01,0.05,0.10,0.20,0.50",
+        help="Comma-separated CER thresholds for tail-count columns (default: 0.01,0.05,0.10,0.20,0.50).",
+    )
     return parser
 
 
@@ -154,25 +160,77 @@ def _summary_threshold(output_root: Path) -> Optional[float]:
     return None
 
 
-def _stats(values: List[float]) -> Dict[str, object]:
+def _percentile(sorted_values: List[float], q: float) -> float:
+    if not sorted_values:
+        return float("nan")
+    q = min(1.0, max(0.0, float(q)))
+    if len(sorted_values) == 1:
+        return float(sorted_values[0])
+    pos = (len(sorted_values) - 1) * q
+    lo = int(math.floor(pos))
+    hi = int(math.ceil(pos))
+    if lo == hi:
+        return float(sorted_values[lo])
+    frac = pos - lo
+    return float(sorted_values[lo] * (1.0 - frac) + sorted_values[hi] * frac)
+
+
+def _threshold_key(threshold: float) -> str:
+    return f"{float(threshold):g}".replace(".", "p")
+
+
+def _parse_thresholds(raw: str) -> List[float]:
+    values: List[float] = []
+    for part in str(raw or "").split(","):
+        part = part.strip()
+        if not part:
+            continue
+        value = _as_float(part)
+        if value is not None:
+            values.append(float(value))
+    return sorted(set(values))
+
+
+def _stats(values: List[float], *, thresholds: List[float]) -> Dict[str, object]:
     values = [float(v) for v in values if math.isfinite(float(v))]
     values.sort()
     if not values:
-        return {
+        empty = {
             "n": 0,
             "cer_min": "",
             "cer_max": "",
             "cer_mean": "",
             "cer_median": "",
+            "cer_p75": "",
+            "cer_p90": "",
+            "cer_p95": "",
+            "cer_p99": "",
             "cer_std": "",
         }
-    return {
+        for threshold in thresholds:
+            key = _threshold_key(threshold)
+            empty[f"cer_gt_{key}_n"] = ""
+            empty[f"cer_gt_{key}_rate"] = ""
+        return empty
+    stats = {
         "n": len(values),
         "cer_min": min(values),
         "cer_max": max(values),
         "cer_mean": sum(values) / len(values),
         "cer_median": statistics.median(values),
+        "cer_p75": _percentile(values, 0.75),
+        "cer_p90": _percentile(values, 0.90),
+        "cer_p95": _percentile(values, 0.95),
+        "cer_p99": _percentile(values, 0.99),
         "cer_std": statistics.pstdev(values) if len(values) > 1 else 0.0,
+    }
+    for threshold in thresholds:
+        key = _threshold_key(threshold)
+        count = sum(1 for value in values if value > threshold)
+        stats[f"cer_gt_{key}_n"] = int(count)
+        stats[f"cer_gt_{key}_rate"] = float(count / len(values))
+    return {
+        **stats,
     }
 
 
@@ -196,7 +254,15 @@ def _write_csv(path: Path, rows: List[Dict[str, object]], fields: List[str]) -> 
             writer.writerow({field: row.get(field, "") for field in fields})
 
 
-def _write_report(path: Path, rows: List[Dict[str, object]], *, top_n: int, scanned: List[str], warnings: List[str]) -> None:
+def _write_report(
+    path: Path,
+    rows: List[Dict[str, object]],
+    *,
+    top_n: int,
+    scanned: List[str],
+    warnings: List[str],
+    thresholds: List[float],
+) -> None:
     path.parent.mkdir(parents=True, exist_ok=True)
     shown_rows = rows if top_n <= 0 else rows[:top_n]
     lines = [
@@ -217,28 +283,40 @@ def _write_report(path: Path, rows: List[Dict[str, object]], *, top_n: int, scan
         [
             "## Metrics By Checkpoint / Split / Source Dataset",
             "",
-            "| checkpoint | split | source_dataset | n | cer_min | cer_mean | cer_max | cer_median | cer_std |",
-            "|---|---|---|---:|---:|---:|---:|---:|---:|",
+            "| checkpoint | split | source_dataset | n | mean | median | p90 | p95 | p99 | max | >10% | >20% |",
+            "|---|---|---|---:|---:|---:|---:|---:|---:|---:|---:|---:|",
         ]
     )
     for row in shown_rows:
+        gt_10 = row.get("cer_gt_0p1_rate", "")
+        gt_20 = row.get("cer_gt_0p2_rate", "")
         lines.append(
-            "| {checkpoint} | {split} | {source_dataset} | {n} | {cer_min} | {cer_mean} | {cer_max} | {cer_median} | {cer_std} |".format(
+            "| {checkpoint} | {split} | {source_dataset} | {n} | {cer_mean} | {cer_median} | {cer_p90} | {cer_p95} | {cer_p99} | {cer_max} | {gt_10} | {gt_20} |".format(
                 checkpoint=row.get("checkpoint", ""),
                 split=row.get("split", ""),
                 source_dataset=row.get("source_dataset", ""),
                 n=row.get("n", ""),
-                cer_min=_fmt(row.get("cer_min")),
                 cer_mean=_fmt(row.get("cer_mean")),
-                cer_max=_fmt(row.get("cer_max")),
                 cer_median=_fmt(row.get("cer_median")),
-                cer_std=_fmt(row.get("cer_std")),
+                cer_p90=_fmt(row.get("cer_p90")),
+                cer_p95=_fmt(row.get("cer_p95")),
+                cer_p99=_fmt(row.get("cer_p99")),
+                cer_max=_fmt(row.get("cer_max")),
+                gt_10=_fmt(gt_10),
+                gt_20=_fmt(gt_20),
             )
         )
     if top_n > 0 and len(rows) > top_n:
         lines.append("")
         lines.append(f"Showing top {top_n} rows of {len(rows)}. See CSV for the full table.")
     lines.append("")
+    if thresholds:
+        lines.append("## Tail Count Columns")
+        lines.append("")
+        for threshold in thresholds:
+            key = _threshold_key(threshold)
+            lines.append(f"- `cer_gt_{key}_n` / `cer_gt_{key}_rate`: samples with CER > {threshold:g}")
+        lines.append("")
     lines.append("## Scanned Files")
     lines.append("")
     for item in scanned:
@@ -251,6 +329,7 @@ def run(args: argparse.Namespace) -> Dict[str, object]:
     output_dir = Path(str(args.output_dir)).expanduser().resolve() if str(args.output_dir or "").strip() else root_dir / "donut_ocr_extraction_metric_summary"
     jsonl_name = str(args.jsonl_name or "errors.jsonl")
     jsonl_paths = sorted(root_dir.glob(f"**/meta/{jsonl_name}"))
+    thresholds = _parse_thresholds(str(getattr(args, "cer_thresholds", "") or ""))
 
     grouped: Dict[MetricKey, List[float]] = defaultdict(list)
     scanned: List[str] = []
@@ -290,7 +369,7 @@ def run(args: argparse.Namespace) -> Dict[str, object]:
             "source_dataset": key.source_dataset,
             "output_dir": key.output_dir,
         }
-        row.update(_stats(values))
+        row.update(_stats(values, thresholds=thresholds))
         rows.append(row)
 
     rows.sort(key=lambda r: (str(r.get("checkpoint")), str(r.get("split")), str(r.get("source_dataset"))))
@@ -303,7 +382,7 @@ def run(args: argparse.Namespace) -> Dict[str, object]:
                     "split": "unknown",
                     "source_dataset": "NO_USABLE_CER_RECORDS",
                     "output_dir": str(Path(path).parent.parent),
-                    **_stats([]),
+                    **_stats([], thresholds=thresholds),
                 }
             )
     elif empty_outputs:
@@ -316,9 +395,19 @@ def run(args: argparse.Namespace) -> Dict[str, object]:
         "n",
         "cer_min",
         "cer_mean",
-        "cer_max",
         "cer_median",
+        "cer_p75",
+        "cer_p90",
+        "cer_p95",
+        "cer_p99",
+        "cer_max",
         "cer_std",
+        *[
+            field
+            for threshold in thresholds
+            for key in [_threshold_key(threshold)]
+            for field in (f"cer_gt_{key}_n", f"cer_gt_{key}_rate")
+        ],
         "output_dir",
     ]
     csv_path = output_dir / "source_dataset_cer_summary.csv"
@@ -326,7 +415,14 @@ def run(args: argparse.Namespace) -> Dict[str, object]:
     json_path = output_dir / "source_dataset_cer_summary.json"
 
     _write_csv(csv_path, rows, fields)
-    _write_report(report_path, rows, top_n=int(getattr(args, "top_n", 0) or 0), scanned=scanned, warnings=warnings)
+    _write_report(
+        report_path,
+        rows,
+        top_n=int(getattr(args, "top_n", 0) or 0),
+        scanned=scanned,
+        warnings=warnings,
+        thresholds=thresholds,
+    )
     json_path.write_text(
         json.dumps(
             {
@@ -334,6 +430,7 @@ def run(args: argparse.Namespace) -> Dict[str, object]:
                 "n_scanned_files": len(scanned),
                 "n_summary_rows": len(rows),
                 "warnings": warnings,
+                "cer_threshold_columns": thresholds,
                 "rows": rows,
                 "outputs": {
                     "csv": str(csv_path),
